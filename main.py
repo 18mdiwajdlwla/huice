@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.152.0"
+VERSION = "1.152.1"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -14234,7 +14234,7 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--best);outline-offse
 .wrap{max-width:1100px;margin:0 auto;padding:12px 16px 40px}
 header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 12px;padding:4px 0 6px}
 .ttl{display:flex;flex-direction:column;gap:2px;min-width:0}
-h1{font-size:20px;font-weight:750;letter-spacing:-.01em;margin:0;line-height:1.3}h2{font-size:13px;font-weight:700;color:var(--text);letter-spacing:.02em;margin:0}
+h1{font-size:20px;font-weight:750;letter-spacing:-.01em;margin:0;line-height:1.3}h2{font-size:13px;font-weight:700;color:var(--text);letter-spacing:.02em;margin:0}.hd h2{white-space:nowrap;flex:0 0 auto}
 .meta{color:var(--muted);font-size:12px;display:flex;flex-wrap:wrap;gap:2px 10px;font-variant-numeric:tabular-nums}
 .tog{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:12.5px;line-height:1.4;color:var(--muted);background:var(--card);border:1px solid var(--line);border-radius:999px;padding:4px 11px 4px 9px;cursor:pointer;user-select:none;white-space:nowrap;transition:border-color .15s,color .15s}.tog:hover{border-color:var(--best-soft);color:var(--text)}
 a{color:var(--best)}.mut{color:var(--muted)}.small{font-size:12.5px}.warn{color:var(--warn)}.bad{color:var(--hot)}.ok{color:var(--best)}
@@ -14284,44 +14284,37 @@ dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
 .note{font-size:12.5px;background:var(--chip);border-radius:10px;padding:8px 10px;border-left:3px solid var(--warn)}.note.bad{border-left-color:var(--hot)}
 footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:var(--faint);font-size:12px}
 .evchart{width:100%;height:auto;display:block;margin:6px 0 2px;background:var(--chip);border-radius:10px}.evchart .grid{stroke:var(--line2)}.evchart .zero{stroke:var(--faint);stroke-dasharray:3 3}.evchart text{font-size:10px;fill:var(--faint)}.evchart .band{fill:var(--best-soft);opacity:.35}.evchart .ev{fill:none;stroke:var(--muted);stroke-width:1.5;stroke-dasharray:5 4}.evchart .pnl{fill:none;stroke:var(--best);stroke-width:2}.evchart circle.pnl{fill:var(--best)}.evchart circle.ev{fill:var(--muted)}
-.tbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:2px 0 10px}.tbar .tq.on{border-color:var(--best);color:var(--best);background:var(--best-bg)}ul.notes{margin:4px 0 10px;padding-left:20px;font-size:13px;line-height:1.55}ul.notes li{margin:2px 0}.tbar select,.tbar input,.tbar button{font:inherit;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}.tbar button{cursor:pointer}.tcust{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}.tsum{font-size:13px;margin:2px 0 4px}.tcu{color:var(--up)}.tcd{color:var(--down)}.tdots{display:flex;flex-direction:column;gap:3px;margin:10px 0 6px}.trow{display:flex;align-items:flex-start;gap:8px;font-size:11px;color:var(--muted)}.trow .tl{width:70px;flex:none;font-variant-numeric:tabular-nums;line-height:13px}.trow .tcells{display:flex;flex-wrap:wrap;gap:3px}.tdot{width:12px;height:12px;border-radius:50%;display:inline-block;flex:none;vertical-align:-2px;box-sizing:border-box}.tdot.u{background:var(--up)}.tdot.d{background:var(--down)}.tdot.f{background:var(--faint)}.tdot.n{opacity:.42}.tdot.x{border:1.5px solid var(--line)}.tdot.bad{box-shadow:0 0 0 2px var(--warn)}.tlegend .tdot{margin:0 4px 0 8px}.tdots .tdot{cursor:pointer}.tdots.only .tdot:not(.bad){opacity:.15}.tdot.sel{outline:2px solid var(--text);outline-offset:1px}.tdet{font-size:12.5px;background:var(--chip);border-radius:10px;padding:7px 10px;margin:4px 0}.tdays tr.pick{cursor:pointer}.tdays tr.on td{background:var(--best-bg)}
+details.hint{margin:4px 0 8px}details.hint>summary{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--muted);cursor:pointer;list-style:none;user-select:none;padding:2px 0}details.hint>summary::-webkit-details-marker{display:none}details.hint>summary:before{content:"ⓘ"}details.hint>summary:after{content:"▸";font-size:10px}details.hint[open]>summary:after{content:"▾"}details.hint[open]>summary{color:var(--text)}details.hint>p{margin:3px 0 0;font-size:12.5px;color:var(--muted);line-height:1.6}details.fold{border-top:1px solid var(--line2)}details.fold>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:8px;padding:10px 0;user-select:none}details.fold>summary::-webkit-details-marker{display:none}details.fold>summary:before{content:"▸";color:var(--muted);font-size:11px;width:10px;flex:0 0 auto}details.fold[open]>summary:before{content:"▾"}details.fold>summary h3{margin:0;font-size:13.5px;color:var(--text)}details.fold[open]{padding-bottom:10px}details.fold.sub{border-top:0}details.fold.sub>summary{padding:6px 0 4px;font-size:12px;color:var(--muted);font-weight:600}details.fold.sub[open]{padding-bottom:4px}details.cust{display:contents}details.cust>summary{list-style:none;display:inline-flex;align-items:center;cursor:pointer;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}details.cust>summary::-webkit-details-marker{display:none}details.cust>summary:after{content:" ▾";font-size:10px}details.cust[open]>summary{border-color:var(--best);color:var(--best)}details.cust .tcust{flex-basis:100%}details.menu{display:inline-block;position:relative}details.menu>summary{list-style:none}details.menu>summary::-webkit-details-marker{display:none}details.menu .mlist{position:absolute;z-index:8;top:calc(100% + 4px);left:0;display:flex;flex-direction:column;gap:2px;min-width:160px;padding:6px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow2)}details.menu .mlist a{padding:7px 10px;border-radius:8px;color:var(--text);text-decoration:none;font-size:13px}details.menu .mlist a:hover{background:var(--chip)}.tbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:2px 0 10px}.tbar .tq.on{border-color:var(--best);color:var(--best);background:var(--best-bg)}ul.notes{margin:4px 0 10px;padding-left:20px;font-size:13px;line-height:1.55}ul.notes li{margin:2px 0}.tbar select,.tbar input,.tbar button{font:inherit;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}.tbar button{cursor:pointer}.tcust{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}.tsum{font-size:13px;margin:2px 0 4px}.tcu{color:var(--up)}.tcd{color:var(--down)}.tdots{display:flex;flex-direction:column;gap:3px;margin:10px 0 6px}.trow{display:flex;align-items:flex-start;gap:8px;font-size:11px;color:var(--muted)}.trow .tl{width:70px;flex:none;font-variant-numeric:tabular-nums;line-height:13px}.trow .tcells{display:flex;flex-wrap:wrap;gap:3px}.tdot{width:12px;height:12px;border-radius:50%;display:inline-block;flex:none;vertical-align:-2px;box-sizing:border-box}.tdot.u{background:var(--up)}.tdot.d{background:var(--down)}.tdot.f{background:var(--faint)}.tdot.n{opacity:.42}.tdot.x{border:1.5px solid var(--line)}.tdot.bad{box-shadow:0 0 0 2px var(--warn)}.tlegend .tdot{margin:0 4px 0 8px}.tdots .tdot{cursor:pointer}.tdots.only .tdot:not(.bad){opacity:.15}.tdot.sel{outline:2px solid var(--text);outline-offset:1px}.tdet{font-size:12.5px;background:var(--chip);border-radius:10px;padding:7px 10px;margin:4px 0}.tdays tr.pick{cursor:pointer}.tdays tr.on td{background:var(--best-bg)}
 </style></head><body><div class="wrap">
 <header><div class="ttl"><h1 id="title">交易复盘</h1><div class="meta" id="meta">加载中…</div></div><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button></header>
-<div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="交易日记.csv">导出 CSV</a><a class="btn" id="scsv" href="summary.csv" download="复盘汇总.csv">导出汇总 CSV</a><a class="btn" id="mcsv" href="samples.csv" download="模型样本.csv">导出模型样本</a><a class="btn" id="json" href="journal.json?full=1" download="交易日记.json">导出 JSON</a></div>
+<div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><details class="menu" id="exports"><summary class="btn">导出 ▾</summary><div class="mlist"><a id="csv" href="journal.csv" download="交易日记.csv">交易日记 CSV</a><a id="scsv" href="summary.csv" download="复盘汇总.csv">复盘汇总 CSV</a><a id="mcsv" href="samples.csv" download="模型样本.csv">模型样本 CSV</a><a id="json" href="journal.json?full=1" download="交易日记.json">交易日记 JSON</a></div></details></div>
 <div class="tiles" id="tiles"></div>
 <section class="box" id="unrecbox" hidden><div class="hd"><h2>账户里有、记录里没有的持仓</h2><span class="sum" id="unrecsum"></span></div>
-<div class="body" id="unrecbody"></div><p class="small mut" id="unrecnote" hidden>按最近一次读到的 Predict 持仓，减去记录和开盘前预挂的份数；多出来的多半是没有记录的挂单成交了（手动单、丢失跟踪的单）。每分钟一次的持仓核对会把它补记到同一方向最近结束的订单上，没有这样的订单就留在这里；/live fills 给出逐项对照。</p></section>
+<div class="body" id="unrecbody"></div><details class="hint" id="unrecnote" hidden><summary>说明</summary><p>按最近一次读到的 Predict 持仓，减去记录和开盘前预挂的份数；多出来的多半是没有记录的挂单成交了（手动单、丢失跟踪的单）。每分钟一次的持仓核对会把它补记到同一方向最近结束的订单上，没有这样的订单就留在这里；/live fills 给出逐项对照。</p></details></section>
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
-<div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>按市场 · <span id="scrng">今天</span> <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbar" id="cbar"><button type="button" class="tq on" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><button type="button" class="tq" data-r="all">全部</button><span class="tcust"><input type="date" id="cfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="cto" aria-label="结束日期"><button type="button" id="cgo">查看</button></span></div><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><p class="small mut">选的日子（北京时间）里下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；开盘前预挂（两边挂）单独成行，名字后带“· 开盘前预挂”，按场次开始的日期算，下单时预期按五五开算。<b>偏离</b> = 实际盈亏比下单时预期差了几个 σ（σ 按下单时的概率算）：±2σ 以内可能只是运气，低于 −2σ 就不像运气了，是这个市场有问题。点一行看明细：原策略是这段时间的每一笔；开盘前预挂是钱亏在哪——只成交一边时那边赢几成、按开始时间、按成交时距开场、按方向和价格档。</p><p class="small mut">按下单日期（北京时间）统计，开盘前预挂的场次按场次开始的日期计入当天，点开那一天有单独的“开盘前预挂”一行；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
+<div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>按市场 · <span id="scrng">今天</span> <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbar" id="cbar"><button type="button" class="tq on" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><button type="button" class="tq" data-r="all">全部</button><details class="cust" id="ccust"><summary>自定义</summary><span class="tcust"><input type="date" id="cfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="cto" aria-label="结束日期"><button type="button" id="cgo">查看</button></span></details></div><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><details class="hint"><summary>说明</summary><p>选的日子（北京时间）里下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；开盘前预挂（两边挂）单独成行，名字后带“· 开盘前预挂”，按场次开始的日期算，下单时预期按五五开算。<b>偏离</b> = 实际盈亏比下单时预期差了几个 σ（σ 按下单时的概率算）：±2σ 以内可能只是运气，低于 −2σ 就不像运气了，是这个市场有问题。点一行看明细：原策略是这段时间的每一笔；开盘前预挂是钱亏在哪——只成交一边时那边赢几成、按开始时间、按成交时距开场、按方向和价格档。</p><p>按下单日期（北京时间）统计，开盘前预挂的场次按场次开始的日期计入当天，点开那一天有单独的“开盘前预挂”一行；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></details></div></section>
 <section class="box" id="tallybox"><div class="hd" id="tallyhd"><h2>市场涨跌统计</h2><span class="sum" id="tallysum"></span><button type="button" class="lnk" id="foldtally">收起</button></div>
-<div class="body" id="tallybody"><div class="tbar"><select id="tcard" aria-label="市场"></select><button type="button" class="tq" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><span class="tcust"><input type="date" id="tfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="tto" aria-label="结束日期"><button type="button" id="tgo">查看</button></span></div>
+<div class="body" id="tallybody"><div class="tbar"><select id="tcard" aria-label="市场"></select><button type="button" class="tq" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><details class="cust" id="tcustd"><summary>自定义</summary><span class="tcust"><input type="date" id="tfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="tto" aria-label="结束日期"><button type="button" id="tgo">查看</button></span></details></div>
 <div id="tally"></div>
-<p class="small mut">每一场按币安 1 分钟 K 线算：结束时的价格高于开始为涨、低于为跌，完全一样才记平；涨跌很小的（BTC/ETH/BNB 不到 0.01%，黄金、原油、股票不到 0.05%）照样算涨跌，圆点画浅一点——Predict 按 Chainlink 的价格结算，差距这么小时官方结果偶尔会相反；只算已经结束的场次。Predict 按 Chainlink 的价格结算，偶尔和 K 线不同：有官方结果的场次（预挂有成交的、原策略交易过的）单独核对，不一致的圆点带黄圈。按北京时间的日期查，以前的任何一天都能查，一次最多 31 天；查几天时上面是按日期的表，每天涨几局、跌几局，点一天看那天的每一场。点圆点看那一场的时间、起止价和官方结果。</p></div></section>
+<details class="hint"><summary>说明</summary><p>每一场按币安 1 分钟 K 线算：结束时的价格高于开始为涨、低于为跌，完全一样才记平；涨跌很小的（BTC/ETH/BNB 不到 0.01%，黄金、原油、股票不到 0.05%）照样算涨跌，圆点画浅一点——Predict 按 Chainlink 的价格结算，差距这么小时官方结果偶尔会相反；只算已经结束的场次。Predict 按 Chainlink 的价格结算，偶尔和 K 线不同：有官方结果的场次（预挂有成交的、原策略交易过的）单独核对，不一致的圆点带黄圈。按北京时间的日期查，以前的任何一天都能查，一次最多 31 天；查几天时上面是按日期的表，每天涨几局、跌几局，点一天看那天的每一场。点圆点看那一场的时间、起止价和官方结果。</p></details></div></section>
 <section class="box" id="anabox"><div class="hd" id="anahd"><h2>复盘分析</h2><span class="sum" id="anasum"></span><button type="button" class="lnk" id="anaref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><button type="button" class="lnk" id="foldana">展开</button></div>
 <div class="body" id="anabody" hidden>
 <div class="note fline" id="anafilt" hidden></div><div class="small mut" id="anaat"></div>
-<h3 id="h-ev" hidden>模型 EV 对实际盈亏</h3><div id="a-ev" hidden></div>
-<p class="small mut" id="p-ev" hidden>把每一笔已结算的单当成一次下注：模型预期 = 下单时净优势 × 份数（预挂按五五开：每边 (50¢ − 挂价) × 成交份数），实际 = 结算盈亏。按模型自己给的概率，这些注的累计盈亏有一个 ±2σ 的正常范围：实际落在带子里是运气，跌出下沿就是模型把优势看高了（激进）——这是比停机线更早的信号；冲出上沿是看低了（保守）。少于 30 笔不下结论。近 7 天跌出下沿时 Telegram 每天最多提醒一次。原策略按下单日、预挂按场次开始日（北京时间），最近 30 天；筛选条选了市场、类型、挂/吃时只算原策略的记录。</p>
-<h3>按设置版本</h3><div id="a-versions"></div>
-<p class="small mut">每笔记录都存了下单时的设置。这里把每个改过的设置单独拿出来：每种取值一行，带用它的时间段（中间换过别的值又换回来的写“N 段”），比已结算盈亏对“下单时预期”、胜率对平均公平价——改了以后这两组差距变小，就是改对了。同一时间改了几个设置时，这几张表是同一种切分，分不出是哪个起的作用；时间段不同，行情也不同，样本少时差别多半是运气。代码版本按大版本合并（1.106.x 算一个）。</p>
-<h3>按标的</h3><div id="a-items"></div>
-<h3>按下单时净优势</h3><div id="a-edges"></div>
-<p class="small mut">每桶的已结算盈亏对比“下单时预期”（净优势 × 份数），胜率（平局算半）对比平均公平价：胜率低于公平价的桶，模型把优势看高了。</p>
-<h3>按下单时公平价</h3><div id="a-fairs"></div>
-<h3>按时段</h3><div id="a-sessions"></div>
-<h3 id="h-windows" hidden>15 分钟涨跌</h3><div id="a-windows" hidden></div>
-<p class="small mut" id="p-windows" hidden>只算 15 分钟窗口的记录：按窗口开始的整点（北京时间，两张卡都有时分开写），和按下单时离窗口结束还有几分钟。胜率低于平均公平价、成交后 1 / 5 分钟市价持续为负的那一行，就是模型在那个时段或那个时点看错的地方。</p>
-<p class="small mut">按下单时标的所在的时段（交易所当地时间）；成交后市场走向 = 盘口中间价 − 成交价，每份，持续为负 = 这个时段的成交常是别人在出货；没有开盘时段的市场（加密）记在“无交易时段”。</p>
-<h3 id="h-preopen" hidden>开盘前预挂</h3><div id="a-preopen" hidden></div>
-<p class="small mut" id="p-preopen" hidden>开盘前预挂模式（PREOPEN_15M）自己的记录，不受上面的筛选条影响：每场涨、跌两边各一张固定价买单，成交的那一边按官方结果结算（赢 = 1 − 价格、输 = −价格，每份，平局按 0.5）。记录 = 一次报价（同一场重新报价算两条），场次 = 不同的窗口；没成交就撤掉的场次不算输赢。按日期、开始时间都是场次开始的北京时间。</p>
-<h3>挂单效率</h3><div id="a-makers"></div>
-<h3>被拦下的机会</h3><div id="a-blocked"></div>
-<p class="small mut">组上限（SIM_GROUP_USD）最近一周拦下的买入：市场已出结果的，按每笔份数（SIM_SHARES）算若当时买入的盈亏——长期为正说明上限偏紧。</p></div></section>
+<details class="fold" data-k="ev" id="h-ev" hidden><summary><h3>模型 EV 对实际盈亏</h3></summary><div id="a-ev" hidden></div><details class="hint" id="p-ev" hidden><summary>说明</summary><p>把每一笔已结算的单当成一次下注：模型预期 = 下单时净优势 × 份数（预挂按五五开：每边 (50¢ − 挂价) × 成交份数），实际 = 结算盈亏。按模型自己给的概率，这些注的累计盈亏有一个 ±2σ 的正常范围：实际落在带子里是运气，跌出下沿就是模型把优势看高了（激进）——这是比停机线更早的信号；冲出上沿是看低了（保守）。少于 30 笔不下结论。近 7 天跌出下沿时 Telegram 每天最多提醒一次。原策略按下单日、预挂按场次开始日（北京时间），最近 30 天；筛选条选了市场、类型、挂/吃时只算原策略的记录。</p></details></details>
+<details class="fold" data-k="versions"><summary><h3>按设置版本</h3></summary><div id="a-versions"></div><details class="hint"><summary>说明</summary><p>每笔记录都存了下单时的设置。这里把每个改过的设置单独拿出来：每种取值一行，带用它的时间段（中间换过别的值又换回来的写“N 段”），比已结算盈亏对“下单时预期”、胜率对平均公平价——改了以后这两组差距变小，就是改对了。同一时间改了几个设置时，这几张表是同一种切分，分不出是哪个起的作用；时间段不同，行情也不同，样本少时差别多半是运气。代码版本按大版本合并（1.106.x 算一个）。</p></details></details>
+<details class="fold" data-k="items"><summary><h3>按标的</h3></summary><div id="a-items"></div></details>
+<details class="fold" data-k="edges"><summary><h3>按下单时净优势</h3></summary><div id="a-edges"></div><details class="hint"><summary>说明</summary><p>每桶的已结算盈亏对比“下单时预期”（净优势 × 份数），胜率（平局算半）对比平均公平价：胜率低于公平价的桶，模型把优势看高了。</p></details></details>
+<details class="fold" data-k="fairs"><summary><h3>按下单时公平价</h3></summary><div id="a-fairs"></div></details>
+<details class="fold" data-k="sessions"><summary><h3>按时段</h3></summary><div id="a-sessions"></div><details class="hint"><summary>说明</summary><p>按下单时标的所在的时段（交易所当地时间）；成交后市场走向 = 盘口中间价 − 成交价，每份，持续为负 = 这个时段的成交常是别人在出货；没有开盘时段的市场（加密）记在“无交易时段”。</p></details></details>
+<details class="fold" data-k="windows" id="h-windows" hidden><summary><h3>15 分钟涨跌</h3></summary><div id="a-windows" hidden></div><details class="hint" id="p-windows" hidden><summary>说明</summary><p>只算 15 分钟窗口的记录：按窗口开始的整点（北京时间，两张卡都有时分开写），和按下单时离窗口结束还有几分钟。胜率低于平均公平价、成交后 1 / 5 分钟市价持续为负的那一行，就是模型在那个时段或那个时点看错的地方。</p></details></details>
+<details class="fold" data-k="preopen" id="h-preopen" hidden><summary><h3>开盘前预挂</h3></summary><div id="a-preopen" hidden></div><details class="hint" id="p-preopen" hidden><summary>说明</summary><p>开盘前预挂模式（PREOPEN_15M）自己的记录，不受上面的筛选条影响：每场涨、跌两边各一张固定价买单，成交的那一边按官方结果结算（赢 = 1 − 价格、输 = −价格，每份，平局按 0.5）。记录 = 一次报价（同一场重新报价算两条），场次 = 不同的窗口；没成交就撤掉的场次不算输赢。按日期、开始时间都是场次开始的北京时间。</p></details></details>
+<details class="fold" data-k="makers"><summary><h3>挂单效率</h3></summary><div id="a-makers"></div></details>
+<details class="fold" data-k="blocked"><summary><h3>被拦下的机会</h3></summary><div id="a-blocked"></div><details class="hint"><summary>说明</summary><p>组上限（SIM_GROUP_USD）最近一周拦下的买入：市场已出结果的，按每笔份数（SIM_SHARES）算若当时买入的盈亏——长期为正说明上限偏紧。</p></details></details></div></section>
 <section class="box" id="statsbox"><div class="hd" id="statshd"><h2>统计与风险</h2><span class="sum" id="statsum"></span><button type="button" class="lnk" id="foldstats">展开</button></div>
 <div class="body" id="statsbody" hidden><div id="stats"></div>
 <h3 id="h-groups" hidden>分组</h3><div class="tbl" id="groups" hidden></div>
 <h3 id="h-risk" hidden>共同风险</h3><div id="risk" hidden></div>
-<h3>规则</h3><p class="small mut" id="intro"></p></div></section>
+<details class="fold" data-k="rules"><summary><h3>规则</h3></summary><p class="small mut" id="intro"></p></details></div></section>
 <div class="search"><input type="search" id="q" placeholder="搜市场、订单号、价格（21）、份数（298.73）、状态…" autocomplete="off"><span class="small mut" id="qn"></span></div>
 <div class="filters" id="filters"></div>
 <div class="list" id="list"></div>
@@ -14376,6 +14369,9 @@ function dl(obj,skip){const d=$("dl");Object.entries(obj||{}).forEach(([k,v])=>{
 const WRAP=new Set(["说明","事件","原因","依据"]);
 function table(head,rows){const w=$("div","tbl"),t=$("table"),h=$("tr");head.forEach(x=>h.append($("th","",x)));t.append(h);
   rows.forEach(r=>{const tr=$("tr");r.forEach((x,i)=>{const td=$("td",i===r.length-1&&WRAP.has(head[i])?"wrap":"");td.append(x instanceof Node?x:String(x??"—"));tr.append(td)});t.append(tr)});w.append(t);return w}
+function hint(...texts){const d=$("details","hint");d.append($("summary","","说明"),...texts.map(t=>$("p","",t)));return d}  // an explanation, folded behind 说明 (1.152.1)
+function bigTable(title,node,count,n){if(count<=(n||12))return [$("div","sub",title),node];  // a long table folded behind its title and row count (1.152.1)
+  const d=$("details","fold sub");d.append($("summary","",title+"（"+count+" 行，点开）"),node);return [d]}
 function sec(title,...kids){const s=$("div","sec"),h=$("h3","",title);s.append(h,...kids.filter(Boolean));return s}
 function cat(t){if(t.status==="resting")return"rest";if(t.status==="filled")return"open";if(t.status==="expired"||t.status==="cancelled")return"exp";
   return t.confirm==="confirmed"?"ok":t.confirm==="mismatch"?"bad":"pre"}
@@ -14580,7 +14576,7 @@ function poDiag(r,span,fold){  // under a pre-open line of 按市场 (1.151.0): 
   if((d.lead||[]).length)kids.push($("div","sub","按成交时距开场（第一次看到成交的时刻，1.151.0 起才记）"),table(["成交",...cols],d.lead.map(line)));
   kids.push($("div","sub","按方向（一场的涨、跌是两张单）"),table(["方向","挂出","有成交","成交份数","成交额","已结算","盈亏"],(d.sides||[]).map(x=>[x.name,x.records,x.filled_windows||"—",num(x.filled),usd(x.volume),poWl(x),x.settled?poPn(x.pnl):"—"])));
   if((d.levels||[]).length>1)kids.push($("div","sub","按价格档"),table(["价格","记录","有成交","成交份数","已结算","盈亏"],d.levels.map(x=>[x.name,x.records,x.filled_windows||"—",num(x.filled),poWl(x),x.settled?poPn(x.pnl):"—"])));
-  kids.push($("p","small mut","怎么看：只成交一边时成交那边赢不到一半、偏离低于 −2σ，就是被知道方向的人挑着吃（逆向选择），不是运气；亏损挤在某几个开始时间，或者越早成交越亏，多半是那几个钟点标的休市、刚开盘或有固定的消息。两边都成交的场次两边对冲，每场稳赚 1 − 两边价格。"));
+  kids.push(hint("怎么看：只成交一边时成交那边赢不到一半、偏离低于 −2σ，就是被知道方向的人挑着吃（逆向选择），不是运气；亏损挤在某几个开始时间，或者越早成交越亏，多半是那几个钟点标的休市、刚开盘或有固定的消息。两边都成交的场次两边对冲，每场稳赚 1 − 两边价格。"));
   return kids}
 function dayDetail(rows){  // under the daily summary (1.115.0): the opened day's records (the filter's; journal.json?rows=1&day=…), by card with each card's figures first
   const el=document.getElementById("d-detail"),r=dayOpen&&rows?rows.find(x=>x.day===dayOpen):null;if(!r){el.replaceChildren();el.hidden=true;return}
@@ -14640,15 +14636,15 @@ function preopenSection(po){  // 开盘前预挂 (1.128.0): the mode's own ledge
   p("场次",t.windows+"（记录 "+t.records+"，挂着 "+t.resting+" 场、预留 "+usd(po.resting_usd)+"，没成交撤掉 "+t.withdrawn+"）");
   p("有成交",t.filled_windows+" 场 · "+num(t.filled)+" 份 · "+usd(t.volume)+(t.pending?" · 待结算 "+t.pending+" 场":""));
   p("已结算",t.settled?[t.settled+" 场（赢 "+t.wins+" 输 "+t.losses+(t.ties?" 平 "+t.ties:"")+"）盈亏 ",poPn(t.pnl)," · 平均每场 ",poPn(t.pnl/t.settled)]:"还没有结算的场次");
-  el.append(d,$("div","sub","按日期"),poTable(po.days||[]),$("div","sub","按标的"),poTable(po.cards||[]));
+  el.append(d,...bigTable("按日期",poTable(po.days||[]),(po.days||[]).length),$("div","sub","按标的"),poTable(po.cards||[]));
   if((po.levels||[]).length>1)el.append($("div","sub","按价格档位（每档一条记录）"),poTable(po.levels));
-  el.append($("div","sub","按开始时间"),poTable(po.hours||[]));
+  el.append(...bigTable("按开始时间",poTable(po.hours||[]),(po.hours||[]).length));
   if((po.weekly||[]).length)el.append($("div","sub","周末 vs 工作日（按场次开始时间；周末 = 北京时间周六 00:00 到周一 08:00，和“周末也挂”的开关同一区间）"),poTable(po.weekly));
   el.append($("div","sub","按方向（一场的涨、跌是两张单）"),table(["方向","挂出","有成交","成交份数","成交额","已结算","盈亏"],(po.sides||[]).map(r=>[r.name,r.records,r.filled_windows||"—",num(r.filled),usd(r.volume),poWl(r),r.settled?poPn(r.pnl):"—"])));
   if((po.recent||[]).length){const res=x=>x==="up"?"涨":x==="down"?"跌":x==="split"?"平":"未出";
     const fl=m=>m==null?"—":m<0?"撤单后才读到":m>=120?(m/60).toFixed(1)+" 小时":m.toFixed(0)+" 分钟";  // 1.151.0: the first fill seen, this long before the start
-    el.append($("div","sub","有成交的场次（最近 "+po.recent.length+" 场，新的在前）"),table(["开始","场次","涨成交","跌成交","价格","成交额","结果","盈亏","状态","挂上时距开场","成交时距开场","撤单确认","第几次报价"],
-      po.recent.map(r=>[when(r.start_ms),r.name,num(r.filled_up),num(r.filled_down),cent(r.price),usd(r.volume),res(r.result),r.pnl==null?"—":poPn(r.pnl),r.status,r.lead_min==null?"—":r.lead_min.toFixed(0)+" 分钟",fl(r.fill_lead_min),r.cancel_s==null?"—":r.cancel_s.toFixed(1)+" 秒",r.attempt+1])))}}
+    el.append(...bigTable("有成交的场次（最近 "+po.recent.length+" 场，新的在前）",table(["开始","场次","涨成交","跌成交","价格","成交额","结果","盈亏","状态","挂上时距开场","成交时距开场","撤单确认","第几次报价"],
+      po.recent.map(r=>[when(r.start_ms),r.name,num(r.filled_up),num(r.filled_down),cent(r.price),usd(r.volume),res(r.result),r.pnl==null?"—":poPn(r.pnl),r.status,r.lead_min==null?"—":r.lead_min.toFixed(0)+" 分钟",fl(r.fill_lead_min),r.cancel_s==null?"—":r.cancel_s.toFixed(1)+" 秒",r.attempt+1])),po.recent.length,8))}}
 const evZ=g=>g.bets&&g.sigma>0?(g.z>=0?"+":"−")+Math.abs(g.z).toFixed(1)+"σ":"—";
 function evChart(days){  // cumulative model EV (dashed) against cumulative P&L (solid), inside the ±2σ band the model's own probabilities draw
   const W=640,H=220,L=54,R=12,T=14,B=28,ns="http://www.w3.org/2000/svg",el=(t,a)=>{const e=document.createElementNS(ns,t);for(const k in a)e.setAttribute(k,a[k]);return e};
@@ -14670,8 +14666,8 @@ function evSection(ev){  // 模型 EV 对实际盈亏 (1.140.0): the poker track
   const line=g=>g.bets?[g.bets+" 笔 · 模型预期 ",pn(g.ev)," · 实际 ",pn(g.pnl)," · 偏离 "+evZ(g)+" · ",vb(g)]:"还没有结算的记录";
   const d=$("dl"),p=(k,v)=>{const dd=$("dd","");if(Array.isArray(v))dd.append(...v);else dd.textContent=v;d.append($("dt","",k),dd)};
   p("近 "+ev.window_days+" 天",line(ev.recent));p("近 "+ev.days_span+" 天",line(ev.total));el.append(d);
-  if((ev.days||[]).length){el.append(evChart(ev.days),$("p","small mut","虚线 = 模型预期累计（净优势 × 份数），实线 = 实际累计盈亏，浅色带 = 按模型自己给的概率算的 ±2σ 范围：实线跌出下沿 = 模型把优势看高了（激进），冲出上沿 = 看低了（保守）。"),
-    $("div","sub","按日期（新的在前）"),table(["日期","笔数","当日预期","当日实际","累计预期","累计实际","偏离"],ev.days.slice().reverse().map(x=>[x.label,x.bets,money(x.ev),pn(x.pnl),money(x.cum_ev),pn(x.cum_pnl),evZ(x)])))}
+  if((ev.days||[]).length){el.append(evChart(ev.days),hint("虚线 = 模型预期累计（净优势 × 份数），实线 = 实际累计盈亏，浅色带 = 按模型自己给的概率算的 ±2σ 范围：实线跌出下沿 = 模型把优势看高了（激进），冲出上沿 = 看低了（保守）。"),
+    ...bigTable("按日期（新的在前）",table(["日期","笔数","当日预期","当日实际","累计预期","累计实际","偏离"],ev.days.slice().reverse().map(x=>[x.label,x.bets,money(x.ev),pn(x.pnl),money(x.cum_ev),pn(x.cum_pnl),evZ(x)])),ev.days.length,7))}
   const gt=rows=>table(["分组","笔数","模型预期","实际","实际 − 预期","偏离","判断"],rows.map(g=>[g.name,g.bets,money(g.ev),pn(g.pnl),pn(g.pnl-g.ev),evZ(g),vb(g)]));
   if((ev.strategies||[]).length)el.append($("div","sub","按策略"),gt(ev.strategies));
   if((ev.cards||[]).length)el.append($("div","sub","按市场"),gt(ev.cards))}
@@ -14688,7 +14684,7 @@ function analysis(){  // per setting, per underlying, per net edge and fair pric
   put("a-sessions",a.sessions,{head:["成交后 5 分钟","成交后 30 分钟"],cells:r=>[mo(r,"5m"),mo(r,"30m")]});
   const w=a.windows||{},wins=(w.hours||[]).length>0;["h-windows","a-windows","p-windows"].forEach(id=>{document.getElementById(id).hidden=!wins});
   if(wins){const ex={head:["成交后 1 分钟","成交后 5 分钟"],cells:r=>[mo(r,"1m"),mo(r,"5m")]};
-    document.getElementById("a-windows").replaceChildren($("div","sub","按窗口开始（北京时间）"),anaTable(w.hours,ex),$("div","sub","按下单时离窗口结束"),anaTable(w.left||[],ex),$("div","sub","按方向（涨 / 跌各算）"),anaTable(w.sides||[],ex))}
+    document.getElementById("a-windows").replaceChildren(...bigTable("按窗口开始（北京时间）",anaTable(w.hours,ex),w.hours.length),$("div","sub","按下单时离窗口结束"),anaTable(w.left||[],ex),$("div","sub","按方向（涨 / 跌各算）"),anaTable(w.sides||[],ex))}
   const po=a.preopen,pos=!!(po&&po.total&&po.total.records);["h-preopen","a-preopen","p-preopen"].forEach(id=>{document.getElementById(id).hidden=!pos});
   if(pos)preopenSection(po);
   const ev=a.ev,evs=!!(ev&&ev.total&&ev.total.bets);["h-ev","a-ev","p-ev"].forEach(id=>{document.getElementById(id).hidden=!evs});
@@ -14744,7 +14740,7 @@ function risk(){  // the open positions by the event that settles them (ten mark
   const el=document.getElementById("risk"),h=document.getElementById("h-risk"),gs=(data.groups||[]),src=data.sources||[],bl=data.blocks||[];
   el.hidden=h.hidden=!gs.length&&!bl.length;if(el.hidden)return;
   const parts=[];
-  if(gs.length){parts.push($("p","small mut","持仓按结算事件分组：同一标的的几档、同一指数同一天的几笔，一次行情一起亏。最坏单一事件 = 对这组最不利的那一个走势（涨到某档、跌到某档、收涨/收跌、都没触及）下的合计盈亏；挂单按未成交份数另计。"+(data.group_cap?"每组最坏单一事件不超过 $"+data.group_cap+"（SIM_GROUP_USD），超过的建议不买、记在下面。":"")));
+  if(gs.length){parts.push(hint("持仓按结算事件分组：同一标的的几档、同一指数同一天的几笔，一次行情一起亏。最坏单一事件 = 对这组最不利的那一个走势（涨到某档、跌到某档、收涨/收跌、都没触及）下的合计盈亏；挂单按未成交份数另计。"+(data.group_cap?"每组最坏单一事件不超过 $"+data.group_cap+"（SIM_GROUP_USD），超过的建议不买、记在下面。":"")));
     parts.push(table(["事件 / 标的","持仓","成本","占持仓","最坏单一事件","合计盈亏","挂单中","市场"],gs.map(g=>{const v=$("b","",g.positions?money(g.worst):"—");v.className=g.worst<0?"bad":"ok";
       const n=$("span","",g.name);n.title=(g.items||[]).join("、");return[n,g.positions+" 笔",usd(g.cost),g.positions?(g.share*100).toFixed(0)+"%":"—",g.event||"—",v,g.resting?g.resting+" 笔（"+usd(g.resting_usd)+"）":"—",(g.items||[]).join("、")]})))}
   if(src.length){parts.push($("div","sub","持仓依赖的数据源（一个源停更或出错，这些仓位的判断一起失效）"));
@@ -14844,9 +14840,9 @@ document.addEventListener("visibilitychange",()=>{if(document.visibilityState===
 const THEMES={auto:["◐","自动"],light:["☀","浅色"],dark:["☾","深色"]};let theme="auto";try{const t=JSON.parse(localStorage.getItem("theme"));if(typeof t==="string"&&Object.prototype.hasOwnProperty.call(THEMES,t))theme=t}catch(e){}
 function applyTheme(){const r=document.documentElement;if(theme==="auto")delete r.dataset.theme;else r.dataset.theme=theme;const b=document.getElementById("theme");b.textContent=THEMES[theme][0]+" "+THEMES[theme][1];b.title="主题："+THEMES[theme][1]+"（点击切换）"}
 document.getElementById("theme").addEventListener("click",()=>{const ks=Object.keys(THEMES);theme=ks[(ks.indexOf(theme)+1)%ks.length];try{localStorage.setItem("theme",JSON.stringify(theme))}catch(e){}applyTheme()});applyTheme();
-let tallyOpen=true,tallyKey="BTC-5M",tallyFrom="",tallyTo="",tallyRng="today",tallySeq=0,tallyDay="",tallyLast=null,tallyOnly=false;  // 市场涨跌统计 (1.143.0; the day picked, 1.143.1)
+let tallyOpen=false,tallyKey="BTC-5M",tallyFrom="",tallyTo="",tallyRng="today",tallySeq=0,tallyDay="",tallyLast=null,tallyOnly=false;  // 市场涨跌统计 (1.143.0; the day picked, 1.143.1)
 const bjDate=ms=>DAYF.format(new Date(ms)).replace(/\//g,"-");
-try{tallyOpen=localStorage.getItem("jrntally")!=="0";tallyKey=localStorage.getItem("jrntallykey")||tallyKey}catch(e){}
+try{tallyOpen=localStorage.getItem("jrntally")==="1";tallyKey=localStorage.getItem("jrntallykey")||tallyKey}catch(e){}
 const tallyWord=r=>({u:"涨",d:"跌",f:"平",x:"没数据",s:"平（50/50）"})[r]||r;
 const tallyNear=j=>"涨跌不到 "+(+(j.tie*100).toFixed(4))+"%";  // a close call (1.144.1): within the card's band, Chainlink may see it the other way
 function tallyAt(ms,j){const d=new Date(ms);return (j.from!==j.to||j.cycle_ms>=86400e3?MDF.format(d).replace("/","-")+" ":"")+HMF.format(d)}
@@ -14941,6 +14937,9 @@ document.getElementById("tallyhd").addEventListener("click",()=>{tallyOpen=!tall
   document.getElementById("tallybody").hidden=!tallyOpen;document.getElementById("foldtally").textContent=tallyOpen?"收起":"展开";if(tallyOpen&&!document.querySelector("#tally .tdots"))tallyLoad(0)});
 document.getElementById("tallybody").hidden=!tallyOpen;document.getElementById("foldtally").textContent=tallyOpen?"收起":"展开";
 if(tallyOpen)tallyLoad(0);
+document.querySelectorAll("details.fold[data-k]").forEach(d=>{const k="jrnfold:"+d.dataset.k;let open=d.dataset.k==="ev";  // 1.152.1: each part of 复盘分析 folds on its own, remembered
+  try{const v=localStorage.getItem(k);if(v!==null)open=v==="1"}catch(e){}d.open=open;d.addEventListener("toggle",()=>{try{localStorage.setItem(k,d.open?"1":"0")}catch(e){}})});
+document.addEventListener("click",e=>{const m=document.getElementById("exports");if(m&&m.open&&!m.contains(e.target))m.open=false});  // the export menu closes on a tap elsewhere
 load();setInterval(load,60000);
 </script></body></html>"""
 

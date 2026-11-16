@@ -273,6 +273,9 @@ async def browser_check(bot):
             errors = []
             page.on("pageerror", lambda e: errors.append(str(e)))
             await page.goto(f"http://127.0.0.1:{port}/p/{TOKEN}/journal")
+            await page.wait_for_selector("#tallyhd")
+            assert await page.is_hidden("#tallybody"), "1.152.1: folded until opened by hand (then remembered)"
+            await page.click("#tallyhd")
             await page.wait_for_selector("#tally .tdots .tdot")
             assert await page.locator("#tally .tdots .tdot").count() == 120
             assert await page.locator("#tally .tdots .tdot.bad").count() == 1 and await page.locator("#tally .tdots .trow").count() == 10
