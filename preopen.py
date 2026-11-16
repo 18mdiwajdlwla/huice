@@ -361,6 +361,8 @@ def candidate_problem(market: dict, now_ms: int, config: Any, settings: Settings
         holidays = config.holidays.get(rolling.exchange, frozenset()) if rolling.exchange else frozenset()
         if not rolling.exists(start, holidays):
             return "不在交易时段内"
+        if shut := market_shut(rolling, start):
+            return shut
         if str(market.get("status") or "").upper() != "REGISTERED" or market.get("isVisible") is False:
             return f"状态 {market.get('status') or '?'}" + ("、不可见" if market.get("isVisible") is False else "")
         if str(market.get("tradingStatus") or "").upper() not in {"OPEN", "MATCHING_NOT_ENABLED"}:
@@ -390,12 +392,30 @@ def candidate(market: dict, now_ms: int, config: Any, settings: Settings) -> dic
 def session_opening(rolling: Any, start_ms: int, holidays: frozenset, quiet_ms: int) -> bool:
     """Whether a stock card's window starts within ``quiet_ms`` of one of its exchange's session segments' open (the day's
     open, the afternoon's): the opening auction's indicative price and the break's news are public before the index moves,
-    so that window's direction is no coin toss (1.135.1: not quoted, PREOPEN_OPEN_QUIET_MINUTES)."""
-    if not rolling.exchange or quiet_ms <= 0:
+    so that window's direction is no coin toss (1.135.1: not quoted, PREOPEN_OPEN_QUIET_MINUTES). A CME card's (gold's,
+    oil's) within ``quiet_ms`` of CME's reopen likewise — the shut hour's news is out before the index moves (1.150.1: 11-16's
+    18:00–18:15 ET window had its Up side swept hours ahead)."""
+    if quiet_ms <= 0:
+        return False
+    if getattr(rolling, "cme", False):
+        return any(back <= start_ms < back + quiet_ms for _, back in core.cme_shuts(start_ms - quiet_ms, start_ms + 1))
+    if not rolling.exchange:
         return False
     tz = dt.timezone(dt.timedelta(hours=core.STOCK_MARKETS[rolling.exchange].utc_offset))
     day = dt.datetime.fromtimestamp(start_ms / 1000, tz).date()
     return any(seg_open <= start_ms < seg_open + quiet_ms for seg_open, _ in core.session_segments(rolling.exchange, day, holidays))
+
+
+CME_SHUT_TEXT = "纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00"
+
+
+def market_shut(rolling: Any, start_ms: int) -> str:
+    """Why a CME card's (gold's, oil's) window is not quoted ("" when it may be): it starts in or runs into CME Globex's shut
+    (core.cme_shuts). The index stands still there, and Predict lists those windows all the same: 11-16 each of
+    17:00–18:00 ET had the mode's Down bids filled hours before it began, the Up ones left (1.150.1)."""
+    if getattr(rolling, "cme", False) and core.cme_shuts(start_ms, rolling.end_of(start_ms)):
+        return f"{rolling.coin}休市（{CME_SHUT_TEXT}）"
+    return ""
 
 
 WEEKEND_END_HOUR = 8  # the weekend runs to Monday this o'clock Beijing (1.139.2: Sunday evening in the US to the Asian open is crypto's thinnest stretch)
@@ -411,7 +431,8 @@ def on_weekend(ms: int) -> bool:
 def window_starts(now_ms: int, config: Any, settings: Settings) -> list[tuple[Any, int]]:
     """The windows this mode looks for now: each configured card's quarter hours from PREOPEN_ENTRY_SECONDS ahead to
     PREOPEN_AHEAD_MINUTES ahead, whatever the day, on the card's exchange session, a stock card's first windows after each
-    session open left out (session_opening), the weekend's when PREOPEN_WEEKEND is off — (card, start_ms), soonest first."""
+    session open left out (session_opening), gold's and oil's in CME's shut too (market_shut), the weekend's when
+    PREOPEN_WEEKEND is off — (card, start_ms), soonest first."""
     out = []
     quiet_ms = int(getattr(settings, "open_quiet_minutes", 0) or 0) * 60_000
     weekend = getattr(settings, "weekend", True)
@@ -421,7 +442,8 @@ def window_starts(now_ms: int, config: Any, settings: Settings) -> list[tuple[An
         holidays = config.holidays.get(rolling.exchange, frozenset()) if rolling.exchange else frozenset()
         start = rolling.first_start(now_ms + settings.entry_seconds * 1000)
         while start <= now_ms + settings.ahead_minutes * 60_000:
-            if rolling.exists(start, holidays) and not session_opening(rolling, start, holidays, quiet_ms) and (weekend or not on_weekend(start)):
+            if (rolling.exists(start, holidays) and not market_shut(rolling, start) and not session_opening(rolling, start, holidays, quiet_ms)
+                    and (weekend or not on_weekend(start))):
                 out.append((rolling, start))
             start = rolling.next_start(start)  # a quarter hour, five minutes, an hour, a day (noon ET to noon ET: 23 or 25 hours over a switch)
     return sorted(out, key=lambda rs: (rs[1], rs[0].key))
@@ -1557,6 +1579,8 @@ class Controller:
         if rolling is None or session_opening(rolling, int(pair["start_ms"]), self.owner.config.holidays.get(rolling.exchange, frozenset()),
                                               int(self.settings.open_quiet_minutes) * 60_000):
             return False  # 1.135.1: a stock card's first window after a session open, quoted before the rule (or with it off): withdrawn
+        if market_shut(rolling, int(pair["start_ms"])):
+            return False  # 1.150.1: gold's and oil's windows in CME's shut, quoted before the rule: withdrawn
         if not self.settings.weekend and on_weekend(int(pair["start_ms"])):
             return False  # 1.136.0: the weekend switched off since it was quoted: withdrawn
         if int(pair.get("expires") or 0) != pair["start_ms"] // 1000 - self.settings.expiry_seconds:
@@ -2729,6 +2753,8 @@ class Controller:
             if p["phase"] == "active" and p.get("key"):
                 quoted_to[p["key"]] = max(quoted_to.get(p["key"], 0), int(p.get("start_ms") or 0))
         windows_left, pairs_left, usd_left = self.unplaced()
+        cme = "、".join(r.coin for r in core.preopen_cards() if getattr(r, "cme", False) and r.key in self.settings.markets)  # 1.150.1: the cards CME's shut keeps back
+        shut = next(iter(core.cme_shuts(self.now(), self.now() + 3 * core.DAY_MS)), None) if cme else None  # the shut now in force, or the next
         named = lambda ps: "、".join(str(p.get("name") or window_of(p)) + (f" 第 {int(p['level']) + 1} 档" if p.get("level") else "") for p in ps[:3]) + ("…" if len(ps) > 3 else "")
         why = (self.hold() or self.budget_problem()) if self.alive else ""
         state = ("已停止" if not self.alive else f"收尾中（{self.winding}）：不再新挂，挂着的单分批撤完、成交核对完就自动停止" if self.winding
@@ -2748,6 +2774,8 @@ class Controller:
                 f"撤单：开场前 {self.settings.cancel_seconds} 秒发出，之后到开场前 {self.settings.expiry_seconds} 秒到期为止每 {SPRINT_MS // 1000} 秒催一次；"
                 f"不足 {self.settings.entry_seconds} 秒不再新挂"
                 + (f"；股票卡开盘、午后头 {self.settings.open_quiet_minutes} 分钟内开始的场次不挂" if self.settings.open_quiet_minutes else "")
+                + (f"；{cme}休市（{CME_SHUT_TEXT}）期间的场次不挂" + (f"、重开后头 {self.settings.open_quiet_minutes} 分钟内开始的也不挂" if self.settings.open_quiet_minutes else "")
+                   + (f"（北京时间 {when(shut[0], self.now())}–{when(shut[1], shut[0])}）" if shut else "") if cme else "")  # the end's date only when not the start's
                 + (f"；周末不挂（北京时间周六 00:00 到周一 {WEEKEND_END_HOUR:02d}:00 开始的场次）" if not self.settings.weekend else "") + "\n"
                 f"已记录 {len({window_of(p) for p in rows})} 场、{len(rows)} 条（{sum(1 for p in rows if p['phase'] == 'active')} 条挂着，{sum(1 for p in rows if p.get('accounted'))} 条已结清）"
                 + (f"，另有 {self.ledger.archived_count} 条已归档（结束超过 {ARCHIVE_AFTER_MS // core.DAY_MS} 天、已撤且没成交的；复盘页照常统计）" if self.ledger.archived_count else "") + "，"

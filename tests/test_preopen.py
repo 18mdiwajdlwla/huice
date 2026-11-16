@@ -880,6 +880,73 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(again.queue.qsize(), 0, "not quoted again: the window is left out")
             await self.finish(again)
 
+    async def test_gold_and_oil_are_not_quoted_while_cme_is_shut(self):
+        """1.150.1: gold and oil follow CME Globex — shut 17:00–18:00 New York time every day and from Friday 17:00 to Sunday
+        18:00, their index standing still — and Predict lists their windows through the shut: 11-16 the mode's Down bids on
+        every 17:00–18:00 ET window, and the Up ones on 18:00–18:15, were filled hours ahead, the other side left. A window
+        touching the shut is not quoted (one resting from before is withdrawn at the next start, free), nor one starting
+        within PREOPEN_OPEN_QUIET_MINUTES of the 18:00 reopen; the crypto cards and the model trader's windows are untouched."""
+        et = lambda h, mi, day=16, month=11, offset=-5: m.et_ms(2026, month, day, h, mi, offset)
+        now = et(8, 30)  # Monday 11-16 21:30 Beijing (EST): the screenshot's moment
+        ctl, api, clock = controller(PREOPEN_MARKETS="xau,cl,btc", PREOPEN_AHEAD_MINUTES="1440", PREOPEN_OPEN_QUIET_MINUTES="15")
+        starts = p.window_starts(now, ctl.owner.config, ctl.settings)
+        by = lambda key, got=starts: [s for r, s in got if r.key == key]
+        shut = {et(17, 0), et(17, 15), et(17, 30), et(17, 45)}  # 06:00–07:00 Beijing on 11-17
+        for key in ("XAU-15M", "CL-15M"):
+            self.assertFalse(set(by(key)) & shut, key)
+            self.assertNotIn(et(18, 0), by(key), "the reopen's first window: quiet 15")
+            self.assertTrue({et(16, 45), et(18, 15)} <= set(by(key)), "the last window before the shut ends at 17:00: quoted")
+            self.assertEqual(len(by(key)), len(by("BTC-15M")) - 5)
+        self.assertTrue(shut | {et(18, 0)} <= set(by("BTC-15M")), "round the clock: untouched")
+        xau = next(r for r in m.WINDOW_UPDOWN_MARKETS if r.key == "XAU-15M")
+        why = "黄金休市（纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00）"
+        self.assertEqual(p.candidate_problem(market("xau", at=et(17, 15), mid=41), now, ctl.owner.config, ctl.settings), why)
+        self.assertIsNone(p.candidate(market("xau", at=et(17, 15), mid=41), now, ctl.owner.config, ctl.settings))
+        self.assertEqual(p.candidate_problem(market("xau", at=et(16, 45), mid=42), now, ctl.owner.config, ctl.settings), "")
+        self.assertEqual(p.candidate_problem(market("btc", at=et(17, 15), mid=43), now, ctl.owner.config, ctl.settings), "")
+        self.assertTrue(xau.exists(et(17, 15)) and xau.current(et(17, 20)).start_ms == et(17, 15) - 60_000, "the model trader's card: as before")
+        # the weekend: Friday 17:00 to Sunday 18:00, then the reopen's first window left out too
+        friday = p.window_starts(et(16, 0, 20), ctl.owner.config, ctl.settings)
+        self.assertEqual(by("XAU-15M", friday), [et(16, 15, 20), et(16, 30, 20), et(16, 45, 20)])
+        self.assertEqual(len(by("BTC-15M", friday)), 96)
+        self.assertEqual(min(by("XAU-15M", p.window_starts(et(12, 0, 22), ctl.owner.config, ctl.settings))), et(18, 15, 22), "Sunday's reopen")
+        # New York's clock, DST followed: 05:00 Beijing in summer; the shut that spans the switch (11-01) keeps both ends right
+        self.assertTrue(p.market_shut(xau, et(17, 0, 15, 7, -4)))
+        self.assertFalse(p.market_shut(xau, et(16, 45, 15, 7, -4)))
+        self.assertEqual(dt.datetime.fromtimestamp(et(17, 0, 15, 7, -4) / 1000, m.BEIJING).strftime("%m-%d %H:%M"), "07-16 05:00")
+        self.assertEqual(m.cme_shuts(et(12, 0, 30, 10, -4), et(12, 0, 2)), [(et(17, 0, 30, 10, -4), et(18, 0, 1))])
+        self.assertEqual(m.cme_shuts(et(16, 45), et(17, 0)) + m.cme_shuts(et(18, 0), et(18, 15)), [], "the boundaries: a window may end at the shut, start at the reopen")
+        self.assertIn("黄金、原油休市（纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00）期间的场次不挂、重开后头 15 分钟内开始的也不挂（北京时间 11-07 06:00–11-09 07:00）", ctl.status())
+        await self.finish(ctl)
+        quiet0, _, _ = controller(PREOPEN_MARKETS="xau")  # the suite's quiet 0: the reopen's window quoted, the shut's still not
+        got = set(by("XAU-15M", p.window_starts(now, quiet0.owner.config, dataclasses.replace(quiet0.settings, ahead_minutes=1440))))
+        self.assertEqual((et(18, 0) in got, bool(got & shut)), (True, False))
+        self.assertIn("黄金休市（纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00）期间的场次不挂（北京时间", quiet0.status())
+        await self.finish(quiet0)
+        btc, _, _ = controller(PREOPEN_MARKETS="btc")
+        self.assertNotIn("休市", btc.status())
+        await self.finish(btc)
+        with tempfile.TemporaryDirectory() as folder:  # quoted by an older version: the next start withdraws it, a free withdrawal, not quoted again
+            db = {"STATE_DB": str(Path(folder) / "state.sqlite3")}
+            at = et(17, 15, 6)  # Friday 11-06 17:15 ET: 21 hours after the suite's NOW
+            ctl, api, clock = controller([market("xau", at=at, mid=51)], PREOPEN_MARKETS="xau", PREOPEN_AHEAD_MINUTES="1440", **db)
+            with patch.object(p, "market_shut", lambda rolling, start: ""):
+                c = p.candidate(market("xau", at=at, mid=51), NOW, ctl.owner.config, ctl.settings)
+                await ctl.place_pair(c)
+            self.assertEqual(ctl.ledger.rows[c["slug"]]["phase"], "active")
+            ctl.keep_on_stop = True
+            await ctl.on_stop()
+            ctl.ledger.close()
+            again, _, _ = controller([market("xau", at=at, mid=51)], PREOPEN_MARKETS="xau", PREOPEN_AHEAD_MINUTES="1440", **db)
+            again.api = again.cancel_api = api; api.ctl = again
+            again.adopt()
+            pair = again.ledger.rows[c["slug"]]
+            self.assertEqual((pair["phase"], pair.get("free"), again.resumed), ("closing", True, 0))
+            await again.cancel_pair(pair, pair["reason"])
+            await again.discover()
+            self.assertEqual(again.queue.qsize(), 0, "not quoted again: the window is left out")
+            await self.finish(again)
+
     async def test_five_minute_cards_are_quoted_on_their_own_rhythm(self):
         """1.137.0: btc5 / eth5 / bnb5 name the 5-minute cards (btc-updown-5m-<start>): a window every five minutes, the
         listing expected five minutes after the last; the 15-minute card keeps the stem btc. The model trader leaves them

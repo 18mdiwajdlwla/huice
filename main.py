@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.150.0"
+VERSION = "1.150.1"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -514,7 +514,7 @@ class PreopenSettings:
     levels: tuple = ((D("0.49"), D("10")),)  # (price, shares) a side per level, the first = price × shares; PREOPEN_LEVELS adds deeper ones (1.129.0)
     deep_ahead_minutes: int = 1440  # PREOPEN_DEEP_AHEAD_MINUTES: the deeper levels are placed only this close to the start (the first keeps ahead_minutes)
     limit_gap_pct: float = 2.0  # PREOPEN_LIMIT_GAP_PCT: a stock card's windows are not quoted (resting ones withdrawn) within this of the day's limit, or halted; 0 = off
-    open_quiet_minutes: int = 15  # PREOPEN_OPEN_QUIET_MINUTES: a stock card's windows starting within this of a session segment's open (the day's, the afternoon's) are not quoted — the auction's indicative price, the break's news (1.135.1); 0 = all
+    open_quiet_minutes: int = 15  # PREOPEN_OPEN_QUIET_MINUTES: a stock card's windows starting within this of a session segment's open (the day's, the afternoon's) are not quoted — the auction's indicative price, the break's news (1.135.1); gold's and oil's within this of CME's 18:00 ET reopen (1.150.1); 0 = all
     markets: frozenset = frozenset({"BTC-15M"})  # PREOPEN_MARKETS: BTC alone by default; "all" = every 15-minute card
     exclusive: bool = False    # PREOPEN_EXCLUSIVE: on = the model trader opens nothing while this mode runs for real (off: both run, jointly capped)
     weekend: bool = True       # PREOPEN_WEEKEND: off = no window starting Saturday 00:00 to Monday 08:00 (Beijing time) is quoted, resting ones withdrawn (1.136.0; 1.139.2)
@@ -671,7 +671,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_PRICE_CENTS", "预挂价格（¢）", "1～50：涨跌两边都按这个价挂买单（默认 49）"),
     ("PREOPEN_LEVELS", "更深的价格档位", "第 2 档起，价格x份数、逗号分隔、价格逐档递减、最多再 7 档，如 48x20,47x40：每场每边在第一档之下再挂这些买单，每档一条记录；空 = 只挂第一档"),
     ("PREOPEN_DEEP_AHEAD_MINUTES", "第 2 档起只挂几分钟内开始的场次", "3～提前范围：第一档按“只挂几分钟内开始的场次”挂（排队靠前），更深的档位离开场这么近才挂，少占资金；0 = 和第一档一样"),
-    ("PREOPEN_OPEN_QUIET_MINUTES", "股票卡开盘后几分钟内开始的场次不挂", "0～120：海力士、宇树、智谱每个交易时段（开盘、午后）开始后这么多分钟内开始的场次不挂。集合竞价的参考价（韩交所 08:30 起、港交所 09:00 起、上交所 09:15 起）和午休里的消息（A50 期货午休照常交易）在指数动之前就已公开，这几场的方向不是五五开，49¢ 的买单正好给知道方向的人接。默认 15 = 跳过开盘和午后的第一场；0 = 都挂"),
+    ("PREOPEN_OPEN_QUIET_MINUTES", "股票卡开盘后几分钟内开始的场次不挂", "0～120：海力士、宇树、智谱每个交易时段（开盘、午后）开始后这么多分钟内开始的场次不挂；黄金、原油每天休市一小时后（纽约时间 18:00）重新开盘的也算（1.150.1）。集合竞价的参考价（韩交所 08:30 起、港交所 09:00 起、上交所 09:15 起）和午休里的消息（A50 期货午休照常交易）在指数动之前就已公开，这几场的方向不是五五开，49¢ 的买单正好给知道方向的人接。默认 15 = 跳过开盘和午后的第一场；0 = 都挂"),
     ("PREOPEN_LIMIT_GAP_PCT", "股票卡距涨跌停不足几 % 时不挂", "0～20：海力士、宇树（智谱在港交所没有涨跌停，只看临停）的交易所现价离当日涨停或跌停（按前收盘价算：科创板 ±20%、韩交所 ±30%）不到这么多时不新挂、撤掉已挂的；交易时段里成交时间 3 分钟没动（临停、VI）同样处理；0 = 不管（默认 2）"),
     ("PREOPEN_AHEAD_MINUTES", "只挂几分钟内开始的场次", "3～1440：默认 1440 = 24 小时内已发布的全部场次，发布一场挂一场、最近的先；想少占资金就调小"),
     ("PREOPEN_CANCEL_SECONDS", "开场前几秒撤单", "至少比到期多 5 秒、至多 900：撤单发出后到到期前每 2 秒催一次（默认 20）"),
@@ -7907,6 +7907,31 @@ DAILY_UPDOWN_MARKETS: tuple[DailyUpDownSpec, ...] = (
 )
 
 
+# 1.150.1: gold and oil trade on CME Globex's hours — Sunday 18:00 to Friday 17:00 New York time, shut an hour from 17:00 every
+# day — and their Binance index stands still while shut (flat_minutes); Predict lists their windows through the shut all the same
+CME_SHUT_HOUR, CME_REOPEN_HOUR = 17, 18  # New York wall clock: shut at 17:00, reopened at 18:00 (Friday's shut to Sunday's 18:00)
+UNIX_ORDINAL = dt.date(1970, 1, 1).toordinal()
+
+
+@functools.lru_cache(maxsize=64)
+def cme_shut_on(ordinal: int) -> tuple[int, int] | None:
+    """The shut stretch that begins on the New York date of this ordinal, (shut, reopened) in ms; None on a Saturday or Sunday
+    (inside Friday's). Kept: the pre-open discovery asks for every window of the day ahead, every second or two."""
+    day = dt.date.fromordinal(ordinal)
+    if day.weekday() > 4:
+        return None
+    return et_wall_ms(day, CME_SHUT_HOUR, 0), et_wall_ms(day + dt.timedelta(days=2 if day.weekday() == 4 else 0), CME_REOPEN_HOUR, 0)
+
+
+def cme_shuts(from_ms: int, to_ms: int) -> list[tuple[int, int]]:
+    """CME Globex's shut stretches that overlap [from_ms, to_ms), as (shut, reopened) in ms: 17:00–18:00 New York time Monday
+    to Thursday, and Friday 17:00 to Sunday 18:00 (DST followed: 05:00–06:00 Beijing in summer, 06:00–07:00 in winter). A
+    US holiday's early halt is not in it."""
+    first = UNIX_ORDINAL + from_ms // DAY_MS - 3  # New York's date is the UTC one or the day before; Friday's stretch reaches two days on
+    last = UNIX_ORDINAL + max(from_ms, to_ms - 1) // DAY_MS
+    return [s for o in range(first, last + 1) if (s := cme_shut_on(o)) is not None and s[0] < to_ms and from_ms < s[1]]
+
+
 def window_title_text(question: str, spec: "UpDownSpec") -> str:
     """A 15-minute market's question names its time range ("… 10:00PM-10:15PM ET"): when it does, it must start where the
     slug's time was read as the start (WindowUpDownSpec), or nothing is suggested. "" when it agrees or says no time."""
@@ -7955,6 +7980,7 @@ class WindowUpDownSpec:
     venue: str = "futures"  # the Binance venue the price comes from: a contract's index (IndexUpDownMarket) or a spot pair's trades (SpotWindowMarket, 1.109.0)
     limit_pct: float = 0.0  # the exchange's daily price limit on the stock (STAR 0.20, KRX 0.30; 1.130.0): the pre-open mode stands aside near it; 0 = none
     model: bool = True      # whether the model trader trades the card unless told otherwise: False puts it on SIM_SKIP's default — the pre-open mode's alone until restored on the page (1.135.0)
+    cme: bool = False       # the underlying trades on CME Globex's hours (cme_shuts): the pre-open mode quotes no window touching a shut stretch, nor the reopen's first (1.150.1)
     ROLL_WAIT_MS = 60_000  # the card waits this long past a window's end for the end's index, then moves on regardless
     SCHEDULE_DAYS = 40     # how far current / before look for a trading day (the longest closure, Lunar New Year, is nine days)
 
@@ -8078,9 +8104,11 @@ WINDOW_UPDOWN_MARKETS: tuple[WindowUpDownSpec, ...] = (
     WindowUpDownSpec("BNB-15M", "bnb", "BNBUSDT", "BNB", venue="spot"),
     # 1.134.0: "黄金 (XAU) 涨或跌 15分" (xau-updown-15m-1793942100: 11-06 13:15–13:30 Beijing) and "CL 涨或跌 15分" (cl-updown-15m-…)
     # on the same rules — Chainlink's XAU/USDT and CL/USDT streams, the index price (field i) of Binance's USDⓈ-M futures mark
-    # price stream; no exchange session here: Predict lists the windows while the index trades, the discovery takes what it lists
-    WindowUpDownSpec("XAU-15M", "xau", "XAUUSDT", "黄金"),
-    WindowUpDownSpec("CL-15M", "cl", "CLUSDT", "原油"),
+    # price stream; no exchange session here: Predict lists the windows while the index trades, the discovery takes what it lists.
+    # 1.150.1: Predict lists them through CME's daily shut too, and there the pre-open mode's bids were filled hours ahead, one side
+    # alone (11-16: Down on each of 17:00–18:00 ET, Up on 18:00–18:15; three of them to the deepest level): cme — the mode leaves those out
+    WindowUpDownSpec("XAU-15M", "xau", "XAUUSDT", "黄金", cme=True),
+    WindowUpDownSpec("CL-15M", "cl", "CLUSDT", "原油", cme=True),
     # "智谱 (ZHIPU) 涨或跌 15分" (zhipu-updown-15m-1793942100: 13:15–13:30 Beijing): Chainlink's ZHIPU/USDT stream on the same
     # rules; the windows follow the Hong Kong session (智谱 2513.HK: 09:30–12:00, 13:00–16:00), which has no daily price limit —
     # of the pre-open mode's stock guard only the halt rule applies
