@@ -335,6 +335,15 @@ async def run():
                                                            "请核实；暂不给建议")
     bot.predict.info[spec.slug]["question"] = "宇树科技 (UNITREE) 涨或跌 15分"  # no time named: nothing to check
     assert bot.updown_hold(card, odds, T0 + 7_000) == ("", "")
+    # 1.151.1: a card with hours (gold, oil, the US stocks): no suggestion in a window that touches its market's shut, nor in the
+    # first after a reopen — the model trader trades a window once it has started, the pre-open mode's rule while it runs
+    xau_rule = next(w for w in m.WINDOW_UPDOWN_MARKETS if w.key == "XAU-15M")
+    for start, want in ((m.et_wall_ms(dt.date(2026, 11, 3), 17, 15), "黄金休市"), (m.et_wall_ms(dt.date(2026, 11, 3), 18, 0), "黄金重新开盘后的第一场"),
+                        (m.et_wall_ms(dt.date(2026, 11, 3), 18, 15), "")):
+        xw = bot.index_markets["XAUUSDT"][0].at(xau_rule.window_spec(start))
+        xw.advice_problem = lambda odds, now_ms: ""  # (its own data aside: the hours alone)
+        got = bot.updown_hold(xw, odds, start + 120_000)
+        assert (got[0].startswith(want) if want else got == ("", "")), (start, got)
     # the half of the day written once, at the end ("10:00-10:15PM"), names the start's too; over noon or midnight the start
     # is in the other half ("11:45-12:00PM": an hour before noon; "11:45-12:00AM": before midnight); a 24-hour range as is
     for question, ok in (("10:00-10:15PM ET", True), ("10:00-10:15AM ET", False), ("22:00-22:15 ET", True), ("22:00 - 22:15 EST", True)):

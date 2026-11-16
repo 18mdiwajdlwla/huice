@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.151.0"
+VERSION = "1.151.1"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -522,7 +522,7 @@ class PreopenSettings:
     levels: tuple = ((D("0.49"), D("10")),)  # (price, shares) a side per level, the first = price × shares; PREOPEN_LEVELS adds deeper ones (1.129.0)
     deep_ahead_minutes: int = 1440  # PREOPEN_DEEP_AHEAD_MINUTES: the deeper levels are placed only this close to the start (the first keeps ahead_minutes)
     limit_gap_pct: float = 2.0  # PREOPEN_LIMIT_GAP_PCT: a stock card's windows are not quoted (resting ones withdrawn) within this of the day's limit, or halted; 0 = off
-    open_quiet_minutes: int = 15  # PREOPEN_OPEN_QUIET_MINUTES: a stock card's windows starting within this of a session segment's open (the day's, the afternoon's) are not quoted — the auction's indicative price, the break's news (1.135.1); gold's and oil's within this of CME's 18:00 ET reopen (1.150.1), a US stock card's of the 09:30 open (1.151.0); 0 = all
+    open_quiet_minutes: int = 15  # PREOPEN_OPEN_QUIET_MINUTES: a stock card's windows starting within this of a session segment's open (the day's, the afternoon's) are not quoted — the auction's indicative price, the break's news (1.135.1); gold's and oil's within this of CME's 18:00 ET reopen (1.150.1), a US stock card's of the 09:30 open (1.151.0); 1.151.1: at least the first window whatever it says (preopen.open_quiet_ms) — 0 is 15
     markets: frozenset = frozenset({"BTC-15M"})  # PREOPEN_MARKETS: BTC alone by default; "all" = every 15-minute card
     exclusive: bool = False    # PREOPEN_EXCLUSIVE: on = the model trader opens nothing while this mode runs for real (off: both run, jointly capped)
     weekend: bool = True       # PREOPEN_WEEKEND: off = no window starting Saturday 00:00 to Monday 08:00 (Beijing time) is quoted, resting ones withdrawn (1.136.0; 1.139.2)
@@ -578,7 +578,7 @@ class PreopenSettings:
             raise ValueError("PREOPEN_LIMIT_GAP_PCT 0～20（0 = 不管涨跌停）")
         open_quiet = int(e.get("PREOPEN_OPEN_QUIET_MINUTES", "15") or 0)
         if not 0 <= open_quiet <= 120:
-            raise ValueError("PREOPEN_OPEN_QUIET_MINUTES 0～120（0 = 开盘、午后第一场也挂）")
+            raise ValueError("PREOPEN_OPEN_QUIET_MINUTES 0～120（开盘后第一场固定不挂，这里只能再加长；0 按 15 算）")
         if (len(levels) > PREOPEN_MAX_LEVELS or any(not 1 <= c <= 50 or not 1 <= s <= 500 or c * s / 100 < PREOPEN_MIN_SIDE_USD for c, s in levels)
                 or any(levels[i][0] <= levels[i + 1][0] for i in range(len(levels) - 1)) or not 3 <= deep <= ahead):
             raise ValueError(f"PREOPEN_LEVELS 连第一档至多 {PREOPEN_MAX_LEVELS} 档，每档价格 1～50¢、份数 1～500、每边不少于 ${PREOPEN_MIN_SIDE_USD:g}，价格要比第一档低、逐档递减；"
@@ -679,7 +679,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_PRICE_CENTS", "预挂价格（¢）", "1～50：涨跌两边都按这个价挂买单（默认 49）"),
     ("PREOPEN_LEVELS", "更深的价格档位", "第 2 档起，价格x份数、逗号分隔、价格逐档递减、最多再 7 档，如 48x20,47x40：每场每边在第一档之下再挂这些买单，每档一条记录；空 = 只挂第一档"),
     ("PREOPEN_DEEP_AHEAD_MINUTES", "第 2 档起只挂几分钟内开始的场次", "3～提前范围：第一档按“只挂几分钟内开始的场次”挂（排队靠前），更深的档位离开场这么近才挂，少占资金；0 = 和第一档一样"),
-    ("PREOPEN_OPEN_QUIET_MINUTES", "股票卡开盘后几分钟内开始的场次不挂", "0～120：海力士、宇树、智谱每个交易时段（开盘、午后）开始后这么多分钟内开始的场次不挂；黄金、原油每天休市一小时后（纽约时间 18:00）重新开盘的也算（1.150.1），美股卡 09:30 开盘的也算（1.151.0）。集合竞价的参考价（韩交所 08:30 起、港交所 09:00 起、上交所 09:15 起）和午休里的消息（A50 期货午休照常交易）在指数动之前就已公开，这几场的方向不是五五开，49¢ 的买单正好给知道方向的人接。默认 15 = 跳过开盘和午后的第一场；0 = 都挂"),
+    ("PREOPEN_OPEN_QUIET_MINUTES", "开盘后几分钟内开始的场次不挂", "15～120：海力士、宇树、智谱每个交易时段（开盘、午后）开始后，黄金、原油休市后重新开盘（纽约时间 18:00，周末和节假日之后也算）后，美股卡 09:30 开盘后，这么多分钟内开始的场次不挂。集合竞价的参考价（韩交所 08:30 起、港交所 09:00 起、上交所 09:15 起）、午休和休市期间的消息在指数动之前就已公开，这几场的方向不是五五开，49¢ 的买单正好给知道方向的人接。1.151.1 起开盘后第一场（15 分钟）固定不挂，这里只能再加长，填 0 也按 15 算；默认 15"),
     ("PREOPEN_LIMIT_GAP_PCT", "股票卡距涨跌停不足几 % 时不挂", "0～20：海力士、宇树（智谱在港交所没有涨跌停，只看临停）的交易所现价离当日涨停或跌停（按前收盘价算：科创板 ±20%、韩交所 ±30%）不到这么多时不新挂、撤掉已挂的；交易时段里成交时间 3 分钟没动（临停、VI）同样处理；0 = 不管（默认 2）"),
     ("PREOPEN_AHEAD_MINUTES", "只挂几分钟内开始的场次", "3～1440：默认 1440 = 24 小时内已发布的全部场次，发布一场挂一场、最近的先；想少占资金就调小"),
     ("PREOPEN_CANCEL_SECONDS", "开场前几秒撤单", "至少比到期多 5 秒、至多 900：撤单发出后到到期前每 2 秒催一次（默认 20）"),
@@ -8001,6 +8001,33 @@ def market_shuts(hours: str, from_ms: int, to_ms: int) -> list[tuple[int, int]]:
     return cme_shuts(from_ms, to_ms) if hours == "cme" else us_shuts(from_ms, to_ms) if hours == "us" else []
 
 
+SHUT_TEXT = {"cme": "纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00，CME 节假日从 12:00 起",  # 1.150.1; the holidays 1.151.0
+             "us": "美股常规交易时段以外：纽约时间 09:30–16:00 以外、周末、美国假日，半日市 13:00 后"}  # 1.151.0
+OPEN_FIRST_MINUTES = 15  # 1.151.1: the first window after an open or a reopen is never traded on a card with hours, never quoted ahead by the pre-open mode
+
+
+def reopened_within(hours: str, start_ms: int, quiet_ms: int) -> bool:
+    """Whether a window starting at ``start_ms`` starts within ``quiet_ms`` of the end of one of ``hours``' shut stretches (a reopen)."""
+    return quiet_ms > 0 and any(back <= start_ms < back + quiet_ms for _, back in market_shuts(hours, start_ms - quiet_ms, start_ms + 1))
+
+
+def window_hours_hold(spec: "UpDownSpec") -> str:
+    """Why the model trader leaves a window of a card with ``hours`` alone ("" when it need not; Bot.updown_hold, 1.151.1): the
+    window touches its market's shut — gold's and oil's index stands still while CME is shut, the model's 50/50 there is the
+    one view the market does not share (11-16: every window of the shut hour had one side swept) — or it is the first after
+    a reopen, what happened while shut being out before the index moves. The pre-open mode's rule (preopen.market_shut,
+    session_opening), applied while the window runs: the model trader trades a window only once it has started."""
+    card = next((c for c in WINDOW_UPDOWN_MARKETS if c.key == spec.key and c.hours), None)
+    if card is None:
+        return ""
+    start, end = spec.start_ms + 60_000, spec.end_ms + 60_000  # (an UpDownSpec names its candles by their open, a minute before)
+    if market_shuts(card.hours, start, end):
+        return f"{card.coin}休市（{SHUT_TEXT[card.hours]}）：指数不动，暂不给建议"
+    if reopened_within(card.hours, start, OPEN_FIRST_MINUTES * 60_000):
+        return f"{card.coin}重新开盘后的第一场：休市期间的消息在指数动之前就已公开，暂不给建议"
+    return ""
+
+
 def window_title_text(question: str, spec: "UpDownSpec") -> str:
     """A 15-minute market's question names its time range ("… 10:00PM-10:15PM ET"): when it does, it must start where the
     slug's time was read as the start (WindowUpDownSpec), or nothing is suggested. "" when it agrees or says no time."""
@@ -11590,7 +11617,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_LEVELS": {"kind": "text", "group": "预挂", "presets": ["", "48x20", "48x20,47x40", "48x10,47x10", "47x40", "48x10,47x20,46x40", "48x10,47x20,46x40,43x40,40x40"], "unit": "", "empty": "只挂第一档"},
     "PREOPEN_DEEP_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "60", "120", "240", "1440"], "unit": "分钟", "zero": "和第一档一样"},
     "PREOPEN_LIMIT_GAP_PCT": {"kind": "number", "group": "预挂", "presets": ["0", "1", "2", "3", "5"], "unit": "%", "zero": "不管涨跌停"},
-    "PREOPEN_OPEN_QUIET_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "15", "30", "60"], "unit": "分钟", "zero": "开盘第一场也挂"},
+    "PREOPEN_OPEN_QUIET_MINUTES": {"kind": "number", "group": "预挂", "presets": ["15", "30", "60"], "unit": "分钟", "zero": "按 15 算（第一场固定不挂）"},
     "PREOPEN_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["60", "120", "240", "720", "1440"], "unit": "分钟"},
     "PREOPEN_CANCEL_SECONDS": {"kind": "number", "group": "预挂", "presets": ["10", "15", "20", "30", "60"], "unit": "秒"},
     "PREOPEN_EXPIRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["5", "10", "15", "30"], "unit": "秒"},
@@ -18865,6 +18892,8 @@ class Bot:
         index = isinstance(mkt, IndexUpDownMarket)
         if index and not hold:
             hold = self.window_title_problem(mkt.spec)  # the window Predict names must be the one the slug was read as
+        if index and not hold and not odds.settled:
+            hold = window_hours_hold(mkt.spec)  # 1.151.1: gold's, oil's, a US stock's shut and the first window after it
         strike = (self.predict.strikes.get(mkt.spec.slug) or (None,))[0]
         if strike is None:
             if (index and not hold and not odds.settled and mkt.STRIKE_WAIT_MS and now_ms < mkt.spec.start_ms + 60_000 + mkt.STRIKE_WAIT_MS

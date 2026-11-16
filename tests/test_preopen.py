@@ -420,7 +420,9 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         ctl, api, _ = controller(rows)
         starts = p.window_starts(NOW, ctl.owner.config, ctl.settings)
         self.assertEqual([(r.key, (s - NOW) // 60_000) for r, s in starts][:4], [("BTC-15M", 15), ("SKHYNIX-15M", 15), ("BTC-15M", 30), ("SKHYNIX-15M", 30)])
-        self.assertTrue(all(s - NOW >= 180_000 and s - NOW <= 3_600_000 for _, s in starts) and ("UNITREE-15M", 30) in [(r.key, (s - NOW) // 60_000) for r, s in starts])
+        got = [(r.key, (s - NOW) // 60_000) for r, s in starts]
+        self.assertTrue(all(s - NOW >= 180_000 and s - NOW <= 3_600_000 for _, s in starts) and ("UNITREE-15M", 45) in got)
+        self.assertNotIn(("UNITREE-15M", 30), got, "1.151.1: the SSE open's first window (09:30) is never quoted, the suite's 0 or not")
         await ctl.discover()
         self.assertEqual(ctl.queue.qsize(), 3)  # the 3-hour one is not even asked for
         order = [ctl.queue.get_nowait()[2]["market_id"] for _ in range(3)]
@@ -918,10 +920,12 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(m.cme_shuts(et(16, 45), et(17, 0)) + m.cme_shuts(et(18, 0), et(18, 15)), [], "the boundaries: a window may end at the shut, start at the reopen")
         self.assertIn("黄金、原油休市（纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00，CME 节假日从 12:00 起）期间的场次不挂、重开后头 15 分钟内开始的也不挂（北京时间 11-07 06:00–11-09 07:00）", ctl.status())
         await self.finish(ctl)
-        quiet0, _, _ = controller(PREOPEN_MARKETS="xau")  # the suite's quiet 0: the reopen's window quoted, the shut's still not
+        quiet0, _, _ = controller(PREOPEN_MARKETS="xau")  # the suite's quiet 0 — 1.151.1: the reopen's first window is not quoted all the same (fixed)
         got = set(by("XAU-15M", p.window_starts(now, quiet0.owner.config, dataclasses.replace(quiet0.settings, ahead_minutes=1440))))
-        self.assertEqual((et(18, 0) in got, bool(got & shut)), (True, False))
-        self.assertIn("黄金休市（纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00，CME 节假日从 12:00 起）期间的场次不挂（北京时间", quiet0.status())
+        self.assertEqual((et(18, 0) in got, et(18, 15) in got, bool(got & shut)), (False, True, False))
+        self.assertIn("黄金休市（纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00，CME 节假日从 12:00 起）期间的场次不挂、重开后头 15 分钟内开始的也不挂（北京时间", quiet0.status())
+        longer = set(by("XAU-15M", p.window_starts(now, quiet0.owner.config, dataclasses.replace(quiet0.settings, ahead_minutes=1440, open_quiet_minutes=30))))
+        self.assertEqual((et(18, 0) in longer, et(18, 15) in longer, et(18, 30) in longer), (False, False, True), "the setting lengthens it")
         await self.finish(quiet0)
         btc, _, _ = controller(PREOPEN_MARKETS="btc")
         self.assertNotIn("休市", btc.status())
@@ -1077,6 +1081,33 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(p.cards_between(working, "2026-11-05", "2026-11-06", share)[0]["records"] + 0, next(
                 r for r in p.cards_between(rows, "2026-11-05", "2026-11-06") if r["card"] == "黄金 15分涨跌")["records"])
             led.close()
+
+    async def test_the_first_window_after_an_open_is_never_quoted_nor_traded(self):
+        """1.151.1: the first window after any open or reopen is not quoted whatever PREOPEN_OPEN_QUIET_MINUTES says — gold's and
+        oil's 18:00 ET (Polymarket lists no window there), a US stock's 09:30, a stock card's open and its afternoon's — the
+        setting lengthens it, 0 no longer takes it away (1.135.1–1.151.0: 0 quoted them); and the model trader gives no
+        suggestion on a window of a card with hours that touches its shut or is the reopen's first (window_hours_hold)."""
+        self.assertEqual([p.open_quiet_ms(types.SimpleNamespace(open_quiet_minutes=x)) // 60_000 for x in (0, 5, 15, 30, None)], [15, 15, 15, 30, 15])
+        ctl, api, clock = controller(PREOPEN_MARKETS="unitree,zhipu,skhynix", PREOPEN_AHEAD_MINUTES="1440")  # the suite's 0
+        self.assertEqual(ctl.settings.open_quiet_minutes, 0)
+        bj = lambda h, mi=0: int(dt.datetime(2026, 11, 6, h, mi, tzinfo=m.BEIJING).timestamp() * 1000)  # Friday, NOW 09:00 Beijing
+        got = {(r.key, s) for r, s in p.window_starts(NOW, ctl.owner.config, ctl.settings)}
+        for key, at in (("UNITREE-15M", bj(9, 30)), ("UNITREE-15M", bj(13)), ("ZHIPU-15M", bj(9, 30)), ("ZHIPU-15M", bj(13))):
+            self.assertNotIn((key, at), got, (key, at))
+        for key, at in (("UNITREE-15M", bj(9, 45)), ("UNITREE-15M", bj(13, 15)), ("ZHIPU-15M", bj(9, 45)), ("SKHYNIX-15M", bj(9, 15))):
+            self.assertIn((key, at), got, (key, at))
+        self.assertIn("股票卡开盘、午后头 15 分钟内开始的场次不挂", ctl.status(), "the minutes in force, not the setting's 0")
+        await self.finish(ctl)
+        et = lambda d, h, mi=0: m.et_wall_ms(dt.date(2026, 11, d), h, mi)
+        cards = {r.key: r for r in m.WINDOW_UPDOWN_MARKETS}
+        hold = lambda key, start: m.window_hours_hold(cards[key].window_spec(start))
+        self.assertEqual(hold("XAU-15M", et(16, 17, 15)), "黄金休市（纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00，CME 节假日从 12:00 起）：指数不动，暂不给建议")
+        self.assertEqual(hold("CL-15M", et(16, 18)), "原油重新开盘后的第一场：休市期间的消息在指数动之前就已公开，暂不给建议")
+        self.assertTrue(hold("XAU-15M", et(26, 13)).startswith("黄金休市"), "Thanksgiving's early halt")
+        self.assertTrue(hold("XAU-15M", et(29, 18)).startswith("黄金重新开盘后的第一场"), "the Sunday reopen after the long weekend")
+        self.assertTrue(hold("NVDA-15M", et(16, 9, 30)).startswith("英伟达重新开盘后的第一场") and hold("NVDA-15M", et(16, 16)).startswith("英伟达休市"))
+        for key, start in (("XAU-15M", et(16, 16, 45)), ("XAU-15M", et(16, 18, 15)), ("NVDA-15M", et(16, 9, 45)), ("BTC-15M", et(16, 18)), ("UNITREE-15M", NOW + 30 * 60_000)):
+            self.assertEqual(hold(key, start), "", (key, start))
 
     async def test_five_minute_cards_are_quoted_on_their_own_rhythm(self):
         """1.137.0: btc5 / eth5 / bnb5 name the 5-minute cards (btc-updown-5m-<start>): a window every five minutes, the
