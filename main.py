@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.150.1"
+VERSION = "1.151.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -291,8 +291,16 @@ DEFAULT_HOLIDAYS = {
 #     session 10:00–16:30 KST, close fixed at 16:30, Nextrade after-hours from 16:40.
 #   SGX half days (the eves of Lunar New Year, Christmas and New Year): the A50 day session ends at noon
 #     (A50_HALF_DAY_END) and there is no T+1 session that evening.
+#   CME Globex holiday schedules (1.151.0; gold and oil, the pre-open mode's CME cards — override with CME_EARLY_DAYS /
+#     CME_CLOSED_DAYS): an early halt of metals and energy (the US holidays CME trades through, the day after Thanksgiving,
+#     the eves of Christmas and New Year — 12:15 to 14:45 New York time by product and year, CME fixes them about two weeks
+#     ahead: taken as shut from noon), and the days with no session (Christmas, New Year's Day, Good Friday). Listed wide on
+#     purpose: a day too many costs an afternoon of gold and oil quotes, a day missing leaves them on a standing index.
 DEFAULT_SPECIAL_DAYS = {"HK_HALF": "2026-12-24,2026-12-31,2027-02-05", "KR_LATE": "2026-11-19",
-                        "SG_HALF": "2026-02-16,2026-12-24,2026-12-31"}
+                        "SG_HALF": "2026-02-16,2026-12-24,2026-12-31",
+                        "CME_EARLY": "2026-11-26,2026-11-27,2026-12-24,2026-12-31,2027-01-18,2027-02-15,2027-05-31,2027-06-18,2027-07-05,"
+                                     "2027-09-06,2027-11-25,2027-11-26",
+                        "CME_CLOSED": "2026-12-25,2027-01-01,2027-03-26,2027-12-24"}
 HOLIDAY_WARN_DAYS = 30  # warn this many days before the configured calendar runs out
 
 
@@ -514,7 +522,7 @@ class PreopenSettings:
     levels: tuple = ((D("0.49"), D("10")),)  # (price, shares) a side per level, the first = price × shares; PREOPEN_LEVELS adds deeper ones (1.129.0)
     deep_ahead_minutes: int = 1440  # PREOPEN_DEEP_AHEAD_MINUTES: the deeper levels are placed only this close to the start (the first keeps ahead_minutes)
     limit_gap_pct: float = 2.0  # PREOPEN_LIMIT_GAP_PCT: a stock card's windows are not quoted (resting ones withdrawn) within this of the day's limit, or halted; 0 = off
-    open_quiet_minutes: int = 15  # PREOPEN_OPEN_QUIET_MINUTES: a stock card's windows starting within this of a session segment's open (the day's, the afternoon's) are not quoted — the auction's indicative price, the break's news (1.135.1); gold's and oil's within this of CME's 18:00 ET reopen (1.150.1); 0 = all
+    open_quiet_minutes: int = 15  # PREOPEN_OPEN_QUIET_MINUTES: a stock card's windows starting within this of a session segment's open (the day's, the afternoon's) are not quoted — the auction's indicative price, the break's news (1.135.1); gold's and oil's within this of CME's 18:00 ET reopen (1.150.1), a US stock card's of the 09:30 open (1.151.0); 0 = all
     markets: frozenset = frozenset({"BTC-15M"})  # PREOPEN_MARKETS: BTC alone by default; "all" = every 15-minute card
     exclusive: bool = False    # PREOPEN_EXCLUSIVE: on = the model trader opens nothing while this mode runs for real (off: both run, jointly capped)
     weekend: bool = True       # PREOPEN_WEEKEND: off = no window starting Saturday 00:00 to Monday 08:00 (Beijing time) is quoted, resting ones withdrawn (1.136.0; 1.139.2)
@@ -671,7 +679,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_PRICE_CENTS", "预挂价格（¢）", "1～50：涨跌两边都按这个价挂买单（默认 49）"),
     ("PREOPEN_LEVELS", "更深的价格档位", "第 2 档起，价格x份数、逗号分隔、价格逐档递减、最多再 7 档，如 48x20,47x40：每场每边在第一档之下再挂这些买单，每档一条记录；空 = 只挂第一档"),
     ("PREOPEN_DEEP_AHEAD_MINUTES", "第 2 档起只挂几分钟内开始的场次", "3～提前范围：第一档按“只挂几分钟内开始的场次”挂（排队靠前），更深的档位离开场这么近才挂，少占资金；0 = 和第一档一样"),
-    ("PREOPEN_OPEN_QUIET_MINUTES", "股票卡开盘后几分钟内开始的场次不挂", "0～120：海力士、宇树、智谱每个交易时段（开盘、午后）开始后这么多分钟内开始的场次不挂；黄金、原油每天休市一小时后（纽约时间 18:00）重新开盘的也算（1.150.1）。集合竞价的参考价（韩交所 08:30 起、港交所 09:00 起、上交所 09:15 起）和午休里的消息（A50 期货午休照常交易）在指数动之前就已公开，这几场的方向不是五五开，49¢ 的买单正好给知道方向的人接。默认 15 = 跳过开盘和午后的第一场；0 = 都挂"),
+    ("PREOPEN_OPEN_QUIET_MINUTES", "股票卡开盘后几分钟内开始的场次不挂", "0～120：海力士、宇树、智谱每个交易时段（开盘、午后）开始后这么多分钟内开始的场次不挂；黄金、原油每天休市一小时后（纽约时间 18:00）重新开盘的也算（1.150.1），美股卡 09:30 开盘的也算（1.151.0）。集合竞价的参考价（韩交所 08:30 起、港交所 09:00 起、上交所 09:15 起）和午休里的消息（A50 期货午休照常交易）在指数动之前就已公开，这几场的方向不是五五开，49¢ 的买单正好给知道方向的人接。默认 15 = 跳过开盘和午后的第一场；0 = 都挂"),
     ("PREOPEN_LIMIT_GAP_PCT", "股票卡距涨跌停不足几 % 时不挂", "0～20：海力士、宇树（智谱在港交所没有涨跌停，只看临停）的交易所现价离当日涨停或跌停（按前收盘价算：科创板 ±20%、韩交所 ±30%）不到这么多时不新挂、撤掉已挂的；交易时段里成交时间 3 分钟没动（临停、VI）同样处理；0 = 不管（默认 2）"),
     ("PREOPEN_AHEAD_MINUTES", "只挂几分钟内开始的场次", "3～1440：默认 1440 = 24 小时内已发布的全部场次，发布一场挂一场、最近的先；想少占资金就调小"),
     ("PREOPEN_CANCEL_SECONDS", "开场前几秒撤单", "至少比到期多 5 秒、至多 900：撤单发出后到到期前每 2 秒催一次（默认 20）"),
@@ -946,7 +954,9 @@ class Config:
         holidays = parse_holidays(e)
         CALENDAR.configure(parse_dates(e.get("HK_HALF_DAYS", DEFAULT_SPECIAL_DAYS["HK_HALF"]), "HK_HALF_DAYS"),
                            parse_dates(e.get("KR_LATE_DAYS", DEFAULT_SPECIAL_DAYS["KR_LATE"]), "KR_LATE_DAYS"),
-                           holidays["sg"], parse_dates(e.get("SG_HALF_DAYS", DEFAULT_SPECIAL_DAYS["SG_HALF"]), "SG_HALF_DAYS"))
+                           holidays["sg"], parse_dates(e.get("SG_HALF_DAYS", DEFAULT_SPECIAL_DAYS["SG_HALF"]), "SG_HALF_DAYS"),
+                           parse_dates(e.get("CME_EARLY_DAYS", DEFAULT_SPECIAL_DAYS["CME_EARLY"]), "CME_EARLY_DAYS"),
+                           parse_dates(e.get("CME_CLOSED_DAYS", DEFAULT_SPECIAL_DAYS["CME_CLOSED"]), "CME_CLOSED_DAYS"))
         preopen = PreopenSettings.from_env(e)
         if preopen.enabled:  # a stock card the pre-open mode quotes: its exchange ticker (the limit / halt guard's quote) even when the pair is not in SYMBOLS (1.134.0: 智谱)
             for spec in WINDOW_UPDOWN_MARKETS:
@@ -4431,11 +4441,17 @@ class SessionCalendar:
         self.kr_late: frozenset = frozenset()
         self.sg_holidays: frozenset = frozenset()  # SGX closures (the A50 futures trade neither session)
         self.sg_half: frozenset = frozenset()      # SGX half days (A50 morning only, no T+1 session)
+        self.cme_early: frozenset = frozenset()    # CME Globex holiday schedules: an early halt (shut from noon New York time; 1.151.0)
+        self.cme_closed: frozenset = frozenset()   # ...and the days without a session (cme_shuts)
 
     def configure(self, hk_half: frozenset, kr_late: frozenset, sg_holidays: frozenset = frozenset(),
-                  sg_half: frozenset = frozenset()) -> None:
+                  sg_half: frozenset = frozenset(), cme_early: frozenset | None = None, cme_closed: frozenset | None = None) -> None:
         self.hk_half, self.kr_late = frozenset(hk_half), frozenset(kr_late)
         self.sg_holidays, self.sg_half = frozenset(sg_holidays), frozenset(sg_half)
+        if cme_early is not None:
+            self.cme_early = frozenset(cme_early)
+        if cme_closed is not None:
+            self.cme_closed = frozenset(cme_closed)
 
     def half_day(self, market: str, day: dt.date) -> bool:
         return (market == "hk" and day in self.hk_half) or (market == "sg" and day in self.sg_half)
@@ -4483,7 +4499,8 @@ class SessionCalendar:
 
 CALENDAR = SessionCalendar()
 CALENDAR.configure(parse_dates(DEFAULT_SPECIAL_DAYS["HK_HALF"], "HK_HALF_DAYS"), parse_dates(DEFAULT_SPECIAL_DAYS["KR_LATE"], "KR_LATE_DAYS"),
-                   parse_dates(DEFAULT_HOLIDAYS["SG"], "HOLIDAYS_SG"), parse_dates(DEFAULT_SPECIAL_DAYS["SG_HALF"], "SG_HALF_DAYS"))
+                   parse_dates(DEFAULT_HOLIDAYS["SG"], "HOLIDAYS_SG"), parse_dates(DEFAULT_SPECIAL_DAYS["SG_HALF"], "SG_HALF_DAYS"),
+                   parse_dates(DEFAULT_SPECIAL_DAYS["CME_EARLY"], "CME_EARLY_DAYS"), parse_dates(DEFAULT_SPECIAL_DAYS["CME_CLOSED"], "CME_CLOSED_DAYS"))
 PRIOR_VOL = {"sh": 0.035, "sz": 0.035, "hk": 0.03, "kr": 0.03, "HSI": 0.013, "KOSPI": 0.02, "SSE": 0.011}
 PRIOR_WEIGHT = 10  # pseudo-observations given to the prior when blending with estimated volatility
 
@@ -7908,28 +7925,80 @@ DAILY_UPDOWN_MARKETS: tuple[DailyUpDownSpec, ...] = (
 
 
 # 1.150.1: gold and oil trade on CME Globex's hours — Sunday 18:00 to Friday 17:00 New York time, shut an hour from 17:00 every
-# day — and their Binance index stands still while shut (flat_minutes); Predict lists their windows through the shut all the same
+# day — and their Binance index stands still while shut (flat_minutes); Predict lists their windows through the shut all the same.
+# 1.151.0: CME's holiday schedules (CALENDAR.cme_early / cme_closed) and the US stock cards' regular session (us_session) too:
+# a card's ``hours`` names whose shut stretches its windows must keep out of (market_shuts)
 CME_SHUT_HOUR, CME_REOPEN_HOUR = 17, 18  # New York wall clock: shut at 17:00, reopened at 18:00 (Friday's shut to Sunday's 18:00)
+CME_EARLY_SHUT_HOUR = 12  # a holiday schedule's early halt (12:15–14:45 New York time by product and year, published about two weeks ahead): shut from noon
 UNIX_ORDINAL = dt.date(1970, 1, 1).toordinal()
 
 
-@functools.lru_cache(maxsize=64)
-def cme_shut_on(ordinal: int) -> tuple[int, int] | None:
-    """The shut stretch that begins on the New York date of this ordinal, (shut, reopened) in ms; None on a Saturday or Sunday
-    (inside Friday's). Kept: the pre-open discovery asks for every window of the day ahead, every second or two."""
+@functools.lru_cache(maxsize=512)
+def cme_day_shuts(ordinal: int, early: bool, closed: bool) -> tuple[tuple[int, int], ...]:
+    """The shut stretches the New York date of this ordinal brings, (shut, reopened) in ms: its daily break 17:00–18:00 (a
+    Friday's to Sunday 18:00); on a holiday schedule's early halt (``early``) from CME_EARLY_SHUT_HOUR; on a day without a
+    session (``closed``: Christmas, New Year's Day, Good Friday) the session it would have had, from 18:00 the evening
+    before. None on a Saturday or Sunday (inside Friday's). Kept: the discovery asks for every window of a day, every second."""
     day = dt.date.fromordinal(ordinal)
     if day.weekday() > 4:
-        return None
-    return et_wall_ms(day, CME_SHUT_HOUR, 0), et_wall_ms(day + dt.timedelta(days=2 if day.weekday() == 4 else 0), CME_REOPEN_HOUR, 0)
+        return ()
+    close = et_wall_ms(day, CME_SHUT_HOUR, 0)
+    out = [(close, et_wall_ms(day + dt.timedelta(days=2 if day.weekday() == 4 else 0), CME_REOPEN_HOUR, 0))]
+    if early:
+        out.append((et_wall_ms(day, CME_EARLY_SHUT_HOUR, 0), close))
+    if closed:
+        out.append((et_wall_ms(day - dt.timedelta(days=1), CME_REOPEN_HOUR, 0), close))
+    return tuple(out)
+
+
+def merge_stretches(stretches: Iterable[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+    """Stretches that overlap or touch, as one: a holiday's early halt, its break and the weekend after it are one shut,
+    whose end is the reopen (session_opening's)."""
+    out: list[tuple[int, int]] = []
+    for a, b in sorted(stretches):
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return tuple(out)
+
+
+@functools.lru_cache(maxsize=512)
+def cme_stretches(first: int, last: int, early: frozenset, closed: frozenset) -> tuple[tuple[int, int], ...]:
+    """CME's shut stretches of the New York dates of the ordinals ``first``..``last``, merged."""
+    return merge_stretches(s for o in range(first, last + 1)
+                  for s in cme_day_shuts(o, dt.date.fromordinal(o) in early, dt.date.fromordinal(o) in closed))
 
 
 def cme_shuts(from_ms: int, to_ms: int) -> list[tuple[int, int]]:
     """CME Globex's shut stretches that overlap [from_ms, to_ms), as (shut, reopened) in ms: 17:00–18:00 New York time Monday
-    to Thursday, and Friday 17:00 to Sunday 18:00 (DST followed: 05:00–06:00 Beijing in summer, 06:00–07:00 in winter). A
-    US holiday's early halt is not in it."""
-    first = UNIX_ORDINAL + from_ms // DAY_MS - 3  # New York's date is the UTC one or the day before; Friday's stretch reaches two days on
-    last = UNIX_ORDINAL + max(from_ms, to_ms - 1) // DAY_MS
-    return [s for o in range(first, last + 1) if (s := cme_shut_on(o)) is not None and s[0] < to_ms and from_ms < s[1]]
+    to Thursday, and Friday 17:00 to Sunday 18:00 (DST followed: 05:00–06:00 Beijing in summer, 06:00–07:00 in winter);
+    a holiday schedule's day (CALENDAR: CME_EARLY_DAYS from noon, CME_CLOSED_DAYS the whole session), merged with them."""
+    first = UNIX_ORDINAL + from_ms // DAY_MS - 5  # a holiday after a weekend reaches back four days; New York's date the UTC one or the day before
+    last = UNIX_ORDINAL + max(from_ms, to_ms - 1) // DAY_MS + 1  # a closed day's session begins the evening before
+    return [s for s in cme_stretches(first, last, CALENDAR.cme_early, CALENDAR.cme_closed) if s[0] < to_ms and from_ms < s[1]]
+
+
+@functools.lru_cache(maxsize=512)
+def us_stretches(first: int, last: int) -> tuple[tuple[int, int], ...]:
+    """The time between the US regular sessions (us_session: 09:30–16:00 New York time, 13:00 on a half day, none on a
+    weekend or a holiday) of the New York dates of the ordinals ``first``..``last``, a week each side for the sessions
+    around them: (a session's close, the next one's open)."""
+    sessions = [s for o in range(first - 7, last + 8) if (s := us_session(dt.date.fromordinal(o)))]
+    return tuple((a[1], b[0]) for a, b in zip(sessions, sessions[1:]))
+
+
+def us_shuts(from_ms: int, to_ms: int) -> list[tuple[int, int]]:
+    """The stretches outside the US regular session that overlap [from_ms, to_ms), as (close, the next open) in ms (1.151.0:
+    the US stock cards — the index is the session's price, and the open is where the night's news lands)."""
+    first, last = UNIX_ORDINAL + from_ms // DAY_MS - 1, UNIX_ORDINAL + max(from_ms, to_ms - 1) // DAY_MS
+    return [s for s in us_stretches(first, last) if s[0] < to_ms and from_ms < s[1]]
+
+
+def market_shuts(hours: str, from_ms: int, to_ms: int) -> list[tuple[int, int]]:
+    """The shut stretches that overlap [from_ms, to_ms) of a card's ``hours`` (WindowUpDownSpec.hours): "cme" (cme_shuts), "us"
+    (us_shuts); none for a card without (round the clock, or a stock exchange's session its windows already follow)."""
+    return cme_shuts(from_ms, to_ms) if hours == "cme" else us_shuts(from_ms, to_ms) if hours == "us" else []
 
 
 def window_title_text(question: str, spec: "UpDownSpec") -> str:
@@ -7980,7 +8049,7 @@ class WindowUpDownSpec:
     venue: str = "futures"  # the Binance venue the price comes from: a contract's index (IndexUpDownMarket) or a spot pair's trades (SpotWindowMarket, 1.109.0)
     limit_pct: float = 0.0  # the exchange's daily price limit on the stock (STAR 0.20, KRX 0.30; 1.130.0): the pre-open mode stands aside near it; 0 = none
     model: bool = True      # whether the model trader trades the card unless told otherwise: False puts it on SIM_SKIP's default — the pre-open mode's alone until restored on the page (1.135.0)
-    cme: bool = False       # the underlying trades on CME Globex's hours (cme_shuts): the pre-open mode quotes no window touching a shut stretch, nor the reopen's first (1.150.1)
+    hours: str = ""         # whose shut stretches the windows keep out of (market_shuts): "cme" — CME Globex (1.150.1), "us" — the US regular session (1.151.0); the pre-open mode quotes no window touching one, nor the reopen's first
     ROLL_WAIT_MS = 60_000  # the card waits this long past a window's end for the end's index, then moves on regardless
     SCHEDULE_DAYS = 40     # how far current / before look for a trading day (the longest closure, Lunar New Year, is nine days)
 
@@ -8107,8 +8176,8 @@ WINDOW_UPDOWN_MARKETS: tuple[WindowUpDownSpec, ...] = (
     # price stream; no exchange session here: Predict lists the windows while the index trades, the discovery takes what it lists.
     # 1.150.1: Predict lists them through CME's daily shut too, and there the pre-open mode's bids were filled hours ahead, one side
     # alone (11-16: Down on each of 17:00–18:00 ET, Up on 18:00–18:15; three of them to the deepest level): cme — the mode leaves those out
-    WindowUpDownSpec("XAU-15M", "xau", "XAUUSDT", "黄金", cme=True),
-    WindowUpDownSpec("CL-15M", "cl", "CLUSDT", "原油", cme=True),
+    WindowUpDownSpec("XAU-15M", "xau", "XAUUSDT", "黄金", hours="cme"),
+    WindowUpDownSpec("CL-15M", "cl", "CLUSDT", "原油", hours="cme"),
     # "智谱 (ZHIPU) 涨或跌 15分" (zhipu-updown-15m-1793942100: 13:15–13:30 Beijing): Chainlink's ZHIPU/USDT stream on the same
     # rules; the windows follow the Hong Kong session (智谱 2513.HK: 09:30–12:00, 13:00–16:00), which has no daily price limit —
     # of the pre-open mode's stock guard only the halt rule applies
@@ -8116,19 +8185,21 @@ WINDOW_UPDOWN_MARKETS: tuple[WindowUpDownSpec, ...] = (
     # 1.135.0: twelve US stocks and ETFs (mu-updown-15m-1793983500: 11-07 00:45–01:00 Beijing, 11-06 11:45 ET) on the same rules,
     # Chainlink's <X>/USDT streams on Binance's futures index; no session here (the bot has no US quote feed: no stock guard) —
     # Predict lists the windows while the US session runs and the discovery takes what it lists; the model trader leaves them
-    # alone by default (model=False: SIM_SKIP's default), the pre-open mode quotes them when PREOPEN_MARKETS names them
-    WindowUpDownSpec("MU-15M", "mu", "MUUSDT", "美光", model=False),
-    WindowUpDownSpec("SNDK-15M", "sndk", "SNDKUSDT", "闪迪", model=False),
-    WindowUpDownSpec("AVGO-15M", "avgo", "AVGOUSDT", "博通", model=False),
-    WindowUpDownSpec("SPCX-15M", "spcx", "SPCXUSDT", "SPCX", model=False),
-    WindowUpDownSpec("NVDA-15M", "nvda", "NVDAUSDT", "英伟达", model=False),
-    WindowUpDownSpec("GOOGL-15M", "googl", "GOOGLUSDT", "谷歌", model=False),
-    WindowUpDownSpec("META-15M", "meta", "METAUSDT", "Meta", model=False),
-    WindowUpDownSpec("TSM-15M", "tsm", "TSMUSDT", "台积电", model=False),
-    WindowUpDownSpec("AMZN-15M", "amzn", "AMZNUSDT", "亚马逊", model=False),
-    WindowUpDownSpec("QQQ-15M", "qqq", "QQQUSDT", "纳指ETF", model=False),
-    WindowUpDownSpec("SPY-15M", "spy", "SPYUSDT", "标普ETF", model=False),
-    WindowUpDownSpec("MSFT-15M", "msft", "MSFTUSDT", "微软", model=False),
+    # alone by default (model=False: SIM_SKIP's default), the pre-open mode quotes them when PREOPEN_MARKETS names them.
+    # 1.151.0: hours="us" — the pre-open mode quotes only windows inside the regular session (us_session: holidays, half days),
+    # and not the open's first: the night's news and the pre-market are public before the 09:30 print moves the index
+    WindowUpDownSpec("MU-15M", "mu", "MUUSDT", "美光", model=False, hours="us"),
+    WindowUpDownSpec("SNDK-15M", "sndk", "SNDKUSDT", "闪迪", model=False, hours="us"),
+    WindowUpDownSpec("AVGO-15M", "avgo", "AVGOUSDT", "博通", model=False, hours="us"),
+    WindowUpDownSpec("SPCX-15M", "spcx", "SPCXUSDT", "SPCX", model=False, hours="us"),
+    WindowUpDownSpec("NVDA-15M", "nvda", "NVDAUSDT", "英伟达", model=False, hours="us"),
+    WindowUpDownSpec("GOOGL-15M", "googl", "GOOGLUSDT", "谷歌", model=False, hours="us"),
+    WindowUpDownSpec("META-15M", "meta", "METAUSDT", "Meta", model=False, hours="us"),
+    WindowUpDownSpec("TSM-15M", "tsm", "TSMUSDT", "台积电", model=False, hours="us"),
+    WindowUpDownSpec("AMZN-15M", "amzn", "AMZNUSDT", "亚马逊", model=False, hours="us"),
+    WindowUpDownSpec("QQQ-15M", "qqq", "QQQUSDT", "纳指ETF", model=False, hours="us"),
+    WindowUpDownSpec("SPY-15M", "spy", "SPYUSDT", "标普ETF", model=False, hours="us"),
+    WindowUpDownSpec("MSFT-15M", "msft", "MSFTUSDT", "微软", model=False, hours="us"),
     # 1.137.0: the 5-minute BTC / ETH / BNB cards (btc-updown-5m-1793986800: 11-07 01:40–01:45 Beijing) on the 15-minute cards'
     # rules, a window every five minutes; the pre-open mode's alone (model=False) — PREOPEN_MARKETS names them btc5 / eth5 / bnb5
     WindowUpDownSpec("BTC-5M", "btc", "BTCUSDT", "BTC", minutes=5, venue="spot", model=False),
@@ -12350,11 +12421,12 @@ def card_of(trade: dict) -> str:
 
 def sim_by_card(trades: list[dict], marks: Mapping | None = None) -> list[dict]:
     """summary_of per card (card_of), the most traded first, each with settled_extras: the review page's 今日按市场 table
-    (analysis.cards_today) — a market's P&L for the day, the 15-minute cards' windows together."""
+    (analysis.cards_today) — a market's P&L for the day, the 15-minute cards' windows together; 1.151.0: and over any days
+    (Bot.journal_cards), each card with its settled P&L against the model's expectation in σ (luck_of)."""
     by: dict[str, list[dict]] = {}
     for t in trades:
         by.setdefault(card_of(t), []).append(t)
-    out = [{"name": name, **summary_of(rows, marks), **settled_extras(rows)} for name, rows in by.items()]
+    out = [{"name": name, **summary_of(rows, marks), **settled_extras(rows), "luck": luck_of(sim_ev_bets(rows))} for name, rows in by.items()]
     return sorted(out, key=lambda r: (-r["records"], -r["volume"], r["name"]))
 
 
@@ -12413,6 +12485,14 @@ def ev_group(name: str, bets: list[dict]) -> dict:
     enough = len(bets) >= EV_MIN_BETS
     verdict = "样本不足" if not enough else "激进" if z <= -EV_FLAG_Z else "保守" if z >= EV_FLAG_Z else "相符"
     return {"name": name, "bets": len(bets), "ev": ev, "pnl": pnl, "sigma": sigma, "z": z, "verdict": verdict, "flag": enough and z <= -EV_FLAG_Z}
+
+
+def luck_of(bets: list[dict]) -> dict:
+    """A group's settled P&L against what was expected of it at the order, in the σ the bets' own probabilities give
+    (ev_group): the review page's 偏离 column of 按市场 (1.151.0) — within ±EV_FLAG_Z σ a market's loss can be luck, past −EV_FLAG_Z
+    it is not."""
+    g = ev_group("", bets)
+    return {k: round(g[k], 4) if isinstance(g[k], float) else g[k] for k in ("bets", "ev", "pnl", "sigma", "z", "verdict")}
 
 
 def sim_ev_timeline(bets: list[dict], now_ms: int, days: int = EV_DAYS) -> dict:
@@ -12634,6 +12714,35 @@ def sim_by_window(trades: list[dict], marks: Mapping | None = None) -> dict:
 
 # --- the review page's filter (1.107.0): the daily summary and the analysis over a card, a kind, a way of trading ----------------
 JOURNAL_WAYS = {"maker": True, "taker": False}
+JOURNAL_RANGES = {"today": 0, "yesterday": 0, "7d": 6, "30d": 29}  # the review page's presets: days back from the last
+CARDS_MAX_DAYS = 366  # 按市场 over a range (1.151.0): at most this many days ("all" = this many back from today)
+
+
+def journal_days(frm: str, to: str, rng: str, today: dt.date, max_days: int) -> tuple[dt.date, dt.date]:
+    """The Beijing days a review query covers, (first, last): a preset ``rng`` (JOURNAL_RANGES; "all" = the last ``max_days``)
+    or ``frm``..``to`` (ISO dates; ``to`` missing: that one day; neither reads: today) — never after today, at most
+    ``max_days`` (the first moved up). The 市场涨跌统计 (1.143.0) and 按市场 (1.151.0) ranges."""
+    try:
+        d0 = dt.date.fromisoformat(frm[:10]) if frm else today
+        d1 = dt.date.fromisoformat(to[:10]) if to else d0
+    except ValueError:
+        d0 = d1 = today
+    if rng in JOURNAL_RANGES or rng == "all":
+        d1 = today - dt.timedelta(days=1) if rng == "yesterday" else today
+        d0 = d1 - dt.timedelta(days=max_days - 1 if rng == "all" else JOURNAL_RANGES[rng])
+    d1 = min(d1, today)
+    d0 = min(d0, d1)
+    if (d1 - d0).days >= max_days:
+        d0 = d1 - dt.timedelta(days=max_days - 1)
+    return d0, d1
+
+
+def journal_days_label(d0: dt.date, d1: dt.date, today: dt.date) -> str:
+    """今天 / 昨天 / 11-16 / 11-10 至 11-16（7 天）."""
+    if d0 == d1:
+        return "今天" if d1 == today else "昨天" if d1 == today - dt.timedelta(days=1) else f"{d1:%m-%d}"
+    return f"{d0:%m-%d} 至 {d1:%m-%d}（{(d1 - d0).days + 1} 天）"
+
 
 
 def journal_filter_of(params: Mapping) -> dict[str, str]:
@@ -14118,7 +14227,7 @@ dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
 .note{font-size:12.5px;background:var(--chip);border-radius:10px;padding:8px 10px;border-left:3px solid var(--warn)}.note.bad{border-left-color:var(--hot)}
 footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:var(--faint);font-size:12px}
 .evchart{width:100%;height:auto;display:block;margin:6px 0 2px;background:var(--chip);border-radius:10px}.evchart .grid{stroke:var(--line2)}.evchart .zero{stroke:var(--faint);stroke-dasharray:3 3}.evchart text{font-size:10px;fill:var(--faint)}.evchart .band{fill:var(--best-soft);opacity:.35}.evchart .ev{fill:none;stroke:var(--muted);stroke-width:1.5;stroke-dasharray:5 4}.evchart .pnl{fill:none;stroke:var(--best);stroke-width:2}.evchart circle.pnl{fill:var(--best)}.evchart circle.ev{fill:var(--muted)}
-.tbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:2px 0 10px}.tbar select,.tbar input,.tbar button{font:inherit;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}.tbar button{cursor:pointer}.tcust{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}.tsum{font-size:13px;margin:2px 0 4px}.tcu{color:var(--up)}.tcd{color:var(--down)}.tdots{display:flex;flex-direction:column;gap:3px;margin:10px 0 6px}.trow{display:flex;align-items:flex-start;gap:8px;font-size:11px;color:var(--muted)}.trow .tl{width:70px;flex:none;font-variant-numeric:tabular-nums;line-height:13px}.trow .tcells{display:flex;flex-wrap:wrap;gap:3px}.tdot{width:12px;height:12px;border-radius:50%;display:inline-block;flex:none;vertical-align:-2px;box-sizing:border-box}.tdot.u{background:var(--up)}.tdot.d{background:var(--down)}.tdot.f{background:var(--faint)}.tdot.n{opacity:.42}.tdot.x{border:1.5px solid var(--line)}.tdot.bad{box-shadow:0 0 0 2px var(--warn)}.tlegend .tdot{margin:0 4px 0 8px}.tdots .tdot{cursor:pointer}.tdots.only .tdot:not(.bad){opacity:.15}.tdot.sel{outline:2px solid var(--text);outline-offset:1px}.tdet{font-size:12.5px;background:var(--chip);border-radius:10px;padding:7px 10px;margin:4px 0}.tdays tr.pick{cursor:pointer}.tdays tr.on td{background:var(--best-bg)}
+.tbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:2px 0 10px}.tbar .tq.on{border-color:var(--best);color:var(--best);background:var(--best-bg)}ul.notes{margin:4px 0 10px;padding-left:20px;font-size:13px;line-height:1.55}ul.notes li{margin:2px 0}.tbar select,.tbar input,.tbar button{font:inherit;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}.tbar button{cursor:pointer}.tcust{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}.tsum{font-size:13px;margin:2px 0 4px}.tcu{color:var(--up)}.tcd{color:var(--down)}.tdots{display:flex;flex-direction:column;gap:3px;margin:10px 0 6px}.trow{display:flex;align-items:flex-start;gap:8px;font-size:11px;color:var(--muted)}.trow .tl{width:70px;flex:none;font-variant-numeric:tabular-nums;line-height:13px}.trow .tcells{display:flex;flex-wrap:wrap;gap:3px}.tdot{width:12px;height:12px;border-radius:50%;display:inline-block;flex:none;vertical-align:-2px;box-sizing:border-box}.tdot.u{background:var(--up)}.tdot.d{background:var(--down)}.tdot.f{background:var(--faint)}.tdot.n{opacity:.42}.tdot.x{border:1.5px solid var(--line)}.tdot.bad{box-shadow:0 0 0 2px var(--warn)}.tlegend .tdot{margin:0 4px 0 8px}.tdots .tdot{cursor:pointer}.tdots.only .tdot:not(.bad){opacity:.15}.tdot.sel{outline:2px solid var(--text);outline-offset:1px}.tdet{font-size:12.5px;background:var(--chip);border-radius:10px;padding:7px 10px;margin:4px 0}.tdays tr.pick{cursor:pointer}.tdays tr.on td{background:var(--best-bg)}
 </style></head><body><div class="wrap">
 <header><div class="ttl"><h1 id="title">交易复盘</h1><div class="meta" id="meta">加载中…</div></div><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button></header>
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><a class="btn" id="csv" href="journal.csv" download="交易日记.csv">导出 CSV</a><a class="btn" id="scsv" href="summary.csv" download="复盘汇总.csv">导出汇总 CSV</a><a class="btn" id="mcsv" href="samples.csv" download="模型样本.csv">导出模型样本</a><a class="btn" id="json" href="journal.json?full=1" download="交易日记.json">导出 JSON</a></div>
@@ -14126,7 +14235,7 @@ footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:v
 <section class="box" id="unrecbox" hidden><div class="hd"><h2>账户里有、记录里没有的持仓</h2><span class="sum" id="unrecsum"></span></div>
 <div class="body" id="unrecbody"></div><p class="small mut" id="unrecnote" hidden>按最近一次读到的 Predict 持仓，减去记录和开盘前预挂的份数；多出来的多半是没有记录的挂单成交了（手动单、丢失跟踪的单）。每分钟一次的持仓核对会把它补记到同一方向最近结束的订单上，没有这样的订单就留在这里；/live fills 给出逐项对照。</p></section>
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
-<div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>今日按市场 <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><p class="small mut">今天（北京时间）下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；要看别的日子，点下面筛选条里的市场，每天的标题行就是那张卡片当天的盈亏。开盘前预挂（49¢ 两边挂）单独成行，名字后带“· 开盘前预挂”，按场次开始的时间算今天，下单时预期按五五开算。</p><p class="small mut">按下单日期（北京时间）统计，开盘前预挂的场次按场次开始的日期计入当天，点开那一天有单独的“开盘前预挂”一行；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
+<div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>按市场 · <span id="scrng">今天</span> <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbar" id="cbar"><button type="button" class="tq on" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><button type="button" class="tq" data-r="all">全部</button><span class="tcust"><input type="date" id="cfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="cto" aria-label="结束日期"><button type="button" id="cgo">查看</button></span></div><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><p class="small mut">选的日子（北京时间）里下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；开盘前预挂（两边挂）单独成行，名字后带“· 开盘前预挂”，按场次开始的日期算，下单时预期按五五开算。<b>偏离</b> = 实际盈亏比下单时预期差了几个 σ（σ 按下单时的概率算）：±2σ 以内可能只是运气，低于 −2σ 就不像运气了，是这个市场有问题。点一行看明细：原策略是这段时间的每一笔；开盘前预挂是钱亏在哪——只成交一边时那边赢几成、按开始时间、按成交时距开场、按方向和价格档。</p><p class="small mut">按下单日期（北京时间）统计，开盘前预挂的场次按场次开始的日期计入当天，点开那一天有单独的“开盘前预挂”一行；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></div></section>
 <section class="box" id="tallybox"><div class="hd" id="tallyhd"><h2>市场涨跌统计</h2><span class="sum" id="tallysum"></span><button type="button" class="lnk" id="foldtally">收起</button></div>
 <div class="body" id="tallybody"><div class="tbar"><select id="tcard" aria-label="市场"></select><button type="button" class="tq" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><span class="tcust"><input type="date" id="tfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="tto" aria-label="结束日期"><button type="button" id="tgo">查看</button></span></div>
 <div id="tally"></div>
@@ -14342,18 +14451,37 @@ function summary(){  // per day the records were opened on: records, markets, wh
   el.append(t);dayDetail(rows);
   const d=rows[0];head.replaceChildren((S.label?S.label+"｜":"")+d.label+"：记录 "+d.records+" · 成交 "+usd(d.volume)+(d.settled?" · 盈亏 ":""));
   if(d.settled){const b=$("b","",money(d.pnl));b.className=d.pnl>=0?"ok":"bad";head.append(b)}
-  const ct=(S.a||{}).cards_today||[];cel.replaceChildren(ct.length?cardsTable(ct):$("p","small mut","今天还没有记录"));cardDetail(ct);
+  cardsView(S);
   document.getElementById("sumbody").hidden=!sumOpen;document.getElementById("foldsum").textContent=sumOpen?"收起":"展开"}
 function pn(x){const b=$("b","",money(x));b.className=x>=0?"ok":"bad";return b}
-let cardOpen="",dayOpen="";const rowsCache={},rowsBusy=new Set();  // the card of 今日按市场 (1.114.0) and the day of the summary (1.115.0) whose records are shown under their tables; the records read for a panel, by query (journal.json?rows=1&…), again after each refresh
-function cardsTable(ct){  // 今日按市场: anaTable's lines, each opening the card's records of the day under the table (cardDetail) when clicked
+let cardOpen="",dayOpen="";const rowsCache={},rowsBusy=new Set();  // the card of 按市场 (1.114.0) and the day of the summary (1.115.0) whose records are shown under their tables; the records read for a panel, by query (journal.json?rows=1&…), again after each refresh
+let cardRng="today",cardFrom="",cardTo="";const cardsCache={},cardsBusy=new Set();  // 按市场's days (1.151.0): a preset (today / yesterday / 7d / 30d / all) or from..to; the rows read for each, by query
+function cardsRange(){return cardRng?["range="+cardRng]:["from="+cardFrom,"to="+(cardTo||cardFrom)]}
+function cardsView(S){  // 按市场: today's rows come with the summary's analysis; other days are read from the server (journal.json?cards=1&…), again after each refresh
+  const cel=document.getElementById("s-cards"),lab=document.getElementById("scrng");
+  if(cardRng==="today"){lab.textContent="今天";const ct=(S.a||{}).cards_today||[];cel.replaceChildren(ct.length?cardsTable(ct):$("p","small mut","今天还没有记录"));cardDetail(ct,"今天");return}
+  const fk=filterKey(),q=["cards=1",...cardsRange()].join("&")+(fk?"&"+fk:""),c=cardsCache[q];if(!c||c.at!==okAt)loadCards(q);
+  if(!c||!c.data){cel.replaceChildren($("p","small mut",c&&c.error?"读取失败："+c.error:"读取中…"));cardDetail([],"");return}
+  const j=c.data,fi=document.getElementById("cfrom"),ti=document.getElementById("cto");lab.textContent=j.label;
+  if(document.activeElement!==fi&&document.activeElement!==ti){fi.value=j.from;ti.value=j.to}fi.max=ti.max=j.today;
+  const kids=[];if(c.error)kids.push($("p","small bad","刷新失败："+c.error+"，下面是上一次读到的"));
+  kids.push((j.rows||[]).length?cardsTable(j.rows):$("p","small mut","这段时间没有记录"));cel.replaceChildren(...kids);cardDetail(j.rows||[],j.label)}
+async function loadCards(q){const at=okAt;if(cardsBusy.has(q))return;cardsBusy.add(q);
+  try{const k=ctlKey();const r=await fetch(base+"/journal.json?"+q,{cache:"no-store",headers:k?{"X-Control-Key":k}:{}});if(!r.ok)throw new Error("HTTP "+r.status);cardsCache[q]={at,data:await r.json()}}
+  catch(e){cardsCache[q]={at,error:e.message||"读取失败",data:(cardsCache[q]||{}).data}}  // a failed re-read keeps what was shown
+  finally{cardsBusy.delete(q)}
+  summary()}
+function cardsPick(rng,from,to){cardRng=rng;cardFrom=from||"";cardTo=to||"";cardOpen="";document.querySelectorAll("#cbar .tq").forEach(b=>b.classList.toggle("on",b.dataset.r===cardRng));summary()}
+function luckCell(r){  // 偏离 (1.151.0): the settled P&L against the expectation at the order, in the σ the order's own probabilities give
+  const l=r.luck;if(!l||!l.bets||!(l.sigma>0))return"—";const z=l.z,out=$("span","");
+  const b=$("b",z<=-2?"bad":z>=2?"ok":"",(z>=0?"+":"−")+Math.abs(z).toFixed(1)+"σ");
+  out.title="实际 "+money(l.pnl)+"，下单时预期 "+money(l.ev)+"，相差 "+money(l.pnl-l.ev)+"；按下单时的概率算，这些单的波动 σ = "+usd(l.sigma)+"（"+l.bets+" 场有结果）";
+  out.append(b,(z<=-2?" 不像运气":z>=2?" 好于预期":"")+(l.bets<30?"（"+l.bets+" 场）":""));return out}  // within ±2σ the number alone: it can be luck
+function cardsTable(ct){  // 按市场: anaTable's lines and 偏离, each opening under the table (cardDetail) the card's records — or, a pre-open line, where its money went (1.151.0)
   if(cardOpen&&!ct.some(r=>r.name===cardOpen))cardOpen="";
-  const w=anaTable(ct);[...w.querySelectorAll("tr")].slice(1).forEach((tr,i)=>{const r=ct[i],open=r.name===cardOpen;
-    if(r.preopen){tr.className="dayrow";tr.title="开盘前预挂模式今天开始的场次：每一场的明细在下面“开盘前预挂”一节";tr.firstChild.textContent="▸ "+r.name;  // 1.131.5
-      tr.addEventListener("click",()=>{if(!anaOpen){anaOpen=true;try{localStorage.setItem("jrnana","1")}catch(e){}  // 1.143.1: folded, the scroll went nowhere
-          document.getElementById("anabody").hidden=false;document.getElementById("foldana").textContent="收起"}
-        const h=document.getElementById("h-preopen");if(h&&!h.hidden)h.scrollIntoView({block:"start"})});return}
-    tr.className="dayrow"+(open?" open":"");tr.title=open?"收起这个市场今天的记录":"点开看这个市场今天的每一笔：已结算的盈亏和确认状态、持仓、挂单";
+  const w=anaTable(ct,{head:["偏离"],cells:r=>[luckCell(r)]});[...w.querySelectorAll("tr")].slice(1).forEach((tr,i)=>{const r=ct[i],open=r.name===cardOpen;
+    tr.className="dayrow"+(open?" open":"");
+    tr.title=open?"收起":r.preopen?"点开看钱亏在哪：只成交一边时那边赢几成，按开始时间、按成交时距开场、按方向和价格档":"点开看这个市场这段时间的每一笔：已结算的盈亏和确认状态、持仓、挂单";
     tr.firstChild.textContent=(open?"▾ ":"▸ ")+r.name;tr.addEventListener("click",()=>{cardOpen=open?"":r.name;summary()})});
   return w}
 const itemLess=(it,name)=>{it=it||"";const s=name&&it.startsWith(name)?it.slice(name.length).replace(/^[\s｜|·]+/,""):it;return s||it||"—"};  // an item less its card's name (a window, a day); the whole item when nothing is left
@@ -14368,14 +14496,35 @@ function panel(el,title,buttons,q,note,grp,empty){  // one records panel (a card
     kids.push($("p","small mut",note+(rest>0?"另有 "+rest+" 笔未成交 / 撤单的没有列出。":"")));
     kids.push(ts.length?recTable(ts,grp):$("p","small mut",empty))}
   el.replaceChildren(...kids)}
-function cardDetail(ct){  // under 今日按市场: the opened card's records of today (journal.json?rows=1&day=today&card=…: the list below holds only the latest records), by market (a 15-minute card's windows)
-  const el=document.getElementById("s-detail");if(!cardOpen||!ct.some(r=>r.name===cardOpen)){el.replaceChildren();el.hidden=true;return}
-  const name=cardOpen,fold=$("button","lnk","收起"),flt=$("button","lnk","在下面列表里筛选这个市场");fold.type=flt.type="button";
-  fold.addEventListener("click",()=>{cardOpen="";summary()});
+function cardDetail(ct,span){  // under 按市场: the opened card's records of the days shown (journal.json?rows=1&…&card=…: the list below holds only the latest records), by market (a 15-minute card's windows); a pre-open line's breakdown instead (poDiag, 1.151.0)
+  const el=document.getElementById("s-detail"),r=cardOpen?ct.find(x=>x.name===cardOpen):null;if(!r){el.replaceChildren();el.hidden=true;return}
+  const name=cardOpen,fold=$("button","lnk","收起");fold.type="button";fold.addEventListener("click",()=>{cardOpen="";summary()});
+  if(r.preopen){el.hidden=false;el.replaceChildren(...poDiag(r,span,fold));return}
+  const flt=$("button","lnk","在下面列表里筛选这个市场");flt.type="button";
   flt.addEventListener("click",()=>{cardF=name;stateF="all";shown=PAGE;render();document.getElementById("filters").scrollIntoView({block:"start"})});
-  panel(el,name+" · 今天的每一笔",[fold,flt],panelQuery(["day=today","card="+encodeURIComponent(name)]),
+  const today=cardRng==="today";
+  panel(el,name+" · "+(today?"今天":span+" ")+"的每一笔",[fold,flt],panelQuery([...(today?["day=today"]:cardsRange()),"card="+encodeURIComponent(name)]),
     "盈亏 = (结算价 − 买价) × 份数，合计就是上表这一行的盈亏；状态是结果的确认情况（预结算 / 已确认 / 结果不一致）。点一行看完整记录。",
-    {key:t=>t.item||"",label:k=>itemLess(k,name),sub:t=>itemLess(t.item,name)},"今天还没有成交、持仓或挂单")}
+    {key:t=>t.item||"",label:k=>itemLess(k,name),sub:t=>itemLess(t.item,name)},(today?"今天":"这段时间")+"还没有成交、持仓或挂单")}
+function poDiag(r,span,fold){  // under a pre-open line of 按市场 (1.151.0): where the card's money was made or lost over the days shown (preopen.card_diag)
+  const go=$("button","lnk","开盘前预挂一节（全部日子）");go.type="button";
+  go.addEventListener("click",()=>{if(!anaOpen){anaOpen=true;try{localStorage.setItem("jrnana","1")}catch(e){}  // 1.143.1: folded, the scroll went nowhere
+      document.getElementById("anabody").hidden=false;document.getElementById("foldana").textContent="收起"}
+    const t=document.getElementById("h-preopen");if(t&&!t.hidden)t.scrollIntoView({block:"start"})});
+  const h=$("h3","",r.name+" · "+span+"：钱亏在哪");h.append(fold,go);const kids=[h],d=r.diag;
+  if(!d){kids.push($("p","small mut","没有明细"));return kids}
+  if((d.notes||[]).length){const ul=$("ul","notes");d.notes.forEach(n=>ul.append($("li","",n)));kids.push(ul)}
+  const o=d.one||{},b=d.both||{};
+  kids.push($("p","small","有成交 "+d.windows+" 场：只成交一边且分出涨跌的 "+(o.one||0)+" 场，成交那边赢 "+(o.won||0)+" 场（"+tallyPc(o.won||0,o.one||0)+"，五五开该一半"
+    +(o.z!=null?"，偏离 "+tallyZ(o.z):"")+"）· 两边都成交 "+(b.windows||0)+" 场"+(b.settled?"（对冲，"+money(b.pnl)+"）":"")));
+  const line=x=>[x.name,x.windows,x.settled||"—",x.settled?poPn(x.pnl):"—",x.one?x.won+"/"+x.one+"（"+tallyPc(x.won,x.one)+"）":"—"];
+  const cols=["有成交","已结算","盈亏","只成交一边：那边赢"];
+  if((d.hours||[]).length)kids.push($("div","sub","按开始时间（北京时间，几天里同一小时合在一起）"),table(["开始",...cols],d.hours.map(line)));
+  if((d.lead||[]).length)kids.push($("div","sub","按成交时距开场（第一次看到成交的时刻，1.151.0 起才记）"),table(["成交",...cols],d.lead.map(line)));
+  kids.push($("div","sub","按方向（一场的涨、跌是两张单）"),table(["方向","挂出","有成交","成交份数","成交额","已结算","盈亏"],(d.sides||[]).map(x=>[x.name,x.records,x.filled_windows||"—",num(x.filled),usd(x.volume),poWl(x),x.settled?poPn(x.pnl):"—"])));
+  if((d.levels||[]).length>1)kids.push($("div","sub","按价格档"),table(["价格","记录","有成交","成交份数","已结算","盈亏"],d.levels.map(x=>[x.name,x.records,x.filled_windows||"—",num(x.filled),poWl(x),x.settled?poPn(x.pnl):"—"])));
+  kids.push($("p","small mut","怎么看：只成交一边时成交那边赢不到一半、偏离低于 −2σ，就是被知道方向的人挑着吃（逆向选择），不是运气；亏损挤在某几个开始时间，或者越早成交越亏，多半是那几个钟点标的休市、刚开盘或有固定的消息。两边都成交的场次两边对冲，每场稳赚 1 − 两边价格。"));
+  return kids}
 function dayDetail(rows){  // under the daily summary (1.115.0): the opened day's records (the filter's; journal.json?rows=1&day=…), by card with each card's figures first
   const el=document.getElementById("d-detail"),r=dayOpen&&rows?rows.find(x=>x.day===dayOpen):null;if(!r){el.replaceChildren();el.hidden=true;return}
   const fold=$("button","lnk","收起");fold.type="button";fold.addEventListener("click",()=>{dayOpen="";summary()});
@@ -14440,8 +14589,9 @@ function preopenSection(po){  // 开盘前预挂 (1.128.0): the mode's own ledge
   if((po.weekly||[]).length)el.append($("div","sub","周末 vs 工作日（按场次开始时间；周末 = 北京时间周六 00:00 到周一 08:00，和“周末也挂”的开关同一区间）"),poTable(po.weekly));
   el.append($("div","sub","按方向（一场的涨、跌是两张单）"),table(["方向","挂出","有成交","成交份数","成交额","已结算","盈亏"],(po.sides||[]).map(r=>[r.name,r.records,r.filled_windows||"—",num(r.filled),usd(r.volume),poWl(r),r.settled?poPn(r.pnl):"—"])));
   if((po.recent||[]).length){const res=x=>x==="up"?"涨":x==="down"?"跌":x==="split"?"平":"未出";
-    el.append($("div","sub","有成交的场次（最近 "+po.recent.length+" 场，新的在前）"),table(["开始","场次","涨成交","跌成交","价格","成交额","结果","盈亏","状态","挂上时距开场","撤单确认","第几次报价"],
-      po.recent.map(r=>[when(r.start_ms),r.name,num(r.filled_up),num(r.filled_down),cent(r.price),usd(r.volume),res(r.result),r.pnl==null?"—":poPn(r.pnl),r.status,r.lead_min==null?"—":r.lead_min.toFixed(0)+" 分钟",r.cancel_s==null?"—":r.cancel_s.toFixed(1)+" 秒",r.attempt+1])))}}
+    const fl=m=>m==null?"—":m<0?"撤单后才读到":m>=120?(m/60).toFixed(1)+" 小时":m.toFixed(0)+" 分钟";  // 1.151.0: the first fill seen, this long before the start
+    el.append($("div","sub","有成交的场次（最近 "+po.recent.length+" 场，新的在前）"),table(["开始","场次","涨成交","跌成交","价格","成交额","结果","盈亏","状态","挂上时距开场","成交时距开场","撤单确认","第几次报价"],
+      po.recent.map(r=>[when(r.start_ms),r.name,num(r.filled_up),num(r.filled_down),cent(r.price),usd(r.volume),res(r.result),r.pnl==null?"—":poPn(r.pnl),r.status,r.lead_min==null?"—":r.lead_min.toFixed(0)+" 分钟",fl(r.fill_lead_min),r.cancel_s==null?"—":r.cancel_s.toFixed(1)+" 秒",r.attempt+1])))}}
 const evZ=g=>g.bets&&g.sigma>0?(g.z>=0?"+":"−")+Math.abs(g.z).toFixed(1)+"σ":"—";
 function evChart(days){  // cumulative model EV (dashed) against cumulative P&L (solid), inside the ±2σ band the model's own probabilities draw
   const W=640,H=220,L=54,R=12,T=14,B=28,ns="http://www.w3.org/2000/svg",el=(t,a)=>{const e=document.createElementNS(ns,t);for(const k in a)e.setAttribute(k,a[k]);return e};
@@ -14727,6 +14877,8 @@ async function tallyLoad(tries){const my=++tallySeq,el=document.getElementById("
   catch(e){if(my===tallySeq)el.replaceChildren($("p","small mut","读取失败："+(e.message||e)))}}
 document.getElementById("tcard").addEventListener("change",e=>{tallyKey=e.target.value;try{localStorage.setItem("jrntallykey",tallyKey)}catch(err){}tallyLoad(0)});
 document.querySelectorAll("#tallybody .tq").forEach(b=>b.addEventListener("click",()=>{tallyRng=b.dataset.r;tallyLoad(0)}));
+document.querySelectorAll("#cbar .tq").forEach(b=>b.addEventListener("click",()=>cardsPick(b.dataset.r)));  // 按市场's days (1.151.0)
+document.getElementById("cgo").addEventListener("click",()=>{const f=document.getElementById("cfrom").value,t=document.getElementById("cto").value;if(f)cardsPick("",f,t||f)});
 document.getElementById("tgo").addEventListener("click",()=>{const f=document.getElementById("tfrom").value,t=document.getElementById("tto").value;if(!f)return;tallyRng="";tallyFrom=f;tallyTo=t||f;tallyLoad(0)});
 document.getElementById("tallyhd").addEventListener("click",()=>{tallyOpen=!tallyOpen;try{localStorage.setItem("jrntally",tallyOpen?"1":"0")}catch(e){}
   document.getElementById("tallybody").hidden=!tallyOpen;document.getElementById("foldtally").textContent=tallyOpen?"收起":"展开";if(tallyOpen&&!document.querySelector("#tally .tdots"))tallyLoad(0)});
@@ -15249,10 +15401,22 @@ class WebServer:
             flt = journal_filter_of(params)
             name = "journal.json?analysis" + "".join(f"&{k}={v}" for k, v in sorted(flt.items()))
             return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_analysis(flt), ensure_ascii=False, default=str).encode("utf-8"))
-        if flag("rows"):  # the records of a card (the filter) opened on a day, as list rows: under a line of 今日按市场 (1.114.0)
-            flt, day, lean = journal_filter_of(params), (params.get("day") or [""])[0].strip()[:10], flag("lean")
-            name = "journal.json?rows&day=" + day + ("&lean=1" if lean else "") + "".join(f"&{k}={v}" for k, v in sorted(flt.items()))
-            return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_rows(flt, day, lean), ensure_ascii=False, default=str).encode("utf-8"))
+        arg = lambda key: (params.get(key) or [""])[0].strip()[:10]
+        if flag("cards"):  # 按市场 over a range of days (1.151.0): today, yesterday, 7d, 30d, all, or from..to
+            flt = journal_filter_of(params)
+            name = f"journal.json?cards&range={arg('range')}&from={arg('from')}&to={arg('to')}" + "".join(f"&{k}={v}" for k, v in sorted(flt.items()))
+            return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_cards(flt, arg("from"), arg("to"), arg("range")),
+                                                                    ensure_ascii=False, default=str).encode("utf-8"))
+        if flag("rows"):  # the records of a card (the filter) opened on a day, as list rows: under a line of 今日按市场 (1.114.0); or over a range (1.151.0)
+            flt, day, lean = journal_filter_of(params), arg("day"), flag("lean")
+            ranged = bool(arg("from") or arg("range"))
+            if ranged:
+                today = dt.datetime.fromtimestamp(self.bot.market.now_ms() / 1000, BEIJING).date()
+                first, last = journal_days(arg("from"), arg("to"), arg("range"), today, CARDS_MAX_DAYS)
+            name = ("journal.json?rows&day=" + day + (f"&from={first}&to={last}" if ranged else "") + ("&lean=1" if lean else "")
+                    + "".join(f"&{k}={v}" for k, v in sorted(flt.items())))
+            return 200, ctype, self.cached(name, lambda: json.dumps(self.bot.journal_rows(flt, day, lean, *((first, last) if ranged else ())),
+                                                                    ensure_ascii=False, default=str).encode("utf-8"))
         full, everything = flag("full"), flag("all")
         name = "journal.json" + ("?full" if full else "?all" if everything else "")
         return 200, ctype, self.cached(name, lambda: json.dumps(
@@ -22049,6 +22213,34 @@ class Bot:
         """The pre-open mode's ledger records (LiveBot.preopen_rows); none here, where there is no mode."""
         return []
 
+    def preopen_cards(self, first: str, last: str) -> list[dict]:
+        """The pre-open mode's 按市场 rows over the Beijing dates ``first``..``last`` (LiveBot.preopen_cards); none here."""
+        return []
+
+    def journal_cards(self, flt: Mapping | None = None, frm: str = "", to: str = "", rng: str = "") -> dict:
+        """journal.json?cards=1&range=today | yesterday | 7d | 30d | all (or &from=<date>&to=<date>) — the review page's 按市场
+        over a range of days (1.151.0; 今日按市场 was today's alone): the model trader's records in ``flt`` opened on those
+        Beijing days, per card (sim_by_card: the figures, the settled P&L against the model's expectation in σ), and —
+        unfiltered — the pre-open mode's windows starting on them (preopen_cards: where each card's money went, card_diag)."""
+        flt = dict(flt or {})
+        now_ms = self.market.now_ms()
+        today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
+        d0, d1 = journal_days(frm, to, rng, today, CARDS_MAX_DAYS)
+        opened = lambda t: d0 <= dt.datetime.fromtimestamp(int(t.get("opened") or 0) / 1000, BEIJING).date() <= d1
+        trades = [t for t in self.sim_trades().values() if journal_match(t, flt) and opened(t)]
+        markets: dict[str, SimMarket] = {}
+        if any(t["status"] in {"resting", "filled"} for t in trades):
+            try:
+                markets = {mk.market: mk for mk in self.sim_markets(now_ms)}
+            except Exception as error:  # the rows still come; open trades just cannot be marked
+                LOG.warning("journal: markets unavailable: %s", clean_error(error) or type(error).__name__)
+        rows = sim_by_card(trades, self.sim_marks(markets, now_ms))
+        if not flt:  # the filter bar picks the model trader's records; the pre-open mode's rows stand beside them unfiltered (as in sim_analysis)
+            rows += self.preopen_cards(d0.isoformat(), d1.isoformat())
+        return {"version": VERSION, "server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）", "filter": flt,
+                "from": d0.isoformat(), "to": d1.isoformat(), "today": today.isoformat(), "range": rng if rng in JOURNAL_RANGES or rng == "all" else "",
+                "label": journal_days_label(d0, d1, today) if rng != "all" else f"全部（{d0:%m-%d} 起）", "rows": rows}
+
     def sim_ev(self, trades: list[dict] | None = None, preopen: bool = True) -> dict:
         """模型 EV 对实际盈亏 (sim_ev_timeline, 1.140.0) over ``trades`` (every record when None) and, when ``preopen``, the
         pre-open mode's settled fills (preopen.ev_bets: each window one coin-flip bet at its price, 1.150.x)."""
@@ -22118,18 +22310,7 @@ class Bot:
         now_ms = self.market.now_ms()
         card = tally_card(key) or tally_card("BTC-5M") or preopen_cards()[0]
         today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
-        try:
-            d0 = dt.date.fromisoformat(frm[:10]) if frm else today
-            d1 = dt.date.fromisoformat(to[:10]) if to else d0
-        except ValueError:
-            d0 = d1 = today
-        if rng in {"today", "yesterday", "7d", "30d"}:
-            d1 = today - dt.timedelta(days=1) if rng == "yesterday" else today
-            d0 = d1 - dt.timedelta(days={"7d": 6, "30d": 29}.get(rng, 0))
-        d1 = min(d1, today)
-        d0 = min(d0, d1)
-        if (d1 - d0).days >= TALLY_MAX_DAYS:
-            d0 = d1 - dt.timedelta(days=TALLY_MAX_DAYS - 1)
+        d0, d1 = journal_days(frm, to, rng if rng in JOURNAL_RANGES else "", today, TALLY_MAX_DAYS)
         day_ms = lambda d: int(dt.datetime(d.year, d.month, d.day, tzinfo=BEIJING).timestamp() * 1000)
         from_ms, to_ms = day_ms(d0), day_ms(d1 + dt.timedelta(days=1))
         holidays = self.config.holidays.get(card.exchange, frozenset()) if card.exchange else frozenset()
@@ -22269,13 +22450,15 @@ class Bot:
                 "filter_text": journal_filter_text(flt), "records": len(values),
                 "summary": self.summary_rows(values, marks, flt), "analysis": self.sim_analysis(values, marks, flt)}
 
-    def journal_rows(self, flt: Mapping | None = None, day: str = "", lean: bool = False) -> dict:
+    def journal_rows(self, flt: Mapping | None = None, day: str = "", lean: bool = False, first: dt.date | None = None,
+                     last: dt.date | None = None) -> dict:
         """The records in ``flt`` (journal_filter_of) opened on ``day`` — a Beijing date, "today" for the bot's, "" (or
         one that does not read) for any day — as list rows (journal_row), newest first, with summary_of them: what
         the review page shows under a line of 今日按市场 (journal.json?rows=1&day=today&card=…, 1.114.0) and under a
         day of the summary (1.115.0). The list payload holds only the latest records; this reads every one of the
         day. ``lean`` lists only the settled, open and resting ones (the total is still over every one): a day's
-        thousands of unfilled orders are counted, not sent."""
+        thousands of unfilled orders are counted, not sent. ``first``..``last`` (1.151.0): the days of a range instead (a
+        line of 按市场 over several days)."""
         flt = dict(flt or {})
         now_ms = self.market.now_ms()
         wanted: dt.date | None = None
@@ -22284,7 +22467,10 @@ class Bot:
         elif day.strip():
             with contextlib.suppress(ValueError):
                 wanted = dt.date.fromisoformat(day.strip())
-        opened_on = lambda t: wanted is None or dt.datetime.fromtimestamp(int(t.get("opened") or 0) / 1000, BEIJING).date() == wanted
+        if first is not None and last is not None:
+            opened_on = lambda t: first <= dt.datetime.fromtimestamp(int(t.get("opened") or 0) / 1000, BEIJING).date() <= last
+        else:
+            opened_on = lambda t: wanted is None or dt.datetime.fromtimestamp(int(t.get("opened") or 0) / 1000, BEIJING).date() == wanted
         trades = sorted(((tid, t) for tid, t in self.sim_trades().items() if journal_match(t, flt) and opened_on(t)),
                         key=lambda kv: kv[1].get("opened", 0), reverse=True)
         values = [t for _, t in trades]
@@ -22296,7 +22482,8 @@ class Bot:
                 LOG.warning("journal: markets unavailable: %s", clean_error(error) or type(error).__name__)
         marks = self.sim_marks(markets, now_ms)
         return {"version": VERSION, "server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）", "filter": flt,
-                "filter_text": journal_filter_text(flt), "day": wanted.isoformat() if wanted else "",
+                "filter_text": journal_filter_text(flt), "day": wanted.isoformat() if wanted and first is None else "",
+                **({"from": first.isoformat(), "to": last.isoformat()} if first is not None and last is not None else {}),
                 "total": {**summary_of(values, marks), **settled_extras(values)},
                 "trades": [self.journal_row(tid, t, markets.get(t["market"]), now_ms, False) for tid, t in trades
                            if not lean or t["status"] in {"settled", "filled", "resting"}]}

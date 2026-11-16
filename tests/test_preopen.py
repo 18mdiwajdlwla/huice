@@ -899,7 +899,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(by(key)), len(by("BTC-15M")) - 5)
         self.assertTrue(shut | {et(18, 0)} <= set(by("BTC-15M")), "round the clock: untouched")
         xau = next(r for r in m.WINDOW_UPDOWN_MARKETS if r.key == "XAU-15M")
-        why = "黄金休市（纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00）"
+        why = "黄金休市（纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00，CME 节假日从 12:00 起）"
         self.assertEqual(p.candidate_problem(market("xau", at=et(17, 15), mid=41), now, ctl.owner.config, ctl.settings), why)
         self.assertIsNone(p.candidate(market("xau", at=et(17, 15), mid=41), now, ctl.owner.config, ctl.settings))
         self.assertEqual(p.candidate_problem(market("xau", at=et(16, 45), mid=42), now, ctl.owner.config, ctl.settings), "")
@@ -916,12 +916,12 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dt.datetime.fromtimestamp(et(17, 0, 15, 7, -4) / 1000, m.BEIJING).strftime("%m-%d %H:%M"), "07-16 05:00")
         self.assertEqual(m.cme_shuts(et(12, 0, 30, 10, -4), et(12, 0, 2)), [(et(17, 0, 30, 10, -4), et(18, 0, 1))])
         self.assertEqual(m.cme_shuts(et(16, 45), et(17, 0)) + m.cme_shuts(et(18, 0), et(18, 15)), [], "the boundaries: a window may end at the shut, start at the reopen")
-        self.assertIn("黄金、原油休市（纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00）期间的场次不挂、重开后头 15 分钟内开始的也不挂（北京时间 11-07 06:00–11-09 07:00）", ctl.status())
+        self.assertIn("黄金、原油休市（纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00，CME 节假日从 12:00 起）期间的场次不挂、重开后头 15 分钟内开始的也不挂（北京时间 11-07 06:00–11-09 07:00）", ctl.status())
         await self.finish(ctl)
         quiet0, _, _ = controller(PREOPEN_MARKETS="xau")  # the suite's quiet 0: the reopen's window quoted, the shut's still not
         got = set(by("XAU-15M", p.window_starts(now, quiet0.owner.config, dataclasses.replace(quiet0.settings, ahead_minutes=1440))))
         self.assertEqual((et(18, 0) in got, bool(got & shut)), (True, False))
-        self.assertIn("黄金休市（纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00）期间的场次不挂（北京时间", quiet0.status())
+        self.assertIn("黄金休市（纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00，CME 节假日从 12:00 起）期间的场次不挂（北京时间", quiet0.status())
         await self.finish(quiet0)
         btc, _, _ = controller(PREOPEN_MARKETS="btc")
         self.assertNotIn("休市", btc.status())
@@ -946,6 +946,137 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             await again.discover()
             self.assertEqual(again.queue.qsize(), 0, "not quoted again: the window is left out")
             await self.finish(again)
+
+    async def test_cme_holidays_and_us_hours_are_not_quoted(self):
+        """1.151.0: gold's and oil's CME holiday schedules — an early halt (CME_EARLY_DAYS: shut from 12:00 New York time) and a day
+        without a session (CME_CLOSED_DAYS: the session it would have had, from 18:00 the evening before) — merge with the daily
+        break and the weekend into one shut, whose end is the reopen the quiet minutes follow; both lists can be overridden. The US
+        stock cards (hours "us") quote only inside the regular session (us_session: US holidays, half days), not the open's first."""
+        et = lambda mo, d, h, mi=0, y=2026: m.et_wall_ms(dt.date(y, mo, d), h, mi)
+        cards = {r.key: r for r in m.WINDOW_UPDOWN_MARKETS}
+        xau, nvda = cards["XAU-15M"], cards["NVDA-15M"]
+        self.assertEqual((xau.hours, cards["CL-15M"].hours, nvda.hours, cards["BTC-15M"].hours, cards["SKHYNIX-15M"].hours), ("cme", "cme", "us", "", ""))
+        # Thanksgiving (11-26) and the day after (11-27), both early: from noon, the Thursday's to its 18:00, the Friday's to Sunday's
+        self.assertEqual(m.cme_shuts(et(11, 26, 0), et(11, 30, 0)), [(et(11, 26, 12), et(11, 26, 18)), (et(11, 27, 12), et(11, 29, 18))])
+        # Christmas Eve (early) and Day (closed), New Year's Eve (early) and Day (closed), Good Friday 2027 (closed): one shut each
+        self.assertIn((et(12, 24, 12), et(12, 27, 18)), m.cme_shuts(et(12, 24, 0), et(12, 28, 0)))
+        self.assertIn((et(12, 31, 12), et(1, 3, 18, 0, 2027)), m.cme_shuts(et(12, 31, 0), et(1, 4, 0, 0, 2027)))
+        self.assertIn((et(3, 25, 17, 0, 2027), et(3, 28, 18, 0, 2027)), m.cme_shuts(et(3, 25, 0, 0, 2027), et(3, 29, 0, 0, 2027)))
+        quiet = 15 * 60_000
+        for at, shut, opening in ((et(11, 26, 11, 45), False, False), (et(11, 26, 12), True, False), (et(11, 26, 17, 45), True, False),
+                                  (et(11, 26, 18), False, True), (et(11, 27, 11, 45), False, False), (et(11, 28, 9), True, False),
+                                  (et(11, 29, 18), False, True), (et(11, 29, 18, 15), False, False)):
+            self.assertEqual((bool(p.market_shut(xau, at)), p.session_opening(xau, at, frozenset(), quiet)), (shut, opening), m.et_clock(at))
+        # the discovery: a day ahead of Thanksgiving morning (08:00 ET, 21:00 Beijing) leaves out noon to 18:00 and the reopen's first
+        ctl, api, clock = controller(PREOPEN_MARKETS="xau", PREOPEN_AHEAD_MINUTES="1440", PREOPEN_OPEN_QUIET_MINUTES="15")
+        got = {s for _, s in p.window_starts(et(11, 26, 8), ctl.owner.config, ctl.settings)}
+        self.assertTrue({et(11, 26, 11, 45), et(11, 26, 18, 15)} <= got and not got & {et(11, 26, 12), et(11, 26, 15), et(11, 26, 18)})
+        self.assertIn("CME 节假日从 12:00 起", ctl.status())
+        await self.finish(ctl)
+        try:  # overridable (the calendar is the process's: the defaults put back after)
+            m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "CME_EARLY_DAYS": "", "CME_CLOSED_DAYS": ""})
+            self.assertEqual(m.cme_shuts(et(11, 26, 0), et(11, 27, 0)), [(et(11, 26, 17), et(11, 26, 18))], "the daily break alone")
+            m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "CME_EARLY_DAYS": "2026-11-18"})
+            self.assertIn((et(11, 18, 12), et(11, 18, 18)), m.cme_shuts(et(11, 18, 0), et(11, 19, 0)))
+        finally:
+            m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline"})
+        self.assertEqual(m.cme_shuts(et(11, 26, 0), et(11, 27, 0))[0], (et(11, 26, 12), et(11, 26, 18)), "the defaults back")
+        # the US stock cards: the regular session only, the open's first window left out; a half day ends at 13:00, a holiday has none
+        for at, shut, opening in ((et(11, 25, 9, 15), True, False), (et(11, 25, 9, 30), False, True), (et(11, 25, 9, 45), False, False),
+                                  (et(11, 25, 15, 45), False, False), (et(11, 25, 16), True, False), (et(11, 26, 12), True, False),
+                                  (et(11, 27, 12, 45), False, False), (et(11, 27, 13), True, False), (et(11, 30, 9, 30), False, True)):
+            self.assertEqual((bool(p.market_shut(nvda, at)), p.session_opening(nvda, at, frozenset(), quiet)), (shut, opening), m.et_clock(at))
+        self.assertEqual(p.market_shut(nvda, et(11, 26, 12)), "英伟达休市（美股常规交易时段以外：纽约时间 09:30–16:00 以外、周末、美国假日，半日市 13:00 后）")
+        us, _, _ = controller(PREOPEN_MARKETS="nvda,msft", PREOPEN_OPEN_QUIET_MINUTES="15")
+        self.assertIn("英伟达、微软只挂美股常规交易时段内的场次（纽约时间 09:30–16:00，美国假日、半日市按日历），开盘后头 15 分钟的不挂", us.status())
+        await self.finish(us)
+
+    async def test_fills_are_timed_and_the_breakdown_says_where_the_money_went(self):
+        """1.151.0: when a fill is first seen (fill_ms, kept) and so how long before the start (quote_of's fill_lead_min); 按市场
+        over any days (cards_between — cards_today is today's) with 偏离, the settled P&L against the coin toss's expectation in σ
+        (core.luck_of), and where the money went (card_diag): the one-sided windows' filled side against half, the start hours
+        that carry the loss, the lead, in words only past the noise; the archived records counted in by their kept counts."""
+        ctl, api, clock = controller()
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        await ctl.place_pair(c)
+        pair = ctl.ledger.rows[c["slug"]]
+        api.rows[pair["orders"]["down"]["hash"]]["amountFilled"] = str(L.to_wei(20))
+        clock.ms = NOW + 60_000
+        await ctl.account()
+        self.assertEqual(pair["orders"]["down"]["fill_ms"], NOW + 60_000)
+        self.assertNotIn("fill_ms", pair["orders"]["up"])
+        api.rows[pair["orders"]["down"]["hash"]]["amountFilled"] = str(L.to_wei(50))
+        clock.ms = NOW + 120_000
+        await ctl.account()
+        self.assertEqual((pair["orders"]["down"]["filled"], pair["orders"]["down"]["fill_ms"]), (50.0, NOW + 60_000), "the first fill seen is kept")
+        self.assertAlmostEqual(p.quote_of(pair)["fill_lead_min"], 59.0)
+        await self.finish(ctl)
+
+        BJ = m.BEIJING
+        at = lambda d, h, mi=0: int(dt.datetime(2026, 11, d, h, mi, tzinfo=BJ).timestamp() * 1000)
+
+        def rec(card, key, stem, start, up, down, result, lead, level=0, price=0.47, shares=30):
+            payout = {"up": 1.0, "down": 0.0}.get(result)
+            pnl = (payout - price) * up + ((1 - payout) - price) * down if payout is not None else 0.0
+            orders = {side: {"state": "final", "filled": float(f), "index_set": 2 if side == "up" else 1,
+                             **({"fill_ms": start - int(lead * 60_000)} if f and lead is not None else {})} for side, f in (("up", up), ("down", down))}
+            return {"slug": f"{stem}-updown-15m-{start // 1000}" + (f"#{level}" if level else ""), "key": key, "name": f"{card} x", "start_ms": start,
+                    "phase": "closed", "accounted": True, "result": result, "pnl": pnl if up or down else 0.0, "price": str(price), "shares": str(shares),
+                    "orders": orders, "level": level, "attempt": 0}
+        rows = []
+        for d in (4, 5, 6):  # gold: the four 06:00 windows (CME's shut) each day, Down filled eight hours ahead at two levels, Up won
+            for mi in (0, 15, 30, 45):
+                rows += [rec("黄金 15分涨跌", "XAU-15M", "xau", at(d, 6, mi), 0, 30, "up", 480), rec("黄金 15分涨跌", "XAU-15M", "xau", at(d, 6, mi), 0, 80, "up", 480, 1, 0.43, 80)]
+            for h, res, side in ((10, "up", "up"), (14, "down", "up"), (20, "down", "down"), (22, "up", "down"), (1, "up", "up")):
+                rows.append(rec("黄金 15分涨跌", "XAU-15M", "xau", at(d, h), 30 if side == "up" else 0, 30 if side == "down" else 0, res, 5))
+            rows.append(rec("黄金 15分涨跌", "XAU-15M", "xau", at(d, 9), 30, 30, "down", 30))  # both sides: hedged
+            for h in range(0, 24, 2):  # BTC: a coin toss — the filled side wins half the time, at any hour, any lead
+                side, res = ("up", "down")[(h // 2 + d) % 2], ("up", "down")[(h // 4 + d) % 2]
+                rows.append(rec("BTC 15分涨跌", "BTC-15M", "btc", at(d, h), 30 if side == "up" else 0, 30 if side == "down" else 0, res, (h % 3) * 200 + 1))
+        out = p.cards_between(rows, "2026-11-04", "2026-11-06")
+        gold, btc = (next(r for r in out if r["card"] == card) for card in ("黄金 15分涨跌", "BTC 15分涨跌"))
+        self.assertEqual((gold["name"], gold["preopen"], gold["markets"], gold["settled"]), ("黄金 15分涨跌 · 开盘前预挂", True, 30, 42))
+        self.assertLess(gold["luck"]["z"], -2)
+        self.assertAlmostEqual(gold["luck"]["pnl"], gold["pnl"], places=6)
+        self.assertAlmostEqual(gold["luck"]["ev"], gold["expected"], places=6)
+        d = gold["diag"]
+        self.assertEqual((d["windows"], d["one"]["one"], d["one"]["won"], d["both"]["windows"]), (30, 27, 9, 3))  # 06:00: 0 of 12; the other hours 9 of 15
+        self.assertEqual([h["name"] for h in d["hours"]], ["01:00", "06:00", "09:00", "10:00", "14:00", "20:00", "22:00"])
+        six = next(h for h in d["hours"] if h["name"] == "06:00")
+        self.assertEqual((six["windows"], six["one"], six["won"]), (12, 12, 0))
+        self.assertEqual([x["name"] for x in d["lead"]], ["开场前 1–10 分钟", "开场前 10–60 分钟", "开场前 6 小时以上"])
+        notes = "\n".join(d["notes"])
+        for want in ("不像运气", "整张卡偏离 −1.7σ 还在运气范围内", "06:00（北京时间）开始的场次只成交一边的 12 场里，成交那边赢 0 场（偏离 −3.5σ）", "逆向选择",
+                     "亏损集中在 06:00", "越早被吃越亏"):
+            self.assertIn(want, notes)
+        self.assertEqual([x["name"] for x in d["levels"]], ["47¢", "43¢"])
+        self.assertGreater(btc["luck"]["z"], -2)
+        bnotes = "\n".join(btc["diag"]["notes"])
+        self.assertIn("运气范围内", bnotes)
+        for absent in ("逆向选择", "亏损集中在", "越早被吃越亏"):
+            self.assertNotIn(absent, bnotes)
+        self.assertEqual(p.cards_between(rows, "2026-11-05", "2026-11-05")[0]["markets"] * 3, gold["markets"])
+        self.assertEqual(p.cards_today(rows, NOW), p.cards_between(rows, "2026-11-06", "2026-11-06"), "today's: the same rows")
+        self.assertEqual(p.card_diag([])["notes"], ["这段时间还没有结算的成交"])
+        # the archived records (finished quotes that filled nothing, moved out two days on) counted in by their kept counts
+        with tempfile.TemporaryDirectory() as folder:
+            led = p.Ledger(str(Path(folder) / "x.preopen.sqlite3"))
+            for row in rows:
+                led.save(row)
+            quiet = [rec("BTC 15分涨跌", "BTC-15M", "btc", at(4, h, 15), 0, 0, "", None) for h in range(5)]
+            for row in quiet:
+                row.update(result="", pnl=0.0)
+                led.save(row)
+            self.assertEqual(led.archive_old(at(9, 0)), 5)
+            working = list(led.rows.values())
+            share = p.archive_share(led, working)
+            self.assertTrue(share.fits(at(9, 0)))
+            ranged = {r["card"]: r for r in p.cards_between(working, "2026-11-04", "2026-11-06", share)}
+            self.assertEqual((ranged["BTC 15分涨跌"]["records"], ranged["BTC 15分涨跌"]["markets"]), (btc["records"] + 5, btc["markets"] + 5))
+            self.assertEqual(ranged["BTC 15分涨跌"]["pnl"], btc["pnl"])
+            self.assertEqual(p.cards_between(working, "2026-11-05", "2026-11-06", share)[0]["records"] + 0, next(
+                r for r in p.cards_between(rows, "2026-11-05", "2026-11-06") if r["card"] == "黄金 15分涨跌")["records"])
+            led.close()
 
     async def test_five_minute_cards_are_quoted_on_their_own_rhythm(self):
         """1.137.0: btc5 / eth5 / bnb5 name the 5-minute cards (btc-updown-5m-<start>): a window every five minutes, the
