@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.151.1"
+VERSION = "1.152.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -527,10 +527,24 @@ class PreopenSettings:
     exclusive: bool = False    # PREOPEN_EXCLUSIVE: on = the model trader opens nothing while this mode runs for real (off: both run, jointly capped)
     weekend: bool = True       # PREOPEN_WEEKEND: off = no window starting Saturday 00:00 to Monday 08:00 (Beijing time) is quoted, resting ones withdrawn (1.136.0; 1.139.2)
     db: str = ""
+    # 1.152.0: BTC 5-minute's own timing (PREOPEN_BTC5_*), each 0 = the general one above — a five-minute window's cancel, expiry,
+    # entry cut-off and horizon need not be a day card's or a quarter hour's (timing)
+    btc5_cancel_seconds: int = 0   # PREOPEN_BTC5_CANCEL_SECONDS
+    btc5_expiry_seconds: int = 0   # PREOPEN_BTC5_EXPIRY_SECONDS
+    btc5_entry_seconds: int = 0    # PREOPEN_BTC5_ENTRY_SECONDS
+    btc5_ahead_minutes: int = 0    # PREOPEN_BTC5_AHEAD_MINUTES
 
     @property
     def side_usd(self) -> float:
         return float(self.price * self.shares)
+
+    def timing(self, key: str) -> "PreopenSettings":
+        """The settings a card's windows are timed by (1.152.0): for BTC 5-minute (BTC-5M) its own cancel, expiry, entry cut-off
+        and horizon where set (PREOPEN_BTC5_*), each else the general one; for every other card these settings as they are."""
+        if key != "BTC-5M" or not (self.btc5_cancel_seconds or self.btc5_expiry_seconds or self.btc5_entry_seconds or self.btc5_ahead_minutes):
+            return self
+        return dataclasses.replace(self, cancel_seconds=self.btc5_cancel_seconds or self.cancel_seconds, expiry_seconds=self.btc5_expiry_seconds or self.expiry_seconds,
+                                   entry_seconds=self.btc5_entry_seconds or self.entry_seconds, ahead_minutes=self.btc5_ahead_minutes or self.ahead_minutes)
 
     @property
     def pair_usd(self) -> float:
@@ -589,9 +603,17 @@ class PreopenSettings:
             raise ValueError("PREOPEN_POLL_SECONDS 1～60、PREOPEN_MAX_OPEN_USD 0～1000000（0 = 不限）、PREOPEN_PRICE_CENTS 1～50、PREOPEN_SHARES 1～500（每边不少于 "
                              f"Predict 最小订单 ${PREOPEN_MIN_SIDE_USD:g}）、PREOPEN_AHEAD_MINUTES 3～1440、PREOPEN_MARKETS 只能是 {'、'.join(sorted(keys))}、all 或 none；"
                              "PREOPEN_EXPIRY_SECONDS 5～600，PREOPEN_CANCEL_SECONDS 至少比它大 5 秒、至多 900，PREOPEN_ENTRY_SECONDS 至少比撤单时间大 60 秒、至多 3600")
+        b5 = [int(e.get(f"PREOPEN_BTC5_{name}", "0") or 0) for name in ("CANCEL_SECONDS", "EXPIRY_SECONDS", "ENTRY_SECONDS", "AHEAD_MINUTES")]  # 1.152.0
+        b5_cancel, b5_expiry, b5_entry, b5_ahead = (own or general for own, general in zip(b5, (cancel, expiry, entry, ahead)))
+        if (min(b5) < 0 or not 5 <= b5_expiry <= 600 or not b5_expiry + 5 <= b5_cancel <= 900 or not b5_cancel + 60 <= b5_entry <= 3600
+                or not 3 <= b5_ahead <= 1440):
+            raise ValueError("BTC 5 分钟自己的预挂时间（PREOPEN_BTC5_*，0 = 跟所有卡一样，按合起来的值算）：签名到期 5～600 秒，撤单至少比到期早 5 秒、至多 900，"
+                             f"新挂截止至少比撤单早 60 秒、至多 3600，只挂 3～1440 分钟内开始的场次；现在是撤单 {b5_cancel}、到期 {b5_expiry}、新挂截止 {b5_entry} 秒、"
+                             f"{b5_ahead} 分钟")
         return cls(enabled, poll=poll, cancel_seconds=cancel, expiry_seconds=expiry, entry_seconds=entry, ahead_minutes=ahead, max_open_usd=cap,
                    price=price, shares=D(shares), markets=markets, exclusive=exclusive, weekend=weekend, db=cls.db_of(e),
-                   levels=tuple((D(c) / 100, D(s)) for c, s in levels), deep_ahead_minutes=deep, limit_gap_pct=limit_gap, open_quiet_minutes=open_quiet)
+                   levels=tuple((D(c) / 100, D(s)) for c, s in levels), deep_ahead_minutes=deep, limit_gap_pct=limit_gap, open_quiet_minutes=open_quiet,
+                   btc5_cancel_seconds=b5[0], btc5_expiry_seconds=b5[1], btc5_entry_seconds=b5[2], btc5_ahead_minutes=b5[3])
 
     @classmethod
     def from_config(cls, config: "Config", force: bool = False) -> "PreopenSettings":
@@ -685,6 +707,10 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_CANCEL_SECONDS", "开场前几秒撤单", "至少比到期多 5 秒、至多 900：撤单发出后到到期前每 2 秒催一次（默认 20）"),
     ("PREOPEN_EXPIRY_SECONDS", "签名开场前几秒到期", "5～600：撤单发不出去时的兜底，到期后不再撮合（默认 10）"),
     ("PREOPEN_ENTRY_SECONDS", "距开场不足几秒不再新挂", "至少比撤单时间多 60 秒、至多 3600（默认 180）"),
+    ("PREOPEN_BTC5_CANCEL_SECONDS", "BTC 5 分钟：开场前几秒撤单", "只管 BTC 5 分钟卡（1.152.0）；0 = 跟上面所有卡的一样。至少比它自己的到期多 5 秒、至多 900"),
+    ("PREOPEN_BTC5_EXPIRY_SECONDS", "BTC 5 分钟：签名开场前几秒到期", "只管 BTC 5 分钟卡；0 = 跟上面所有卡的一样。5～600：撤单发不出去时的兜底，到期后不再撮合"),
+    ("PREOPEN_BTC5_ENTRY_SECONDS", "BTC 5 分钟：距开场不足几秒不再新挂", "只管 BTC 5 分钟卡；0 = 跟上面所有卡的一样。至少比它自己的撤单时间多 60 秒、至多 3600"),
+    ("PREOPEN_BTC5_AHEAD_MINUTES", "BTC 5 分钟：只挂几分钟内开始的场次", "只管 BTC 5 分钟卡；0 = 跟上面所有卡的一样。3～1440：调小就只挂快开场的几场，少占资金、少读接口"),
     ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "0～1000000，0 = 不限（默认）：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金，成交时才扣款；余额够一场双边就挂）；设了上限时每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放，/preopen 会算出把已发布的全部挂上需要多少"),
 )
 CONTROL_KEY_SET = frozenset(k for k, _, _ in CONTROL_KEYS)
@@ -11622,6 +11648,10 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_CANCEL_SECONDS": {"kind": "number", "group": "预挂", "presets": ["10", "15", "20", "30", "60"], "unit": "秒"},
     "PREOPEN_EXPIRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["5", "10", "15", "30"], "unit": "秒"},
     "PREOPEN_ENTRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["90", "120", "180", "300"], "unit": "秒"},
+    "PREOPEN_BTC5_CANCEL_SECONDS": {"kind": "number", "group": "预挂", "presets": ["0", "10", "15", "20", "30"], "unit": "秒", "zero": "跟所有卡一样"},
+    "PREOPEN_BTC5_EXPIRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["0", "5", "10", "15"], "unit": "秒", "zero": "跟所有卡一样"},
+    "PREOPEN_BTC5_ENTRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["0", "90", "120", "180", "300"], "unit": "秒", "zero": "跟所有卡一样"},
+    "PREOPEN_BTC5_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "30", "60", "120", "240"], "unit": "分钟", "zero": "跟所有卡一样"},
     "PREOPEN_MAX_OPEN_USD": {"kind": "number", "group": "预挂", "presets": ["0", "1000", "5000", "7000", "20000"], "unit": "$", "zero": "不限"},
     "SIM_EDGE_CENTS": {"kind": "number", "group": "策略", "presets": ["3", "5", "8", "10", "15", "20"], "unit": "¢"},
     "SIM_SHARES": {"kind": "number", "group": "策略", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
@@ -23840,6 +23870,8 @@ class Bot:
                   "PREOPEN_WEEKEND": flag(c.preopen.weekend),
                   "PREOPEN_AHEAD_MINUTES": str(c.preopen.ahead_minutes), "PREOPEN_CANCEL_SECONDS": str(c.preopen.cancel_seconds),
                   "PREOPEN_EXPIRY_SECONDS": str(c.preopen.expiry_seconds), "PREOPEN_ENTRY_SECONDS": str(c.preopen.entry_seconds),
+                  "PREOPEN_BTC5_CANCEL_SECONDS": str(c.preopen.btc5_cancel_seconds), "PREOPEN_BTC5_EXPIRY_SECONDS": str(c.preopen.btc5_expiry_seconds),
+                  "PREOPEN_BTC5_ENTRY_SECONDS": str(c.preopen.btc5_entry_seconds), "PREOPEN_BTC5_AHEAD_MINUTES": str(c.preopen.btc5_ahead_minutes),
                   "PREOPEN_MAX_OPEN_USD": plain(c.preopen.max_open_usd), "PREOPEN_EXCLUSIVE": flag(c.preopen.exclusive),
                   "SOURCES_OFF": ",".join(sorted(c.sources_off)), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
