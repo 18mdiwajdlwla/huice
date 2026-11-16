@@ -200,6 +200,33 @@ async def run():
     assert fj("rows=1&day=nope")["total"]["records"] == 6 and fj("rows=1")["day"] == "" and fj("rows=1&day=today&way=maker")["total"]["records"] == 3
     lean = fj("rows=1&day=today&lean=1")  # 1.115.0: only the settled, open and resting records sent (the KOSPI maker was withdrawn), the total over every one
     assert lean["total"]["records"] == 5 and len(lean["trades"]) == 4 and {t["status"] for t in lean["trades"]} == {"settled", "resting"}, [t["status"] for t in lean["trades"]]
+    # --- 1.151.0: 按市场 over a range of days (journal.json?cards=1&range=… | from=…&to=…): the model trader's records opened on those
+    # Beijing days per card, each with 偏离 — the settled P&L against the expectation at the order in σ (luck_of) — and, unfiltered,
+    # the pre-open mode's lines (none on the paper bot); a line's records over the same days (rows=1&range=…)
+    today = fj("cards=1&range=today")
+    assert (today["from"], today["to"], today["label"], today["range"]) == ("2026-10-05", "2026-10-05", "今天", "today")
+    assert [(r["name"], r["records"], round(r["pnl"], 6)) for r in today["rows"]] == [(r["name"], r["records"], round(r["pnl"], 6)) for r in data["analysis"]["cards_today"]]
+    hs = next(r for r in today["rows"] if r["name"] == "恒生指数")
+    assert hs["luck"]["bets"] == 2 and abs(hs["luck"]["pnl"] - hs["pnl"]) < 1e-6 and abs(hs["luck"]["ev"] - hs["expected"]) < 1e-6 and hs["luck"]["sigma"] > 0
+    assert abs(hs["luck"]["z"] - (hs["luck"]["pnl"] - hs["luck"]["ev"]) / hs["luck"]["sigma"]) < 1e-3 and hs["luck"]["verdict"] == "样本不足"
+    yday = fj("cards=1&range=yesterday")
+    assert (yday["from"], yday["label"], [r["name"] for r in yday["rows"]]) == ("2026-10-04", "昨天", ["上证指数"])
+    week = fj("cards=1&range=7d")
+    assert (week["from"], week["to"], week["label"]) == ("2026-09-29", "2026-10-05", "09-29 至 10-05（7 天）")
+    assert {r["name"] for r in week["rows"]} == {r["name"] for r in today["rows"]} | {"上证指数"} and sum(r["records"] for r in week["rows"]) == 6
+    assert fj("cards=1&from=2026-10-04&to=2026-10-04")["rows"] == yday["rows"] and fj("cards=1&range=all")["label"].startswith("全部（")
+    makers = fj("cards=1&range=7d&kind=close&way=maker")  # the filter bar's kind / way apply (and leave the pre-open lines out, as in the analysis)
+    assert makers["filter"] == {"kind": "close", "way": "maker"} and {(r["name"], r["records"]) for r in makers["rows"]} == {("恒生指数", 1), ("KOSPI", 1), ("上证指数", 1)}, makers["rows"]
+    assert all(r["records"] for r in fj("cards=1&range=7d&way=taker")["rows"]) and fj("cards=1&range=7d&way=taker")["filter"] == {"way": "taker"}
+    wk_rows = fj("rows=1&lean=1&range=7d&card=" + urllib.parse.quote("上证指数"))
+    assert (wk_rows["from"], wk_rows["to"], wk_rows["day"], wk_rows["total"]["records"], len(wk_rows["trades"])) == ("2026-09-29", "2026-10-05", "", 1, 1)
+    assert fj("rows=1&from=2026-10-05&to=2026-10-05&card=" + urllib.parse.quote("上证指数"))["total"]["records"] == 0
+    # the days a query covers (journal_days, the tally's too): presets, a range, never after today, at most so many days, junk = today
+    d = lambda *a: m.journal_days(*a, dt.date(2026, 10, 5), 31)
+    assert d("", "", "7d") == (dt.date(2026, 9, 29), dt.date(2026, 10, 5)) and d("", "", "yesterday") == (dt.date(2026, 10, 4),) * 2
+    assert d("2026-10-01", "2026-12-01", "") == (dt.date(2026, 10, 1), dt.date(2026, 10, 5)) and d("2026-10-05", "2026-10-01", "") == (dt.date(2026, 10, 1),) * 2
+    assert d("2026-01-01", "2026-10-05", "") == (dt.date(2026, 9, 5), dt.date(2026, 10, 5)) and d("nope", "", "") == (dt.date(2026, 10, 5),) * 2
+    assert d("", "", "all") == (dt.date(2026, 9, 5), dt.date(2026, 10, 5)) and m.journal_days_label(dt.date(2026, 10, 3), dt.date(2026, 10, 3), dt.date(2026, 10, 5)) == "10-03"
     status, _, body = web.route("GET", f"/p/{TOKEN}/summary.csv", "card=" + urllib.parse.quote("恒生指数"))
     frows = list(csv.reader(io.StringIO(body.decode("utf-8")[1:])))
     assert status == 200 and frows[1][:3] == ["筛选", "恒生指数", "2"] and next(r for r in frows if r[1] == "累计")[2] == "2", frows[:3]
@@ -462,16 +489,33 @@ async def browser_check(bot, data):
         assert await page.is_visible("#anabody") and (await page.inner_text("#anaat")).startswith("已刷新 ")
         await page.click("#anahd")
         assert await page.is_hidden("#anabody")
-        # 1.131.5: the pre-open mode's rows in 今日按市场 (the live bot adds them, preopen.cards_today): named "· 开盘前预挂"; a click
-        # goes to the mode's own section below, no records panel opens (the model trader's records are not theirs)
+        # 1.131.5: the pre-open mode's rows in 今日按市场 (the live bot adds them, preopen.cards_today): named "· 开盘前预挂"; 1.151.0: a
+        # click opens where its money went under the table (preopen.card_diag: the notes, the one-sided fills, by start hour, by
+        # lead, by side), the jump to the mode's own section a button there; no records panel (the model trader's are not theirs)
+        diag = {"windows": 2, "one": {"name": "只成交一边", "windows": 2, "settled": 2, "pnl": -9.4, "one": 2, "won": 0, "z": -1.4142},
+                "both": {"name": "两边都成交", "windows": 0, "settled": 0, "pnl": 0.0, "one": 0, "won": 0},
+                "hours": [{"name": "06:00", "windows": 2, "settled": 2, "pnl": -9.4, "one": 2, "won": 0}],
+                "lead": [{"name": "开场前 6 小时以上", "windows": 2, "settled": 2, "pnl": -9.4, "one": 2, "won": 0}],
+                "sides": [{"name": "涨", "records": 3, "filled_windows": 0, "filled": 0.0, "volume": 0.0, "settled": 0, "wins": 0, "losses": 0, "ties": 0, "pnl": 0.0},
+                          {"name": "跌", "records": 3, "filled_windows": 2, "filled": 20.0, "volume": 9.4, "settled": 2, "wins": 0, "losses": 2, "ties": 0, "pnl": -9.4}],
+                "levels": [], "notes": ["亏损集中在 06:00（北京时间）开始的场次"]}
         po_row = {"name": "BTC 15分涨跌 · 开盘前预挂", "preopen": True, "records": 3, "markets": 3, "filled": 10.0, "volume": 4.9, "settled": 1, "wins": 1,
-                  "losses": 0, "ties": 0, "pnl": 5.1, "open": 0, "open_cost": 0.0, "resting": 2, "marked": 0, "unrealized": 0.0, "expected": 0.1, "hit": 1.0, "avg_fair": 0.5}
+                  "losses": 0, "ties": 0, "pnl": 5.1, "open": 0, "open_cost": 0.0, "resting": 2, "marked": 0, "unrealized": 0.0, "expected": 0.1, "hit": 1.0, "avg_fair": 0.5,
+                  "luck": {"bets": 4, "ev": 0.1, "pnl": 5.1, "sigma": 2.5, "z": 2.0, "verdict": "样本不足"}, "diag": diag}
         plain = bot.sim_analysis
         bot.sim_analysis = lambda trades, marks, flt=None: (lambda a: {**a, "cards_today": [*a["cards_today"], *([] if flt else [po_row])]})(plain(trades, marks, flt))
         await page.click("#scref")
         await page.wait_for_selector("#s-cards tr.dayrow:has-text('开盘前预挂')")
         po_line = page.locator("#s-cards tr.dayrow", has_text="开盘前预挂")
         assert await po_line.count() == 1 and (await po_line.inner_text()).startswith("▸ BTC 15分涨跌 · 开盘前预挂") and "+$5.10" in await po_line.inner_text()
+        assert "+2.0σ 好于预期（4 场）" in await po_line.inner_text()
+        await po_line.locator("td").first.click()
+        await page.wait_for_selector("#s-detail ul.notes")
+        assert (await po_line.inner_text()).startswith("▾ ") and "BTC 15分涨跌 · 开盘前预挂 · 今天：钱亏在哪" in await page.inner_text("#s-detail h3")
+        text = await page.inner_text("#s-detail")
+        for want in ("亏损集中在 06:00（北京时间）开始的场次", "成交那边赢 0 场（0%，五五开该一半，偏离 −1.4σ）", "按开始时间", "开场前 6 小时以上", "按方向"):
+            assert want in text, (want, text)
+        assert await page.locator("#s-detail tr.rec").count() == 0, "the model trader's records panel is not a pre-open line's"
         await po_line.locator("td").first.click()
         assert await page.is_hidden("#s-detail") and (await po_line.inner_text()).startswith("▸ ")
         bot.sim_analysis = plain
@@ -502,6 +546,42 @@ async def browser_check(bot, data):
         assert await page.locator("#s-detail tr.det").count() == 0 and await page.locator("#list .tr.open").count() == 0
         await page.click("#s-detail button:has-text('收起')")
         assert await page.is_hidden("#s-detail") and (await hs_line.inner_text()).startswith("▸ 恒生指数")
+        # 1.151.0: 按市场 over other days — a preset or from..to read from the server (journal.json?cards=1&…), the 偏离 column, a
+        # line's records over those days; the pre-open mode's lines of those days come with their breakdown
+        assert await page.inner_text("#scrng") == "今天" and await page.get_attribute("#cbar .tq.on", "data-r") == "today"
+        assert (await page.locator("#s-cards table th").all_inner_texts())[-1] == "偏离"
+        await page.click("#cbar [data-r=yesterday]")
+        await page.wait_for_selector("#scrng:text-is('昨天')")
+        assert [x[2:] for x in await page.locator("#s-cards tr.dayrow td:first-child").all_inner_texts()] == ["上证指数"]
+        assert await page.input_value("#cfrom") == "2026-10-04" and await page.input_value("#cto") == "2026-10-04"
+        await page.click("#cbar [data-r='7d']")
+        await page.wait_for_selector("#scrng:has-text('7 天')")
+        assert await page.inner_text("#scrng") == "09-29 至 10-05（7 天）" and await page.get_attribute("#cbar .tq.on", "data-r") == "7d"
+        names = {x[2:] for x in await page.locator("#s-cards tr.dayrow td:first-child").all_inner_texts()}
+        assert {"恒生指数", "KOSPI", "上证指数"} <= names, names
+        sh = page.locator("#s-cards tr.dayrow", has_text="上证指数")
+        await sh.locator("td").first.click()
+        await page.wait_for_selector("#s-detail table tr.rec")
+        assert "上证指数 · 09-29 至 10-05（7 天） 的每一笔" in await page.inner_text("#s-detail h3") and await page.locator("#s-detail tr.rec").count() == 1
+        await page.click("#s-detail button:has-text('收起')")
+        await page.fill("#cfrom", "2026-10-05")
+        await page.fill("#cto", "2026-10-05")
+        await page.click("#cgo")
+        await page.wait_for_selector("#scrng:text-is('今天')")
+        assert await page.locator("#cbar .tq.on").count() == 0 and "上证指数" not in await page.inner_text("#s-cards")
+        po_range = {**po_row, "name": "黄金 15分涨跌 · 开盘前预挂", "luck": {**po_row["luck"], "z": -3.29, "bets": 30}}
+        bot.preopen_cards = lambda first, last: [po_range] if first <= "2026-10-04" <= last else []
+        await page.click("#cbar [data-r='30d']")
+        await page.wait_for_selector("#s-cards tr.dayrow:has-text('黄金 15分涨跌')")
+        gold = page.locator("#s-cards tr.dayrow", has_text="黄金 15分涨跌")
+        assert "−3.3σ 不像运气" in await gold.inner_text() and await gold.locator("b.bad").count() >= 1
+        await gold.locator("td").first.click()
+        await page.wait_for_selector("#s-detail ul.notes")
+        assert "黄金 15分涨跌 · 开盘前预挂 · 09-06 至 10-05（30 天）：钱亏在哪" in await page.inner_text("#s-detail h3")
+        await page.click("#cbar [data-r=today]")
+        assert await page.inner_text("#scrng") == "今天" and await page.is_hidden("#s-detail")
+        del bot.preopen_cards
+        assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "no sideways scroll with the range bar"
         assert not errors, errors
         # three rows at first (the resting order and the last two finished ones), every one on request, by day
         assert await page.locator("#list .tr").count() == 3 and "更早的 3 笔可载入" in await page.inner_text("#meta")

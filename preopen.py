@@ -361,6 +361,8 @@ def candidate_problem(market: dict, now_ms: int, config: Any, settings: Settings
         holidays = config.holidays.get(rolling.exchange, frozenset()) if rolling.exchange else frozenset()
         if not rolling.exists(start, holidays):
             return "不在交易时段内"
+        if shut := market_shut(rolling, start):
+            return shut
         if str(market.get("status") or "").upper() != "REGISTERED" or market.get("isVisible") is False:
             return f"状态 {market.get('status') or '?'}" + ("、不可见" if market.get("isVisible") is False else "")
         if str(market.get("tradingStatus") or "").upper() not in {"OPEN", "MATCHING_NOT_ENABLED"}:
@@ -390,12 +392,34 @@ def candidate(market: dict, now_ms: int, config: Any, settings: Settings) -> dic
 def session_opening(rolling: Any, start_ms: int, holidays: frozenset, quiet_ms: int) -> bool:
     """Whether a stock card's window starts within ``quiet_ms`` of one of its exchange's session segments' open (the day's
     open, the afternoon's): the opening auction's indicative price and the break's news are public before the index moves,
-    so that window's direction is no coin toss (1.135.1: not quoted, PREOPEN_OPEN_QUIET_MINUTES)."""
-    if not rolling.exchange or quiet_ms <= 0:
+    so that window's direction is no coin toss (1.135.1: not quoted, PREOPEN_OPEN_QUIET_MINUTES). A card with ``hours``
+    within ``quiet_ms`` of the end of one of its shut stretches likewise — gold's and oil's reopen at 18:00 New York time
+    (1.150.1: 11-16's 18:00–18:15 ET window had its Up side swept hours ahead), a US stock's 09:30 open (1.151.0): what
+    happened while shut is out before the index moves."""
+    if quiet_ms <= 0:
+        return False
+    if hours := getattr(rolling, "hours", ""):
+        return any(back <= start_ms < back + quiet_ms for _, back in core.market_shuts(hours, start_ms - quiet_ms, start_ms + 1))
+    if not rolling.exchange:
         return False
     tz = dt.timezone(dt.timedelta(hours=core.STOCK_MARKETS[rolling.exchange].utc_offset))
     day = dt.datetime.fromtimestamp(start_ms / 1000, tz).date()
     return any(seg_open <= start_ms < seg_open + quiet_ms for seg_open, _ in core.session_segments(rolling.exchange, day, holidays))
+
+
+SHUT_TEXT = {"cme": "纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00，CME 节假日从 12:00 起",  # 1.150.1; the holidays 1.151.0
+             "us": "美股常规交易时段以外：纽约时间 09:30–16:00 以外、周末、美国假日，半日市 13:00 后"}  # 1.151.0
+
+
+def market_shut(rolling: Any, start_ms: int) -> str:
+    """Why a window of a card with ``hours`` is not quoted ("" when it may be): it starts in or runs into one of the card's
+    shut stretches (core.market_shuts). Gold's and oil's index stands still while CME is shut, and Predict lists those
+    windows all the same: 11-16 each of 17:00–18:00 ET had the mode's Down bids filled hours before it began, the Up ones
+    left (1.150.1); a CME holiday's early halt likewise, and a US stock's index outside the regular session (1.151.0)."""
+    hours = getattr(rolling, "hours", "")
+    if hours and core.market_shuts(hours, start_ms, rolling.end_of(start_ms)):
+        return f"{rolling.coin}休市（{SHUT_TEXT[hours]}）"
+    return ""
 
 
 WEEKEND_END_HOUR = 8  # the weekend runs to Monday this o'clock Beijing (1.139.2: Sunday evening in the US to the Asian open is crypto's thinnest stretch)
@@ -411,7 +435,8 @@ def on_weekend(ms: int) -> bool:
 def window_starts(now_ms: int, config: Any, settings: Settings) -> list[tuple[Any, int]]:
     """The windows this mode looks for now: each configured card's quarter hours from PREOPEN_ENTRY_SECONDS ahead to
     PREOPEN_AHEAD_MINUTES ahead, whatever the day, on the card's exchange session, a stock card's first windows after each
-    session open left out (session_opening), the weekend's when PREOPEN_WEEKEND is off — (card, start_ms), soonest first."""
+    session open left out (session_opening), gold's and oil's in CME's shut too (market_shut), the weekend's when
+    PREOPEN_WEEKEND is off — (card, start_ms), soonest first."""
     out = []
     quiet_ms = int(getattr(settings, "open_quiet_minutes", 0) or 0) * 60_000
     weekend = getattr(settings, "weekend", True)
@@ -421,7 +446,8 @@ def window_starts(now_ms: int, config: Any, settings: Settings) -> list[tuple[An
         holidays = config.holidays.get(rolling.exchange, frozenset()) if rolling.exchange else frozenset()
         start = rolling.first_start(now_ms + settings.entry_seconds * 1000)
         while start <= now_ms + settings.ahead_minutes * 60_000:
-            if rolling.exists(start, holidays) and not session_opening(rolling, start, holidays, quiet_ms) and (weekend or not on_weekend(start)):
+            if (rolling.exists(start, holidays) and not market_shut(rolling, start) and not session_opening(rolling, start, holidays, quiet_ms)
+                    and (weekend or not on_weekend(start))):
                 out.append((rolling, start))
             start = rolling.next_start(start)  # a quarter hour, five minutes, an hour, a day (noon ET to noon ET: 23 or 25 hours over a switch)
     return sorted(out, key=lambda rs: (rs[1], rs[0].key))
@@ -531,25 +557,162 @@ def unverified_outcomes(rows: list[dict], now_ms: int, days: int = 3) -> set[tup
 
 
 def cards_today(rows: list[dict], now_ms: int) -> list[dict]:
-    """The review page's 今日按市场 rows of this mode (1.131.5): today's windows (Beijing, by the window's start) per card,
-    in the model trader's rows' shape (core.summary_of with settled_extras): the expectation at the order is a coin toss
-    bought at the pair's price — 0.5 − price a filled share — the mean fair price 0.5, the hit rate the settled records'
-    wins (a tie half)."""
+    """The review page's 今日按市场 rows of this mode (1.131.5): today's windows (Beijing, by the window's start) per card
+    (cards_between over today)."""
     today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date().isoformat()
+    return cards_between(rows, today, today)
+
+
+def cards_between(rows: Iterable[dict], first: str, last: str, old: ArchiveShare | None = None) -> list[dict]:
+    """The review page's 按市场 rows of this mode over the Beijing dates ``first``..``last`` (ISO; by the window's start), per
+    card, in the model trader's rows' shape (core.summary_of with settled_extras): the expectation at the order is a coin
+    toss bought at the pair's price — 0.5 − price a filled share — the mean fair price 0.5, the hit rate the settled
+    records' wins (a tie half). 1.151.0: any range of days (1.131.5: today's alone), each card with ``luck`` — its settled
+    P&L against that expectation in σ (core.luck_of over ev_bets: a window one bet, its unhedged part at risk) — and
+    ``diag``, where it was made or lost (card_diag). ``old``: the archived records (ArchiveShare: finished quotes that
+    filled nothing, moved out two days on) counted in by their kept counts — records and windows only."""
     by: dict[str, list[dict]] = {}
+    pairs: dict[str, list[dict]] = {}
     for pair in rows:
         if any(o.get("state") not in NEVER_PLACED for o in (pair.get("orders") or {}).values()):
             q = quote_of(pair)
-            if q["date"] == today:
+            if first <= q["date"] <= last:
                 by.setdefault(q["card"], []).append(q)
+                pairs.setdefault(q["card"], []).append(pair)
+    archived = sorted((card, date) for card, date in old.lines["cdate"] if first <= date <= last) if old is not None else []
     out = []
-    for card, qs in by.items():
+    for card in sorted(set(by) | {card for card, _ in archived}):
+        qs = by.get(card, [])
         r = review_summary(card, qs)
+        for _, date in (x for x in archived if x[0] == card):
+            r = old.counted(r, "cdate", (card, date), [q for q in qs if q["date"] == date])
         settled = [q for q in qs if q["settled"]]
-        out.append({"name": f"{card} · 开盘前预挂", **summary_shape(r), "preopen": True,
+        luck = core.luck_of(ev_bets(pairs.get(card, [])))
+        out.append({"name": f"{card} · 开盘前预挂", **summary_shape(r), "preopen": True, "card": card,
                     "expected": round(sum((0.5 - q["price"]) * q["filled"] for q in settled), 4), "avg_fair": 0.5 if settled else None,
-                    "hit": (r["wins"] + 0.5 * r["ties"]) / r["settled"] if r["settled"] else None})
+                    "hit": (r["wins"] + 0.5 * r["ties"]) / r["settled"] if r["settled"] else None, "luck": luck, "diag": card_diag(qs, luck)})
     return sorted(out, key=lambda x: (-x["records"], x["name"]))
+
+
+LEAD_BUCKETS = ((0.0, "撤单后才读到（成交时刻不详）"), (1.0, "开场前 1 分钟内"), (10.0, "开场前 1–10 分钟"), (60.0, "开场前 10–60 分钟"),
+                (360.0, "开场前 1–6 小时"), (math.inf, "开场前 6 小时以上"))  # card_diag: how long before the start the first fill was seen, the earliest first
+LOSS_FOCUS_SHARE = 0.6  # card_diag: two start hours carrying this much of a card's losses are named as where it lost
+DIAG_MIN = 5            # ...and a pattern is named only over this many settled windows
+HOUR_FLAG_Z = -3.0      # ...and one start hour's filled side as far below half as this: picked off (24 hours looked at — a −2σ hour comes by chance)
+
+
+def side_won(won: int, n: int) -> float | None:
+    """How far ``won`` of ``n`` coin tosses is from half, in σ (None without one)."""
+    return (won - n / 2) / math.sqrt(n / 4) if n else None
+
+
+def card_diag(qs: list[dict], luck: dict | None = None) -> dict:
+    """Where one card's money was made or lost over its quotes ``qs`` (quote_of; a range of days) — the review page's breakdown
+    under a line of 按市场 (1.151.0). A window (its levels and re-quotes together: one coin toss) counts once:
+      one — the windows only one side of which filled, the result up or down: how often the filled side won, against the
+            half a coin toss gives (z). A 49¢ bid is taken by whoever wants the other side: far fewer than half won is someone
+            who knew the direction when they took it (the gold windows of CME's shut, 11-16: every filled side lost);
+      both — the windows both sides of which filled: hedged, the pair costs under $1, what they made;
+      hours — by the start hour (Beijing): windows filled, settled, P&L, the one-sided ones won — a loss gathered on a few
+              hours is a time something is known ahead;
+      lead — by how long before the start the first fill was seen (fill_ms, 1.151.0 on; older fills say nothing);
+      sides, levels — by side (each order its own bet) and by price;
+      notes — what the figures say, in words (only what DIAG_MIN windows or more bear out)."""
+    windows: dict[str, dict] = {}
+    for q in qs:
+        if q["filled"] <= 0:
+            continue
+        w = windows.setdefault(q["window"], {"hour": q["hour"], "up": 0.0, "down": 0.0, "pnl": 0.0, "settled": 0, "records": 0, "result": "", "lead": None})
+        w["up"] += q["filled_up"]
+        w["down"] += q["filled_down"]
+        w["records"] += 1
+        if q["settled"]:
+            w["pnl"] += q["pnl"]
+            w["settled"] += 1
+        w["result"] = w["result"] or q["result"]
+        if q.get("fill_lead_min") is not None:
+            w["lead"] = q["fill_lead_min"] if w["lead"] is None else max(w["lead"], q["fill_lead_min"])
+    for w in windows.values():
+        w["done"] = w["settled"] == w["records"]  # every filled level of the window priced by the result
+        w["one"] = (w["up"] > 0) != (w["down"] > 0) and w["done"] and w["result"] in {"up", "down"}
+        w["won"] = w["one"] and (w["result"] == "up") == (w["up"] > 0)
+
+    def line(name: str, ws: list[dict]) -> dict:
+        one = [w for w in ws if w["one"]]
+        return {"name": name, "windows": len(ws), "settled": sum(1 for w in ws if w["done"]), "pnl": round(sum(w["pnl"] for w in ws), 4),
+                "one": len(one), "won": sum(1 for w in one if w["won"])}
+    ws = list(windows.values())
+    one = line("只成交一边", [w for w in ws if w["one"]])
+    one["z"] = side_won(one["won"], one["one"])
+    both = line("两边都成交", [w for w in ws if w["up"] > 0 and w["down"] > 0])
+    hours = [line(f"{h:02d}:00", [w for w in ws if w["hour"] == h]) for h in sorted({w["hour"] for w in ws})]
+    leads = []
+    for i, (bound, name) in enumerate(LEAD_BUCKETS):
+        low = LEAD_BUCKETS[i - 1][0] if i else -math.inf
+        group = [w for w in ws if w["lead"] is not None and low <= w["lead"] < bound]
+        if group:
+            leads.append(line(name, group))
+    unknown = [w for w in ws if w["lead"] is None]
+    if unknown and leads:
+        leads.append(line("没记录（1.151.0 之前的成交）", unknown))
+    levels: dict[float, list[dict]] = {}
+    for q in qs:
+        levels.setdefault(q["price"], []).append(q)
+    level_lines = [{**review_summary(f"{price * 100:g}¢", levels[price]), "price": price} for price in sorted(levels, reverse=True)]
+    notes = diag_notes(ws, one, hours, leads, luck)
+    return {"windows": len(ws), "one": one, "both": both, "hours": hours, "lead": leads,
+            "sides": [review_side(name, side, qs) for side, name in (("up", "涨"), ("down", "跌"))],
+            "levels": [x for x in level_lines if x["filled"] > 0], "notes": notes}
+
+
+def diag_notes(ws: list[dict], one: dict, hours: list[dict], leads: list[dict], luck: dict | None) -> list[str]:
+    """What card_diag's figures say, in words — each only when DIAG_MIN settled windows or more bear it out."""
+    usd = lambda x: f"{'+' if x >= 0 else '−'}${abs(x):,.2f}"
+    settled = [w for w in ws if w["done"]]
+    if not settled:
+        return ["这段时间还没有结算的成交"]
+    notes = []
+    if luck and luck.get("bets"):
+        gap, z = luck["pnl"] - luck["ev"], luck["z"]
+        if luck["sigma"] <= 0:
+            pass
+        elif z <= -2:
+            notes.append(f"实际比五五开的预期少 {usd(gap).lstrip('−')}（偏离 {core.sigma_text(z)}）：不像运气，下面找是哪几场、什么时候成交的")
+        elif z >= 2:
+            notes.append(f"实际比五五开的预期多 {usd(gap).lstrip('+')}（偏离 {core.sigma_text(z)}）")
+        else:
+            notes.append(f"实际和五五开的预期差 {usd(gap)}，偏离 {core.sigma_text(z)}，还在运气范围内（±2σ）" + ("；有结果的不到 30 场，样本少" if luck["bets"] < 30 else ""))
+    if one["one"] >= DIAG_MIN:
+        rate = one["won"] / one["one"]
+        if one["z"] is not None and one["z"] <= -2:
+            notes.append(f"只成交一边的 {one['one']} 场里，成交那边只赢了 {one['won']} 场（{rate:.0%}，五五开该一半，偏离 {core.sigma_text(one['z'])}）："
+                         "吃你单的人多半在知道方向时才来吃，是逆向选择，不是运气")
+        elif rate < 0.5:
+            notes.append(f"只成交一边的 {one['one']} 场里成交那边赢 {one['won']} 场（{rate:.0%}），比一半少，但整张卡偏离 {core.sigma_text(one['z'])} 还在运气范围内")
+        else:
+            notes.append(f"只成交一边的 {one['one']} 场里成交那边赢 {one['won']} 场（{rate:.0%}），整张卡没有被单边挑着吃的迹象")
+    for h in hours:  # one start hour picked off — the rest of the card can hide it; −3σ, a day's 24 hours being looked at
+        z = side_won(h["won"], h["one"])
+        if h["one"] >= DIAG_MIN and z is not None and z <= HOUR_FLAG_Z:
+            notes.append(f"{h['name']}（北京时间）开始的场次只成交一边的 {h['one']} 场里，成交那边赢 {h['won']} 场（偏离 {core.sigma_text(z)}）："
+                         "这个钟点是被知道方向的人挑着吃（逆向选择），不是运气")
+    losing = sorted((h for h in hours if h["pnl"] < 0 and h["settled"]), key=lambda h: h["pnl"])
+    loss = -sum(h["pnl"] for h in losing)
+    if len(settled) >= DIAG_MIN and losing and loss > 0 and len([h for h in hours if h["settled"]]) >= 3:
+        top = losing[:2]
+        share = -sum(h["pnl"] for h in top) / loss
+        if share >= LOSS_FOCUS_SHARE:
+            notes.append(f"亏损集中在 {'、'.join(h['name'] for h in top)}（北京时间）开始的场次：{usd(sum(h['pnl'] for h in top))}，占这段亏损的 {share:.0%}"
+                         "——看这几个钟点标的是不是休市、刚开盘或有固定的消息")
+    early = [x for x in leads if x["name"] in {"开场前 1–6 小时", "开场前 6 小时以上"}]
+    late = [x for x in leads if x["name"] in {"开场前 1 分钟内", "开场前 1–10 分钟", "开场前 10–60 分钟"}]
+    early_n, late_n = sum(x["settled"] for x in early), sum(x["settled"] for x in late)
+    if early_n >= DIAG_MIN and late_n >= DIAG_MIN:
+        early_pnl, late_pnl = sum(x["pnl"] for x in early), sum(x["pnl"] for x in late)
+        if early_pnl < 0 <= late_pnl or early_pnl / early_n < late_pnl / late_n - 0.5:
+            notes.append(f"开场前 1 小时以上就成交的 {early_n} 场 {usd(early_pnl)}，1 小时内成交的 {late_n} 场 {usd(late_pnl)}：越早被吃越亏，"
+                         "说明来吃的人提前就知道了什么（休市、开盘跳空这类）")
+    return notes
 
 
 def removable_ids(pair: dict) -> list[str]:
@@ -726,6 +889,7 @@ def quote_of(pair: dict) -> dict:
     payout = {"up": 1.0, "down": 0.0, "split": 0.5}.get(result)
     start = int(pair.get("start_ms") or 0)
     at = dt.datetime.fromtimestamp(start / 1000, core.BEIJING)
+    seen = [int(o["fill_ms"]) for o in orders.values() if o.get("fill_ms") and float(o.get("filled") or 0) > 0]  # 1.151.0: when each fill was first seen
     return {"window": window_of(pair), "key": str(pair.get("key") or ""), "card": str(pair.get("name") or pair.get("key") or "").rsplit(" ", 1)[0],
             "name": str(pair.get("name") or window_of(pair)), "day": at.strftime("%m-%d"), "date": at.date().isoformat(), "hour": at.hour, "start_ms": start,
             "level_name": level_name(price, shares),
@@ -736,6 +900,7 @@ def quote_of(pair: dict) -> dict:
             "side_pnl": {side: ((payout if side == "up" else 1 - payout) - price) * filled[side] if payout is not None else None for side in ("up", "down")},
             "attempt": int(pair.get("attempt") or 0),
             "lead_min": (start - int(pair["created_ms"])) / 60_000 if pair.get("created_ms") else None,
+            "fill_lead_min": (start - min(seen)) / 60_000 if seen else None,  # the first fill seen, this long before the start (negative: read after it)
             "cancel_s": (int(pair["cancel_done_ms"]) - int(pair["cancel_sent_ms"])) / 1000 if pair.get("cancel_sent_ms") and pair.get("cancel_done_ms") else None,
             "status": ("挂着" if pair.get("phase") == "active" else "已结算" if accounted and total > 0 else "已撤" if accounted
                        else "待结算" if total > 0 else "撤单中")}
@@ -861,7 +1026,7 @@ def review(rows: Iterable[dict], now_ms: int, old: ArchiveShare | None = None) -
     def size(card: str) -> int:  # the card's records (the archived ones too)
         return len(cards[card]) + (old.lines["card"][card].records if old is not None and card in old.lines["card"] else 0)
     recent = sorted([q for q in qs if q["filled"] > 0], key=lambda q: q["start_ms"], reverse=True)[:60]
-    shown = ("start_ms", "name", "key", "filled_up", "filled_down", "price", "volume", "result", "pnl", "status", "lead_min", "cancel_s", "attempt")
+    shown = ("start_ms", "name", "key", "filled_up", "filled_down", "price", "volume", "result", "pnl", "status", "lead_min", "cancel_s", "attempt", "fill_lead_min")
     total = summary("全部", qs, "all", "")
     today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date().isoformat()  # the daily summary takes today's and earlier windows: tomorrow's resting pairs are no day yet
     return {"total": total,
@@ -879,14 +1044,15 @@ def review(rows: Iterable[dict], now_ms: int, old: ArchiveShare | None = None) -
             "recent": [{k: q[k] for k in shown} for q in recent]}
 
 
-REVIEW_KINDS = ("all", "date", "day", "card", "level", "hour", "week")  # the review's tables, as ArchiveShare keeps the archive's lines of each
+REVIEW_KINDS = ("all", "date", "day", "card", "level", "hour", "week", "cdate")  # the review's tables (and 按市场's card by date, 1.151.0), as ArchiveShare keeps the archive's lines of each
 
 
 def review_lines(q: dict) -> tuple:
     """The lines of the review's tables a quote is counted on, as (kind, key) — one of each of REVIEW_KINDS: the total, its
-    window's date (the daily summary) and day, its card, its level, its card's start hour, the weekend or the week."""
+    window's date (the daily summary) and day, its card, its level, its card's start hour, the weekend or the week, its card on
+    its date (按市场 over a range of days, 1.151.0)."""
     return (("all", ""), ("date", q["date"]), ("day", q["day"]), ("card", q["card"]), ("level", (q["price"], q["shares"])),
-            ("hour", (q["card"], q["hour"])), ("week", on_weekend(q["start_ms"])))
+            ("hour", (q["card"], q["hour"])), ("week", on_weekend(q["start_ms"])), ("cdate", (q["card"], q["date"])))
 
 
 class ArchiveLine:
@@ -1557,6 +1723,8 @@ class Controller:
         if rolling is None or session_opening(rolling, int(pair["start_ms"]), self.owner.config.holidays.get(rolling.exchange, frozenset()),
                                               int(self.settings.open_quiet_minutes) * 60_000):
             return False  # 1.135.1: a stock card's first window after a session open, quoted before the rule (or with it off): withdrawn
+        if market_shut(rolling, int(pair["start_ms"])):
+            return False  # 1.150.1: gold's and oil's windows in CME's shut, quoted before the rule: withdrawn
         if not self.settings.weekend and on_weekend(int(pair["start_ms"])):
             return False  # 1.136.0: the weekend switched off since it was quoted: withdrawn
         if int(pair.get("expires") or 0) != pair["start_ms"] // 1000 - self.settings.expiry_seconds:
@@ -1995,7 +2163,10 @@ class Controller:
         if amount <= 0 or filled < 0 or filled > amount:
             raise core.RemoteError("成交回报数量无效，保留风险额度")
         shares = D(str(pair_quote(pair)[1] or self.settings.shares))
-        order["filled"] = max(float(order.get("filled") or 0), float(shares * filled / amount))
+        before = float(order.get("filled") or 0)
+        order["filled"] = max(before, float(shares * filled / amount))
+        if order["filled"] > before:  # 1.151.0: when a fill was first seen (the snapshot's pace: seconds, a minute with thousands of orders) — the review's 成交时距开场
+            order.setdefault("fill_ms", self.now())
 
     def gave_up(self, pair: dict) -> bool:
         """Past the window's start by GIVE_UP_MS: an order Predict cannot show cannot fill any more (it expired before
@@ -2729,6 +2900,8 @@ class Controller:
             if p["phase"] == "active" and p.get("key"):
                 quoted_to[p["key"]] = max(quoted_to.get(p["key"], 0), int(p.get("start_ms") or 0))
         windows_left, pairs_left, usd_left = self.unplaced()
+        shut_cards = {h: "、".join(r.coin for r in core.preopen_cards() if getattr(r, "hours", "") == h and r.key in self.settings.markets) for h in SHUT_TEXT}  # 1.150.1: the cards a shut keeps back
+        cme_next = next(iter(core.cme_shuts(self.now(), self.now() + 5 * core.DAY_MS)), None) if shut_cards["cme"] else None  # CME's shut now in force, or the next
         named = lambda ps: "、".join(str(p.get("name") or window_of(p)) + (f" 第 {int(p['level']) + 1} 档" if p.get("level") else "") for p in ps[:3]) + ("…" if len(ps) > 3 else "")
         why = (self.hold() or self.budget_problem()) if self.alive else ""
         state = ("已停止" if not self.alive else f"收尾中（{self.winding}）：不再新挂，挂着的单分批撤完、成交核对完就自动停止" if self.winding
@@ -2748,6 +2921,10 @@ class Controller:
                 f"撤单：开场前 {self.settings.cancel_seconds} 秒发出，之后到开场前 {self.settings.expiry_seconds} 秒到期为止每 {SPRINT_MS // 1000} 秒催一次；"
                 f"不足 {self.settings.entry_seconds} 秒不再新挂"
                 + (f"；股票卡开盘、午后头 {self.settings.open_quiet_minutes} 分钟内开始的场次不挂" if self.settings.open_quiet_minutes else "")
+                + (f"；{shut_cards['cme']}休市（{SHUT_TEXT['cme']}）期间的场次不挂" + (f"、重开后头 {self.settings.open_quiet_minutes} 分钟内开始的也不挂" if self.settings.open_quiet_minutes else "")
+                   + (f"（北京时间 {when(cme_next[0], self.now())}–{when(cme_next[1], cme_next[0])}）" if cme_next else "") if shut_cards["cme"] else "")
+                + (f"；{shut_cards['us']}只挂美股常规交易时段内的场次（纽约时间 09:30–16:00，美国假日、半日市按日历）"
+                   + (f"，开盘后头 {self.settings.open_quiet_minutes} 分钟的不挂" if self.settings.open_quiet_minutes else "") if shut_cards["us"] else "")  # the end's date only when not the start's
                 + (f"；周末不挂（北京时间周六 00:00 到周一 {WEEKEND_END_HOUR:02d}:00 开始的场次）" if not self.settings.weekend else "") + "\n"
                 f"已记录 {len({window_of(p) for p in rows})} 场、{len(rows)} 条（{sum(1 for p in rows if p['phase'] == 'active')} 条挂着，{sum(1 for p in rows if p.get('accounted'))} 条已结清）"
                 + (f"，另有 {self.ledger.archived_count} 条已归档（结束超过 {ARCHIVE_AFTER_MS // core.DAY_MS} 天、已撤且没成交的；复盘页照常统计）" if self.ledger.archived_count else "") + "，"

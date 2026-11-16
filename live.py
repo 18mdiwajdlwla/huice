@@ -6618,6 +6618,28 @@ class LiveBot(core.Bot):
         except Exception:
             return []
 
+    def preopen_cards(self, first: str, last: str) -> list[dict]:
+        """The pre-open mode's 按市场 rows over the Beijing dates ``first``..``last`` (preopen.cards_between, 1.151.0): the
+        controller's ledger, or the file while the mode is off; the archived records (finished quotes that filled nothing)
+        counted in by their kept counts (preopen_review's ArchiveShare, brought up to date) when those can stand for them —
+        else only the records and windows of the older days come out short, never a fill or a P&L."""
+        from preopen import archive_share, cards_between, read_rows
+        try:
+            rows = list(self.preopen.ledger.rows.values()) if self.preopen is not None else read_rows(self.config.preopen.db)
+        except Exception as error:
+            LOG.warning("预挂按市场读取失败：%s", core.clean_error(error) or type(error).__name__)
+            return []
+        share = None
+        try:
+            share = self.preopen_share = archive_share(self.preopen.ledger if self.preopen is not None else self.config.preopen.db, rows,
+                                                       getattr(self, "preopen_share", None))
+            if not share.fits(self.market.now_ms()):
+                share = None
+        except Exception as error:
+            self.preopen_share = share = None
+            LOG.warning("预挂按市场的归档统计没用上（较早日子的记录数会少算）：%s", core.clean_error(error) or type(error).__name__)
+        return cards_between(rows, first, last, share)
+
     def preopen_unverified(self) -> set[tuple[str, int]]:
         """The outcomes where a pre-open order's fills are not read for certain yet (preopen.unverified_outcomes): a position
         there may be its fill — the positions check leaves them alone until the mode has read them (1.131.5)."""
