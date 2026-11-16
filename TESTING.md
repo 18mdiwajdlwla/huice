@@ -1,8 +1,10 @@
 # 测试与交付状态
 
-版本：1.151.0
+版本：1.151.1
 
 ## 已完成
+
+- 1.151.1（开盘后第一场固定不挂，原策略也避开休市）：黄金 18:00–18:15 ET 之前跟着 `PREOPEN_OPEN_QUIET_MINUTES` 走，设成 0 就会挂；Polymarket 根本不上这几场。现在开盘、重开后的第一场（黄金原油每天 18:00 和周末、节假日之后的重开，美股 09:30，海力士、宇树、智谱开盘和午后）固定不挂（`preopen.open_quiet_ms`：设置只能再加长，0 按 15 算），升级前已挂上的重启时撤掉。同样的情况原策略也有：它在窗口开始后才交易，但黄金、原油休市那一小时指数不动、模型按五五开照样下单，所以带 `hours` 的卡在休市期间和重开第一场不给建议（`main.window_hours_hold`，接在 `Bot.updown_hold`）。股票卡的 15 分钟窗口本来就只在交易时段内，原策略不受影响。`tests/test_preopen.py` 的 `test_the_first_window_after_an_open_is_never_quoted_nor_traded`，`tests/test_window.py` 的 `updown_hold` 检查；改了两处原来按“0 = 第一场也挂”写的断言。
 
 - 1.151.0（按市场选日期、找亏钱原因，其他预挂卡的同类问题）：逐张卡查了“开场前就知道结果”的场次。黄金、原油除了每天休市和周末，芝商所节假日也会提前收市或整天不开（最近是 11-26 感恩节、11-27），现在 `CME_EARLY_DAYS` 的日子纽约时间 12:00 起、`CME_CLOSED_DAYS` 整天当作休市，和每天休市、周末连成一段（`main.cme_shuts`，按天缓存）；美股 12 张卡（`hours="us"`）只挂常规时段，09:30 开盘第一场不挂（`main.us_shuts`）；股票卡本来就按交易所日历和开盘静默；BTC/ETH/BNB 全天候，开场前 10–20 秒撤单，结果在开场后才定，没有这类问题。每张预挂单记下第一次看到成交的时刻（`fill_ms`）。复盘页“今日按市场”改成“按市场”：`journal.json?cards=1&range=…|from=…&to=…`（`Bot.journal_cards`，日期解析和市场涨跌统计共用 `journal_days`），每行多“偏离”（`luck_of`：按下单时概率算的 σ）；点开预挂的一行是 `preopen.card_diag`：只成交一边时那边赢几成、按开始时间（单个钟点 −3σ 单独点名）、按成交时距开场、按方向、按价格档和一句话结论；原策略的一行是这段日子的每一笔（`rows=1&range=…`）。归档的预挂记录按卡按日计数（`REVIEW_KINDS` 加 `cdate`）。`tests/test_preopen.py` 的 `test_cme_holidays_and_us_hours_are_not_quoted`、`test_fills_are_timed_and_the_breakdown_says_where_the_money_went`，`tests/test_journal.py` 的接口和浏览器检查。
 
