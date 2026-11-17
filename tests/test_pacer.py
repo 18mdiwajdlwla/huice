@@ -97,5 +97,46 @@ async def run() -> None:
     assert "进入范围到发布中位 86 秒（最早 84；5 次），进入范围 69 秒后开始每 0.5 秒探测" in own.timing_line(), own.timing_line()
 
 
+    # 1.154.2: a backlog's reads — one market read for all the levels of a window far from its start (not one a level), a fresh one
+    # near it; and the known windows not read again while a long queue waits (their details would be stale by their turn)
+    from test_preopen import NOW, market
+    ctl, api, clock = controller(PREOPEN_LEVELS="48x20,47x40", PREOPEN_AHEAD_MINUTES="1440")
+    reads = []
+    plain_market = api.market
+
+    async def counted(mid):
+        reads.append(str(mid))
+        return await plain_market(mid)
+    api.market = counted
+    for mid, ahead_ms in ((321, 5 * 3_600_000), (322, 30 * 60_000)):
+        mk = market(at=NOW + ahead_ms, mid=mid)
+        api.markets[str(mid)] = mk
+        ctl.keep_details(str(mid), mk)
+    clock.ms = NOW + 60_000  # a minute on: past MARKET_FRESH_MS, within MARKET_REUSE_MS
+    ctl.account_at = clock.ms
+    for mid in ("321", "322"):
+        c = p.candidate(api.markets[mid], clock.ms, ctl.owner.config, ctl.settings)
+        assert c is not None, mid
+        for level, (price, shares) in enumerate(ctl.settings.levels):
+            key = c["slug"] if level == 0 else f"{c['slug']}#{level}"
+            await ctl.place_pair({**c, "slug": key, "window": c["slug"], "level": level, "price": str(price), "shares": str(shares),
+                                  "attempt": 0, "market": api.markets[mid], "read_ms": NOW})
+    assert reads.count("321") == 0, ("five hours out: its three levels on the one read", reads)
+    assert reads.count("322") == 1, ("half an hour out: read afresh once, the others on it", reads)
+    assert len([k for k in ctl.ledger.rows if k.startswith("btc-updown-15m-")]) == 6, "all six pairs placed"
+    asked = []
+
+    async def reread(*args):
+        asked.append(1)
+    ctl.reread_known = reread
+    ctl.queued = {f"x{i}" for i in range(p.REREAD_QUEUE_MAX + 1)}
+    ctl.rescan_ms = 0
+    await ctl.discover()
+    assert asked == [], "a long queue: the known windows not read again"
+    ctl.queued = set()
+    await ctl.discover()
+    assert asked == [1], "the queue short again: read"
+
+
 asyncio.run(run())
 print("PACER_OK")

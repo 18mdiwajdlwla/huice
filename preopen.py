@@ -1256,6 +1256,11 @@ FAST_POLL_S = 0.5               # the fast poll's cadence (the queue position: t
 LISTING_PROBE_S = 2.0           # ...and each card's next listing is probed this often the rest of the time (was the poll setting, 5 s); the older windows keep the poll's pace
 PLACE_WORKERS = 4               # pairs placed side by side (three cards list at once, four levels each: twelve pairs — two workers took seconds)
 MARKET_FRESH_MS = 15_000        # a window's details read by the discovery this recently are placed on, not read again
+MARKET_REUSE_MS = 600_000       # 1.154.2: ...and this recently, for a window starting more than REUSE_NEAR_MS on — one read for all its levels
+REUSE_NEAR_MS = 30 * 60_000     #   (its tokens never change; a fee or a status changed meanwhile has the order refused, nothing placed). With
+#                                 thousands queued every level waited past MARKET_FRESH_MS and read the market again: 7 reads a window of 7 levels
+REREAD_QUEUE_MAX = 200          # 1.154.2: the known windows are not read again while this many levels already wait in the queue — read
+#                                 now, their details would be stale by their turn (11-17: 4,229 queued, 8 more read a pass, every one wasted)
 DISCOVER_READS = 8              # listed windows with a level still to quote read in one discovery pass, the soonest first (the rest the next pass); each card's next listing is read besides (1.132.2)
 ALLOWANCE_MS = 60_000           # the exchange allowance is read again this often, not before every pair
 PROBE_HOURS = 2.0      # /preopen probe: the quarters of the next this many hours, each card's at most PROBE_PER_CARD — five cards over a day
@@ -1358,6 +1363,7 @@ class Controller:
         self.listed_by_card: dict[str, int] = {}  # card key -> the latest window of it seen listed (the status, per card: a card never found stands out)
         self.listed_at: dict[str, int] = {}  # card key -> when its latest window was first seen listed: the next listing is expected LISTING_CYCLE_MS on (poll_wait)
         self.allowance_cache: dict[str, tuple[int, int]] = {}  # exchange key -> (read at, allowance in wei)
+        self.details: dict[str, tuple[int, dict]] = {}  # market id -> (read at, its details): one read for every level of a window (1.154.2)
         for p in self.ledger.rows.values():
             self.listed_by_card[str(p.get("key") or "")] = max(self.listed_by_card.get(str(p.get("key") or ""), 0), int(p.get("start_ms") or 0))
         self.account_lock = asyncio.Lock()
@@ -1880,7 +1886,7 @@ class Controller:
         sprint = self.sprinting()  # judged as the pass begins: a pass that started for a listing stays with the listings (the next tick re-reads)
         try:
             await self.probe_listings(known_before, full, attempts, strikes, st)
-            if not probe_only and not st["stopped"] and not sprint:
+            if not probe_only and not st["stopped"] and not sprint and len(self.queued) <= REREAD_QUEUE_MAX:  # 1.154.2: not while a long queue waits
                 self.rescan_ms = self.now()
                 await self.reread_known(known_before, attempts, strikes, st)
         finally:
@@ -2017,6 +2023,8 @@ class Controller:
         """A listed window judged (candidate) and its wanted levels queued at once, the details just read carried along
         (placed on, not read again: MARKET_FRESH_MS); a window that is no candidate is noted (skipped)."""
         self.category_full = market.get("_from") == "category"
+        if market.get("id") is not None:
+            self.keep_details(str(market["id"]), market)
         c = candidate(market, self.now(), self.owner.config, self.settings)
         if c is None:
             self.skipped[slug] = candidate_problem(market, self.now(), self.owner.config, self.settings)
@@ -2030,6 +2038,13 @@ class Controller:
             st["found"] += 1
             self.queue.put_nowait((c["start_ms"], key, {**c, "slug": key, "window": slug, "level": level, "price": str(price), "shares": str(shares),
                                                        "attempt": attempts.get(key, 0), "market": market, "read_ms": self.now()}))
+
+    def keep_details(self, market_id: str, market: dict) -> None:
+        """A window's details as just read (place_pair reuses them for its other levels); the ones past MARKET_REUSE_MS let go."""
+        now = self.now()
+        self.details[market_id] = (now, market)
+        if len(self.details) > 2000:
+            self.details = {k: v for k, v in self.details.items() if now - v[0] <= MARKET_REUSE_MS}
 
     async def refresh_active(self) -> None:
         """An active window's market, read again every REFRESH_MS (REFRESH_FAR_MS while its start is more than an hour
@@ -2077,7 +2092,14 @@ class Controller:
             return "held"
         # Fresh details are authoritative, not a stale listing page or model card — the discovery's own read, when seconds old (MARKET_FRESH_MS)
         fresh = c.get("market") if c.get("market") and self.now() - int(c.get("read_ms") or 0) <= MARKET_FRESH_MS else None
-        market = {**(fresh or await self.api.market(c["market_id"])), "categorySlug": c.get("window", c["slug"])}  # the window the category named: the details' own slug may differ
+        if fresh is None:  # 1.154.2: the window's details as last read for any of its levels, when recent enough for its distance to the start
+            read_ms, kept = self.details.get(str(c["market_id"]), (0, None))
+            ttl = MARKET_FRESH_MS if int(c.get("start_ms") or 0) - self.now() <= REUSE_NEAR_MS else MARKET_REUSE_MS
+            fresh = kept if kept is not None and self.now() - read_ms <= ttl else None
+        if fresh is None:
+            fresh = await self.api.market(c["market_id"])
+            self.keep_details(str(c["market_id"]), fresh)
+        market = {**fresh, "categorySlug": c.get("window", c["slug"])}  # the window the category named: the details' own slug may differ
         current = candidate(market, self.now(), self.owner.config, self.settings)
         if current is None or current["slug"] != c.get("window", c["slug"]):
             return ""
