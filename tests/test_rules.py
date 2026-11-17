@@ -150,6 +150,29 @@ def connected(t, mid, book, age=0.0):
 FAST = {"RULE_FAST_HOURS": "01:00-07:00", "RULE_LEAD_MINUTES": "0", "RULE_OIL": "off", "RULE_GOLD_OPEN_CENTS": "0", "RULE_GOLD_0515_CENTS": "0"}
 
 
+# --- 1.154.14: bought in the window's course (盘中吃单) ---
+XAU = next(c for c in m.WINDOW_UPDOWN_MARKETS if c.key == "XAU-15M")
+GOLD_0700 = bj(2026, 11, 17, 7, 0)  # the first quarter hour after CME's daily break (18:00 New York)
+# gold's shut quarter hours alone, no makers' moment
+IN = {"RULE_OIL": "off", "RULE_GOLD_OPEN_CENTS": "0", "RULE_GOLD_0515_CENTS": "0", "RULE_LEAD_MINUTES": "0"}
+
+
+def gold_card(x, clock, start, line, price, strike=None, age_ms=0):
+    """The bot's own XAU card (main.IndexUpDownMarket) on the window that starts at ``start``: the close of the index's minute
+    candle ending there (``line``; None: not read yet), the index now (``age_ms`` old) and the start price Predict shows."""
+    spec = XAU.window_spec(start)
+    card = m.IndexUpDownMarket(x.owner.store, spec)
+    if line is None:
+        x.owner.store.delete_keys([f"updown:{spec.slug}:start"])
+    else:
+        x.owner.store.put(f"updown:{spec.slug}:start", {"open": spec.start_ms, "close": str(line), "read_ms": clock.ms})
+    card.price = D(str(price)) if price is not None else None
+    card.priced_ms = card.index_ms = clock.ms - age_ms
+    card.strike = D(str(strike)) if strike is not None else None
+    x.owner.updowns = {"XAU-15M": card}
+    return card
+
+
 class RuleTests(unittest.IsolatedAsyncioTestCase):
     def test_windows_follow_new_york_time(self):
         """The shut quarter hours, the daily reopen and 05:15 in New York time: winter and summer, weekdays only, the weekend's
@@ -179,6 +202,8 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
 
     def test_the_book_offers_the_side_at_or_under_the_price(self):
         bids, asks = ((D("0.47"), D("20")), (D("0.45"), D("30")), (D("0.40"), D("50"))), ((D("0.51"), D("30")), (D("0.55"), D("40")), (D("0.60"), D("100")))
+        self.assertEqual(R.without([(D("0.51"), D("30")), (D("0.55"), D("40"))], D("45")), [(D("0.55"), D("25"))], "less what was taken from the cheapest")
+        self.assertEqual(R.without([(D("0.51"), D("30"))], D("0")), [(D("0.51"), D("30"))])
         self.assertEqual(R.offered(bids, asks, "up", D("0.58")), [(D("0.51"), D("30")), (D("0.55"), D("40"))])
         self.assertEqual(R.offered(bids, asks, "down", D("0.55")), [(D("0.53"), D("20")), (D("0.55"), D("30"))], "an Up bid at p is Down for sale at 1 − p")
         self.assertEqual(R.walk(R.offered(bids, asks, "up", D("0.58")), D("50")), (D("0.51") * 30 + D("0.55") * 20) / 50)
@@ -1150,6 +1175,238 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("RULE_API_KEY", plain.fast_line(NOW))
         _, _, _, z = taker("on", RULE_API_KEY="main-key", PREDICT_API_KEY="main-key")  # set to the bot's own key: not a key of its own
         self.assertFalse(R.RuleTaker(z.owner).own_key)
+
+    # --- 1.154.14: 盘中吃单 ---
+    def test_in_window_settings(self):
+        """RULE_GOLD_SHUT_LIVE_CENTS / RULE_GOLD_OPEN_LIVE_CENTS: off by default, 0 or 1–97; on the control page; the rules that can
+        judge a window's course and the settings are the same two."""
+        base = {"TELEGRAM_BOT_TOKEN": "offline"}
+        c = m.Config.from_env(base).rules
+        self.assertEqual([c.live_price(k) for k in ("gold_shut", "gold_open", "oil_shut", "gold_0515")], [0, 0, 0, 0], "off until set")
+        c = m.Config.from_env({**base, "RULE_TAKER": "on", "RULE_GOLD_SHUT_LIVE_CENTS": "97", "RULE_GOLD_OPEN_LIVE_CENTS": "70"}).rules
+        self.assertEqual((c.live_price("gold_shut"), c.live_price("gold_open"), c.price("gold_shut")), (97, 70, 58), "beside the price before the window")
+        for bad in ("98", "-1", "x"):
+            with self.assertRaises(ValueError, msg=bad):
+                m.Config.from_env({**base, "RULE_TAKER": "paper", "RULE_GOLD_OPEN_LIVE_CENTS": bad})
+        self.assertEqual(m.Config.from_env({**base, "RULE_GOLD_SHUT_LIVE_CENTS": "98"}).rules.live_price("gold_shut"), 0, "off: read leniently")
+        self.assertEqual({r.key for r in R.RULES if r.lead > 0}, set(m.RULE_LIVE_KEYS), "a way to judge the course, and a price for it")
+        self.assertEqual({k: R.RULE_OF[k].lead for k in m.RULE_LIVE_KEYS}, {"gold_shut": D("0.00005"), "gold_open": D("0.0002")})
+        self.assertEqual([R.lead_note(R.RULE_OF[k]) for k in ("gold_shut", "gold_open")], ["指数比起点高 0.005% 以上才买", "指数比起点低 0.02% 以上才买"])
+        for key in m.RULE_LIVE_KEYS.values():
+            form = m.CONTROL_FORMS[key]
+            self.assertTrue(key in m.CONTROL_KEY_SET and form["group"] == "规则" and form["presets"][0] == "0" and form["zero"] == "盘中不做", key)
+        bot = types.SimpleNamespace(config=m.Config.from_env({**base, "RULE_TAKER": "paper", "RULE_GOLD_SHUT_LIVE_CENTS": "80"}))
+        self.assertEqual([m.Bot.control_value(bot, k) for k in ("RULE_GOLD_SHUT_LIVE_CENTS", "RULE_GOLD_OPEN_LIVE_CENTS")], ["80", "0"])
+        off = m.Config.from_env({**base, "RULE_TAKER": "on", "RULE_GOLD": "off", "RULE_GOLD_SHUT_LIVE_CENTS": "80"}).rules
+        self.assertEqual(R.live_price_of(off, R.RULE_OF["gold_shut"]), 0, "its market switched off: not in the course either")
+        self.assertEqual(R.live_price_of(c, R.RULE_OF["oil_shut"]), 0, "oil: before the window alone")
+
+    async def test_in_its_course_up_is_bought_while_up_leads(self):
+        """盘中吃单, a shut quarter hour (gold_shut): past the window's start its side is bought at its own price — but only while
+        the bot's card of the market is on this window, has its start (the candle; Predict's own start price too when it
+        agrees) and a fresh index, and the index is over the start by 0.005%. Nothing in the seconds around the start; in the
+        window's first minute no dearer than before it; the order is signed to end 5 s before the window's end; the window's
+        size is one, before it and in its course together."""
+        t, api, clock, x = taker("on", RULE_GOLD_SHUT_LIVE_CENTS="70", RULE_SHARES="40", **IN)
+        t.verify_tick = lambda: None
+        slug, end = f"xau-updown-15m-{GOLD_0600 // 1000}", GOLD_0600 + 900_000
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.65, 30], [0.72, 50]]}
+        reads = lambda: sum(1 for c in api.calls if c.endswith("/orderbook"))
+        clock.ms = GOLD_0600 - 60_000
+        await t.tick()
+        w = t.track[slug]
+        self.assertEqual((w["word"], t.fast), ("盘口没有 ≤58¢ 的涨（最低 65¢）", False), "before the window: the rule's own price")
+        for at in (GOLD_0600 - 10_000, GOLD_0600 + 2_000):  # the seconds around the start
+            clock.ms = at
+            await t.tick()
+            self.assertEqual((w["word"], api.sent, slug in t.track), ("开场前后这几秒不下单（等这一场的起点价）", [], True))
+        seen = t.record(slug)["seen"]
+        self.assertEqual((seen["best"], seen["offer_max"], seen["bought"]), (0.65, 0.0, 0.0), "the watch of the time before the start kept as it ends")
+        clock.ms = GOLD_0600 + 4_000
+        before = reads()
+        await t.tick()
+        self.assertEqual((w["word"], t.fast), ("盘中：机器人没有 XAU-15M 这张卡，判断不了涨跌谁领先", True), "in its course: looked at each second")
+        for card, word in (
+                (dict(start=GOLD_0600 - 900_000, line=4000, price=4000), "盘中：卡片还没换到这一场，等起点价"),
+                (dict(start=GOLD_0600, line=None, price=4000), "盘中：还没读到这一场的起点价"),
+                (dict(start=GOLD_0600, line=4000, price=None), "盘中：还没有实时指数"),
+                (dict(start=GOLD_0600, line=4000, price="3999.99"), "盘中：涨还没领先（指数 3,999.99，起点 4,000，要高出 0.005% 以上），不买"),
+                (dict(start=GOLD_0600, line=4000, price=4000), "盘中：涨还没领先（指数 4,000，起点 4,000，要高出 0.005% 以上），不买"),
+                (dict(start=GOLD_0600, line=4000, price="4000.19"), "盘中：涨还没领先（指数 4,000.19，起点 4,000，要高出 0.005% 以上），不买"),
+                # over the candle by 0.005%, but not over Predict's own start price (agreeing with the candle within 0.1%) by as much
+                (dict(start=GOLD_0600, line=4000, price="4000.6", strike="4000.5"), "盘中：涨还没领先（指数 4,000.6，起点 4,000.5，要高出 0.005% 以上），不买")):
+            clock.ms += 1_000
+            gold_card(x, clock, **card)
+            await t.tick()
+            self.assertEqual((w["word"], api.sent), (word, []), str(card))
+        clock.ms += 1_000
+        gold_card(x, clock, GOLD_0600, 4000, 4001, age_ms=60_000)
+        await t.tick()
+        self.assertTrue(w["word"].startswith("盘中：指数价 60 秒未更新") and not api.sent, w["word"])
+        self.assertEqual(reads(), before, "no book read while Up does not lead, or the index is not known")
+        # Up leads by 0.005% (Predict's start price 0.25% off the candle is another window's: the candle alone) — but in the window's
+        # first minute no dearer than before it: the 65¢ on offer is over the rule's 58¢
+        clock.ms += 1_000
+        gold_card(x, clock, GOLD_0600, 4000, "4000.2", strike="4010")
+        await t.tick()
+        self.assertEqual((w["word"], api.sent, clock.ms - GOLD_0600 < R.LIVE_FULL_MS), ("盘中：盘口没有 ≤58¢ 的涨（最低 65¢）", [], True))
+        # a minute in: at the course's own price
+        clock.ms = GOLD_0600 + R.LIVE_FULL_MS
+        gold_card(x, clock, GOLD_0600, 4000, "4000.2", strike="4010")
+        api.fill[1], api.price = 30.0, 0.65
+        await t.tick()
+        self.assertEqual(len(api.sent), 1)
+        signed = api.sent[0]["data"]["order"]
+        self.assertEqual((L.from_wei(int(signed["takerAmount"])), int(signed["expiration"])), (30.0, end // 1000 - R.EXPIRY_BEFORE_S),
+                         "what the book offers at the course's price; signed to end before the window does")
+        order = t.record(slug)["orders"][-1]
+        self.assertEqual((order["live"], order["limit"], w["word"]), (True, 0.7, "盘中 已下单：涨 ≤70¢ × 30 份"))
+        clock.ms += R.FILL_READ_MS
+        await t.tick()
+        self.assertEqual((R.filled(t.record(slug)), R.in_flight(t.record(slug))), (30.0, False))
+        self.assertIn("🎯 规则吃单·盘中成交", x.notes[-1])
+        self.assertIn("黄金休市 4 档盘中 ≤70¢", x.notes[-1])
+        clock.ms += 1_000
+        gold_card(x, clock, GOLD_0600, 4000, "4000.75")
+        api.fill[2] = 10.0
+        await t.tick()
+        self.assertEqual(L.from_wei(int(api.sent[1]["data"]["order"]["takerAmount"])), 10.0, "RULE_SHARES is the window's, before it and in its course")
+        clock.ms += R.FILL_READ_MS
+        await t.tick()
+        clock.ms += 1_000
+        await t.tick()
+        self.assertEqual((w["word"], len(api.sent)), ("这一场已买满 40 份", 2))
+        self.assertEqual(t.record(slug)["seen"]["bought"], 0.0, "the watch stays that of the time before the start")
+        self.assertEqual(R.course_part(t.record(slug))[:2], (40.0, 40 * 0.65))
+        status = t.status()
+        self.assertIn("设了盘中价格的规则开场后接着买（开场 3 秒后到结束前 15 秒，第 1 分钟最高按盘前的价格）", status)
+        self.assertIn("· 黄金休市 4 档 买涨 ≤58¢｜盘中 ≤70¢（指数比起点高 0.005% 以上才买）", status)
+        self.assertIn("｜这一场 11-17 06:00：这一场已买满 40 份", status)
+        self.assertIn("（其中盘中 40 份）", status)
+        # the window's last seconds: followed no more
+        clock.ms = end - R.LIVE_STOP_MS
+        await t.tick()
+        self.assertNotIn(slug, t.track)
+        self.assertEqual(len([r for r in t.recs.values() if r["slug"] == slug]), 1, "one record, its watch kept once")
+
+    async def test_in_its_course_nothing_is_sent_in_the_last_seconds(self):
+        """The course ends LIVE_STOP_MS before the window does: an offer a second before that is still bought (its order ends 5 s
+        before the window's end), one after it is not; and a taker started in a window's course follows it at once."""
+        t, api, clock, x = taker("on", RULE_GOLD_SHUT_LIVE_CENTS="90", **IN)
+        t.verify_tick = lambda: None
+        slug, end = f"xau-updown-15m-{GOLD_0600 // 1000}", GOLD_0600 + 900_000
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.88, 20]]}
+        clock.ms = end - R.LIVE_STOP_MS - 1_000  # started 14′44″ into the window
+        gold_card(x, clock, GOLD_0600, 4000, "4000.3")
+        await t.tick()
+        self.assertEqual(len(api.sent), 1, "followed from the first tick, bought")
+        self.assertEqual(int(api.sent[0]["data"]["order"]["expiration"]) * 1000 - clock.ms, 11_000)
+        t2, api2, clock2, x2 = taker("on", RULE_GOLD_SHUT_LIVE_CENTS="90", **IN)
+        api2.markets["901"] = gold_market(GOLD_0600)
+        api2.listed.add(slug)
+        api2.books["901"] = {"bids": [], "asks": [[0.88, 20]]}
+        clock2.ms = end - R.LIVE_STOP_MS
+        gold_card(x2, clock2, GOLD_0600, 4000, "4000.3")
+        await t2.tick()
+        self.assertEqual((api2.sent, slug in t2.track), ([], False), "the last 15 s: not a window to buy in")
+        # without a price for the course a window is the rule's until 15 s before its start, as before
+        t3, api3, clock3, x3 = taker("on", **IN)
+        clock3.ms = GOLD_0600 + 60_000
+        await t3.tick()
+        self.assertEqual((slug in t3.track, t3.fast), (False, False))
+
+    async def test_in_its_course_the_reopen_buys_down_only_when_down_leads(self):
+        """盘中吃单, the reopen's first quarter hour (gold_open): Down is bought in the window's course only while the index
+        is under the start by 0.02% — by the lower of the candle and Predict's own start price. On paper: recorded once before
+        the window and once in its course; the course's part of the record reckoned apart (review, /rules)."""
+        t, api, clock, x = taker("paper", RULE_GOLD_OPEN_CENTS="50", RULE_GOLD_OPEN_LIVE_CENTS="80", RULE_OIL="off", RULE_GOLD_SHUT_CENTS="0",
+                                 RULE_GOLD_0515_CENTS="0", RULE_LEAD_MINUTES="0")
+        t.verify_tick = lambda: None
+        slug = f"xau-updown-15m-{GOLD_0700 // 1000}"
+        mkt = api.markets["907"] = gold_market(GOLD_0700, mid=907)
+        api.listed.add(slug)
+        api.books["907"] = {"bids": [[0.55, 10], [0.25, 40]], "asks": [[0.78, 40]]}  # Down for sale: 10 at 45¢, 40 at 75¢
+        clock.ms = GOLD_0700 - 60_000
+        await t.tick()
+        w = t.track[slug]
+        self.assertEqual((w["word"], R.filled(t.record(slug))), ("只记录：跌 45.0¢ × 10 份", 10.0), "before the window: the rule's 50¢")
+        clock.ms += 2_000
+        await t.tick()
+        self.assertTrue(w["word"].startswith("只记录：这一场已记过"), w["word"])
+        clock.ms = GOLD_0700 + 30_000  # the course's first minute: 只记录 waits for the course's own price
+        gold_card(x, clock, GOLD_0700, 4000, 3990)
+        await t.tick()
+        self.assertEqual((w["word"], len(t.record(slug)["orders"])), ("盘中：只记录模式从开场 1 分钟后按盘中的价格记一次（第 1 分钟的价格和盘前一样）", 1))
+        clock.ms = GOLD_0700 + 60_000
+        for card, word in (
+                (dict(line=4000, price=4000), "盘中：跌还没领先（指数 4,000，起点 4,000，要低出 0.02% 以上），不买"),
+                (dict(line=4000, price=4003), "盘中：跌还没领先（指数 4,003，起点 4,000，要低出 0.02% 以上），不买"),
+                (dict(line=4000, price="3999.5"), "盘中：跌还没领先（指数 3,999.5，起点 4,000，要低出 0.02% 以上），不买"),
+                # under the candle by 0.02%, but not under Predict's own start price by as much
+                (dict(line=4000, price="3999.2", strike="3999.6"), "盘中：跌还没领先（指数 3,999.2，起点 3,999.6，要低出 0.02% 以上），不买")):
+            clock.ms += 1_000
+            gold_card(x, clock, GOLD_0700, **card)
+            await t.tick()
+            self.assertEqual((w["word"], len(t.record(slug)["orders"])), (word, 1), str(card))
+        clock.ms += 1_000
+        gold_card(x, clock, GOLD_0700, 4000, "3999.2")  # 0.02% under the start
+        await t.tick()
+        rec = t.record(slug)
+        self.assertEqual([(o.get("live", False), o["filled"], round(o["avg"], 4), o["limit"]) for o in rec["orders"]],
+                         [(False, 10.0, 0.45, 0.5), (True, 40.0, 0.75, 0.8)],
+                         "the 40 left of the window's 50, at the course's price — the 10 at 45¢ the paper order before the window took not again")
+        self.assertEqual(w["word"], "盘中 只记录：跌 75.0¢ × 40 份")
+        self.assertIn("🧪 规则吃单·盘中（只记录，没下单）", x.notes[-1])
+        self.assertIn("黄金开盘第一档盘中 ≤80¢", x.notes[-1])
+        self.assertEqual(api.sent, [])
+        # the result: Down won
+        clock.ms = rec["end_ms"] + R.SETTLE_AFTER_MS
+        mkt["outcomes"][1]["status"] = "WON"
+        await t.tick()
+        rec = t.record(slug)
+        part = round(40 * (1 - R.fee_share(0.75, 200)) - 40 * 0.75, 4)
+        self.assertEqual((rec["result"], R.course_part(rec)[:2], round(R.course_part(rec)[2], 4)), ("down", (40.0, 30.0), part))
+        self.assertEqual(round(rec["pnl"], 4), round(part + 10 * (1 - R.fee_share(0.45, 200)) - 4.5, 4), "the two parts are the record's whole")
+        stats = R.course_stats(t.recs, "gold_open", "paper")
+        self.assertEqual(stats, {"windows": 1, "shares": 40.0, "cost": 30.0, "settled": 1, "wins": 1, "losses": 0, "pnl": part})
+        review = R.review(t.recs, t.settings, clock.ms)
+        row = next(r for r in review["rules"] if r["rule"] == "gold_open" and r["mode"] == "paper")
+        self.assertEqual((row["cents"], row["live_cents"], row["course"], row["shares"]), (50, 80, stats, 50.0))
+        self.assertEqual([(r["shares"], r["live"]) for r in review["recent"]], [(50.0, 40.0)])
+        status = t.status()
+        self.assertIn("· 黄金开盘第一档 买跌 ≤50¢｜盘中 ≤80¢（指数比起点低 0.02% 以上才买）", status)
+        self.assertIn(f"｜盘中近 30 天买到 1 场 40 份（均价 75.0¢），已结算 1 场：赢 1 输 0，{R.money(part)}", status)
+
+    async def test_in_its_course_alone_with_no_price_before_the_window(self):
+        """The price before the window 0 and one for its course: nothing is bought before the start — the market is found and its
+        book subscribed all the same, no watch of the time before the start is kept — and the course is bought as any."""
+        t, api, clock, x = taker("on", RULE_GOLD_SHUT_CENTS="0", RULE_GOLD_SHUT_LIVE_CENTS="60", **IN)
+        t.verify_tick = lambda: None
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.55, 20]]}
+        clock.ms = GOLD_0600 - 5 * 60_000
+        await t.tick()
+        w = t.track[slug]
+        self.assertEqual((w["word"], api.sent, t.stream.wanted), ("盘前不买这条（盘前价格是 0），开场 1 分钟后按盘中的价格买", [], {"901"}))
+        clock.ms = GOLD_0600 + 30_000
+        gold_card(x, clock, GOLD_0600, 4000, 4001)
+        await t.tick()
+        self.assertEqual((w["word"], api.sent), ("盘中：开场后第 1 分钟最高按盘前的价格买（盘前价格是 0，不买），1 分钟后按盘中的价格", []))
+        self.assertEqual(sum(1 for c in api.calls if c.endswith("/orderbook")), 0, "no book read for a time nothing is bought in")
+        clock.ms = GOLD_0600 + R.LIVE_FULL_MS
+        gold_card(x, clock, GOLD_0600, 4000, 4001)
+        await t.tick()
+        self.assertEqual(L.from_wei(int(api.sent[0]["data"]["order"]["takerAmount"])), 20.0)
+        self.assertNotIn("seen", t.record(slug), "no watch kept of a time the rule buys nothing in")
+        self.assertIn("· 黄金休市 4 档 买涨 盘前不买｜盘中 ≤60¢（指数比起点高 0.005% 以上才买）", t.status())
+        review = R.review(t.recs, t.settings, clock.ms)
+        self.assertEqual([(r["cents"], r["live_cents"]) for r in review["rules"] if r["rule"] == "gold_shut"], [(0, 60)])
 
     async def test_off_finishes_what_is_open_and_plans_nothing(self):
         t, api, clock, x = taker("on")

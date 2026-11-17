@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.13"
+VERSION = "1.154.14"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -631,6 +631,9 @@ RULE_DEFAULT_CENTS = {"gold_shut": 58, "gold_open": 50, "gold_0515": 58, "gold_0
 
 
 RULE_MARKET_KEYS = {"gold": ("RULE_GOLD", "RULE_GOLD_SHARES"), "oil": ("RULE_OIL", "RULE_OIL_SHARES")}  # 1.153.1: each market's switch and size
+# 1.154.14: 盘中吃单 — the rules that also buy in the window's course (rules.Rule.lead: while the index is ahead of the window's start on
+# their side), each with its own highest price there (0 = not in its course)
+RULE_LIVE_KEYS = {"gold_shut": "RULE_GOLD_SHUT_LIVE_CENTS", "gold_open": "RULE_GOLD_OPEN_LIVE_CENTS"}
 RULE_FAST_DEFAULT = "01:00-07:00"  # 1.154.12: RULE_FAST_HOURS — the Beijing hours in which the rule taker looks at every listed window each second
 
 
@@ -674,6 +677,7 @@ class RuleSettings:
     shares: tuple = (("gold", 50), ("oil", 50))
     max_day_usd: float = 0.0
     fast: tuple = ((60, 420),)  # RULE_FAST_HOURS (1.154.12): the Beijing hours of the per-second looks, minutes after midnight (day_spans)
+    live: tuple = ()            # RULE_*_LIVE_CENTS (1.154.14): (rule key, cents) — the highest price in the window's course; none or 0 = only before it
     lead_minutes: int = 300     # RULE_LEAD_MINUTES (1.154.13): how long before a window's start the makers post their orders (5 hours, 11-17) — the
     #                             rule taker sprints around that moment of every window (rules.RuleTaker.sprinting); 0 = no such moment
 
@@ -701,6 +705,10 @@ class RuleSettings:
     def on(self, market: str) -> bool:
         return market in self.markets
 
+    def live_price(self, key: str) -> int:
+        """The rule's highest price in its window's course (盘中, 1.154.14), cents; 0 = it buys before the window alone."""
+        return int(dict(self.live).get(key, 0))
+
     def shares_of(self, market: str) -> int:
         return int(dict(self.shares).get(market, 0))
 
@@ -727,13 +735,17 @@ class RuleSettings:
         lead = int(str(e.get("RULE_LEAD_MINUTES", "300")).strip() or 0)
         if not 0 <= lead <= 1440:
             raise ValueError("RULE_LEAD_MINUTES 0～1440（对手提前多少分钟挂单，规则吃单在那一刻前后每秒检查；0 = 不按这个时刻）")
+        live = {key: int(str(e.get(name, "0")).strip() or 0) for key, name in RULE_LIVE_KEYS.items()}
+        if any(not (c == 0 or 1 <= c <= 97) for c in live.values()):
+            raise ValueError("RULE_*_LIVE_CENTS 是 0（盘中不做）或 1～97（¢，开场后的最高买价）")
         if any(v not in {"on", "off"} for v in switches.values()):
             raise ValueError("RULE_GOLD、RULE_OIL 只能是 on 或 off")
         if (any(not (c == 0 or 1 <= c <= 95) for c in cents.values()) or any(not 1 <= n <= 100_000 for n in shares.values())
                 or not 0 <= max_day <= 1_000_000):
             raise ValueError("RULE_*_CENTS 是 0（不做这条规则）或 1～95（¢，最高买价）；RULE_GOLD_SHARES、RULE_OIL_SHARES 每场最多买 1～100000 份；"
                              "RULE_MAX_DAY_USD 0～1000000（每天最多花多少，0 = 不限）")
-        return cls(mode, tuple(cents.items()), frozenset(m for m, v in switches.items() if v == "on"), tuple(shares.items()), max_day, fast, lead)
+        return cls(mode, tuple(cents.items()), frozenset(m for m, v in switches.items() if v == "on"), tuple(shares.items()), max_day, fast,
+                   tuple(live.items()), lead)
 
 
 CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
@@ -830,15 +842,22 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
      "3～1440：调小就只挂快开场的几场，少占资金、少读接口，但新场次要等进了范围才挂，排在先挂的人后面"),
     ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "0～1000000，0 = 不限（默认）：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金，成交时才扣款；余额够一场双边就挂）；设了上限时每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放，/preopen 会算出把已发布的全部挂上需要多少"),
     # 1.153.0: 规则吃单 (rules.py) — the gold / oil windows the backtest found mispriced (README「规则吃单」)
-    ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段，只在开场前吃：Predict 撮合开启后到开场前 15 秒，盘口一出现规则价以内的指定方向就立即买"
-     "（盘口变化由推送送来，不等下一次读）。off 关；paper 只记录不下单：按当时盘口记下会买到多少、按 Predict 的结果结算，先看几天再开；"
+    ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段，开场前吃：Predict 撮合开启后到开场前 15 秒，盘口一出现规则价以内的指定方向就立即买"
+     "（盘口变化由推送送来，不等下一次读）；黄金休市 4 档、开盘第一档另设了盘中价格时，开场后规则方向领先也接着吃（1.154.14）。off 关；paper 只记录不下单：按当时盘口记下会买到多少、按 Predict 的结果结算，先看几天再开；"
      "on 真实吃单（需要 LIVE=on；真实交易暂停、今日亏损停机、接口限流冷却时都不下单）"),
     ("RULE_GOLD", "规则吃单：黄金", "on = 做黄金的规则（下面价格设为 0 的那条不做）；off = 黄金一条都不做"),
     ("RULE_GOLD_SHARES", "黄金：每场最多买多少份", "1～100000：黄金一个 15 分钟场次最多买这么多份（几次吃单合计）；每张单另受 LIVE_MAX_ORDER_USD 限制"),
     ("RULE_GOLD_SHUT_CENTS", "黄金休市 4 档：买涨不高于（¢）", "纽约 17:00–17:45、周一至周四 CME 每天休市的 4 个 15 分钟（北京冬令时 06:00–06:45，夏令时 05:00–05:45）："
-     "指数不动，终点等于起点按涨结算；2025-12 至 2026-11 涨占 90%，每月最低 76%。0 = 不做"),
+     "2025-12 至 2026-11 涨占 90%，每月最低 76%（到 2026-05 休市时指数不动、终点等于起点按涨结算；6 月起指数也在动，涨占 84%）。0 = 不做"),
+    ("RULE_GOLD_SHUT_LIVE_CENTS", "黄金休市 4 档·盘中：买涨不高于（¢）", "开场后也吃（1.154.14）：这一场开始后到结束前 15 秒，币安指数比这一场的起点高 0.005% 以上"
+     "（涨已经领先）时，盘口有不高于这个价的涨就买；没领先不买——开场后价格本身已经反映涨跌，只看价格会买到正在输的一边。2026-06 起休市时指数也在动"
+     "（整体涨 84%）：这 380 场里开场 2 分钟后涨领先的，最后涨占 98%（10 月最差，80%～92%）；只是不低于起点的 93%。开场后第 1 分钟最高按盘前的价格买。"
+     "和盘前共用“每场最多买多少份”；单子在这一场结束前 5 秒到期。0 = 盘中不做"),
     ("RULE_GOLD_OPEN_CENTS", "黄金开盘第一档：买跌不高于（¢）", "纽约 18:00、周一至周四每天重新开盘的第一个 15 分钟（北京冬令时 07:00，夏令时 06:00）；"
      "周一早上那场（周末后开盘）跌只占 41%，不做。2026 年周二至周五跌占 58%，近半年 78%，但前几个月是涨多：0 = 不做"),
+    ("RULE_GOLD_OPEN_LIVE_CENTS", "黄金开盘第一档·盘中：买跌不高于（¢）", "开场后也吃（1.154.14）：币安指数比这一场的起点低 0.02% 以上（跌已经领先）时，盘口有不高于这个价的跌就买；"
+     "没领先不买。2025-12 至 2026-11 的 192 场：第 1～4 分钟跌领先的，最后跌占 89%～91%（上半年只有 70%～85%），第 5 分钟后 94%～99%；"
+     "涨领先时最后跌只有 38%→20%。开场后第 1 分钟最高按盘前的价格买。和盘前共用每场份数；单子在这一场结束前 5 秒到期。0 = 盘中不做"),
     ("RULE_GOLD_0515_CENTS", "黄金纽约 05:15：买跌不高于（¢）", "纽约 05:15–05:30、周一至周五（北京冬令时 18:15，夏令时 17:15）：伦敦上午定盘前，2026 年跌占 65%，"
      "前后几档只有 38–55%；按纽约时间算，夏令时是北京 17:15 那场（北京 18:15 那时跌只占 52%）。0 = 不做"),
     ("RULE_GOLD_0500_CENTS", "黄金纽约 05:00：买涨不高于（¢）", "纽约 05:00–05:15、周一至周五（北京冬令时 18:00，夏令时 17:00），就在 05:15 那档之前："
@@ -11953,7 +11972,9 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_MAX_OPEN_USD": {"kind": "number", "group": "预挂", "presets": ["0", "1000", "5000", "7000", "20000"], "unit": "$", "zero": "不限"},
     "RULE_TAKER": {"kind": "choice", "group": "规则", "options": [["off", "off 关"], ["paper", "paper 只记录不下单"], ["on", "on 真实吃单（需要 LIVE=on）"]]},
     "RULE_GOLD_SHUT_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "55", "58", "60", "65"], "unit": "¢", "zero": "不做"},
+    "RULE_GOLD_SHUT_LIVE_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "60", "70", "80", "90"], "unit": "¢", "zero": "盘中不做"},
     "RULE_GOLD_OPEN_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "45", "48", "50", "52"], "unit": "¢", "zero": "不做"},
+    "RULE_GOLD_OPEN_LIVE_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "60", "70", "80", "90"], "unit": "¢", "zero": "盘中不做"},
     "RULE_GOLD_0515_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "50", "55", "58"], "unit": "¢", "zero": "不做"},
     "RULE_GOLD_0500_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "50", "52", "55"], "unit": "¢", "zero": "不做"},
     "RULE_GOLD_1645_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "50", "52", "55"], "unit": "¢", "zero": "不做"},
@@ -14999,8 +15020,12 @@ function rulesSection(ru){  // 规则吃单 (1.153.0): each rule's totals, the r
   const sp=ru.speed,ms=v=>v==null?"—":Math.round(v)+" ms";  // 1.154.13: the real orders against the clock
   if(sp)kids.push($("p","small mut","下单速度（近 30 天真实订单 "+num(sp.orders)+" 张，"+num(sp.filled)+" 张有成交）：盘口变化→推送到达 中位 "+ms(sp.lag)+"、到达→发出 "+ms(sp.own)+"、发出→应答 "+ms(sp.trip)));
   if((ru.rules||[]).length)kids.push(table(["规则","买","模式","场次","份数","每份成本","成本","已结算","赢/输","盈亏","待结算"],
-    ru.rules.map(r=>[r.name,side(r.side)+(r.cents?" ≤"+r.cents+"¢":"（已关）"),MODE[r.mode]||r.mode,num(r.windows),num(r.shares),r.shares?cent(r.cost/r.shares):"—",usd(r.cost),
+    ru.rules.map(r=>[r.name,side(r.side)+(r.cents?" ≤"+r.cents+"¢":r.live_cents?"（盘前不买）":"（已关）")+(r.live_cents?"｜盘中 ≤"+r.live_cents+"¢":""),MODE[r.mode]||r.mode,num(r.windows),num(r.shares),r.shares?cent(r.cost/r.shares):"—",usd(r.cost),
       num(r.settled),r.wins+"/"+r.losses,r.settled?money(r.pnl):"—",num(r.open)])));
+  const co=(ru.rules||[]).filter(r=>r.course&&r.course.windows);  // 1.154.14: of those, what was bought in the windows' course (RULE_*_LIVE_CENTS)
+  if(co.length)kids.push($("div","sub","其中盘中买的（开场后，规则方向领先时）"),table(["规则","模式","场次","份数","每份成本","成本","已结算","赢/输","盈亏"],
+    co.map(r=>[r.name,MODE[r.mode]||r.mode,num(r.course.windows),num(r.course.shares),r.course.shares?cent(r.course.cost/r.course.shares):"—",usd(r.course.cost),
+      num(r.course.settled),r.course.wins+"/"+r.course.losses,r.course.settled?money(r.course.pnl):"—"])));
   const wt=(ru.rules||[]).filter(r=>r.watch&&r.watch.watched);  // 1.153.2: what the watches saw — is a price or a size off?
   if(wt.length)kids.push($("div","sub","盘口观察（近 30 天）"),table(["规则","模式","看了几场","有规则价以内卖单","平均可买份数","最低卖价中位","撮合开启在开场前","卖单出现在开场前","没买到就没了","买到的"],
     wt.map(r=>[r.name,MODE[r.mode]||r.mode,num(r.watch.watched),num(r.watch.offered),r.watch.offer_avg==null?"—":num(r.watch.offer_avg),
@@ -15010,7 +15035,7 @@ function rulesSection(ru){  // 规则吃单 (1.153.0): each rule's totals, the r
       r.watch.won?num(r.watch.won)+" 场"+(r.watch.won_life==null?"":"（出现到被吃掉中位 "+(r.watch.won_life/1000).toFixed(1)+" 秒）"):"—"])));
   const rec=ru.recent||[];
   if(rec.length)kids.push(...bigTable("最近的场次（北京时间）",table(["场次","规则","买","份数","均价","成本","结果","盈亏","模式"],
-    rec.map(r=>[dayKey(r.start_ms).slice(5)+" "+(r.window||""),r.name,side(r.side),num(r.shares),cent(r.avg),usd(r.cost),RES[r.result]||"待结算",r.pnl==null?"—":money(r.pnl),MODE[r.mode]||r.mode])),rec.length));
+    rec.map(r=>[dayKey(r.start_ms).slice(5)+" "+(r.window||""),r.name,side(r.side),num(r.shares)+(r.live?"（盘中 "+num(r.live)+"）":""),cent(r.avg),usd(r.cost),RES[r.result]||"待结算",r.pnl==null?"—":money(r.pnl),MODE[r.mode]||r.mode])),rec.length));
   document.getElementById("a-rules").replaceChildren(...kids)}
 function analysis(){  // per setting, per underlying, per net edge and fair price at the order, per part of the underlying's day, the 15-minute windows, the pre-open quotes, the resting orders' record, the refused buys' outcomes: folded away
   const S=src(),hd=document.getElementById("anasum");filterLine(document.getElementById("anafilt"),S);
@@ -24243,6 +24268,7 @@ class Bot:
                   "RULE_TAKER": c.rules.mode, "RULE_MAX_DAY_USD": plain(c.rules.max_day_usd), **{name: str(c.rules.price(key)) for key, name in RULE_SETTING_KEYS.items()},
                   **{switch: flag(c.rules.on(mk)) for mk, (switch, _) in RULE_MARKET_KEYS.items()},
                   **{size: str(c.rules.shares_of(mk)) for mk, (_, size) in RULE_MARKET_KEYS.items()},
+                  **{name: str(c.rules.live_price(key)) for key, name in RULE_LIVE_KEYS.items()},
                   "RULE_FAST_HOURS": day_spans_text(c.rules.fast), "RULE_LEAD_MINUTES": str(c.rules.lead_minutes),
                   "SOURCES_OFF": ",".join(sorted(c.sources_off)), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
