@@ -71,6 +71,9 @@ REFRESH_FAR_MS = 900_000  # ...a window starting more than an hour away: this of
 ACCOUNT_PAGE_S = 1.5      # the account snapshot's pace: this long per page of open orders (1,140 orders = 23 pages every 35 s, not every 5), the poll at least
 REFRESH_BATCH = 8         # refresh_active: at most this many market reads an iteration, three at a time (a burst of due windows is spread)
 HOLD_RETRY_MS = 5_000     # a held candidate (hold(): a stale snapshot, the cooldown, the pause; or the budget) waits this long on the side, then is placed again — never read again meanwhile
+FRESH_FIRST_MS = 10 ** 13  # 1.154.8: a window found at its listing is queued this far ahead of any start — placed before the backlog (queue_rank)
+FIRST_SNAPSHOT_GRACE_MS = 300_000  # 1.154.8: after a start, the status re-reads and the known windows' re-reads wait for the first account snapshot
+#                                    (every placement does) — this long at most, so a snapshot failing for good stops neither
 ERROR_RETRY_MS = 30_000   # ...and one whose placement raised (a read failed, the market's tokens could not be told) this long
 HALT_MS = 180_000         # a stock card's exchange quote whose own time stands still this long in session: trading halted (a VI, a 临停)
 CARD_CHECK_MS = 5_000     # the stock cards' limit / halt check (card_hold) this often
@@ -297,6 +300,13 @@ class Ledger:
 
 class NotSent(core.RemoteError):
     """A local gate refused the request before its bytes were dispatched."""
+
+
+def queue_rank(c: dict) -> int:
+    """The placement queue's order (1.154.8): a window found at its listing first — 一有新的就挂、排在最前 (11-17: behind a backlog of
+    557 listed windows, the new listings waited 57 minutes: the queue went by start alone, theirs the latest) — then the backlog, the
+    soonest start first. An int, as the queue's entries always were (start, key, candidate)."""
+    return int(c["start_ms"]) - (FRESH_FIRST_MS if c.get("fresh") else 0)
 
 
 def safe_api(base: str, key: str, wallet: Any, before_send: Any = None, shared: Any = None) -> Any:
@@ -1349,6 +1359,9 @@ class Controller:
         self.listing_lags: collections.deque = collections.deque(maxlen=LISTING_LAGS)  # ms from a window's entry into the range to its listing seen (sprint_lead_ms)
         self.account_pages = 1  # pages the last open-order snapshot took: its pace and staleness follow (ACCOUNT_PAGE_S)
         self.account_page_rows = 0  # the rows Predict put on a full page of it (1.154.7): what LIVE_ORDERS_PAGE really got; 0 = no full page seen yet
+        self.account_started_ms = 0  # when the snapshot read under way began (1.154.8: the hold says how far the first has come)
+        self.snapshots_done = 0  # snapshots read whole since the start (1.154.8: first_snapshot_pending)
+        self.started_ms = self.now()  # the controller's start (FIRST_SNAPSHOT_GRACE_MS)
         self.account_rows: list[dict] = []  # the last complete snapshot's rows: the owner's whole-account view when its own read is cut (LiveBot.live_full_list, 1.136.2)
         self.account_read_s = 0.0  # how long the last complete snapshot read took: the staleness allows for it (1.136.1)
         self.account_failed = ""  # why the last snapshot read failed, until one succeeds (the hold names it: 1.136.1)
@@ -1528,11 +1541,24 @@ class Controller:
         if why := self.blocked():
             return why
         if not self.account_at:
-            return f"账户快照上次读取失败（{self.account_failed}），正在重读" if self.account_failed else "账户快照还没有读到（启动后第一次扫描中）"
+            if self.account_failed:
+                return f"账户快照上次读取失败（{self.account_failed}），正在重读"
+            # 1.154.8: how far the first read has come — 8,000 open orders are some 80 pages; the status re-reads and the known windows'
+            # re-reads wait for it (first_snapshot_pending), the listing probes go on (what they find waits here, ahead of the backlog)
+            pages = int((getattr(self.api, "__dict__", {}).get("paging") or {}).get("/orders", 0) or 0)
+            since = (self.now() - self.account_started_ms) // 1000 if self.account_started_ms else 0
+            return "账户快照还没有读到（启动后第一次读取中" + (f"：已 {since} 秒、读了 {pages} 页挂单" if since or pages else "") + "）"
         if self.now() - self.account_at > self.account_stale_ms():
             return (f"账户快照过期（{(self.now() - self.account_at) // 1000} 秒前读到，每 {self.account_interval_s():.0f} 秒读一次"
                     + (f"，上次读了 {self.account_read_s:.0f} 秒" if self.account_read_s >= 1 else "") + "）")
         return self.cooldown()
+
+    def first_snapshot_pending(self) -> bool:
+        """Whether the first account snapshot since the start is still to come (1.154.8): every placement waits for it (hold), so
+        the status re-reads (refresh_loop) and the known windows' re-reads (discover) leave it the key's budget — 11-17 after a
+        restart: 427 windows parked on "账户快照还没有读到", the snapshot's 80-odd pages sharing the pace with a thousand windows'
+        re-reads. FIRST_SNAPSHOT_GRACE_MS at most: a snapshot failing for good stops neither."""
+        return not self.snapshots_done and not self.account_at and self.now() - self.started_ms < FIRST_SNAPSHOT_GRACE_MS
 
     def page_rows_note(self) -> str:
         """The rows Predict really gives a page of the open-order list, beside what LIVE_ORDERS_PAGE asks (1.154.7), for /preopen."""
@@ -1710,6 +1736,7 @@ class Controller:
         dated when its read began: an order placed meanwhile is not judged by it."""
         import live
         fetched = self.now()
+        self.account_started_ms = fetched  # 1.154.8: the hold's progress note
         try:
             rows = await self.api.orders("OPEN")
             page = int(getattr(self.api, "ORDERS_PAGE", 50) or 50)
@@ -1743,6 +1770,7 @@ class Controller:
             self.account_failed = core.clean_error(error) or type(error).__name__
             raise
         self.account_read_s, self.account_failed = (self.now() - fetched) / 1000, ""
+        self.snapshots_done += 1  # 1.154.8: first_snapshot_pending
         async with self.account_lock:
             self.unmanaged, self.open_reserved, self.balance, self.unmanaged_detail = unmanaged, reserved, balance, detail
             self.listed_ids = {str(r.get("id")) for r in rows}
@@ -1902,7 +1930,8 @@ class Controller:
         sprint = self.sprinting()  # judged as the pass begins: a pass that started for a listing stays with the listings (the next tick re-reads)
         try:
             await self.probe_listings(known_before, full, attempts, strikes, st)
-            if not probe_only and not st["stopped"] and not sprint and len(self.queued) <= REREAD_QUEUE_MAX:  # 1.154.2: not while a long queue waits
+            if (not probe_only and not st["stopped"] and not sprint and len(self.queued) <= REREAD_QUEUE_MAX  # 1.154.2: not while a long queue waits
+                    and not self.first_snapshot_pending()):  # 1.154.8: nor before the first snapshot (it holds every placement: its pages first)
                 self.rescan_ms = self.now()
                 await self.reread_known(known_before, attempts, strikes, st)
         finally:
@@ -1989,7 +2018,7 @@ class Controller:
                     self.listing_lags.append(self.now() - entered)  # how long after its entry Predict listed it (sprint_lead_ms)
                 self.awaiting.pop(rolling.key, None)
                 self.note_listing(rolling, start, known_before)
-                self.enqueue(market, slug, wanted, attempts, st)
+                self.enqueue(market, slug, wanted, attempts, st, fresh=True)  # beyond the known listing: a new one, ahead of the backlog
 
         async def lead(leader: str, followers: list[str]) -> None:
             await one_card(per_card[leader])
@@ -2035,9 +2064,10 @@ class Controller:
             self.listed_at[rolling.key] = self.now()
         self.listed_by_card[rolling.key] = max(self.listed_by_card.get(rolling.key, 0), start)
 
-    def enqueue(self, market: dict, slug: str, wanted: list, attempts: dict, st: dict) -> None:
+    def enqueue(self, market: dict, slug: str, wanted: list, attempts: dict, st: dict, fresh: bool = False) -> None:
         """A listed window judged (candidate) and its wanted levels queued at once, the details just read carried along
-        (placed on, not read again: MARKET_FRESH_MS); a window that is no candidate is noted (skipped)."""
+        (placed on, not read again: MARKET_FRESH_MS); a window that is no candidate is noted (skipped). ``fresh``: found at its
+        listing (probe_listings) — queued ahead of the backlog (queue_rank, 1.154.8)."""
         self.category_full = market.get("_from") == "category"
         if market.get("id") is not None:
             self.keep_details(str(market["id"]), market)
@@ -2052,8 +2082,9 @@ class Controller:
                 self.requoted += 1
             self.queued.add(key)
             st["found"] += 1
-            self.queue.put_nowait((c["start_ms"], key, {**c, "slug": key, "window": slug, "level": level, "price": str(price), "shares": str(shares),
-                                                       "attempt": attempts.get(key, 0), "market": market, "read_ms": self.now()}))
+            item = {**c, "slug": key, "window": slug, "level": level, "price": str(price), "shares": str(shares),
+                    "attempt": attempts.get(key, 0), "market": market, "read_ms": self.now(), "fresh": fresh}
+            self.queue.put_nowait((queue_rank(item), key, item))
 
     def keep_details(self, market_id: str, market: dict) -> None:
         """A window's details as just read (place_pair reuses them for its other levels); the ones past MARKET_REUSE_MS let go."""
@@ -2711,7 +2742,7 @@ class Controller:
                 self.queued.discard(slug)
             elif self.now() >= at:
                 del self.parked[slug]
-                self.queue.put_nowait((c["start_ms"], c["slug"], c))
+                self.queue.put_nowait((queue_rank(c), c["slug"], c))
 
     async def account_loop(self) -> None:
         """The account snapshot (the open orders, the fills they show, the balance) every poll, on its own: the discovery
@@ -2773,7 +2804,7 @@ class Controller:
     async def refresh_loop(self) -> None:
         while not self.stopped():
             try:
-                if not self.blocked():
+                if not self.blocked() and not self.first_snapshot_pending():  # 1.154.8: the first snapshot's pages first
                     await self.refresh_active()
             except asyncio.CancelledError:
                 raise
@@ -3021,7 +3052,7 @@ class Controller:
                 f"队列 {self.queue.qsize() + len(self.parked)} 场" + (f"（{len(self.parked)} 场在等，见暂不新挂）" if self.parked else "") + f"；{listed}"
                 + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"
                 f"预留 {self.risk():.2f}U{f' / 限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '，不设上限'}（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉的场次在撤单 {LATE_FILL_MS // 1000} 秒后读到一份没成交才释放）"
-                + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {self.risk() + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，按开场先后补挂中") if pairs_left else "")
+                + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {self.risk() + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，新发布的先挂，其余按开场先后补挂中") if pairs_left else "")
                 + (f"\n请求约 {self.request_rate():.1f} 次/秒（最近一分钟）；" if self.request_rate() is not None else "\n")
                 + self.pace_line()
                 + f"账户快照每 {self.account_interval_s():.0f} 秒（{self.account_pages} 页挂单" + self.page_rows_note()

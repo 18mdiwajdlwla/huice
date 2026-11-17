@@ -840,12 +840,14 @@ class PredictApi:
         limit = self.ORDERS_PAGES_MAX if not cap else max(1, int(cap))
         pages = limit if not max_pages else max(1, min(limit, int(max_pages)))
         asked = full = 0  # requests made; rows of a page that had a next one (a full page: Predict's real page size)
+        self.__dict__.setdefault("paging", {})[path] = 0
         for _ in range(pages):
             q = {**query, "first": self.ORDERS_PAGE}
             if after:
                 q["after"] = after
             data = await self.authed("GET", f"{path}?{core.urllib.parse.urlencode(q)}")
             asked += 1
+            self.__dict__.setdefault("paging", {})[path] = asked  # the read under way, page by page (1.154.8: the pre-open hold's progress)
             page = self.rows(data)
             rows.extend(page)
             cursor = data.get("cursor") if isinstance(data, dict) else None
