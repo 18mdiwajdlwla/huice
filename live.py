@@ -706,6 +706,7 @@ class PredictApi:
                 self.blocked_until = max(self.blocked_until, time.monotonic() + max(error.retry_after, self.BACKOFF_SECONDS))
                 if http_status(error) == 429:
                     self.limited.append(time.monotonic())
+                    core.predict_pacer(self.api_key).note_429()  # the key's minute then, for /diag (1.154.5)
             raise
 
     async def authed(self, method: str, path: str, payload: dict | None = None, timeout: int = API_TIMEOUT, priority: bool = False) -> Any:
@@ -3233,7 +3234,7 @@ class LiveBot(core.Bot):
             out.append(f"原策略 {(samples[-1][1] - samples[0][1]) / (samples[-1][0] - samples[0][0]):.1f}")
         feed = getattr(getattr(self, "predict", None), "rate", None)
         if callable(feed) and (rate := feed()) is not None:
-            out.append(f"盘口 {rate:.1f}")
+            out.append(f"盘口 {rate:.1f}" + ("（专用 Key）" if self.book_own_key() else ""))
         preopen = getattr(self, "preopen", None)
         if preopen is not None and (rate := preopen.request_rate()) is not None:
             out.append(f"预挂 {rate:.1f}" + ("（专用 Key）" if self.preopen_own_key() else ""))
@@ -3244,15 +3245,31 @@ class LiveBot(core.Bot):
         own = str(getattr(self.config, "preopen_api_key", "") or "")
         return own if own and own != str(getattr(self.config, "predict_api_key", "") or "") else ""
 
+    def book_own_key(self) -> str:
+        """PREDICT_BOOK_API_KEY when it is a key other than the bot's own (the orderbook feed's requests then count on it), else ""."""
+        own = str(getattr(self.config, "predict_book_api_key", "") or "")
+        return own if own and own != str(getattr(self.config, "predict_api_key", "") or "") else ""
+
     def live_key_load(self) -> str:
         """Each API key's requests in the last 60 seconds, every client's on it (core.PredictPacer counts what it lets through),
         beside the pace and Predict's default limit — /diag (1.154.3): how near each key is to a 429, which the clients' own
         rates (live_request_rates) only add up to when nothing else is on the key (the rule taker, /diag's own reads are).
+        1.154.5: the orderbook feed's own key too (PREDICT_BOOK_API_KEY), and a key's 429s of the last day with the count it
+        had let through in the minute before each — below Predict's 240, the limit is not counted the way the pacer counts.
         The keys themselves are never shown."""
         keys = [("主 Key", str(getattr(self.config, "predict_api_key", "") or ""))]
         if own := self.preopen_own_key():
             keys.append(("预挂专用 Key", own))
-        parts = [f"{name} {pacer.last_minute()} 次" for name, key in keys if (pacer := core.PREDICT_PACERS.get(key)) is not None]
+        if (book := self.book_own_key()) and book != own:
+            keys.append(("盘口专用 Key", book))
+        parts, day = [], time.monotonic() - 86400
+        for name, key in keys:
+            pacer = core.PREDICT_PACERS.get(key)
+            if pacer is None:
+                continue
+            hits = [n for t, n in getattr(pacer, "limits", ()) if t >= day]
+            parts.append(f"{name} {pacer.last_minute()} 次"
+                         + (f"（24 小时内 429 {len(hits)} 次，当时前 60 秒 {min(hits)}～{max(hits)} 次）" if hits else ""))
         if not parts:
             return ""
         return "、".join(parts) + f"（节流每分钟 {core.PREDICT_RATE['per_min']:g} 次，Predict 默认上限 240）"

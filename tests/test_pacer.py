@@ -90,10 +90,44 @@ async def run() -> None:
                 m.predict_pacer(key).sent.append(time.monotonic())
         ns = types.SimpleNamespace(config=types.SimpleNamespace(predict_api_key="main-key", preopen_api_key="second-key"))
         ns.preopen_own_key = lambda: L.LiveBot.preopen_own_key(ns)
+        ns.book_own_key = lambda: L.LiveBot.book_own_key(ns)
         line = L.LiveBot.live_key_load(ns)
         assert line.startswith("主 Key 3 次、预挂专用 Key 7 次（节流每分钟 200 次") and "main-key" not in line and "second-key" not in line, line
         ns.config.preopen_api_key = "main-key"  # set to the bot's own key: one key, one figure
         assert L.LiveBot.live_key_load(ns).startswith("主 Key 3 次（"), L.LiveBot.live_key_load(ns)
+        # 1.154.5: the orderbook feed's own key (PREDICT_BOOK_API_KEY), and each 429 with the count the key had let through in the minute
+        # before it (11-17: seven on the bot's key in nine minutes at this pace — is Predict counting as the pacer does?)
+        ns.config.preopen_api_key, ns.config.predict_book_api_key = "second-key", "book-key"
+        for _ in range(5):
+            m.predict_pacer("book-key").sent.append(time.monotonic())
+        main_pacer = m.predict_pacer("main-key")
+        main_pacer.note_429()
+        main_pacer.sent.extend([time.monotonic()] * 4)
+        main_pacer.note_429()
+        line = L.LiveBot.live_key_load(ns)
+        assert line.startswith("主 Key 7 次（24 小时内 429 2 次，当时前 60 秒 3～7 次）、预挂专用 Key 7 次、盘口专用 Key 5 次（节流每分钟 "), line
+        assert "book-key" not in line
+        feed_cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREDICT_API_KEY": "main-key", "PREDICT_BOOK_API_KEY": " book-key "})
+        book_feed = m.PredictFeed(feed_cfg)
+        assert (feed_cfg.predict_book_api_key, book_feed.api_key(), book_feed.headers()) == ("book-key", "book-key", {"x-api-key": "book-key"})
+        assert m.PredictFeed(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREDICT_API_KEY": "main-key"})).headers() == {"x-api-key": "main-key"}
+        paced = []
+        real_pacer = m.predict_pacer
+
+        def watching(key):
+            paced.append(key)
+            return real_pacer(key)
+        real_blocking, m.predict_pacer = m.predict_blocking, watching
+
+        async def answered(fn, *args):
+            return b'{"data": {"bids": [], "asks": []}}'
+        m.predict_blocking = answered
+        try:
+            await book_feed.fetch(m.PREDICT_REST + "/markets/1/orderbook")
+        finally:
+            m.predict_pacer, m.predict_blocking = real_pacer, real_blocking
+        assert paced == ["book-key"], ("the feed's reads on its own key's budget", paced)
+        ns.config.predict_book_api_key = ""
         # the clients' rates: the pre-open mode's said to be on its own key
         ns.config.preopen_api_key, ns.live_rate_samples, ns.predict = "second-key", [], None
         ns.preopen = types.SimpleNamespace(request_rate=lambda: 2.8)

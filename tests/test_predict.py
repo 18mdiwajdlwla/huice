@@ -95,9 +95,9 @@ async def run():
         if url.endswith("/markets/901/orderbook"):
             return {"success": True, "data": {"marketId": 901, "bids": [["0.81", "400"], ["0.80", "110"]], "asks": [["0.85", "12"], ["0.94", "157.4"]]}}
         if url.endswith("/markets/902/orderbook"):
-            raise m.RemoteError("HTTP 404: 接口请求失败")
-        if url.endswith("/markets/0xd/orderbook"):
             return {"data": {"bids": [], "asks": [["0.4", "50"]]}}
+        if url.endswith("/markets/0xd/orderbook"):  # 1.154.5: Predict's path takes the integer id (a conditionId: HTTP 400) — never asked
+            raise AssertionError("a conditionId asked for: " + url)
         raise AssertionError(url)
     bot.predict.fetch = fetch
     outcome = await bot.predict.refresh(targets)
@@ -106,26 +106,42 @@ async def run():
     assert await bot.predict.refresh(targets) is False  # not due yet
     books, errors = bot.predict.books, bot.predict.errors
     assert books["SSE"].bid == (D("0.81"), D("400"))
-    assert books["CXMTUSDT"].ask == (D("0.4"), D("50")) and bot.predict.book_keys["902"] == "0xd"  # id 404 → conditionId
+    assert books["CXMTUSDT"].ask == (D("0.4"), D("50")) and bot.predict.book_keys["902"] == "902"  # 1.154.5: by its integer id (the conditionId fallback is gone: Predict answers it 400)
     assert "还没有这个市场" in errors["UNITREEUSDT"] and "还没有这个市场" in errors["KOSPI"]
     assert "网络错误" in errors["HSI"] and want["HSI"] not in bot.predict.markets  # unknown ≠ not listed: retried next tick
     assert bot.predict.markets[want["UNITREEUSDT"]][0] is None  # cached miss: not looked up again next tick
     n = len(calls); bot.predict.refreshed = -1e9
     await bot.predict.refresh(targets)
-    assert not any(want["UNITREEUSDT"] in u for u, _ in calls[n:]) and any(u.endswith("/markets/0xd/orderbook") for u, _ in calls[n:])
-    assert not any("/markets/902/orderbook" in u for u, _ in calls[n:]), "the key that answered is tried first"
+    assert not any(want["UNITREEUSDT"] in u for u, _ in calls[n:]) and any(u.endswith("/markets/902/orderbook") for u, _ in calls[n:])
+    assert sum(u.endswith("/markets/902/orderbook") for u, _ in calls[n:]) == 1, "one request a market: by its id (1.154.5)"
+    # 1.154.5: an id Predict does not answer (a 404): no second request with the conditionId (11-17: answered 400, which then stood in
+    # /diag for the id's own answer) — the id's answer is the error
+    asked_books = []
+
+    async def refused(url, payload=None):
+        asked_books.append(url)
+        raise m.RemoteError("HTTP 404: 接口请求失败")
+    fake_fetch, bot.predict.fetch = bot.predict.fetch, refused
+    try:
+        await bot.predict.orderbook({"id": "903", "conditionId": "0xe"})
+        raise AssertionError("no book to be had")
+    except m.RemoteError as error:
+        assert "HTTP 404" in str(error), error
+    finally:
+        bot.predict.fetch = fake_fetch
+    assert asked_books == [m.PREDICT_REST + "/markets/903/orderbook"], asked_books
     # tiered polling (1.61.0): the hot keys every round, a cold key only every PREDICT_COLD_POLL_SECONDS; a key with no book yet every round
     n = len(calls); bot.predict.refreshed = -1e9
     await bot.predict.refresh(targets, hot={"SSE"})
-    assert any(u.endswith("/markets/901/orderbook") for u, _ in calls[n:]) and not any(u.endswith("/markets/0xd/orderbook") for u, _ in calls[n:]), calls[n:]
+    assert any(u.endswith("/markets/901/orderbook") for u, _ in calls[n:]) and not any(u.endswith("/markets/902/orderbook") for u, _ in calls[n:]), calls[n:]
     assert any(want["HSI"] in str(v) for _, v in calls[n:]), "HSI (no book) is still asked every round"
     info = bot.predict.round_info  # the round's size and its slowest key, for /diag (1.67.0)
     assert info["keys"] >= 4 and info["rows"] == 0 and info["slowest"][0] in targets and info["ms"] >= 0, info
     bot.predict.key_refreshed["CXMTUSDT"] -= 61; n = len(calls); bot.predict.refreshed = -1e9
     await bot.predict.refresh(targets, hot={"SSE"})
-    assert not any(u.endswith("/markets/0xd/orderbook") for u, _ in calls[n:]), "the cold round runs beside the hot one, not in it (1.63.0)"
+    assert not any(u.endswith("/markets/902/orderbook") for u, _ in calls[n:]), "the cold round runs beside the hot one, not in it (1.63.0)"
     await bot.predict.cold_task
-    assert any(u.endswith("/markets/0xd/orderbook") for u, _ in calls[n:]), "cold, and due again"
+    assert any(u.endswith("/markets/902/orderbook") for u, _ in calls[n:]), "cold, and due again"
     assert m.time.monotonic() - bot.predict.key_refreshed["CXMTUSDT"] < 5
     # the feed tells the trader when a key's books are in (1.66.0: the express lane); a key without a book is not announced
     seen_keys = []

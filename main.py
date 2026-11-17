@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.4"
+VERSION = "1.154.5"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -979,6 +979,8 @@ class Config:
     live_orders_page: int = 50         # LIVE_ORDERS_PAGE: orders per page when the account's open list is read (a page is a round trip; 1.112.1)
     predict_rate_per_min: float = 220.0  # PREDICT_RATE_PER_MIN: every API key's requests paced to this many a minute (PredictPacer, 1.154.0); 0 = no pacing
     preopen_api_key: str = ""          # PREOPEN_API_KEY: a second Predict API key for the pre-open mode alone — its own request budget (1.154.0)
+    predict_book_api_key: str = ""     # PREDICT_BOOK_API_KEY: a Predict API key for the orderbook feed alone (its REST reads and push) — its own budget,
+    #                                    so the model trader's orders and sync never queue behind the book reads (1.154.5); unset: PREDICT_API_KEY
     live_max_open_usd: float = 500.0   # LIVE_MAX_OPEN_USD: filled positions plus resting orders, at cost
     live_max_daily_loss_usd: float = 200.0  # LIVE_MAX_DAILY_LOSS_USD: realised loss per Beijing day that stops new orders; 0 = no limit
     live_auto_redeem: bool = True      # LIVE_AUTO_REDEEM: redeem resolved positions for USDT on-chain
@@ -1200,6 +1202,7 @@ class Config:
             live_orders_page=bounded_int(e, "LIVE_ORDERS_PAGE", 50, 10, 500),
             predict_rate_per_min=float(bounded_int(e, "PREDICT_RATE_PER_MIN", 220, 0, 100_000)),
             preopen_api_key=str(e.get("PREOPEN_API_KEY", "")).strip(),
+            predict_book_api_key=str(e.get("PREDICT_BOOK_API_KEY", "")).strip(),
             live_max_open_usd=parse_bounded(e, "LIVE_MAX_OPEN_USD", "500", 1, 100_000_000),
             live_max_daily_loss_usd=parse_bounded(e, "LIVE_MAX_DAILY_LOSS_USD", "200", 0, 100_000_000),
             live_auto_redeem=not off(e.get("LIVE_AUTO_REDEEM", "on")),
@@ -5438,6 +5441,7 @@ class PredictPacer:
         self.at = time.monotonic()
         self.waited = 0.0  # seconds the reads have waited for a token, in all (/diag)
         self.sent: collections.deque = collections.deque(maxlen=4096)  # monotonic times of the requests let through (/diag: the key's minute)
+        self.limits: collections.deque = collections.deque(maxlen=200)  # (monotonic, the minute's count then) at each 429 on the key (note_429)
 
     def refill(self) -> None:
         now = time.monotonic()
@@ -5461,6 +5465,11 @@ class PredictPacer:
         """The requests let through on the key in the last 60 seconds, every client's (what Predict's per-minute limit counts)."""
         cut = time.monotonic() - 60.0
         return sum(1 for t in self.sent if t >= cut)
+
+    def note_429(self) -> None:
+        """A 429 answered on this key (1.154.5): how many requests the key had let through in the 60 seconds before it — /diag
+        sets it beside Predict's 240 (11-17: seven 429s on the bot's key in nine minutes at this pace, none on the pre-open key)."""
+        self.limits.append((time.monotonic(), self.last_minute()))
 
 
 PREDICT_PACERS: dict[str, PredictPacer] = {}
@@ -6050,7 +6059,12 @@ class PredictFeed:
         self.express_dirty: set[str] = set()                     # item keys whose books came in during their look: looked at once more after it
 
     def headers(self) -> dict[str, str]:
-        return {"x-api-key": self.config.predict_api_key} if self.config.predict_api_key else {}
+        return {"x-api-key": key} if (key := self.api_key()) else {}
+
+    def api_key(self) -> str:
+        """The key this feed's requests go out with: PREDICT_BOOK_API_KEY when set (its own budget and cooldown, 1.154.5),
+        else the bot's PREDICT_API_KEY (the trading clients' too)."""
+        return str(getattr(self.config, "predict_book_api_key", "") or "") or self.config.predict_api_key
 
     def rate(self) -> float | None:
         """Requests a second over the last minute (the REST reads: books, markets), or None before two samples."""
@@ -6067,7 +6081,7 @@ class PredictFeed:
         if left > 0:
             raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
         if url.startswith(PREDICT_REST):
-            await predict_pacer(self.config.predict_api_key).take()  # the key's budget, shared with the trading clients (1.154.0)
+            await predict_pacer(self.api_key()).take()  # the key's budget, shared with the trading clients (1.154.0) unless the feed has its own (1.154.5)
         async with self.gate:
             # 1.150.0: a cooldown that began while this request waited for its slot (another read's 429) is honoured here too,
             # as live.py's send() does since 1.138.0: nothing queued behind the PREDICT_PARALLEL in flight goes out into it.
@@ -6086,6 +6100,7 @@ class PredictFeed:
                     self.blocked_until = max(self.blocked_until, time.monotonic() + max(error.retry_after, PREDICT_BACKOFF_SECONDS))
                     if "429" in str(error):
                         self.limited.append(time.monotonic())  # /diag (1.138.0)
+                        predict_pacer(self.api_key()).note_429()  # ...and the key's minute then (1.154.5)
                 raise
         try:
             return json.loads(raw)
@@ -6201,7 +6216,11 @@ class PredictFeed:
         return found
 
     async def orderbook(self, market: dict) -> tuple[tuple, tuple, str]:
-        keys = [k for k in dict.fromkeys([self.book_keys.get(market["id"]), market["id"], market.get("conditionId")]) if k]
+        # 1.154.5: Predict's path takes the market's integer id — anything else is answered 400 ("failed to parse path `param0`
+        # ... integer_int64"), so a conditionId (0x…) is tried no more: 11-17, each failing level of BNB-2027 sent a second request a
+        # round for that 400, which then stood in /diag for the id's own answer
+        keys = [k for k in dict.fromkeys([self.book_keys.get(market["id"]), market["id"], market.get("conditionId")])
+                if k and (k == market["id"] or str(k).isdigit())]
         last = ""
         for key in keys:
             try:
@@ -6383,13 +6402,18 @@ class PredictFeed:
             self.errors[key] = f"Predict 上还没有这个市场（{slug}）"
             return 0
         have, read_at, now = self.ladder_rows.get(key) or {}, self.row_refreshed.setdefault(key, {}), time.monotonic()
+        # 1.154.5: a level the stream keeps current is read only as a check, every PREDICT_PUSH_CHECK_SECONDS — not by every
+        # hot round (a hot one), nor every PREDICT_COLD_POLL_SECONDS (a cold one)
+        pushed = self.pushed_rows(key)
+        checked = lambda mid: now - read_at.get(mid, -1e9) >= PREDICT_PUSH_CHECK_SECONDS
         if only is None:
-            due = list(markets)
+            due = [m for m in markets if m["id"] not in pushed or checked(m["id"])]
         else:
-            due = [m for m in markets if m["id"] in only or m["id"] not in have]
+            due = [m for m in markets if (m["id"] in only and m["id"] not in pushed) or m["id"] not in have]
             if aged:
                 cold = getattr(self.config, "predict_cold_poll", 0) or 0
-                due += [m for m in markets if m["id"] in have and m["id"] not in only and now - read_at.get(m["id"], -1e9) >= cold]
+                due += [m for m in markets if m["id"] in have and (m["id"] not in only or m["id"] in pushed)
+                        and (checked(m["id"]) if m["id"] in pushed else now - read_at.get(m["id"], -1e9) >= cold)]
         for m in due:
             read_at[m["id"]] = now
         # each level's book is published as it arrives — the express lane looks at it at once — not after the slowest of
@@ -6491,7 +6515,11 @@ class PredictFeed:
     def stream_targets(self, hot: set[str] | None, rows: set[str] | None) -> dict[str, tuple[str, bool]]:
         """Market id -> (item key, a ladder level?) for the stream (PredictStream.want): the hot single markets whose
         book is in hand (a push needs one to put its levels into: the slug, the title, the fee come from the REST read)
-        and, of the hot ladders, the hot levels; ``hot`` None (no trader): every single market, no ladder level."""
+        and, of the hot ladders, the hot levels; then (1.154.5) every other ladder level whose book is in hand — the REST
+        rounds read a pushed level only as a check, every PREDICT_PUSH_CHECK_SECONDS (refresh_ladder): 11-17, the cold
+        ladders' levels, all of them every PREDICT_COLD_POLL_SECONDS, were much of the key's reads. The hot levels stay
+        first, so the topic cap (PREDICT_WS_MAX_TOPICS) trims the others. ``hot`` None (no trader): every single market,
+        no ladder level."""
         ids = {book.market_id: (key, False) for key, book in self.books.items()
                if book.market_id and (hot is None or key in hot) and key not in self.ladder_keys}
         if hot is not None:
@@ -6499,7 +6527,22 @@ class PredictFeed:
                 for mid, row in (self.ladder_rows.get(key) or {}).items():
                     if row.book is not None and (rows is None or mid in rows):
                         ids[mid] = (key, True)
+            for key in sorted(self.ladder_keys):
+                for mid, row in (self.ladder_rows.get(key) or {}).items():
+                    if row.book is not None and mid not in ids:
+                        ids[mid] = (key, True)
         return ids
+
+    def pushed_rows(self, key: str) -> set[str]:
+        """A ladder's levels the stream keeps current (1.154.5): pushed on this connection, the book's age within
+        PREDICT_PUSH_FRESH_MS (the heartbeat restarts it while the topic lives). The REST rounds leave them to the stream,
+        as the hot round does a pushed single market (refresh's pushing), and read each every PREDICT_PUSH_CHECK_SECONDS
+        as a check."""
+        if not self.stream.connected_at:
+            return set()
+        wall = int(time.time() * 1000)
+        return {mid for mid, row in (self.ladder_rows.get(key) or {}).items()
+                if row.book is not None and mid in self.stream.live and 0 <= wall - int(row.book.fetched_ms or 0) <= PREDICT_PUSH_FRESH_MS}
 
     async def refresh_cold(self, due: dict[str, str], aged: dict[str, str] | None = None) -> None:
         """The cold keys' round (refresh), and the cold levels of the hot ladders (``aged``: key -> slug): marked as
@@ -6647,7 +6690,9 @@ class PredictFeed:
                     and str(book.market_id) in self.stream.live and 0 <= wall - int(book.fetched_ms or 0) <= PREDICT_PUSH_FRESH_MS)
         due = {key: slug for key, slug in targets.items()
                if (hot is None or key in hot or (key not in self.books and key not in self.ladders)) and not pushing(key)}
-        cold_due = {key: slug for key, slug in targets.items() if key not in due and now - self.key_refreshed.get(key, -1e9) >= cold}
+        # 1.154.5: a pushed single market is checked by REST every PREDICT_PUSH_CHECK_SECONDS, a cold one read every PREDICT_COLD_POLL_SECONDS
+        cold_due = {key: slug for key, slug in targets.items() if key not in due
+                    and now - self.key_refreshed.get(key, -1e9) >= (max(cold, PREDICT_PUSH_CHECK_SECONDS) if pushing(key) else cold)}
         read = await asyncio.gather(*(self.refresh_timed(key, slug, hot_rows if hot is not None else None) for key, slug in due.items()))
         for key in due:
             self.key_refreshed[key] = now
@@ -6655,8 +6700,9 @@ class PredictFeed:
                            "ms": int((time.monotonic() - now) * 1000),
                            "slowest": max(((key, self.key_ms.get(key, 0)) for key in due), key=lambda kv: kv[1], default=None)}
         # of a hot ladder, the levels nobody is near follow the cold cadence too (refresh_ladder read only the hot ones)
+        # (and, 1.154.5, a hot level the stream pushes — left out of the hot round — is checked every PREDICT_PUSH_CHECK_SECONDS)
         aged = {key: slug for key, slug in due.items() if key in self.ladder_keys and hot is not None and hot_rows is not None
-                and any(mid not in hot_rows and now - at >= cold for mid, at in self.row_refreshed.get(key, {}).items())}
+                and any(now - at >= (PREDICT_PUSH_CHECK_SECONDS if mid in hot_rows else cold) for mid, at in self.row_refreshed.get(key, {}).items())}
         if (cold_due or aged) and (self.cold_task is None or self.cold_task.done()):
             # beside the hot round, never in it: forty ladder levels must not hold the daily cards' books back
             self.cold_task = asyncio.create_task(self.refresh_cold(cold_due, aged), name="predict-cold")
@@ -6676,9 +6722,14 @@ PREDICT_WS_BACKOFF = (2.0, 300.0)           # the wait before a new connection: 
 PREDICT_WS_MAX_TOPICS = 80                  # subscriptions at once: the single markets first, then the hot ladder levels
 PREDICT_WS_RETRY_TOPIC_SECONDS = 300.0      # a topic the server refused (invalid_topic) is asked for again after this long
 PREDICT_WS_SYNC_SECONDS = 30.0              # the subscriptions are brought in step with the wants at least this often
-PREDICT_PUSH_FRESH_MS = 5_000               # a single market pushing on this connection whose book is this fresh is not re-read by the hot REST round:
-#                                             the cold round reads it every PREDICT_COLD_POLL_SECONDS as a check (1.138.2: the hot round re-read every
-#                                             pushed market every few seconds — 9.8 requests a second, 402 reads in six minutes and none differing)
+PREDICT_PUSH_FRESH_MS = 20_000              # a market pushing on this connection whose book is this fresh is not re-read by the hot REST round (1.138.2:
+#                                             the hot round re-read every pushed market every few seconds — 9.8 requests a second, 402 reads in six minutes
+#                                             and none differing). 1.154.5: 20 s, was 5 — a quiet market is not re-sent every second (11-17: 635 re-sends in
+#                                             516 s over 24 topics); its age restarts at each heartbeat (15 s, touch) while its topic lives, so with 5 s it
+#                                             counted as pushing a third of the time and the hot round read it again two rounds in three, on a key that was
+#                                             full. A topic gone silent is not restarted (touch) and ages past this: read again, as before
+PREDICT_PUSH_CHECK_SECONDS = 120.0          # 1.154.5: a pushed market (a single one, a ladder's level) is checked by REST this often (the cold round) —
+#                                             not every PREDICT_COLD_POLL_SECONDS: 11-17, "REST 覆盖推送 36 次，其中盘口不同 0 次"
 
 
 async def ws_connect(url: str, headers: dict[str, str]) -> Any:
