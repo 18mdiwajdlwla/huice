@@ -354,10 +354,11 @@ def candidate_problem(market: dict, now_ms: int, config: Any, settings: Settings
             return "不在 PREOPEN_MARKETS 里"
         if not rolling.on_grid(start):
             return "链接里的时间不在场次边界上"
-        if start - now_ms < settings.entry_seconds * 1000:
-            return "已开始或不足 3 分钟"
-        if start - now_ms > settings.ahead_minutes * 60_000:
-            return f"开始还在 {settings.ahead_minutes} 分钟之外（之后再扫）"
+        timed = settings.timing(rolling.key)  # 1.152.0: BTC 5-minute's own entry cut-off and horizon
+        if start - now_ms < timed.entry_seconds * 1000:
+            return "已开始或不足 3 分钟" if timed.entry_seconds == 180 else f"已开始或不足 {timed.entry_seconds} 秒"
+        if start - now_ms > timed.ahead_minutes * 60_000:
+            return f"开始还在 {timed.ahead_minutes} 分钟之外（之后再扫）"
         holidays = config.holidays.get(rolling.exchange, frozenset()) if rolling.exchange else frozenset()
         if not rolling.exists(start, holidays):
             return "不在交易时段内"
@@ -384,8 +385,9 @@ def candidate(market: dict, now_ms: int, config: Any, settings: Settings) -> dic
     slug = str(market.get("categorySlug") or market.get("slug") or "")
     rolling, start = next((r, s) for r in core.preopen_cards() if (s := r.start_of(slug)) is not None)
     spec = rolling.window_spec(start)
+    timed = settings.timing(rolling.key)  # 1.152.0: BTC 5-minute's own cancel time and signed expiry
     return {"slug": slug, "key": rolling.key, "market_id": str(market["id"]), "start_ms": start, "end_ms": rolling.end_of(start),  # 1.142.0: settled after the end
-            "cancel_ms": start - settings.cancel_seconds * 1000, "expires": start // 1000 - settings.expiry_seconds,
+            "cancel_ms": start - timed.cancel_seconds * 1000, "expires": start // 1000 - timed.expiry_seconds,
             "day": dt.datetime.fromtimestamp(start / 1000, core.BEIJING).date().isoformat(), "name": spec.name}
 
 
@@ -454,8 +456,9 @@ def window_starts(now_ms: int, config: Any, settings: Settings) -> list[tuple[An
         if rolling.key not in settings.markets:
             continue
         holidays = config.holidays.get(rolling.exchange, frozenset()) if rolling.exchange else frozenset()
-        start = rolling.first_start(now_ms + settings.entry_seconds * 1000)
-        while start <= now_ms + settings.ahead_minutes * 60_000:
+        timed = settings.timing(rolling.key)  # 1.152.0: BTC 5-minute's own entry cut-off and horizon
+        start = rolling.first_start(now_ms + timed.entry_seconds * 1000)
+        while start <= now_ms + timed.ahead_minutes * 60_000:
             if (rolling.exists(start, holidays) and not market_shut(rolling, start) and not session_opening(rolling, start, holidays, quiet_ms)
                     and (weekend or not on_weekend(start))):
                 out.append((rolling, start))
@@ -1737,8 +1740,8 @@ class Controller:
             return False  # 1.150.1: gold's and oil's windows in CME's shut, quoted before the rule: withdrawn
         if not self.settings.weekend and on_weekend(int(pair["start_ms"])):
             return False  # 1.136.0: the weekend switched off since it was quoted: withdrawn
-        if int(pair.get("expires") or 0) != pair["start_ms"] // 1000 - self.settings.expiry_seconds:
-            return False
+        if int(pair.get("expires") or 0) != pair["start_ms"] // 1000 - self.settings.timing(str(pair.get("key") or "")).expiry_seconds:
+            return False  # signed to expire otherwise than the card's expiry says now (1.152.0: BTC 5-minute's own)
         price, shares = pair_quote(pair)
         index = int(pair.get("level") or 0)
         level = self.settings.levels[index] if index < len(self.settings.levels) else None
@@ -1762,7 +1765,7 @@ class Controller:
                     pair.update(price=str(price), shares=str(int(shares) if shares == int(shares) else shares))
                     self.ledger.save(pair)
             if pair["phase"] == "active" and self.resumable(pair):
-                pair["cancel_ms"] = pair["start_ms"] - self.settings.cancel_seconds * 1000
+                pair["cancel_ms"] = pair["start_ms"] - self.settings.timing(str(pair.get("key") or "")).cancel_seconds * 1000
                 self.ledger.save(pair)
                 self.resumed += 1
                 if pair.get("key"):  # the listing horizon as the records know it: the status's 发布到, and the discovery's "beyond the listing", from the start
@@ -1779,7 +1782,7 @@ class Controller:
         1.131.6, a withdrawal that was not its doing is free). Accounted means every order verified and nothing filled."""
         if pair["phase"] == "active" or not pair.get("accounted"):
             return False
-        if pair["start_ms"] - self.now() < self.settings.entry_seconds * 1000:
+        if pair["start_ms"] - self.now() < self.settings.timing(str(pair.get("key") or "")).entry_seconds * 1000:
             return False
         if any(o["state"] == "rejected" and not o.get("limited") or o.get("refused") for o in pair["orders"].values()):
             return False  # Predict's refusal, outright or deferred (monitor_pair): the same order would be refused again
@@ -1940,7 +1943,7 @@ class Controller:
                     return  # this card's pass ends here (a 429, the cooldown, a timeout): what was found is queued, the rest read next time
                 if market is None:
                     if first:  # the card's next window is in the range and not listed yet: Predict lists it about a minute on — the sprint (poll_wait)
-                        self.awaiting[rolling.key] = start - self.settings.ahead_minutes * 60_000
+                        self.awaiting[rolling.key] = start - self.settings.timing(rolling.key).ahead_minutes * 60_000
                     first = False
                     misses += 1
                     continue
@@ -2649,7 +2652,7 @@ class Controller:
         """The held candidates whose wait is over go back on the queue (the soonest first); one whose window is too close
         to its start is dropped, as the discovery would not take it either."""
         for slug, (at, c) in list(self.parked.items()):
-            if c["start_ms"] - self.now() < self.settings.entry_seconds * 1000:
+            if c["start_ms"] - self.now() < self.settings.timing(str(c.get("key") or "")).entry_seconds * 1000:
                 del self.parked[slug]
                 self.queued.discard(slug)
             elif self.now() >= at:
@@ -2866,9 +2869,9 @@ class Controller:
             k = record_key(p)
             if k not in latest or int(p.get("attempt") or 0) > int(latest[k].get("attempt") or 0):
                 latest[k] = p
-        cutoff = self.now() + self.settings.entry_seconds * 1000
         spent, refused = [], []
         for k, p in latest.items():
+            cutoff = self.now() + self.settings.timing(str(p.get("key") or "")).entry_seconds * 1000  # (1.152.0: BTC 5-minute's own)
             if p["phase"] == "active" or not p.get("accounted") or int(p.get("start_ms") or 0) <= cutoff:
                 continue
             if any(o["state"] == "rejected" and not o.get("limited") or o.get("refused") for o in p["orders"].values()):
@@ -2937,6 +2940,9 @@ class Controller:
                 + (f"；{shut_cards['us']}只挂美股常规交易时段内的场次（纽约时间 09:30–16:00，美国假日、半日市按日历）"
                    + f"，开盘后头 {quiet} 分钟的不挂" if shut_cards["us"] else "")  # the end's date only when not the start's
                 + (f"；周末不挂（北京时间周六 00:00 到周一 {WEEKEND_END_HOUR:02d}:00 开始的场次）" if not self.settings.weekend else "") + "\n"
+                + (f"BTC 5 分钟自己的时间：开场前 {b5.cancel_seconds} 秒撤单、{b5.expiry_seconds} 秒签名到期，不足 {b5.entry_seconds} 秒不再新挂，"
+                   + ("挂 24 小时内已发布的全部场次" if b5.ahead_minutes >= 1440 else f"只挂 {b5.ahead_minutes} 分钟内开始的场次") + "\n"
+                   if "BTC-5M" in self.settings.markets and (b5 := self.settings.timing("BTC-5M")) is not self.settings else "") +  # 1.152.0
                 f"已记录 {len({window_of(p) for p in rows})} 场、{len(rows)} 条（{sum(1 for p in rows if p['phase'] == 'active')} 条挂着，{sum(1 for p in rows if p.get('accounted'))} 条已结清）"
                 + (f"，另有 {self.ledger.archived_count} 条已归档（结束超过 {ARCHIVE_AFTER_MS // core.DAY_MS} 天、已撤且没成交的；复盘页照常统计）" if self.ledger.archived_count else "") + "，"
                 f"队列 {self.queue.qsize() + len(self.parked)} 场" + (f"（{len(self.parked)} 场在等，见暂不新挂）" if self.parked else "") + f"；{listed}"

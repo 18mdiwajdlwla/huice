@@ -14,6 +14,7 @@
 | 订单 | LIMIT，`isPostOnly=true`，`selfTradePrevention=CANCEL_TAKER` |
 | 数量 | 每场每方向第一档 `PREOPEN_SHARES`（默认 10）份、价格 `PREOPEN_PRICE_CENTS`（默认 49）¢（每边不少于 Predict 的 $1 最小订单），成交后不自动补单，不追价对冲 |
 | 价格档位 | `PREOPEN_LEVELS`（如 `48x20,47x40`）在第一档之下再挂更深的买单，价格逐档递减、最多再 7 档（1.139.1 起，之前 4 档），每档一条记录、各自的 salt、各自结算；第 2 档起只在离开场 `PREOPEN_DEEP_AHEAD_MINUTES` 分钟内才挂（0 = 和第一档一样），第一档照旧按提前范围挂以保住排队位置。两边都成交的那部分是无风险的（成本 < $1 的一对），只成交一边的是 50/50 的赌注，越深的档期望越高、成交越少 |
+| BTC 5 分钟自己的时间 | 控制台“开盘前预挂”一组里有 4 项只管 BTC 5 分钟卡（1.152.0）：开场前几秒撤单（`PREOPEN_BTC5_CANCEL_SECONDS`）、签名开场前几秒到期（`PREOPEN_BTC5_EXPIRY_SECONDS`）、距开场不足几秒不再新挂（`PREOPEN_BTC5_ENTRY_SECONDS`）、只挂几分钟内开始的场次（`PREOPEN_BTC5_AHEAD_MINUTES`）。每项 0 = 跟所有卡的那一项一样；和所有卡的一样按合起来的值检查（到期 5～600 秒，撤单至少比到期早 5 秒，新挂截止至少比撤单早 60 秒）。改了以后 BTC 5 分钟挂着的单按“设置不同”撤掉、按新时间重挂，其他卡不动；`/preopen` 多一行“BTC 5 分钟自己的时间” |
 | 主动撤单 | 每场开始前 `PREOPEN_CANCEL_SECONDS`（默认 20）秒发出，之后到到期前每 2 秒催一次，独立于市场发现和下单队列 |
 | 签名有效期 | 每张订单在所属场次开始前 `PREOPEN_EXPIRY_SECONDS`（默认 10）秒过期：撤单失败时的兜底，到期后交易所合约不再撮合 |
 | 重启、改设置 | 挂单留在簿上：新进程/新设置接管份数、价格、到期和标的都没变的场次（排队位置不丢）；变了的撤掉后按新设置重新报价（新 salt）。进程停止不撤单，靠签名到期兜底；关掉本模式（`PREOPEN_15M=off`）或本模式异常退出才撤单。撤掉挂着的场次的只有操作员的停止：手动暂停、真实交易关闭/暂停/紧急停止、日亏损上限；启动时账户还没核验完不算 |
@@ -61,6 +62,10 @@ PREOPEN_AHEAD_MINUTES=1440   # 只挂这么多分钟内开始的场次（3～144
 PREOPEN_CANCEL_SECONDS=20    # 开场前多少秒发撤单（至少比到期多 5 秒）
 PREOPEN_EXPIRY_SECONDS=10    # 签名开场前多少秒到期（5～600）
 PREOPEN_ENTRY_SECONDS=180    # 距开场不足多少秒不再新挂（至少比撤单多 60 秒）
+PREOPEN_BTC5_CANCEL_SECONDS=0 # BTC 5 分钟自己的撤单时间；0 = 跟上面一样（1.152.0）
+PREOPEN_BTC5_EXPIRY_SECONDS=0 # BTC 5 分钟自己的签名到期；0 = 跟上面一样
+PREOPEN_BTC5_ENTRY_SECONDS=0  # BTC 5 分钟自己的新挂截止；0 = 跟上面一样
+PREOPEN_BTC5_AHEAD_MINUTES=0  # BTC 5 分钟只挂这么多分钟内开始的场次；0 = 跟上面一样
 PREOPEN_MAX_OPEN_USD=0       # 0 = 不限（默认，1.132.3）
 PREOPEN_EXCLUSIVE=off        # on = 预挂时原策略不开新仓
 LIVE=on

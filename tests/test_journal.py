@@ -487,6 +487,28 @@ async def browser_check(bot, data):
         assert await page.is_hidden("#anabody") and await page.inner_text("#anaref") == "刷新" and await page.evaluate("okAt") > read_at
         await page.click("#anahd")
         assert await page.is_visible("#anabody") and (await page.inner_text("#anaat")).startswith("已刷新 ")
+        # 1.152.1: each part of 复盘分析 folds on its own (按标的 folded the first time, remembered once opened), the
+        # explanations wait behind 说明, the exports behind one menu, 市场涨跌统计 folded until opened
+        items = page.locator('details.fold[data-k="items"]')
+        assert await items.get_attribute("open") is None and await page.is_hidden("#a-items")
+        await items.locator("summary").click()
+        await page.locator("#a-items table").wait_for()
+        for _ in range(50):  # (the toggle event comes a task later)
+            if await page.evaluate("localStorage.getItem('jrnfold:items')") == "1":
+                break
+            await asyncio.sleep(0.02)
+        assert await page.evaluate("localStorage.getItem('jrnfold:items')") == "1"
+        hints = page.locator("#sumbody details.hint")
+        assert await hints.count() == 1 and await hints.first.get_attribute("open") is None and await hints.first.locator("p").first.is_hidden()
+        await hints.first.locator("summary").click()
+        assert "选的日子（北京时间）里下单的记录按卡片汇总" in await hints.first.inner_text()
+        await hints.first.locator("summary").click()
+        assert await page.is_hidden("#csv") and await page.get_attribute("#csv", "href") == f"/p/{TOKEN}/journal.csv"
+        await page.click("#exports summary")
+        assert await page.is_visible("#csv") and await page.is_visible("#json")
+        await page.click("#title")  # a tap elsewhere closes the menu
+        assert await page.is_hidden("#csv")
+        assert await page.is_hidden("#tallybody") and await page.inner_text("#foldtally") == "展开"
         await page.click("#anahd")
         assert await page.is_hidden("#anabody")
         # 1.131.5: the pre-open mode's rows in 今日按市场 (the live bot adds them, preopen.cards_today): named "· 开盘前预挂"; 1.151.0: a
@@ -564,6 +586,8 @@ async def browser_check(bot, data):
         await page.wait_for_selector("#s-detail table tr.rec")
         assert "上证指数 · 09-29 至 10-05（7 天） 的每一笔" in await page.inner_text("#s-detail h3") and await page.locator("#s-detail tr.rec").count() == 1
         await page.click("#s-detail button:has-text('收起')")
+        assert await page.is_hidden("#cfrom"), "1.152.1: the custom dates wait behind 自定义"
+        await page.click("#ccust summary")
         await page.fill("#cfrom", "2026-10-05")
         await page.fill("#cto", "2026-10-05")
         await page.click("#cgo")

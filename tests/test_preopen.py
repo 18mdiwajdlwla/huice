@@ -273,7 +273,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         ctl, api, clock = controller(PREOPEN_CANCEL_SECONDS="12", PREOPEN_EXPIRY_SECONDS="6", PREOPEN_ENTRY_SECONDS="120")
         c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
         self.assertEqual((c["cancel_ms"], c["expires"]), (c["start_ms"] - 12_000, c["start_ms"] // 1000 - 6))
-        self.assertEqual(p.candidate_problem(market(at=NOW + 15 * 60_000), NOW + 15 * 60_000 - 119_000, ctl.owner.config, ctl.settings), "已开始或不足 3 分钟")
+        self.assertEqual(p.candidate_problem(market(at=NOW + 15 * 60_000), NOW + 15 * 60_000 - 119_000, ctl.owner.config, ctl.settings), "已开始或不足 120 秒")  # 1.152.0: the cut-off in force (was "3 分钟" whatever it was)
         self.assertIsNotNone(p.candidate(market(at=NOW + 15 * 60_000), NOW + 15 * 60_000 - 121_000, ctl.owner.config, ctl.settings))
         await self.finish(ctl)
         for bad in ({"PREOPEN_EXPIRY_SECONDS": "4"}, {"PREOPEN_CANCEL_SECONDS": "14"}, {"PREOPEN_ENTRY_SECONDS": "79"}, {"PREOPEN_CANCEL_SECONDS": "901", "PREOPEN_ENTRY_SECONDS": "3600"}):
@@ -1108,6 +1108,65 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(hold("NVDA-15M", et(16, 9, 30)).startswith("英伟达重新开盘后的第一场") and hold("NVDA-15M", et(16, 16)).startswith("英伟达休市"))
         for key, start in (("XAU-15M", et(16, 16, 45)), ("XAU-15M", et(16, 18, 15)), ("NVDA-15M", et(16, 9, 45)), ("BTC-15M", et(16, 18)), ("UNITREE-15M", NOW + 30 * 60_000)):
             self.assertEqual(hold(key, start), "", (key, start))
+
+    async def test_btc_five_minute_has_its_own_timing(self):
+        """1.152.0: BTC 5-minute's own cancel time, signed expiry, entry cut-off and horizon (PREOPEN_BTC5_*, each 0 = the general
+        one): its windows are looked for, judged, signed and withdrawn by them, every other card by the general ones; a change
+        of them withdraws BTC 5-minute's resting pairs at the takeover (signed otherwise) and leaves the others; the combination
+        is checked as the general one is; the control page carries the four."""
+        env = {"PREOPEN_MARKETS": "btc5,btc,eth5", "PREOPEN_AHEAD_MINUTES": "120", "PREOPEN_BTC5_CANCEL_SECONDS": "10", "PREOPEN_BTC5_EXPIRY_SECONDS": "5",
+               "PREOPEN_BTC5_ENTRY_SECONDS": "70", "PREOPEN_BTC5_AHEAD_MINUTES": "30"}
+        ctl, api, clock = controller(**env)
+        s = ctl.settings
+        b5 = s.timing("BTC-5M")
+        self.assertEqual((b5.cancel_seconds, b5.expiry_seconds, b5.entry_seconds, b5.ahead_minutes), (10, 5, 70, 30))
+        self.assertIs(s.timing("BTC-15M"), s)
+        self.assertIs(s.timing("ETH-5M"), s, "ETH 5-minute keeps the general timing")
+        starts = p.window_starts(NOW, ctl.owner.config, s)
+        mins = lambda key: [(st - NOW) // 60_000 for r, st in starts if r.key == key]
+        self.assertEqual(mins("BTC-5M"), [5, 10, 15, 20, 25, 30])
+        self.assertEqual((mins("ETH-5M")[0], mins("ETH-5M")[-1], mins("BTC-15M")[-1]), (5, 120, 120))
+        c5 = p.candidate(market(at=NOW + 10 * 60_000, mid=7, minutes=5), NOW, ctl.owner.config, s)
+        c15 = p.candidate(market(at=NOW + 15 * 60_000, mid=8), NOW, ctl.owner.config, s)
+        self.assertEqual((c5["start_ms"] - c5["cancel_ms"], c5["start_ms"] // 1000 - c5["expires"]), (10_000, 5))
+        self.assertEqual((c15["start_ms"] - c15["cancel_ms"], c15["start_ms"] // 1000 - c15["expires"]), (20_000, 10))
+        self.assertEqual(p.candidate_problem(market(at=NOW + 35 * 60_000, mid=9, minutes=5), NOW, ctl.owner.config, s), "开始还在 30 分钟之外（之后再扫）")
+        self.assertEqual(p.candidate_problem(market(at=NOW + 5 * 60_000, mid=10, minutes=5), NOW + 4 * 60_000, ctl.owner.config, s), "已开始或不足 70 秒")
+        self.assertEqual(p.candidate_problem(market(at=NOW + 5 * 60_000, mid=10, minutes=5), NOW + 3 * 60_000, ctl.owner.config, s), "", "120 s ahead: BTC 5-minute takes it")
+        self.assertEqual(p.candidate_problem(market(at=NOW + 15 * 60_000, mid=11), NOW + 13 * 60_000, ctl.owner.config, s), "已开始或不足 3 分钟", "BTC 15-minute: the general 180 s")
+        self.assertIn("BTC 5 分钟自己的时间：开场前 10 秒撤单、5 秒签名到期，不足 70 秒不再新挂，只挂 30 分钟内开始的场次", ctl.status())
+        await self.finish(ctl)
+        plain, _, _ = controller(PREOPEN_MARKETS="btc5")
+        self.assertIs(plain.settings.timing("BTC-5M"), plain.settings)
+        self.assertNotIn("BTC 5 分钟自己的时间", plain.status(), "nothing of its own: no line")
+        await self.finish(plain)
+        # a change of BTC 5-minute's timing: its resting pair is withdrawn at the takeover (signed to expire otherwise), BTC 15-minute's stays
+        with tempfile.TemporaryDirectory() as folder:
+            db = {"STATE_DB": str(Path(folder) / "state.sqlite3")}
+            rows = [market(at=NOW + 10 * 60_000, mid=7, minutes=5), market(at=NOW + 15 * 60_000, mid=8)]
+            ctl, api, clock = controller(rows, PREOPEN_MARKETS="btc5,btc", PREOPEN_AHEAD_MINUTES="120", **db)
+            for mk in rows:
+                await ctl.place_pair(p.candidate(mk, NOW, ctl.owner.config, ctl.settings))
+            ctl.keep_on_stop = True
+            await ctl.on_stop()
+            ctl.ledger.close()
+            again, _, _ = controller(rows, PREOPEN_MARKETS="btc5,btc", PREOPEN_AHEAD_MINUTES="120", PREOPEN_BTC5_EXPIRY_SECONDS="5", PREOPEN_BTC5_CANCEL_SECONDS="10", **db)
+            again.api = again.cancel_api = api; api.ctl = again
+            again.adopt()
+            by_key = {pair["key"]: pair for pair in again.ledger.rows.values()}
+            self.assertEqual((by_key["BTC-5M"]["phase"], by_key["BTC-5M"].get("free"), by_key["BTC-15M"]["phase"], again.resumed), ("closing", True, "active", 1))
+            self.assertEqual(by_key["BTC-15M"]["start_ms"] - by_key["BTC-15M"]["cancel_ms"], 20_000)
+            await self.finish(again)
+        # the combination is checked as the general one is (0 = the general one, counted in)
+        base = {"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64}
+        for bad in ({"PREOPEN_BTC5_CANCEL_SECONDS": "12"}, {"PREOPEN_BTC5_EXPIRY_SECONDS": "3"}, {"PREOPEN_BTC5_AHEAD_MINUTES": "2000"},
+                    {"PREOPEN_BTC5_CANCEL_SECONDS": "10", "PREOPEN_BTC5_EXPIRY_SECONDS": "5", "PREOPEN_BTC5_ENTRY_SECONDS": "60"}, {"PREOPEN_BTC5_ENTRY_SECONDS": "-1"}):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                m.Config.from_env({**base, **bad})
+        self.assertEqual(m.Config.from_env({**base, "PREOPEN_BTC5_EXPIRY_SECONDS": "5", "PREOPEN_BTC5_CANCEL_SECONDS": "10"}).preopen.btc5_entry_seconds, 0)
+        keys = {"PREOPEN_BTC5_CANCEL_SECONDS", "PREOPEN_BTC5_EXPIRY_SECONDS", "PREOPEN_BTC5_ENTRY_SECONDS", "PREOPEN_BTC5_AHEAD_MINUTES"}
+        self.assertTrue(keys <= m.CONTROL_KEY_SET)
+        self.assertEqual({k for k in keys if m.CONTROL_FORMS[k]["group"] == "预挂" and m.CONTROL_FORMS[k]["zero"] == "跟所有卡一样"}, keys)
 
     async def test_five_minute_cards_are_quoted_on_their_own_rhythm(self):
         """1.137.0: btc5 / eth5 / bnb5 name the 5-minute cards (btc-updown-5m-<start>): a window every five minutes, the

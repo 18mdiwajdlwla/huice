@@ -1,8 +1,12 @@
 # 测试与交付状态
 
-版本：1.151.1
+版本：1.152.1
 
 ## 已完成
+
+- 1.152.1（复盘页收紧）：用真实规模的预挂数据渲染，手机上把复盘分析和统计全部展开要 16,428 px 高、可见说明文字约 2,400 字，大头是开盘前预挂的“按开始时间”（每张卡每个钟点一行，几百行）和“有成交的场次”。现在说明文字放进“ⓘ 说明”（`hint()`，默认折起），复盘分析每一块是 `details.fold`（按 `data-k` 记住开合，第一次只开模型 EV），长表用 `bigTable()` 超过行数就折起并标出行数，导出收进一个菜单，市场涨跌统计默认收起，自定义日期收进“自定义”，区块标题不再一字一行。同样的数据全部展开时手机 4,381 px、桌面 3,980 px（原 14,659 px），可见说明文字 0。`tests/test_journal.py` 浏览器检查加了折叠、说明、导出菜单、自定义日期；`tests/test_tally.py` 先点开折起的市场涨跌统计。
+
+- 1.152.0（BTC 5 分钟自己的预挂时间）：控制台加 4 项只管 BTC 5 分钟卡：`PREOPEN_BTC5_CANCEL_SECONDS`、`PREOPEN_BTC5_EXPIRY_SECONDS`、`PREOPEN_BTC5_ENTRY_SECONDS`、`PREOPEN_BTC5_AHEAD_MINUTES`，0 = 跟所有卡一样。`PreopenSettings.timing(key)` 给出一张卡用的时间，发现（`window_starts`）、判断（`candidate_problem`）、签名和撤单时间（`candidate`）、重启接管（`resumable`、`adopt`）、重新报价和等候队列的截止都按卡取；改了以后 BTC 5 分钟挂着的单在接管时撤掉、其他卡照旧接管；合起来的值按所有卡的规则检查，模式开着时不合规的保存被拒。“已开始或不足 N”的理由写实际的截止秒数（之前不管设多少都写 3 分钟）。`tests/test_preopen.py` 的 `test_btc_five_minute_has_its_own_timing`。
 
 - 1.151.1（开盘后第一场固定不挂，原策略也避开休市）：黄金 18:00–18:15 ET 之前跟着 `PREOPEN_OPEN_QUIET_MINUTES` 走，设成 0 就会挂；Polymarket 根本不上这几场。现在开盘、重开后的第一场（黄金原油每天 18:00 和周末、节假日之后的重开，美股 09:30，海力士、宇树、智谱开盘和午后）固定不挂（`preopen.open_quiet_ms`：设置只能再加长，0 按 15 算），升级前已挂上的重启时撤掉。同样的情况原策略也有：它在窗口开始后才交易，但黄金、原油休市那一小时指数不动、模型按五五开照样下单，所以带 `hours` 的卡在休市期间和重开第一场不给建议（`main.window_hours_hold`，接在 `Bot.updown_hold`）。股票卡的 15 分钟窗口本来就只在交易时段内，原策略不受影响。`tests/test_preopen.py` 的 `test_the_first_window_after_an_open_is_never_quoted_nor_traded`，`tests/test_window.py` 的 `updown_hold` 检查；改了两处原来按“0 = 第一场也挂”写的断言。
 
