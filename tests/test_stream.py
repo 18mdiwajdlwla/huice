@@ -270,6 +270,43 @@ async def run():
     assert not fresh.predict.round_due(), "the next round leaves the stream its snapshots first"
     fresh.predict.refreshed = -1e9
     assert isinstance(await fresh.refresh_books(NOW), m.Refreshed) and len(asked_hot) == 3, "later rounds: worked out once, before"
+    # 1.154.9: the snapshot a subscription brings first, equal to the REST book read just before it, marks the market pushed on this
+    # connection (it used to leave a quiet market out of `live` for good: read by every hot round — 订阅 75 个、在推 55 个)
+    quiet = feed_with_books()
+    quiet.stream.wanted = {"8": ("BTC", False)}
+    quiet.stream.book("8", {"bids": [], "asks": [["0.5", "10"]]})  # BTC's REST book, again
+    assert quiet.stream.repeated == 1 and quiet.stream.live == {"8"} and quiet.stream.books == 0, (quiet.stream.repeated, quiet.stream.live)
+    # 1.154.9: a single market whose book Predict answers 404 ("Orderbook not found") is an answer, asked again in PREDICT_ABSENT_SECONDS —
+    # not every round (11-17: NVDA-2027, BNB-2027 every ten seconds on a full key), nor a failure of the round
+    bare = feed_with_books()
+    nvda = "will-nvidia-nvda-stock-hit-160-or-210-first"
+
+    async def resolve(slug):
+        return {"id": "77", "title": "NVDA 160/210", "conditionId": "0x77"}
+
+    async def nothing(*args, **kwargs):
+        return None
+
+    async def no_book(market):
+        raise m.RemoteError("HTTP 404: Orderbook not found")
+    bare.resolve, bare.strike, bare.market_fee, bare.orderbook = resolve, nothing, nothing, no_book
+    assert await bare.refresh_one("NVDA-2027", nvda) == 0
+    assert "没有盘口" in bare.errors["NVDA-2027"] and "HTTP 404" in bare.errors["NVDA-2027"] and "NVDA-2027" in bare.absent_at, bare.errors
+    rounds_read = []
+
+    async def counting(key, slug, rows=None):
+        rounds_read.append(key)
+        return 1
+    bare.refresh_timed = counting
+    bare.refreshed = -1e9
+    for k in ("HSI", "BTC", "BTC-HIT-10"):
+        bare.key_refreshed[k] = time.monotonic()
+    result = await bare.refresh({"HSI": HSI_SLUG, "NVDA-2027": nvda}, hot={"HSI", "NVDA-2027"})
+    assert "NVDA-2027" not in rounds_read and result.status == "ok", (rounds_read, result)
+    bare.absent_at["NVDA-2027"] -= m.PREDICT_ABSENT_SECONDS + 1
+    rounds_read.clear(); bare.refreshed = -1e9
+    await bare.refresh({"HSI": HSI_SLUG, "NVDA-2027": nvda}, hot={"HSI", "NVDA-2027"})
+    assert "NVDA-2027" in rounds_read, ("two minutes on: asked again", rounds_read)
     # 1.154.5: a ladder's level the stream keeps current is read by REST only as a check, every PREDICT_PUSH_CHECK_SECONDS — not by every
     # hot round (a hot level) nor every PREDICT_COLD_POLL_SECONDS (a cold one); a level not pushed is read as before
     lad = feed_with_books()

@@ -415,6 +415,81 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(c.startswith("/categories/") for c in api.calls))
         await self.finish(ctl)
 
+    async def test_a_new_listing_goes_ahead_of_the_backlog_and_the_first_snapshot_comes_first(self):
+        """1.154.8 (11-17 14:36): the placement queue went by start alone, so behind a backlog of 557 listed windows the new listings
+        — the latest starts — waited 57 minutes (发现→挂上中位 3434 秒); 一有新的就挂、排在最前. And after a restart every placement waits
+        for the first account snapshot (427 windows parked on "账户快照还没有读到"): the status re-reads and the known windows'
+        re-reads leave its pages the budget until it comes (FIRST_SNAPSHOT_GRACE_MS at most), and the hold says how far it has come."""
+        ctl, api, clock = controller()
+        backlog = {"start_ms": NOW + 3_600_000, "slug": "old-window", "fresh": False}
+        newest = {"start_ms": NOW + 20 * 3_600_000, "slug": "new-window", "fresh": True}
+        later_new = {"start_ms": NOW + 21 * 3_600_000, "slug": "newer-window", "fresh": True}
+        for c in (backlog, later_new, newest):
+            ctl.queue.put_nowait((p.queue_rank(c), c["slug"], c))
+        self.assertEqual([ctl.queue.get_nowait()[2]["slug"] for _ in range(3)], ["new-window", "newer-window", "old-window"],
+                         "the new listings first (the soonest of them first), then the backlog")
+        ctl.parked["new-window"] = (clock.ms - 1, newest)  # held, then back on the queue: still ahead of the backlog
+        ctl.queue.put_nowait((p.queue_rank(backlog), backlog["slug"], backlog))
+        ctl.unpark()
+        self.assertEqual(ctl.queue.get_nowait()[2]["slug"], "new-window")
+        ctl.queue.get_nowait()
+        # the listing probe queues what it finds as fresh; the known windows' re-read as the backlog
+        found = []
+        real = ctl.enqueue
+
+        def noting(market, slug, wanted, attempts, st, fresh=False):
+            found.append((slug, fresh))
+            return real(market, slug, wanted, attempts, st, fresh)
+        ctl.enqueue = noting
+        await ctl.discover()
+        self.assertTrue(found and all(fresh for _, fresh in found), found)
+        while not ctl.queue.empty():
+            self.assertTrue(ctl.queue.get_nowait()[2]["fresh"])
+        ctl.enqueue = real
+        await self.finish(ctl)
+        # after a start: no snapshot yet — the status re-reads and the known windows' re-reads wait; the hold says how far it has come
+        ctl, api, clock = controller()
+        ctl.account_at = 0
+        self.assertTrue(ctl.first_snapshot_pending())
+        refreshed = []
+
+        async def refresh():
+            refreshed.append(1)
+        ctl.refresh_active = refresh
+        ctl.stopped = lambda: bool(refreshed) or len(slept) > 0
+        slept = []
+        real_sleep = asyncio.sleep
+
+        async def nap(s):
+            slept.append(s)
+            await real_sleep(0)
+        p.asyncio.sleep, saved = nap, p.asyncio.sleep
+        try:
+            await ctl.refresh_loop()
+        finally:
+            p.asyncio.sleep = saved
+            del ctl.stopped  # the loop's one turn done: the method again
+        self.assertEqual(refreshed, [], "no status re-read before the first snapshot")
+        asked = []
+
+        async def reread(*args):
+            asked.append(1)
+        ctl.reread_known, ctl.rescan_ms, ctl.queued = reread, 0, set()
+        await ctl.discover()
+        self.assertEqual(asked, [], "nor the known windows' re-read")
+        ctl.account_started_ms, api.paging = clock.ms - 40_000, {"/orders": 23}
+        self.assertEqual(ctl.hold(), "账户快照还没有读到（启动后第一次读取中：已 40 秒、读了 23 页挂单）")
+        await ctl.account()  # the first snapshot: all goes on as before
+        self.assertFalse(ctl.first_snapshot_pending())
+        await ctl.discover()
+        self.assertEqual(asked, [1])
+        fresh_ctl, _, fresh_clock = controller()
+        fresh_ctl.account_at = 0
+        fresh_clock.ms += p.FIRST_SNAPSHOT_GRACE_MS
+        self.assertFalse(fresh_ctl.first_snapshot_pending(), "a snapshot failing for good stops the re-reads no longer than the grace")
+        await self.finish(fresh_ctl)
+        await self.finish(ctl)
+
     async def test_discovery_takes_the_soonest_first_and_only_within_the_horizon(self):
         rows = [market(at=NOW + 45 * 60_000, mid=1), market(at=NOW + 15 * 60_000, mid=2), market(at=NOW + 3 * 3600_000, mid=3), market("skhynix", at=NOW + 30 * 60_000, mid=4)]
         ctl, api, _ = controller(rows)

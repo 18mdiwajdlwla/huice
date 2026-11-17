@@ -64,6 +64,15 @@ async def run() -> None:
             assert time.monotonic() - started >= 0.08, "a placement made ahead of time waits for the pace"
         finally:
             L.PredictApi.send = original
+        # 1.154.9: a low read (the orderbook feed's: dozens a round) leaves LOW_RESERVE tokens behind — the trader's read, asked after
+        # it, goes first (11-17 14:41: the trader's sync queued 22 s behind the book rounds on a key at 220 a minute)
+        low_pacer, order = m.PredictPacer(600), []  # 10 a second, empty
+
+        async def reader(name, low):
+            await low_pacer.take(low=low)
+            order.append(name)
+        await asyncio.gather(reader("feed", True), reader("trader", False))
+        assert order == ["trader", "feed"], order
         # off: nothing waits
         assert await asyncio.wait_for(m.PredictPacer(0).take(), 0.01) is None
         # 1.154.3: what a key let through in the last 60 seconds, every client's — counted whether paced or not (/diag)
