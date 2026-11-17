@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.9"
+VERSION = "1.154.10"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -7679,14 +7679,6 @@ TOUCH_MARKETS = (
     # High / Low; neither hit → 50/50. Its own key: the earlier BTC 70k/90k (Aug 25 – Oct 25) stays "BTC" in TOUCH_SETTLED (1.132.0)
     TouchSpec("BTC-2027", "will-btc-hit-70000-or-90000-first-before-may-6-2027", "BTCUSDT", D("70000"), D("90000"),
               et_ms(2026, 11, 5, 9, 0, -5), et_ms(2027, 5, 5, 23, 59, -4), -4, fixed_start=True),
-    # "between the creation of this market and May 5th 2027 at 11:59 PM ET" (EDT): Binance BNB/USDT 1-minute High / Low, neither
-    # hit → 50/50; the window opens at the creation Predict gives. Its own key: BNB 700/900 (decided 11-04) stays "BNB" in TOUCH_SETTLED (1.132.2)
-    TouchSpec("BNB-2027", "will-bnb-hit-600-or-800-first", "BNBUSDT", D("600"), D("800"), 0, et_ms(2027, 5, 5, 23, 59, -4), -4),
-    # 1.146.0: "between market creation and April 30th, 2027 at 11:59 PM ET" (EDT): Pyth's NVDA/USD 1-minute candles of the regular
-    # session (9:30 AM – 4:00 PM ET; pre-market and after-hours prices do not count), the Low at or below $160 or the High at or
-    # above $210 first; neither by then: 50/50; split-adjusted (the lines too). Read from Yahoo (StockTouchMarket)
-    TouchSpec("NVDA-2027", "will-nvidia-nvda-stock-hit-160-or-210-first", "NVDA", D("160"), D("210"), 0,
-              et_ms(2027, 4, 30, 23, 59, -4), -4, stock=True),
 )
 # Touch markets no longer listed: no card, no book, no trading. Kept only so that a trade bought on one is still settled
 # on Predict's result, whose outcome names ("$700" / "$900") are read against the market's two lines (touch_spec).
@@ -7697,6 +7689,17 @@ TOUCH_SETTLED = (
     # "between August 25th, 2026 at 10:00 AM ET and October 25th, 2026 at 11:59 PM ET" (both EDT): over, taken off in 1.95.0
     TouchSpec("BTC", "will-btc-hit-70000-or-90000-first", "BTCUSDT", D("70000"), D("90000"),
               et_ms(2026, 8, 25, 10, 0, -4), et_ms(2026, 10, 25, 23, 59, -4), -4, fixed_start=True),
+    # 1.154.10 (11-17): BNB 600/800 and NVIDIA 160/210 taken off — Predict answers their books 404 ("Orderbook not found"), read
+    # every round for nothing on a full API key; off the page at the operator's word, their deadlines still ahead.
+    # "between the creation of this market and May 5th 2027 at 11:59 PM ET" (EDT): Binance BNB/USDT 1-minute High / Low, neither
+    # hit → 50/50; the window opens at the creation Predict gives (1.132.2: its own key, BNB 700/900 stays "BNB")
+    TouchSpec("BNB-2027", "will-bnb-hit-600-or-800-first", "BNBUSDT", D("600"), D("800"), 0, et_ms(2027, 5, 5, 23, 59, -4), -4),
+    # 1.146.0: "between market creation and April 30th, 2027 at 11:59 PM ET" (EDT): Pyth's NVDA/USD 1-minute candles of the regular
+    # session (9:30 AM – 4:00 PM ET; pre-market and after-hours prices do not count), the Low at or below $160 or the High at or
+    # above $210 first; neither by then: 50/50; split-adjusted (the lines too). Read from Yahoo (StockTouchMarket: kept for the next
+    # US stock's touch market — the suites list this one again as its fixture)
+    TouchSpec("NVDA-2027", "will-nvidia-nvda-stock-hit-160-or-210-first", "NVDA", D("160"), D("210"), 0,
+              et_ms(2027, 4, 30, 23, 59, -4), -4, stock=True),
 )
 
 

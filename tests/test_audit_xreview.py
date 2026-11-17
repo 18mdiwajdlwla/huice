@@ -4,6 +4,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "tests"))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
+# 1.154.10: NVIDIA 160/210 was taken off the page (TOUCH_SETTLED: Predict answers its book 404); the stock touch card stays,
+# and this suite lists the market again as its fixture
+if m.touch_spec("NVDA-2027") not in m.TOUCH_MARKETS:
+    m.TOUCH_MARKETS = (*m.TOUCH_MARKETS, m.touch_spec("NVDA-2027"))
 import live as L
 
 # test_trading's fakes (FakeApi, make_bot, step, hsi …) without running its suites: only the definitions before "async def run()"

@@ -19,7 +19,11 @@ D = m.D
 ET = lambda mo, d, h, mi, y=2026: m.et_wall_ms(dt.date(y, mo, d), h, mi)
 NOW = ET(11, 10, 11, 0)          # Tuesday 11:00 ET (16:00 UTC): the session running
 START = ET(11, 2, 10, 0)         # the market's creation (Predict's createdAt): Monday 11-02 10:00 ET
-SPEC = next(s for s in m.TOUCH_MARKETS if s.key == "NVDA-2027")
+# 1.154.10: NVIDIA 160/210 was taken off the page (TOUCH_SETTLED: Predict answers its book 404); the stock touch card stays, and
+# this suite lists the market again as its fixture
+SPEC = m.touch_spec("NVDA-2027")
+assert SPEC in m.TOUCH_SETTLED and SPEC not in m.TOUCH_MARKETS
+m.TOUCH_MARKETS = (*m.TOUCH_MARKETS, SPEC)
 
 
 class FM:
@@ -84,7 +88,7 @@ async def run():
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT"})
     bot = m.Bot(cfg, m.Store(":memory:"), FM(NOW), None)
     card = bot.touches["NVDA-2027"]
-    assert isinstance(card, m.StockTouchMarket) and type(bot.touches["BNB-2027"]) is m.TouchMarket and card.GROUP == "contract"
+    assert isinstance(card, m.StockTouchMarket) and type(bot.touches["BTC-2027"]) is m.TouchMarket and card.GROUP == "contract"
     assert "NVDA" not in bot.binance_streams["spot"].symbols() and ("spot", "NVDA") not in bot.pair_markets
     assert bot.predict_targets(NOW)["NVDA-2027"] == SPEC.slug
     assert "美股先触·NVDA" in [p[0] for p in bot.diag_probes(NOW)]

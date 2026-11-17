@@ -3,6 +3,10 @@ import asyncio, json, sys
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
+# 1.154.10: NVIDIA 160/210 was taken off the page (TOUCH_SETTLED: Predict answers its book 404); the stock touch card stays,
+# and this suite lists the market again as its fixture (SOURCES_OFF: its Yahoo chart)
+if m.touch_spec("NVDA-2027") not in m.TOUCH_MARKETS:
+    m.TOUCH_MARKETS = (*m.TOUCH_MARKETS, m.touch_spec("NVDA-2027"))
 import live as L
 WEI = 10 ** 18
 TOKEN = "t" * 20

@@ -7,9 +7,10 @@ retired.install()
 D = m.D
 BNB, SOL, BTC, ETH = m.TOUCH_MARKETS
 # 1.132.0: BTC 先触 70k/90k to May 2027, under its own key — the earlier one (to 10-25) stays "BTC" for the trades bought on it
-assert [s.key for s in retired.LIVE["TOUCH_MARKETS"]] == ["SOL", "ETH", "BTC-2027", "BNB-2027", "NVDA-2027"]  # 1.146.0
+assert [s.key for s in retired.LIVE["TOUCH_MARKETS"]] == ["SOL", "ETH", "BTC-2027"]  # 1.146.0; 1.154.10: BNB 600/800 and NVIDIA 160/210 taken off (TOUCH_SETTLED)
 # 1.132.2: BNB 先触 600/800 to May 2027, from the market's creation (Predict's time), under its own key: the decided 700/900 stays "BNB"
-NEW_BNB = retired.LIVE["TOUCH_MARKETS"][3]
+NEW_BNB = m.touch_spec("BNB-2027")  # 1.154.10: off the page (its book answered 404), kept to settle the trades bought on it
+assert NEW_BNB in m.TOUCH_SETTLED
 assert NEW_BNB.slug == "will-bnb-hit-600-or-800-first" and NEW_BNB.symbol == "BNBUSDT" and (NEW_BNB.low, NEW_BNB.high) == (D("600"), D("800"))
 assert not NEW_BNB.fixed_start and NEW_BNB.created_ms == 0 and NEW_BNB.deadline_ms == int(dt.datetime(2027, 5, 6, 3, 59, tzinfo=dt.timezone.utc).timestamp() * 1000)
 m.TOUCH_MARKETS, kept = retired.LIVE["TOUCH_MARKETS"], m.TOUCH_MARKETS  # main's own tables for a moment: a record keyed "BNB" still finds the 700/900 lines
