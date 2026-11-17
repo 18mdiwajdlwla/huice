@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.15"
+VERSION = "1.154.16"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -15037,6 +15037,13 @@ function rulesSection(ru){  // 规则吃单 (1.153.0): each rule's totals, the r
       r.watch.offer_lead==null?"—":"中位 "+Math.round(r.watch.offer_lead)+" 分钟",  // 1.154.13: the makers' lead, and the offers a faster taker had
       r.watch.lost?num(r.watch.lost)+" 场"+(r.watch.life==null?"":"（存活中位 "+(r.watch.life/1000).toFixed(1)+" 秒）"):"—",
       r.watch.won?num(r.watch.won)+" 场"+(r.watch.won_life==null?"":"（出现到被吃掉中位 "+(r.watch.won_life/1000).toFixed(1)+" 秒）"):"—"])));
+  const rc=ru.races||[],sec=v=>v==null?"—":(v/1000).toFixed(2)+" 秒",ord=o=>"要 "+num(o.shares)+" 成交 "+num(o.filled)+(o.after==null?"":"，出现后 "+o.after+" ms 发出")
+    +(o.lag==null?"":"，推送 "+o.lag+" ms")+(o.own==null?"":"，到达→发出 "+o.own+" ms"+(o.fresh===false?"（不是盘口一到就下的）":""))+(o.trip==null?"":"，往返 "+o.trip+" ms");
+  // 1.154.16: each window's race — when the offer at the rule's price showed, how soon it was first taken from and gone (Predict's own stamps), what was bought, each order against the clock
+  if(rc.length)kids.push(...bigTable("抢单记录（北京时间；开始被吃 / 被吃光 = 卖单出现之后多久，按 Predict 盘口的时间戳）",table(["场次","规则","卖单出现","开场前","最多份数","开始被吃","被吃光","买到","我们的单"],
+    rc.map(r=>[dayKey(r.start_ms).slice(5)+" "+(r.window||""),r.name,r.offer_at?when(r.offer_at):"没记到",r.lead_min==null?"—":r.lead_min+" 分钟",r.offer_at?num(r.peak):"—",sec(r.cut_ms),
+      r.gone_ms==null?(r.offer_at&&r.open?"还在":"—"):sec(r.gone_ms),r.orders.length?(r.bought?num(r.bought)+"/"+num(r.asked):"没买到"):"没下单",
+      r.orders.filter(o=>!o.paper).map(ord).join("；")||(r.orders.length?"只记录":"—")])),rc.length));
   const rec=ru.recent||[];
   if(rec.length)kids.push(...bigTable("最近的场次（北京时间）",table(["场次","规则","买","份数","均价","成本","结果","盈亏","模式"],
     rec.map(r=>[dayKey(r.start_ms).slice(5)+" "+(r.window||""),r.name,side(r.side),num(r.shares)+(r.live?"（盘中 "+num(r.live)+"）":""),cent(r.avg),usd(r.cost),RES[r.result]||"待结算",r.pnl==null?"—":money(r.pnl),MODE[r.mode]||r.mode])),rec.length));
@@ -16552,7 +16559,8 @@ COMMANDS: tuple[Command, ...] = (
     Command("live", "真实交易（LIVE=on）：钱包、余额、真实订单、持仓与风控；暂停/恢复/撤单/领取；fills 把账户持仓和记录逐项核对", "pause|resume|cancel all|redeem|redeem check|redeem forget 市场号|check|fills",
             "LIVE=on 时模拟交易的每个决定都会在 Predict 真实下单；/live pause 停止开新仓，/live resume 恢复"),
     Command("preopen", "15 分钟市场开盘前双边预挂（PREOPEN_15M=on，真实交易）：状态；check 体检（限流、卡住的撤单、最近问题）；pause / resume 暂停恢复；probe 只读探测市场列表", "check|pause|resume|probe"),
-    Command("rules", "规则吃单（RULE_TAKER，真实交易模块里）：黄金、原油几个固定时段开场前按规则价吃单——状态、每条规则的下一场、今天的成交"),
+    Command("rules", "规则吃单（RULE_TAKER，真实交易模块里）：黄金、原油几个固定时段开场前按规则价吃单——状态、每条规则的下一场、下单速度、"
+                     "最近几场的抢单记录（卖单几点出现、多久被别人吃光、我们买到多少）、今天的成交"),
     Command("diag", "逐个检测数据源（币安/交易所/上证/A50/恒指/KOSPI/HL/汇率），找出哪里出问题"),
     Command("speed", "指数查价测速（开盘时用）：每个指数数据源每秒查一次、各 30 秒，看请求要多久、指数多久一变、会不会被拒，给出最快能多久查一次", "0.5",
             "不带参数每 1 秒查一次；/speed 0.5 每 0.5 秒（0.5～5）。同一网站一次只测一个源，连续失败 3 次或被拒就停下，不会把服务器 IP 弄进黑名单"),

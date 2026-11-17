@@ -1662,6 +1662,97 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
                                                  "［其中到达→开始处理 10 ms］、发出→应答 325 ms（最快 300）")
 
 
+    async def test_each_windows_race_is_in_the_status_and_survives_a_restart(self):
+        """1.154.16 — "没买到的卖单存活了多久，也就是抢走它的人有多快：这个在哪里看". /rules had a month's medians, and those only
+        once a window had begun; the watch was in memory alone (11-18: three deploys after the offers of 01:00–01:45, the watches
+        of those windows knew of none). Now the watch is on the window's record the moment an offer shows, is taken from, is
+        gone — a restart finds it — and /rules lists the latest windows' races, a line each: when the offer showed and how long
+        before the start, how much, how soon it was first taken from and gone (Predict's own stamps), what was bought, each
+        order against the clock."""
+        t, api, clock, x = taker("on", RULE_GOLD_SHARES="300", RULE_GOLD_SHUT_CENTS="60", **FAST)
+        t.verify_tick = lambda: None
+        mids = {"901": GOLD_0600, "902": GOLD_0600 + 900_000}
+        for mid, start in mids.items():
+            api.markets[mid] = gold_market(start, mid=int(mid))
+            api.listed.add(api.markets[mid]["categorySlug"])
+            api.books[mid] = {"bids": [], "asks": []}
+        slug1, slug2 = (api.markets[mid]["categorySlug"] for mid in ("901", "902"))
+        clock.ms = GOLD_0600 - 300 * 60_000 - 2_000  # 00:59:58, five hours before the 06:00 window
+        await t.tick()
+        for mid in mids:
+            connected(t, mid, {"bids": [], "asks": []})
+        self.assertNotIn("抢单记录", t.status())
+        wall = int(time.time() * 1000)
+        # 901: a ladder shows at 01:00:01 — bought in part: a faster taker begins on it 0.4 s after it showed, it is gone 1.2 s after
+        clock.ms += 3_000
+        t.stream.take("901", {"version": 2, "updateTimestampMs": wall - 300, "bids": [], "asks": [[0.50, 100], [0.51, 49.2], [0.52, 46.2]]})
+        api.fill[1] = 212.0
+        await t.tick()
+        kept = x.owner.store.get(R.PREFIX + slug1)["seen"]
+        self.assertEqual((kept["open"], kept["offer_ts"], kept["offer_max"], kept["start_ms"], kept["cents"]), (True, wall - 300, 195.4, GOLD_0600, 60),
+                         "on the record the moment the offer shows — not at the window's start, five hours on")
+        self.assertEqual((t.record(slug1)["index_set"], R.unverified(t.recs)), (1, {("901", 1)}), "the record the watch made knows its outcome once an order goes on it")
+        t.stream.take("901", {"version": 3, "updateTimestampMs": wall + 100, "bids": [], "asks": [[0.52, 20], [0.53, 57.4]]})
+        clock.ms += 200
+        await t.tick()
+        t.stream.take("901", {"version": 4, "updateTimestampMs": wall + 900, "bids": [], "asks": []})
+        clock.ms += 800
+        await t.tick()
+        seen = t.track[slug1]["seen"]
+        self.assertEqual((seen["cut_ts"] - seen["offer_ts"], seen["gone_ts"] - seen["offer_ts"]), (400, 1_200))
+        self.assertEqual(x.owner.store.get(R.PREFIX + slug1)["seen"]["gone_ts"], wall + 900, "...and as it is taken from and gone")
+        clock.ms += R.FILL_READ_MS
+        await t.tick()
+        # the process is restarted: the watch of the window, hours from its start, is as it stood
+        again = R.RuleTaker(x.owner)
+        api2 = again.api = Api(again)
+        api2.markets, api2.listed, api2.books, api2.rows = api.markets, api.listed, api.books, api.rows
+        again.verify_tick = lambda: None
+        await again.tick()
+        back = again.track[slug1]["seen"]
+        self.assertEqual((back["offer_ts"], back["cut_ts"], back["gone_ts"], back["offer_max"], back["listed_ms"]),
+                         (wall - 300, wall + 100, wall + 900, 195.4, seen["listed_ms"]), "restored, the listing's moment as first seen")
+        for mid in mids:
+            connected(again, mid, {"bids": [], "asks": []})
+        # 902: an offer shows at 01:15:01 and a faster taker has all of it 0.35 s later; this taker's order finds nothing
+        clock.ms = GOLD_0600 + 900_000 - 300 * 60_000 + 1_000
+        again.stream.take("902", {"version": 2, "updateTimestampMs": wall - 250, "bids": [], "asks": [[0.50, 100], [0.51, 50]]})
+        await again.tick()
+        again.stream.take("902", {"version": 3, "updateTimestampMs": wall + 100, "bids": [], "asks": []})
+        clock.ms += 400
+        await again.tick()
+        clock.ms += R.FILL_READ_MS
+        await again.tick()
+        rows = R.races(again.recs, "on", 0)
+        self.assertEqual([(r["slug"], r["lead_min"], r["peak"], r["cut_ms"], r["gone_ms"], r["asked"], r["bought"], r["open"]) for r in rows],
+                         [(slug2, 300.0, 150.0, 350, 350, 300.0, 0.0, True), (slug1, 300.0, 195.4, 400, 1_200, 300.0, 212.0, True)], "the latest window first")
+        first = rows[1]["orders"][0]
+        self.assertEqual((first["shares"], first["filled"], first["seen"], first["fresh"], first["after"] - first["lag"] - first["own"]), (300.0, 212.0, 195.4, True, 0),
+                         "how long after the offer showed the order left: the push's lag and the taker's own time")
+        status = again.status()
+        self.assertIn("抢单记录（最近 2 场，北京时间；“开始被吃 / 被吃光”是卖单出现之后多久，按 Predict 盘口自己的时间戳——抢走它的人有多快）：", status)
+        self.assertRegex(status, r"  11-17 06:15 黄金休市 4 档：≤60¢ 的卖单 \d\d:\d\d:\d\d 出现（开场前 300 分钟），最多 150 份；0\.35 秒后开始被吃、0\.35 秒后被吃光；"
+                                 r"下了 300 份，没买到｜第 1 张 要 300 成交 0（当时盘口上 150 份）：出现后 \d+ ms 发出、推送 \d+ ms、到达→发出 \d+ ms、往返 \d+ ms")
+        self.assertRegex(status, r"  11-17 06:00 黄金休市 4 档：≤60¢ 的卖单 \d\d:\d\d:\d\d 出现（开场前 300 分钟），最多 195\.4 份；0\.40 秒后开始被吃、1\.20 秒后被吃光；"
+                                 r"买到 212/300 份｜第 1 张 要 300 成交 212（当时盘口上 195\.4 份）：出现后 \d+ ms 发出")
+        # the month's medians count the windows whose watch is over: none yet — then both
+        self.assertEqual(R.watch_stats(again.recs, "gold_shut", "on", 0)["watched"], 0)
+        clock.ms = GOLD_0600 + 900_000 - R.STOP_MS
+        await again.tick()
+        st = R.watch_stats(again.recs, "gold_shut", "on", 0)
+        self.assertEqual((st["watched"], st["offered"], st["lost"], st["life"], st["won"], st["won_life"]), (2, 2, 1, 350, 1, 1_200))
+        self.assertEqual([(r["open"], r["bought"]) for r in R.races(again.recs, "on", 0)], [(False, 0.0), (False, 212.0)])
+        page = R.review(again.recs, again.settings, clock.ms)
+        self.assertEqual([(r["slug"], r["gone_ms"]) for r in page["races"]], [(slug2, 350), (slug1, 1_200)])
+        # a window nothing was seen of — a restart's, an older version's — with an order: the order's own clock is what there is
+        text = R.race_text({"start_ms": GOLD_0600, "name": "黄金休市 4 档", "cents": 60, "offer_at": 0, "lead_min": None, "peak": 0.0, "cut_ms": None,
+                            "gone_ms": None, "open": False, "asked": 212.0, "bought": 212.0, "orders": [
+                                {"shares": 166.0, "filled": 166.0, "paper": False, "seen": None, "fresh": None, "after": None, "lag": 240, "own": 96, "trip": 350},
+                                {"shares": 46.0, "filled": 46.0, "paper": False, "seen": None, "fresh": None, "after": None, "lag": 252, "own": 4_100, "trip": 366}]})
+        self.assertEqual(text, "11-17 06:00 黄金休市 4 档：卖单出现的时刻没有记到（重启前的，或没看到规则价以内的卖单）；买到 212/212 份"
+                               "｜第 1 张 要 166 成交 166：推送 240 ms、到达→发出 96 ms、往返 350 ms｜第 2 张 要 46 成交 46：推送 252 ms、到达→发出 4100 ms、往返 366 ms")
+
+
     async def test_off_finishes_what_is_open_and_plans_nothing(self):
         t, api, clock, x = taker("on")
         slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
