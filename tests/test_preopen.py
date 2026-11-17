@@ -1167,6 +1167,22 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         keys = {"PREOPEN_BTC5_CANCEL_SECONDS", "PREOPEN_BTC5_EXPIRY_SECONDS", "PREOPEN_BTC5_ENTRY_SECONDS", "PREOPEN_BTC5_AHEAD_MINUTES"}
         self.assertTrue(keys <= m.CONTROL_KEY_SET)
         self.assertEqual({k for k in keys if m.CONTROL_FORMS[k]["group"] == "预挂" and m.CONTROL_FORMS[k]["zero"] == "跟所有卡一样"}, keys)
+        # 1.152.2: 挂满 — BTC 5-minute quotes every listed window, the one Predict lists just now included (the front of the 49¢ queue),
+        # while the other cards keep their 120 minutes; the control page names the preset
+        form = m.CONTROL_FORMS["PREOPEN_BTC5_AHEAD_MINUTES"]
+        self.assertEqual((form["presets"][-1], form["captions"]["1440"]), ("1440", "挂满：一发布就挂"))
+        self.assertEqual(m.CONTROL_FORMS["PREOPEN_AHEAD_MINUTES"]["captions"], {"1440": "挂满"})
+        self.assertEqual(m.Config.from_env({**base, "PREOPEN_BTC5_AHEAD_MINUTES": "1440"}).preopen.btc5_ahead_minutes, 1440)
+        full, _, _ = controller(PREOPEN_MARKETS="btc5,btc", PREOPEN_AHEAD_MINUTES="120", PREOPEN_BTC5_AHEAD_MINUTES="1440")
+        starts = p.window_starts(NOW, full.owner.config, full.settings)
+        five = [(st - NOW) // 60_000 for r, st in starts if r.key == "BTC-5M"]
+        self.assertEqual((five[0], five[-1], len(five)), (5, 1440, 288))
+        self.assertEqual(max((st - NOW) // 60_000 for r, st in starts if r.key == "BTC-15M"), 120)
+        self.assertEqual(p.candidate_problem(market(at=NOW + 1440 * 60_000, mid=12, minutes=5), NOW, full.owner.config, full.settings), "",
+                         "listed a day ahead: placed at once")
+        self.assertEqual(p.candidate_problem(market(at=NOW + 135 * 60_000, mid=13), NOW, full.owner.config, full.settings), "开始还在 120 分钟之外（之后再扫）")
+        self.assertIn("BTC 5 分钟自己的时间：开场前 20 秒撤单、10 秒签名到期，不足 180 秒不再新挂，挂 24 小时内已发布的全部场次", full.status())
+        await self.finish(full)
 
     async def test_five_minute_cards_are_quoted_on_their_own_rhythm(self):
         """1.137.0: btc5 / eth5 / bnb5 name the 5-minute cards (btc-updown-5m-<start>): a window every five minutes, the

@@ -458,6 +458,32 @@ async def browser_check(bot, data):
         assert await page.is_visible("#statsbody") and "模型预期（下单时）" in await page.inner_text("#statsbody") and await page.is_visible("#groups")
         await page.click("#statshd")
         assert await page.is_hidden("#statsbody")
+        # 1.152.2: 账户里有、记录里没有的持仓 sits below 统计与风险, folded to one line; opened, the market is named in full and linked,
+        # with its value and result — and no 均价 / 持仓时间 columns when Predict gave none (they were all "—")
+        assert await page.is_hidden("#unrecbox"), "a paper bot: nothing to show"
+        await page.evaluate("""data.live={unrecorded:[{name:"Will $PONS FDV hit $20M before November 2026? / No",shares:10.7535,price:null,at:0,value:10.75,
+          url:"https://predict.fun/zh-cn/market/what-fdv-will-pons-hit-before-nov-2026",status:"WON",market_id:"778",index_set:2}],unknown_orders:2,positions_at:Date.now()};unrecorded()""")
+        assert await page.is_visible("#unrecbox") and await page.is_hidden("#unrecbody") and await page.inner_text("#foldunrec") == "展开"
+        assert await page.inner_text("#unrecsum") == "1 个 · 现值 $10.75 · 挂单 2 张", await page.inner_text("#unrecsum")
+        assert await page.evaluate("!!(document.getElementById('statsbox').compareDocumentPosition(document.getElementById('unrecbox'))&Node.DOCUMENT_POSITION_FOLLOWING)")
+        await page.click("#unrechd")
+        assert await page.is_visible("#unrecbody") and await page.inner_text("#foldunrec") == "收起" and await page.evaluate("localStorage.getItem('jrnunrec')") == "1"
+        assert await page.locator("#unrectbl .urow").count() == 1 and await page.inner_text("#unrectbl .urow a") == "Will $PONS FDV hit $20M before November 2026? / No"
+        assert await page.get_attribute("#unrectbl .urow a", "href") == "https://predict.fun/zh-cn/market/what-fdv-will-pons-hit-before-nov-2026"
+        assert await page.inner_text("#unrectbl .urow .small") == "账户多出 10.7535 份 · 现值 $10.75 · 已结算：赢", "no 均价 nor 持仓时间 when Predict gave none"
+        assert "账户上还有 2 张没有记录的挂单" in await page.inner_text("#unrecread")
+        await page.click("#unrechd")
+        assert await page.is_hidden("#unrecbody") and await page.evaluate("localStorage.getItem('jrnunrec')") == "0"
+        await page.evaluate("data.live=null;unrecorded()")
+        assert await page.is_hidden("#unrecbox")
+        # 1.153.0: 规则吃单 in 复盘分析 — each rule's totals (the real and the paper apart) and the windows bought
+        await page.evaluate("""rulesSection({mode:"paper",markets:{gold:{on:true,shares:50,name:"黄金"},oil:{on:false,shares:50,name:"原油"}},max_day_usd:200,rules:[{rule:"gold_shut",name:"黄金休市 4 档",side:"up",cents:58,mode:"paper",windows:3,
+          shares:150,cost:78.9,settled:2,wins:2,losses:0,pnl:46.1,open:1,watch:{watched:20,offered:12,offer_avg:35.5,best_mid:0.51,open_lead:142}}],recent:[{slug:"xau-updown-15m-1",rule:"gold_shut",name:"黄金休市 4 档",
+          window:"黄金 15分涨跌 06:00–06:15",start_ms:Date.now(),side:"up",mode:"paper",shares:50,avg:0.526,cost:26.3,result:"up",pnl:23.2}]})""")
+        rtxt = await page.text_content("#a-rules")
+        for want in ("只记录（不下单）", "黄金 开（每场最多 50 份）、原油 关", "每天最多 $200", "盘口观察（近 30 天）", "35.5", "中位 142 秒", "黄金休市 4 档", "涨 ≤58¢", "+$46.10", "2/0", "黄金 15分涨跌 06:00–06:15", "52.6¢", "+$23.20"):
+            assert want in rtxt, (want, rtxt)
+        assert await page.get_attribute("#h-rules", "data-k") == "ruletaker", "its own fold key: 统计与风险's 规则 keeps rules"
         # 1.113.0: the daily summary is one line per day until that line is clicked (its kind / way lines then show; a second
         # click folds them); 今日按市场 has a refresh button and says when the data was read
         days = page.locator("#summary tr.dayrow")

@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.152.1"
+VERSION = "1.153.3"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -621,6 +621,72 @@ class PreopenSettings:
         return config.preopen
 
 
+# 1.153.0: 规则吃单 (rules.py) — each rule's price setting (cents, 0 = the rule off) and its default
+RULE_SETTING_KEYS = {"gold_shut": "RULE_GOLD_SHUT_CENTS", "gold_open": "RULE_GOLD_OPEN_CENTS", "gold_0515": "RULE_GOLD_0515_CENTS",
+                     "gold_0500": "RULE_GOLD_0500_CENTS", "gold_1645": "RULE_GOLD_1645_CENTS",
+                     "oil_shut": "RULE_OIL_SHUT_CENTS", "oil_open": "RULE_OIL_OPEN_CENTS", "oil_0045": "RULE_OIL_0045_CENTS"}
+# oil_shut 0: ties settle Up, Down won 42% (1.153.0); oil_open 50 (1.153.2, was 55: +3¢ a share there, +8¢ at 50); the three the slot scan
+# found (1.153.2) off until tried on paper
+RULE_DEFAULT_CENTS = {"gold_shut": 58, "gold_open": 50, "gold_0515": 58, "gold_0500": 0, "gold_1645": 0, "oil_shut": 0, "oil_open": 50, "oil_0045": 0}
+
+
+RULE_MARKET_KEYS = {"gold": ("RULE_GOLD", "RULE_GOLD_SHARES"), "oil": ("RULE_OIL", "RULE_OIL_SHARES")}  # 1.153.1: each market's switch and size
+
+
+@dataclass(frozen=True)
+class RuleSettings:
+    """规则吃单 (rules.py): RULE_TAKER off | paper (只记录，不下单) | on (真实吃单, with LIVE=on); each market on or off by itself
+    (RULE_GOLD, RULE_OIL, 1.153.1) with the most shares bought a window (RULE_GOLD_SHARES, RULE_OIL_SHARES; RULE_SHARES, 1.153.0's
+    one figure, is the default of both); each rule's highest price in cents (RULE_*_CENTS, 0 = that rule off); the most spent a
+    Beijing day, the rules together (RULE_MAX_DAY_USD, 0 = no cap). Validated when on or paper; read leniently when off, as
+    PreopenSettings is."""
+    mode: str = "off"
+    cents: tuple = tuple(RULE_DEFAULT_CENTS.items())
+    markets: frozenset = frozenset(RULE_MARKET_KEYS)
+    shares: tuple = (("gold", 50), ("oil", 50))
+    max_day_usd: float = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode != "off"
+
+    def price(self, key: str) -> int:
+        return int(dict(self.cents).get(key, 0))
+
+    def on(self, market: str) -> bool:
+        return market in self.markets
+
+    def shares_of(self, market: str) -> int:
+        return int(dict(self.shares).get(market, 0))
+
+    @classmethod
+    def from_env(cls, e: Mapping, force: bool = False) -> "RuleSettings":
+        mode = str(e.get("RULE_TAKER", "off")).strip().lower()
+        try:
+            return cls.parse(e, mode)
+        except ValueError:
+            if mode != "off" or force:
+                raise
+            return cls()
+
+    @classmethod
+    def parse(cls, e: Mapping, mode: str) -> "RuleSettings":
+        if mode not in {"off", "paper", "on"}:
+            raise ValueError("RULE_TAKER 只能是 off、paper（只记录不下单）或 on（真实吃单）")
+        cents = {key: int(str(e.get(name, RULE_DEFAULT_CENTS[key])).strip() or 0) for key, name in RULE_SETTING_KEYS.items()}
+        switches = {m: str(e.get(switch, "on")).strip().lower() for m, (switch, _) in RULE_MARKET_KEYS.items()}
+        default = str(e.get("RULE_SHARES", "50")).strip() or "50"
+        shares = {m: int(str(e.get(name, default)).strip() or 0) for m, (_, name) in RULE_MARKET_KEYS.items()}
+        max_day = float(str(e.get("RULE_MAX_DAY_USD", "0")).strip() or 0)
+        if any(v not in {"on", "off"} for v in switches.values()):
+            raise ValueError("RULE_GOLD、RULE_OIL 只能是 on 或 off")
+        if (any(not (c == 0 or 1 <= c <= 95) for c in cents.values()) or any(not 1 <= n <= 100_000 for n in shares.values())
+                or not 0 <= max_day <= 1_000_000):
+            raise ValueError("RULE_*_CENTS 是 0（不做这条规则）或 1～95（¢，最高买价）；RULE_GOLD_SHARES、RULE_OIL_SHARES 每场最多买 1～100000 份；"
+                             "RULE_MAX_DAY_USD 0～1000000（每天最多花多少，0 = 不限）")
+        return cls(mode, tuple(cents.items()), frozenset(m for m, v in switches.items() if v == "on"), tuple(shares.items()), max_day)
+
+
 CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("LIVE", "真实交易模式", "off 只记账 / pause 登录 Predict、可自检和挂单测试、不开新仓 / on 真实下单（pause、on 需要已配置 PREDICT_PRIVATE_KEY）"),
     ("SIM_EDGE_CENTS", "触发买入的净优势（¢/份）", "0.5～50"),
@@ -710,8 +776,35 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_BTC5_CANCEL_SECONDS", "BTC 5 分钟：开场前几秒撤单", "只管 BTC 5 分钟卡（1.152.0）；0 = 跟上面所有卡的一样。至少比它自己的到期多 5 秒、至多 900"),
     ("PREOPEN_BTC5_EXPIRY_SECONDS", "BTC 5 分钟：签名开场前几秒到期", "只管 BTC 5 分钟卡；0 = 跟上面所有卡的一样。5～600：撤单发不出去时的兜底，到期后不再撮合"),
     ("PREOPEN_BTC5_ENTRY_SECONDS", "BTC 5 分钟：距开场不足几秒不再新挂", "只管 BTC 5 分钟卡；0 = 跟上面所有卡的一样。至少比它自己的撤单时间多 60 秒、至多 3600"),
-    ("PREOPEN_BTC5_AHEAD_MINUTES", "BTC 5 分钟：只挂几分钟内开始的场次", "只管 BTC 5 分钟卡；0 = 跟上面所有卡的一样。3～1440：调小就只挂快开场的几场，少占资金、少读接口"),
+    ("PREOPEN_BTC5_AHEAD_MINUTES", "BTC 5 分钟：只挂几分钟内开始的场次", "只管 BTC 5 分钟卡；0 = 跟上面所有卡的一样。1440 = 挂满：Predict 发布的场次全部挂上，"
+     "新场次一发布就挂（0.5 秒内），排在 49¢ 买单队伍最前面；24 小时最多 288 场，每场两边各 49¢ × 每次份数，预挂资金上限不够时最晚发布的几场挂不上（预挂状态写“已发布未挂”）。"
+     "3～1440：调小就只挂快开场的几场，少占资金、少读接口，但新场次要等进了范围才挂，排在先挂的人后面"),
     ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "0～1000000，0 = 不限（默认）：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金，成交时才扣款；余额够一场双边就挂）；设了上限时每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放，/preopen 会算出把已发布的全部挂上需要多少"),
+    # 1.153.0: 规则吃单 (rules.py) — the gold / oil windows the backtest found mispriced (README「规则吃单」)
+    ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段，只在开场前吃：Predict 撮合开启后到开场前 15 秒，盘口一出现规则价以内的指定方向就立即买"
+     "（盘口变化由推送送来，不等下一次读）。off 关；paper 只记录不下单：按当时盘口记下会买到多少、按 Predict 的结果结算，先看几天再开；"
+     "on 真实吃单（需要 LIVE=on；真实交易暂停、今日亏损停机、接口限流冷却时都不下单）"),
+    ("RULE_GOLD", "规则吃单：黄金", "on = 做黄金的规则（下面价格设为 0 的那条不做）；off = 黄金一条都不做"),
+    ("RULE_GOLD_SHARES", "黄金：每场最多买多少份", "1～100000：黄金一个 15 分钟场次最多买这么多份（几次吃单合计）；每张单另受 LIVE_MAX_ORDER_USD 限制"),
+    ("RULE_GOLD_SHUT_CENTS", "黄金休市 4 档：买涨不高于（¢）", "纽约 17:00–17:45、周一至周四 CME 每天休市的 4 个 15 分钟（北京冬令时 06:00–06:45，夏令时 05:00–05:45）："
+     "指数不动，终点等于起点按涨结算；2025-12 至 2026-11 涨占 90%，每月最低 76%。0 = 不做"),
+    ("RULE_GOLD_OPEN_CENTS", "黄金开盘第一档：买跌不高于（¢）", "纽约 18:00、周一至周四每天重新开盘的第一个 15 分钟（北京冬令时 07:00，夏令时 06:00）；"
+     "周一早上那场（周末后开盘）跌只占 41%，不做。2026 年周二至周五跌占 58%，近半年 78%，但前几个月是涨多：0 = 不做"),
+    ("RULE_GOLD_0515_CENTS", "黄金纽约 05:15：买跌不高于（¢）", "纽约 05:15–05:30、周一至周五（北京冬令时 18:15，夏令时 17:15）：伦敦上午定盘前，2026 年跌占 65%，"
+     "前后几档只有 38–55%；按纽约时间算，夏令时是北京 17:15 那场（北京 18:15 那时跌只占 52%）。0 = 不做"),
+    ("RULE_GOLD_0500_CENTS", "黄金纽约 05:00：买涨不高于（¢）", "纽约 05:00–05:15、周一至周五（北京冬令时 18:00，夏令时 17:00），就在 05:15 那档之前："
+     "2025-12 至 2026-11 涨占 62%（上半年 57%、下半年 66%；3 月、5 月是跌多）；52¢ 每份约 +9¢。按全部时段扫出来的，默认 0 = 不做，建议先只记录"),
+    ("RULE_GOLD_1645_CENTS", "黄金休市前一档：买涨不高于（¢）", "纽约 16:45–17:00、周一至周五（北京冬令时 05:45，夏令时 04:45），CME 每天休市前的最后一档："
+     "涨占 60%（周二只有 44%，最近三个月 68–90%）；52¢ 每份约 +7¢。按全部时段扫出来的，默认 0 = 不做，建议先只记录"),
+    ("RULE_OIL", "规则吃单：原油", "on = 做原油的规则（下面价格设为 0 的那条不做）；off = 原油一条都不做"),
+    ("RULE_OIL_SHARES", "原油：每场最多买多少份", "1～100000：原油一个 15 分钟场次最多买这么多份（几次吃单合计）；每张单另受 LIVE_MAX_ORDER_USD 限制"),
+    ("RULE_OIL_SHUT_CENTS", "原油休市 4 档：买跌不高于（¢）", "原油的同一时段（纽约 17:00–17:45，周一至周四）。指数不动时按涨结算，2026-04 至 11 跌只占 42%："
+     "45¢ 买跌每份约亏 3.6¢，所以默认 0 = 不做"),
+    ("RULE_OIL_OPEN_CENTS", "原油开盘第一档：买跌不高于（¢）", "原油纽约 18:00、周一至周四重新开盘的第一个 15 分钟（北京冬令时 07:00）；2026 年跌占 59%："
+     "50¢ 每份约赚 8¢（默认，1.153.2；55¢ 只剩约 3¢）。0 = 不做"),
+    ("RULE_OIL_0045_CENTS", "原油纽约 00:45：买跌不高于（¢）", "原油纽约 00:45–01:00、周一至周五（北京冬令时 13:45，夏令时 12:45）：2026-04 至 11 跌占 62%，"
+     "每个月 50–76%；50¢ 每份约 +11¢。按全部时段扫出来的、显著性刚到边，默认 0 = 不做，建议先只记录"),
+    ("RULE_MAX_DAY_USD", "规则吃单：每天最多花多少（$）", "0～1000000：黄金、原油合计，一天（北京时间）下单的金额（成交的按成交价、还没结果的按全额）到这个数就不再买；0 = 不限"),
 )
 CONTROL_KEY_SET = frozenset(k for k, _, _ in CONTROL_KEYS)
 # One-click combinations for the control page (一键搭配): the strategy settings only. What to trade (SIM_MARKETS, SIM_SKIP),
@@ -894,6 +987,7 @@ class Config:
     web_control_key: str = field(default="", repr=False)  # WEB_CONTROL_KEY: the control page's secret; "" = the page is read-only
     env: dict = field(default_factory=dict, repr=False, compare=False)  # the variables this was read from (runtime changes re-read it)
     preopen: PreopenSettings = field(default_factory=PreopenSettings)  # the pre-open quoting mode (preopen.py), the control page's values included
+    rules: RuleSettings = field(default_factory=RuleSettings)  # 规则吃单 (rules.py, 1.153.0), the control page's values included
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -984,6 +1078,7 @@ class Config:
                            parse_dates(e.get("CME_EARLY_DAYS", DEFAULT_SPECIAL_DAYS["CME_EARLY"]), "CME_EARLY_DAYS"),
                            parse_dates(e.get("CME_CLOSED_DAYS", DEFAULT_SPECIAL_DAYS["CME_CLOSED"]), "CME_CLOSED_DAYS"))
         preopen = PreopenSettings.from_env(e)
+        rules = RuleSettings.from_env(e)
         if preopen.enabled:  # a stock card the pre-open mode quotes: its exchange ticker (the limit / halt guard's quote) even when the pair is not in SYMBOLS (1.134.0: 智谱)
             for spec in WINDOW_UPDOWN_MARKETS:
                 if spec.exchange and spec.key in preopen.markets and spec.symbol not in tickers:
@@ -991,7 +1086,7 @@ class Config:
         return cls(
             token=e.get("TELEGRAM_BOT_TOKEN", "").strip(),
             admin_id=bounded_int(e, "ADMIN_USER_ID", 0, 0, 10**15),
-            symbols=symbols, db_path=e.get("STATE_DB", "./data/bot.sqlite3"), preopen=preopen,
+            symbols=symbols, db_path=e.get("STATE_DB", "./data/bot.sqlite3"), preopen=preopen, rules=rules,
             threshold=threshold,
             cooldown=bounded_int(e, "ALERT_COOLDOWN_SECONDS", 300, 0, 86400),
             poll=bounded_int(e, "POLL_SECONDS", 5, 3, 3600),
@@ -11644,15 +11739,30 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_DEEP_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "60", "120", "240", "1440"], "unit": "分钟", "zero": "和第一档一样"},
     "PREOPEN_LIMIT_GAP_PCT": {"kind": "number", "group": "预挂", "presets": ["0", "1", "2", "3", "5"], "unit": "%", "zero": "不管涨跌停"},
     "PREOPEN_OPEN_QUIET_MINUTES": {"kind": "number", "group": "预挂", "presets": ["15", "30", "60"], "unit": "分钟", "zero": "按 15 算（第一场固定不挂）"},
-    "PREOPEN_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["60", "120", "240", "720", "1440"], "unit": "分钟"},
+    "PREOPEN_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["60", "120", "240", "720", "1440"], "unit": "分钟", "captions": {"1440": "挂满"}},
     "PREOPEN_CANCEL_SECONDS": {"kind": "number", "group": "预挂", "presets": ["10", "15", "20", "30", "60"], "unit": "秒"},
     "PREOPEN_EXPIRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["5", "10", "15", "30"], "unit": "秒"},
     "PREOPEN_ENTRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["90", "120", "180", "300"], "unit": "秒"},
     "PREOPEN_BTC5_CANCEL_SECONDS": {"kind": "number", "group": "预挂", "presets": ["0", "10", "15", "20", "30"], "unit": "秒", "zero": "跟所有卡一样"},
     "PREOPEN_BTC5_EXPIRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["0", "5", "10", "15"], "unit": "秒", "zero": "跟所有卡一样"},
     "PREOPEN_BTC5_ENTRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["0", "90", "120", "180", "300"], "unit": "秒", "zero": "跟所有卡一样"},
-    "PREOPEN_BTC5_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "30", "60", "120", "240"], "unit": "分钟", "zero": "跟所有卡一样"},
+    "PREOPEN_BTC5_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "30", "60", "120", "240", "1440"], "unit": "分钟", "zero": "跟所有卡一样",
+                                   "captions": {"1440": "挂满：一发布就挂"}},  # 1.152.2: every listed window, each placed the moment it is listed
     "PREOPEN_MAX_OPEN_USD": {"kind": "number", "group": "预挂", "presets": ["0", "1000", "5000", "7000", "20000"], "unit": "$", "zero": "不限"},
+    "RULE_TAKER": {"kind": "choice", "group": "规则", "options": [["off", "off 关"], ["paper", "paper 只记录不下单"], ["on", "on 真实吃单（需要 LIVE=on）"]]},
+    "RULE_GOLD_SHUT_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "55", "58", "60", "65"], "unit": "¢", "zero": "不做"},
+    "RULE_GOLD_OPEN_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "45", "48", "50", "52"], "unit": "¢", "zero": "不做"},
+    "RULE_GOLD_0515_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "50", "55", "58"], "unit": "¢", "zero": "不做"},
+    "RULE_GOLD_0500_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "50", "52", "55"], "unit": "¢", "zero": "不做"},
+    "RULE_GOLD_1645_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "50", "52", "55"], "unit": "¢", "zero": "不做"},
+    "RULE_OIL_SHUT_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "35", "40", "45"], "unit": "¢", "zero": "不做"},
+    "RULE_OIL_OPEN_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "45", "50", "55"], "unit": "¢", "zero": "不做"},
+    "RULE_OIL_0045_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "45", "50", "52"], "unit": "¢", "zero": "不做"},
+    "RULE_GOLD": {"kind": "choice", "group": "规则", "options": [["on", "on 开"], ["off", "off 关"]]},
+    "RULE_GOLD_SHARES": {"kind": "number", "group": "规则", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
+    "RULE_OIL": {"kind": "choice", "group": "规则", "options": [["on", "on 开"], ["off", "off 关"]]},
+    "RULE_OIL_SHARES": {"kind": "number", "group": "规则", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
+    "RULE_MAX_DAY_USD": {"kind": "number", "group": "规则", "presets": ["0", "50", "100", "200", "500", "1000"], "unit": "$", "zero": "不限"},
     "SIM_EDGE_CENTS": {"kind": "number", "group": "策略", "presets": ["3", "5", "8", "10", "15", "20"], "unit": "¢"},
     "SIM_SHARES": {"kind": "number", "group": "策略", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
     "SIM_TAKER_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "10", "20", "50", "100", "200"], "unit": "份", "zero": "同每次份数"},
@@ -14284,13 +14394,12 @@ dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
 .note{font-size:12.5px;background:var(--chip);border-radius:10px;padding:8px 10px;border-left:3px solid var(--warn)}.note.bad{border-left-color:var(--hot)}
 footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:var(--faint);font-size:12px}
 .evchart{width:100%;height:auto;display:block;margin:6px 0 2px;background:var(--chip);border-radius:10px}.evchart .grid{stroke:var(--line2)}.evchart .zero{stroke:var(--faint);stroke-dasharray:3 3}.evchart text{font-size:10px;fill:var(--faint)}.evchart .band{fill:var(--best-soft);opacity:.35}.evchart .ev{fill:none;stroke:var(--muted);stroke-width:1.5;stroke-dasharray:5 4}.evchart .pnl{fill:none;stroke:var(--best);stroke-width:2}.evchart circle.pnl{fill:var(--best)}.evchart circle.ev{fill:var(--muted)}
+.ulist{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:2px 12px}.ulist .urow{padding:8px 0;border-bottom:1px solid var(--line2);font-size:13px;line-height:1.5}.ulist .urow:last-child{border-bottom:0}.ulist .urow>a,.ulist .urow>span{overflow-wrap:anywhere}.ulist .urow .small{margin-top:2px}
 details.hint{margin:4px 0 8px}details.hint>summary{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--muted);cursor:pointer;list-style:none;user-select:none;padding:2px 0}details.hint>summary::-webkit-details-marker{display:none}details.hint>summary:before{content:"ⓘ"}details.hint>summary:after{content:"▸";font-size:10px}details.hint[open]>summary:after{content:"▾"}details.hint[open]>summary{color:var(--text)}details.hint>p{margin:3px 0 0;font-size:12.5px;color:var(--muted);line-height:1.6}details.fold{border-top:1px solid var(--line2)}details.fold>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:8px;padding:10px 0;user-select:none}details.fold>summary::-webkit-details-marker{display:none}details.fold>summary:before{content:"▸";color:var(--muted);font-size:11px;width:10px;flex:0 0 auto}details.fold[open]>summary:before{content:"▾"}details.fold>summary h3{margin:0;font-size:13.5px;color:var(--text)}details.fold[open]{padding-bottom:10px}details.fold.sub{border-top:0}details.fold.sub>summary{padding:6px 0 4px;font-size:12px;color:var(--muted);font-weight:600}details.fold.sub[open]{padding-bottom:4px}details.cust{display:contents}details.cust>summary{list-style:none;display:inline-flex;align-items:center;cursor:pointer;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}details.cust>summary::-webkit-details-marker{display:none}details.cust>summary:after{content:" ▾";font-size:10px}details.cust[open]>summary{border-color:var(--best);color:var(--best)}details.cust .tcust{flex-basis:100%}details.menu{display:inline-block;position:relative}details.menu>summary{list-style:none}details.menu>summary::-webkit-details-marker{display:none}details.menu .mlist{position:absolute;z-index:8;top:calc(100% + 4px);left:0;display:flex;flex-direction:column;gap:2px;min-width:160px;padding:6px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow2)}details.menu .mlist a{padding:7px 10px;border-radius:8px;color:var(--text);text-decoration:none;font-size:13px}details.menu .mlist a:hover{background:var(--chip)}.tbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:2px 0 10px}.tbar .tq.on{border-color:var(--best);color:var(--best);background:var(--best-bg)}ul.notes{margin:4px 0 10px;padding-left:20px;font-size:13px;line-height:1.55}ul.notes li{margin:2px 0}.tbar select,.tbar input,.tbar button{font:inherit;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}.tbar button{cursor:pointer}.tcust{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}.tsum{font-size:13px;margin:2px 0 4px}.tcu{color:var(--up)}.tcd{color:var(--down)}.tdots{display:flex;flex-direction:column;gap:3px;margin:10px 0 6px}.trow{display:flex;align-items:flex-start;gap:8px;font-size:11px;color:var(--muted)}.trow .tl{width:70px;flex:none;font-variant-numeric:tabular-nums;line-height:13px}.trow .tcells{display:flex;flex-wrap:wrap;gap:3px}.tdot{width:12px;height:12px;border-radius:50%;display:inline-block;flex:none;vertical-align:-2px;box-sizing:border-box}.tdot.u{background:var(--up)}.tdot.d{background:var(--down)}.tdot.f{background:var(--faint)}.tdot.n{opacity:.42}.tdot.x{border:1.5px solid var(--line)}.tdot.bad{box-shadow:0 0 0 2px var(--warn)}.tlegend .tdot{margin:0 4px 0 8px}.tdots .tdot{cursor:pointer}.tdots.only .tdot:not(.bad){opacity:.15}.tdot.sel{outline:2px solid var(--text);outline-offset:1px}.tdet{font-size:12.5px;background:var(--chip);border-radius:10px;padding:7px 10px;margin:4px 0}.tdays tr.pick{cursor:pointer}.tdays tr.on td{background:var(--best-bg)}
 </style></head><body><div class="wrap">
 <header><div class="ttl"><h1 id="title">交易复盘</h1><div class="meta" id="meta">加载中…</div></div><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button></header>
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><details class="menu" id="exports"><summary class="btn">导出 ▾</summary><div class="mlist"><a id="csv" href="journal.csv" download="交易日记.csv">交易日记 CSV</a><a id="scsv" href="summary.csv" download="复盘汇总.csv">复盘汇总 CSV</a><a id="mcsv" href="samples.csv" download="模型样本.csv">模型样本 CSV</a><a id="json" href="journal.json?full=1" download="交易日记.json">交易日记 JSON</a></div></details></div>
 <div class="tiles" id="tiles"></div>
-<section class="box" id="unrecbox" hidden><div class="hd"><h2>账户里有、记录里没有的持仓</h2><span class="sum" id="unrecsum"></span></div>
-<div class="body" id="unrecbody"></div><details class="hint" id="unrecnote" hidden><summary>说明</summary><p>按最近一次读到的 Predict 持仓，减去记录和开盘前预挂的份数；多出来的多半是没有记录的挂单成交了（手动单、丢失跟踪的单）。每分钟一次的持仓核对会把它补记到同一方向最近结束的订单上，没有这样的订单就留在这里；/live fills 给出逐项对照。</p></details></section>
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
 <div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>按市场 · <span id="scrng">今天</span> <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbar" id="cbar"><button type="button" class="tq on" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><button type="button" class="tq" data-r="all">全部</button><details class="cust" id="ccust"><summary>自定义</summary><span class="tcust"><input type="date" id="cfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="cto" aria-label="结束日期"><button type="button" id="cgo">查看</button></span></details></div><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><details class="hint"><summary>说明</summary><p>选的日子（北京时间）里下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；开盘前预挂（两边挂）单独成行，名字后带“· 开盘前预挂”，按场次开始的日期算，下单时预期按五五开算。<b>偏离</b> = 实际盈亏比下单时预期差了几个 σ（σ 按下单时的概率算）：±2σ 以内可能只是运气，低于 −2σ 就不像运气了，是这个市场有问题。点一行看明细：原策略是这段时间的每一笔；开盘前预挂是钱亏在哪——只成交一边时那边赢几成、按开始时间、按成交时距开场、按方向和价格档。</p><p>按下单日期（北京时间）统计，开盘前预挂的场次按场次开始的日期计入当天，点开那一天有单独的“开盘前预挂”一行；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></details></div></section>
 <section class="box" id="tallybox"><div class="hd" id="tallyhd"><h2>市场涨跌统计</h2><span class="sum" id="tallysum"></span><button type="button" class="lnk" id="foldtally">收起</button></div>
@@ -14308,6 +14417,7 @@ details.hint{margin:4px 0 8px}details.hint>summary{display:inline-flex;align-ite
 <details class="fold" data-k="sessions"><summary><h3>按时段</h3></summary><div id="a-sessions"></div><details class="hint"><summary>说明</summary><p>按下单时标的所在的时段（交易所当地时间）；成交后市场走向 = 盘口中间价 − 成交价，每份，持续为负 = 这个时段的成交常是别人在出货；没有开盘时段的市场（加密）记在“无交易时段”。</p></details></details>
 <details class="fold" data-k="windows" id="h-windows" hidden><summary><h3>15 分钟涨跌</h3></summary><div id="a-windows" hidden></div><details class="hint" id="p-windows" hidden><summary>说明</summary><p>只算 15 分钟窗口的记录：按窗口开始的整点（北京时间，两张卡都有时分开写），和按下单时离窗口结束还有几分钟。胜率低于平均公平价、成交后 1 / 5 分钟市价持续为负的那一行，就是模型在那个时段或那个时点看错的地方。</p></details></details>
 <details class="fold" data-k="preopen" id="h-preopen" hidden><summary><h3>开盘前预挂</h3></summary><div id="a-preopen" hidden></div><details class="hint" id="p-preopen" hidden><summary>说明</summary><p>开盘前预挂模式（PREOPEN_15M）自己的记录，不受上面的筛选条影响：每场涨、跌两边各一张固定价买单，成交的那一边按官方结果结算（赢 = 1 − 价格、输 = −价格，每份，平局按 0.5）。记录 = 一次报价（同一场重新报价算两条），场次 = 不同的窗口；没成交就撤掉的场次不算输赢。按日期、开始时间都是场次开始的北京时间。</p></details></details>
+<details class="fold" data-k="ruletaker" id="h-rules" hidden><summary><h3>规则吃单</h3></summary><div id="a-rules"></div><details class="hint"><summary>说明</summary><p>黄金、原油 15 分钟的几个固定时段（控制台“规则吃单”一组，RULE_TAKER）：开场前盘口出现规则价格以下的指定方向就吃单，每场最多 RULE_SHARES 份。真实吃单和只记录（paper：按当时盘口记下会买到多少，不下单）分开算；成本含吃单手续费，按 Predict 的结果结算。不受上面的筛选条影响。</p></details></details>
 <details class="fold" data-k="makers"><summary><h3>挂单效率</h3></summary><div id="a-makers"></div></details>
 <details class="fold" data-k="blocked"><summary><h3>被拦下的机会</h3></summary><div id="a-blocked"></div><details class="hint"><summary>说明</summary><p>组上限（SIM_GROUP_USD）最近一周拦下的买入：市场已出结果的，按每笔份数（SIM_SHARES）算若当时买入的盈亏——长期为正说明上限偏紧。</p></details></details></div></section>
 <section class="box" id="statsbox"><div class="hd" id="statshd"><h2>统计与风险</h2><span class="sum" id="statsum"></span><button type="button" class="lnk" id="foldstats">展开</button></div>
@@ -14315,6 +14425,8 @@ details.hint{margin:4px 0 8px}details.hint>summary{display:inline-flex;align-ite
 <h3 id="h-groups" hidden>分组</h3><div class="tbl" id="groups" hidden></div>
 <h3 id="h-risk" hidden>共同风险</h3><div id="risk" hidden></div>
 <details class="fold" data-k="rules"><summary><h3>规则</h3></summary><p class="small mut" id="intro"></p></details></div></section>
+<section class="box" id="unrecbox" hidden><div class="hd" id="unrechd"><h2>账户里有、记录里没有的持仓</h2><span class="sum" id="unrecsum"></span><button type="button" class="lnk" id="foldunrec">展开</button></div>
+<div class="body" id="unrecbody" hidden><p class="small mut" id="unrecread"></p><div id="unrectbl"></div><details class="hint"><summary>说明</summary><p>按最近一次读到的 Predict 持仓，减去记录和开盘前预挂的份数；多出来的多半是没有记录的挂单成交了（手动单、丢失跟踪的单）。每分钟一次的持仓核对会把它补记到同一方向最近结束的订单上，没有这样的订单就留在这里；/live fills 给出逐项对照。市场名点开是它在 Predict 的页面；现值按 Predict 给的持仓市值折算到多出的份数；Predict 的持仓接口不给均价，所以不写均价。这一栏默认收起，点标题展开。</p></details></div></section>
 <div class="search"><input type="search" id="q" placeholder="搜市场、订单号、价格（21）、份数（298.73）、状态…" autocomplete="off"><span class="small mut" id="qn"></span></div>
 <div class="filters" id="filters"></div>
 <div class="list" id="list"></div>
@@ -14358,6 +14470,7 @@ const details={};  // trade id -> its whole record, fetched when the trade is op
 try{statsOpen=localStorage.getItem("jrnstats")==="1"}catch(e){}
 let sumOpen=true;try{sumOpen=localStorage.getItem("jrnsum")!=="0"}catch(e){}  // the daily summary: open unless folded by hand
 let anaOpen=false;try{anaOpen=localStorage.getItem("jrnana")==="1"}catch(e){}  // the analysis tables: folded unless opened by hand
+let unrecOpen=false;try{unrecOpen=localStorage.getItem("jrnunrec")==="1"}catch(e){}  // 账户里有、记录里没有的持仓: folded unless opened by hand (1.152.2)
 const base=location.pathname.replace(/\/journal\/?$/,"");
 document.getElementById("back").href=base;document.getElementById("ctl").href=base+"/control";
 document.getElementById("csv").href=base+"/journal.csv";document.getElementById("scsv").href=base+"/summary.csv";document.getElementById("json").href=base+"/journal.json?full=1";document.getElementById("mcsv").href=base+"/samples.csv";  // also right under /journal/ (CTRL-MCSV: the 导出模型样本 link too, else /journal/samples.csv 404s)
@@ -14671,12 +14784,27 @@ function evSection(ev){  // 模型 EV 对实际盈亏 (1.140.0): the poker track
   const gt=rows=>table(["分组","笔数","模型预期","实际","实际 − 预期","偏离","判断"],rows.map(g=>[g.name,g.bets,money(g.ev),pn(g.pnl),pn(g.pnl-g.ev),evZ(g),vb(g)]));
   if((ev.strategies||[]).length)el.append($("div","sub","按策略"),gt(ev.strategies));
   if((ev.cards||[]).length)el.append($("div","sub","按市场"),gt(ev.cards))}
+function rulesSection(ru){  // 规则吃单 (1.153.0): each rule's totals, the real and the paper apart, and the last windows bought
+  const MODE={on:"真实",paper:"只记录"},RES={up:"涨",down:"跌",split:"平"},side=s=>s==="up"?"涨":"跌",kids=[];
+  const mk=Object.values(ru.markets||{}).map(x=>x.name+(x.on?" 开（每场最多 "+num(x.shares)+" 份）":" 关")).join("、");
+  kids.push($("p","small mut","现在："+({off:"关",paper:"只记录（不下单）",on:"真实吃单"}[ru.mode]||ru.mode)+(mk?"；"+mk:"")+(ru.max_day_usd?"；每天最多 $"+ru.max_day_usd:"")));
+  if((ru.rules||[]).length)kids.push(table(["规则","买","模式","场次","份数","每份成本","成本","已结算","赢/输","盈亏","待结算"],
+    ru.rules.map(r=>[r.name,side(r.side)+(r.cents?" ≤"+r.cents+"¢":"（已关）"),MODE[r.mode]||r.mode,num(r.windows),num(r.shares),r.shares?cent(r.cost/r.shares):"—",usd(r.cost),
+      num(r.settled),r.wins+"/"+r.losses,r.settled?money(r.pnl):"—",num(r.open)])));
+  const wt=(ru.rules||[]).filter(r=>r.watch&&r.watch.watched);  // 1.153.2: what the watches saw — is a price or a size off?
+  if(wt.length)kids.push($("div","sub","盘口观察（近 30 天）"),table(["规则","模式","看了几场","有规则价以内卖单","平均可买份数","最低卖价中位","撮合开启在开场前"],
+    wt.map(r=>[r.name,MODE[r.mode]||r.mode,num(r.watch.watched),num(r.watch.offered),r.watch.offer_avg==null?"—":num(r.watch.offer_avg),
+      r.watch.best_mid==null?"—":cent(r.watch.best_mid),r.watch.open_lead==null?"—":"中位 "+Math.round(r.watch.open_lead)+" 秒"])));
+  const rec=ru.recent||[];
+  if(rec.length)kids.push(...bigTable("最近的场次（北京时间）",table(["场次","规则","买","份数","均价","成本","结果","盈亏","模式"],
+    rec.map(r=>[dayKey(r.start_ms).slice(5)+" "+(r.window||""),r.name,side(r.side),num(r.shares),cent(r.avg),usd(r.cost),RES[r.result]||"待结算",r.pnl==null?"—":money(r.pnl),MODE[r.mode]||r.mode])),rec.length));
+  document.getElementById("a-rules").replaceChildren(...kids)}
 function analysis(){  // per setting, per underlying, per net edge and fair price at the order, per part of the underlying's day, the 15-minute windows, the pre-open quotes, the resting orders' record, the refused buys' outcomes: folded away
   const S=src(),hd=document.getElementById("anasum");filterLine(document.getElementById("anafilt"),S);
   document.getElementById("anaat").textContent=okAt?"已刷新 "+clock(okAt):"";
   const ids=["a-versions","a-items","a-edges","a-fairs","a-sessions","a-makers","a-blocked"];
   if(S.a===null){ids.forEach(id=>document.getElementById(id).replaceChildren($("p","small mut",S.err?"按筛选读取失败："+S.err:"按筛选读取中…")));
-    ["h-windows","a-windows","p-windows","h-preopen","a-preopen","p-preopen","h-ev","a-ev","p-ev"].forEach(id=>{document.getElementById(id).hidden=true});hd.textContent=S.label;
+    ["h-windows","a-windows","p-windows","h-preopen","a-preopen","p-preopen","h-rules","h-ev","a-ev","p-ev"].forEach(id=>{document.getElementById(id).hidden=true});hd.textContent=S.label;
     document.getElementById("anabody").hidden=!anaOpen;document.getElementById("foldana").textContent=anaOpen?"收起":"展开";return}
   const a=S.a,put=(id,rows,extra)=>{const el=document.getElementById(id);el.replaceChildren(rows&&rows.length?anaTable(rows,extra):$("p","small mut","还没有记录"))};
   versions(a);put("a-items",a.items);put("a-edges",a.edges);put("a-fairs",a.fairs);
@@ -14687,6 +14815,8 @@ function analysis(){  // per setting, per underlying, per net edge and fair pric
     document.getElementById("a-windows").replaceChildren(...bigTable("按窗口开始（北京时间）",anaTable(w.hours,ex),w.hours.length),$("div","sub","按下单时离窗口结束"),anaTable(w.left||[],ex),$("div","sub","按方向（涨 / 跌各算）"),anaTable(w.sides||[],ex))}
   const po=a.preopen,pos=!!(po&&po.total&&po.total.records);["h-preopen","a-preopen","p-preopen"].forEach(id=>{document.getElementById(id).hidden=!pos});
   if(pos)preopenSection(po);
+  const ru=a.rules,rus=!!(ru&&((ru.rules||[]).length||(ru.recent||[]).length));document.getElementById("h-rules").hidden=!rus;
+  if(rus)rulesSection(ru);
   const ev=a.ev,evs=!!(ev&&ev.total&&ev.total.bets);["h-ev","a-ev","p-ev"].forEach(id=>{document.getElementById(id).hidden=!evs});
   if(evs)evSection(ev);
   const mk=a.makers||{},mb=document.getElementById("a-makers");mb.replaceChildren();
@@ -14791,10 +14921,18 @@ function render(){
   const nodes=[];let day="";page.forEach(t=>{const k=dayKey(t.opened);if(k!==day){day=k;nodes.push(dayHead(t.opened,byDay.get(k)))}nodes.push(row(t))});
   document.getElementById("list").replaceChildren(...(nodes.length?nodes:[$("p","mut",data.trades.length?"没有符合条件的交易":"还没有交易")]));
   more(all.length)}
-function unrecorded(){  // the positions the account holds beyond the records (1.130.3), and the orders without a record
-  const L=data.live||{},rows=L.unrecorded||[],box=document.getElementById("unrecbox");box.hidden=!rows.length&&!L.unknown_orders;document.getElementById("unrecnote").hidden=box.hidden;if(box.hidden)return;
-  document.getElementById("unrecsum").textContent=(L.unknown_orders?"账户上还有 "+L.unknown_orders+" 张没有记录的挂单；":"")+(L.positions_at?"持仓读于 "+when(L.positions_at):"还没读过持仓");
-  document.getElementById("unrecbody").replaceChildren(rows.length?table(["市场 / 方向","账户多出的份数","Predict 均价","持仓时间"],rows.map(r=>[r.name,num(r.shares),r.price==null?"—":cent(r.price),r.at?when(r.at):"—"])):$("p","small mut","持仓和记录一致"))}
+const UNREC_RESULT={WON:"已结算：赢",WIN:"已结算：赢",WINNER:"已结算：赢",LOST:"已结算：输",LOSE:"已结算：输",LOSER:"已结算：输"};
+function unrecorded(){  // the positions the account holds beyond the records (1.130.3), and the orders without a record: 1.152.2 below 统计与风险, folded
+  const L=data.live||{},rows=L.unrecorded||[],box=document.getElementById("unrecbox");box.hidden=!rows.length&&!L.unknown_orders;if(box.hidden)return;
+  const valued=rows.filter(r=>r.value!=null),worth=valued.reduce((s,r)=>s+r.value,0);
+  document.getElementById("unrecsum").textContent=[rows.length?rows.length+" 个":"",valued.length?"现值 "+usd(worth):"",L.unknown_orders?"挂单 "+L.unknown_orders+" 张":""].filter(Boolean).join(" · ");
+  document.getElementById("unrecbody").hidden=!unrecOpen;document.getElementById("foldunrec").textContent=unrecOpen?"收起":"展开";
+  document.getElementById("unrecread").textContent=(L.unknown_orders?"账户上还有 "+L.unknown_orders+" 张没有记录的挂单。":"")+(L.positions_at?"持仓读于 "+when(L.positions_at):"还没读过持仓");
+  const list=$("div","ulist");  // one position a row: its market (named in full, linked to Predict) above, the figures below — a phone shows them all
+  rows.forEach(r=>{const it=$("div","urow");let nm=$("span","",r.name);if(r.url){nm=$("a","",r.name);nm.href=r.url;nm.target="_blank";nm.rel="noopener"}
+    it.append(nm,$("div","small mut",["账户多出 "+num(r.shares)+" 份",r.value!=null?"现值 "+usd(r.value):"",r.price!=null?"Predict 均价 "+cent(r.price):"",  // Predict's positions carry no average price: said only when a row states one
+      r.status?UNREC_RESULT[r.status]||r.status:"",r.at?"持仓时间 "+when(r.at):""].filter(Boolean).join(" · ")));list.append(it)});
+  document.getElementById("unrectbl").replaceChildren(rows.length?list:$("p","small mut","持仓和记录一致"))}
 let okAt=0,dead=false;
 function two(n){return String(n).padStart(2,"0")}
 function clock(ms){const d=new Date(ms);return two(d.getHours())+":"+two(d.getMinutes())+":"+two(d.getSeconds())}
@@ -14825,6 +14963,8 @@ async function load(){  // the list: light rows, the open trades and the last fe
   try{const r=await fetch(a.href,{cache:"no-store",headers:{"X-Control-Key":key}});if(!r.ok)throw new Error("HTTP "+r.status);const u=URL.createObjectURL(await r.blob());
     const t=document.createElement("a");t.href=u;t.download=a.getAttribute("download");document.body.append(t);t.click();t.remove();setTimeout(()=>URL.revokeObjectURL(u),5000)}
   catch(err){alert("导出失败："+err.message)}})});
+document.getElementById("unrechd").addEventListener("click",()=>{unrecOpen=!unrecOpen;try{localStorage.setItem("jrnunrec",unrecOpen?"1":"0")}catch(e){}
+  document.getElementById("unrecbody").hidden=!unrecOpen;document.getElementById("foldunrec").textContent=unrecOpen?"收起":"展开"});
 document.getElementById("statshd").addEventListener("click",()=>{statsOpen=!statsOpen;try{localStorage.setItem("jrnstats",statsOpen?"1":"0")}catch(e){}
   document.getElementById("statsbody").hidden=!statsOpen;document.getElementById("foldstats").textContent=statsOpen?"收起":"展开"});
 document.getElementById("q").addEventListener("input",e=>{qF=e.target.value.trim();shown=PAGE;render()});
@@ -15093,8 +15233,9 @@ function switchMode(v){if(data.live&&v===data.live.mode)return;
   const ask={on:"切到 LIVE=on 后，模拟交易的每个决定都会在 Predict 真实下单。继续？",off:"切到 LIVE=off 会撤掉未成交的真实挂单并回到只记账（已有持仓继续跟踪到结算）。继续？",pause:"切到 LIVE=pause：登录 Predict、可自检和挂单测试，不开新仓。继续？"}[v];
   if(ask&&!confirm(ask))return;act({action:"mode",value:v})}
 $("modebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b||b.disabled)return;switchMode(b.dataset.mode)});
-const GROUPS=[["策略","策略"],["风控","真实交易风控"],["预挂","开盘前预挂（15 分钟市场）"],["高级","高级参数"]];
+const GROUPS=[["策略","策略"],["风控","真实交易风控"],["预挂","开盘前预挂（15 分钟市场）"],["规则","规则吃单（黄金、原油固定时段）"],["高级","高级参数"]];
 function fmt(s,v){return s.unit==="$"?"$"+v:s.unit==="¢"?v+"¢":s.unit?v+" "+s.unit:v}
+function capOf(s,v){return s.captions&&s.captions[v]?"（"+s.captions[v]+"）":""}  // a preset's own name: 1440 分钟（挂满） (1.152.2)
 function selected(s){return new Set(s.kind==="multi"?(s.value==="all"?s.options.map(o=>o[0]):s.value.split(",")):[s.value])}
 function pick(s,v){
   if(s.key==="LIVE")return data.live?switchMode(v):act({action:"set",values:{LIVE:v}});
@@ -15105,13 +15246,13 @@ function card(s){
   if(s.kind==="detail")return null;  // drawn inside another card as its market chips (DETAIL)
   const c=el("div","set");c.dataset.key=s.key;
   const t=el("div","ttl");t.append(el("b","",s.label));
-  const now=el("span","now","当前 "+(s.kind==="number"?fmt(s,s.value):s.none&&s.value===s.none?"无（一键全关）":s.value)+" ");
+  const now=el("span","now","当前 "+(s.kind==="number"?fmt(s,s.value)+capOf(s,s.value):s.none&&s.value===s.none?"无（一键全关）":s.value)+" ");
   now.append(s.saved||s.overridden?el("span","badge saved","已保存"):el("span","badge",s.env?"环境变量 "+s.env:"默认值"));
   if(MAKER_MODES.has(s.key)&&s.value!=="0"&&(data.settings.find(x=>x.key==="SIM_WAYS")||{}).value==="taker")now.append(" ",el("span","badge warn","挂单没开，不生效"));
   t.append(now);c.append(t);
   c.append(el("div","hint",s.hint));
   const sel=selected(s),o=el("div","opts");
-  (s.kind==="number"||s.kind==="text"?s.presets.map(v=>[v,v===""?(s.empty||"清空"):fmt(s,v)+(s.zero&&v==="0"?"（"+s.zero+"）":"")]):s.options).forEach(([v,cap])=>{
+  (s.kind==="number"||s.kind==="text"?s.presets.map(v=>[v,v===""?(s.empty||"清空"):fmt(s,v)+(s.zero&&v==="0"?"（"+s.zero+"）":"")+capOf(s,v)]):s.options).forEach(([v,cap])=>{
     const b=el("button","opt"+(sel.has(v)?" sel":""),cap);b.dataset.v=v;b.disabled=!data.enabled;b.addEventListener("click",()=>pick(s,v));o.append(b)});
   c.append(o);
   if(s.kind==="multi"&&s.none){const a=el("div","opts");  // 1.136.0: every card on or off in one click (none = no card, the mode stays on)
@@ -16165,6 +16306,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("live", "真实交易（LIVE=on）：钱包、余额、真实订单、持仓与风控；暂停/恢复/撤单/领取；fills 把账户持仓和记录逐项核对", "pause|resume|cancel all|redeem|redeem check|redeem forget 市场号|check|fills",
             "LIVE=on 时模拟交易的每个决定都会在 Predict 真实下单；/live pause 停止开新仓，/live resume 恢复"),
     Command("preopen", "15 分钟市场开盘前双边预挂（PREOPEN_15M=on，真实交易）：状态；check 体检（限流、卡住的撤单、最近问题）；pause / resume 暂停恢复；probe 只读探测市场列表", "check|pause|resume|probe"),
+    Command("rules", "规则吃单（RULE_TAKER，真实交易模块里）：黄金、原油几个固定时段开场前按规则价吃单——状态、每条规则的下一场、今天的成交"),
     Command("diag", "逐个检测数据源（币安/交易所/上证/A50/恒指/KOSPI/HL/汇率），找出哪里出问题"),
     Command("speed", "指数查价测速（开盘时用）：每个指数数据源每秒查一次、各 30 秒，看请求要多久、指数多久一变、会不会被拒，给出最快能多久查一次", "0.5",
             "不带参数每 1 秒查一次；/speed 0.5 每 0.5 秒（0.5～5）。同一网站一次只测一个源，连续失败 3 次或被拒就停下，不会把服务器 IP 弄进黑名单"),
@@ -16536,7 +16678,7 @@ class Bot:
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
             "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag, "/speed": self.cmd_speed, "/calib": self.cmd_calib, "/samples": self.cmd_samples,
             "/journal": self.cmd_journal, "/summary": self.cmd_summary, "/markout": self.cmd_markout, "/market": self.cmd_market,
-            "/book": self.cmd_book, "/sim": self.cmd_sim, "/edge": self.cmd_edge, "/live": self.cmd_live, "/preopen": self.cmd_preopen,
+            "/book": self.cmd_book, "/sim": self.cmd_sim, "/edge": self.cmd_edge, "/live": self.cmd_live, "/preopen": self.cmd_preopen, "/rules": self.cmd_rules,
         }
 
     def settings(self) -> dict:
@@ -22261,10 +22403,15 @@ class Bot:
                 "versions": sim_by_version(trades, marks),  # 1.107.0: a setting changed, its values side by side
                 "windows": sim_by_window(trades, marks),    # 1.107.0: the 15-minute windows by start hour and by minutes left
                 "preopen": self.preopen_review(),           # 1.128.0: the pre-open mode's own quotes (LiveBot; None without it)
+                "rules": self.rules_review(),               # 1.153.0: 规则吃单's records (LiveBot; None without it)
                 "ev": self.sim_ev(trades, preopen=not flt)}  # 1.140.0: the model's EV against the settled P&L, day by day (the pre-open fills counted in when unfiltered)
 
     def preopen_review(self) -> dict | None:
         """The review page's 开盘前预挂 section: the pre-open mode's ledger (preopen.review); None here, where there is no mode."""
+        return None
+
+    def rules_review(self) -> dict | None:
+        """The review page's 规则吃单 section (rules.review); None here, where there is no real trading module."""
         return None
 
     def preopen_rows(self) -> list[dict]:
@@ -22689,6 +22836,9 @@ class Bot:
         if not self.config.sim or not self.config.predict:
             return Reply("模拟交易已关闭（SIM=off 或 PREDICT=off）。")
         return Reply(self.sim_text(), html=True)
+
+    def cmd_rules(self, req: Request) -> Any:
+        return "规则吃单在真实交易模块里：设置 PREDICT_PRIVATE_KEY 启动真实交易模块后，控制台“规则吃单”一组开启（RULE_TAKER=paper 只记录、on 真实吃单）"
 
     def cmd_preopen(self, req: Request) -> Any:
         return "开盘前预挂模式在真实交易模块里：设置 PREDICT_PRIVATE_KEY 启动真实交易模块后，PREOPEN_15M=on 开启，/preopen probe 只读探测"
@@ -23872,6 +24022,9 @@ class Bot:
                   "PREOPEN_BTC5_CANCEL_SECONDS": str(c.preopen.btc5_cancel_seconds), "PREOPEN_BTC5_EXPIRY_SECONDS": str(c.preopen.btc5_expiry_seconds),
                   "PREOPEN_BTC5_ENTRY_SECONDS": str(c.preopen.btc5_entry_seconds), "PREOPEN_BTC5_AHEAD_MINUTES": str(c.preopen.btc5_ahead_minutes),
                   "PREOPEN_MAX_OPEN_USD": plain(c.preopen.max_open_usd), "PREOPEN_EXCLUSIVE": flag(c.preopen.exclusive),
+                  "RULE_TAKER": c.rules.mode, "RULE_MAX_DAY_USD": plain(c.rules.max_day_usd), **{name: str(c.rules.price(key)) for key, name in RULE_SETTING_KEYS.items()},
+                  **{switch: flag(c.rules.on(mk)) for mk, (switch, _) in RULE_MARKET_KEYS.items()},
+                  **{size: str(c.rules.shares_of(mk)) for mk, (_, size) in RULE_MARKET_KEYS.items()},
                   "SOURCES_OFF": ",".join(sorted(c.sources_off)), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
                   "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait), "LIVE_TAKER_PRICE": c.live_taker_price,

@@ -1490,7 +1490,7 @@ class Controller:
         if reason := self.owner.live_paused() or self.owner.live_killed():
             return reason
         cap = c.live_max_daily_loss_usd
-        if cap and self.daily_pnl() + self.owner.live_daily_pnl(self.owner.sim_trades(), self.now()) <= -cap:
+        if cap and self.daily_pnl() + self.owner.live_daily_pnl(self.owner.sim_trades(), self.now()) + float(getattr(self.owner, "rules_pnl", lambda: 0.0)()) <= -cap:  # the rule taker's day too (1.153.0)
             return "已达到今日真实亏损上限"
         return ""
 
@@ -1691,7 +1691,8 @@ class Controller:
             self.account_pages = max(1, -(-len(rows) // page))
             other = self.unmanaged_rows(rows)
             known_core = {str(t.get("live", {}).get("order_id")) for t in self.owner.sim_trades().values() if isinstance(t.get("live"), dict)}
-            strangers = [r for r in other if str(r.get("id")) not in known_core]
+            rule_ids, rule_hashes = getattr(self.owner, "rules_known", lambda: (set(), set()))()  # the rule taker's orders (1.153.3)
+            strangers = [r for r in other if str(r.get("id")) not in known_core | rule_ids and live.order_hash_of(r) not in rule_hashes]
             unmanaged = len(strangers)
             detail = [order_brief(r) for r in strangers[:5]]  # /preopen check names them (1.132.1)
             reserved = 0.0
