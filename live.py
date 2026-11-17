@@ -671,6 +671,9 @@ class PredictApi:
             raise core.RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
         if method == "POST" and payload is None:
             payload = {}
+        # 1.154.0: the key's request budget first (core.PredictPacer): a read waits for its token; an order or a cancel may borrow a
+        # burst ahead of the reads — and Predict's 429, with its twenty seconds of silence for every client on the key, is not met
+        await core.predict_pacer(self.api_key).take(priority)
         self.calls += 1
         if priority:
             self.writes_inflight += 1

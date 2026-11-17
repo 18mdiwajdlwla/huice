@@ -1248,6 +1248,10 @@ def cycle_ms(key: str) -> int:
     card = next((r for r in core.preopen_cards() if r.key == key), None)
     return int(card.cycle_ms) if card is not None else LISTING_CYCLE_MS
 LISTING_EARLY_MS, LISTING_LATE_MS = 30_000, 120_000  # ...and the discovery polls fast from this long before that moment until this long after it (or the listing)
+SPRINT_EARLY_MS = 15_000        # 1.154.0: a window that entered the range is probed fast from this long before the soonest delay its
+#                                 listing has come with lately (LISTING_LAGS of them, MIN_LAGS at least) — not from the entry: Predict lists
+#                                 about 85 s on (11-06), and the minute of probes every 0.5 s before it was a quarter of the key's requests
+LISTING_LAGS, MIN_LAGS = 40, 5
 FAST_POLL_S = 0.5               # the fast poll's cadence (the queue position: the bid goes in within a second of the listing; 1.133.0: was 1 s)
 LISTING_PROBE_S = 2.0           # ...and each card's next listing is probed this often the rest of the time (was the poll setting, 5 s); the older windows keep the poll's pace
 PLACE_WORKERS = 4               # pairs placed side by side (three cards list at once, four levels each: twelve pairs — two workers took seconds)
@@ -1337,6 +1341,7 @@ class Controller:
         self.listing_deltas: collections.deque = collections.deque(maxlen=20)  # ms: each new listing's time against the expected moment (the last listing a cycle on)
         self.category_full: bool | None = None  # whether the category answers carried everything an order needs (no details read) — None until a listing was read
         self.awaiting: dict[str, int] = {}  # card -> when its next window (beyond the known listing, not listed yet) entered the range: the sprint runs from then (1.133.1)
+        self.listing_lags: collections.deque = collections.deque(maxlen=LISTING_LAGS)  # ms from a window's entry into the range to its listing seen (sprint_lead_ms)
         self.account_pages = 1  # pages the last open-order snapshot took: its pace and staleness follow (ACCOUNT_PAGE_S)
         self.account_rows: list[dict] = []  # the last complete snapshot's rows: the owner's whole-account view when its own read is cut (LiveBot.live_full_list, 1.136.2)
         self.account_read_s = 0.0  # how long the last complete snapshot read took: the staleness allows for it (1.136.1)
@@ -1356,14 +1361,20 @@ class Controller:
         for p in self.ledger.rows.values():
             self.listed_by_card[str(p.get("key") or "")] = max(self.listed_by_card.get(str(p.get("key") or ""), 0), int(p.get("start_ms") or 0))
         self.account_lock = asyncio.Lock()
-        shared = getattr(owner.live, "api", None)  # the bot's own client: one rate-limit cooldown for all three
-        self.api = safe_api(live.API_BASES[owner.config.live_chain], owner.config.predict_api_key, owner.live.wallet, self.before_send, shared)
+        # 1.154.0: PREOPEN_API_KEY — a second key of the account's for this mode alone: Predict limits each key (240 a minute by
+        # default), so the mode's own traffic (thousands of orders, the snapshot's pages) has its own budget (its own PredictPacer)
+        # and its own cooldown; without one, the bot's key and the bot's own client's cooldown, as before
+        own_key = str(getattr(owner.config, "preopen_api_key", "") or "")
+        key = own_key or owner.config.predict_api_key
+        shared = None if own_key else getattr(owner.live, "api", None)  # the bot's own client: one rate-limit cooldown for all on the key
+        self.api = safe_api(live.API_BASES[owner.config.live_chain], key, owner.live.wallet, self.before_send, shared)
+        shared = shared or self.api  # (its own key: its three clients share one cooldown among themselves)
         # A separate request gate leaves cancellation capacity available even when
         # placement requests are queued or their HTTP responses are slow.
-        self.cancel_api = safe_api(live.API_BASES[owner.config.live_chain], owner.config.predict_api_key, owner.live.wallet, None, shared)
+        self.cancel_api = safe_api(live.API_BASES[owner.config.live_chain], key, owner.live.wallet, None, shared)
         # 1.141.1: the batch withdrawals have a client of their own: a window's cancel at its cancel time and the final reads keep
         # the cancel client's slots (four batches of hundreds held them for seconds)
-        self.bulk_api = safe_api(live.API_BASES[owner.config.live_chain], owner.config.predict_api_key, owner.live.wallet, None, shared)
+        self.bulk_api = safe_api(live.API_BASES[owner.config.live_chain], key, owner.live.wallet, None, shared)
         self.cancel_made = self.cancel_api  # the batches go through bulk_api while the cancel client is this one (the tests put their own in)
         self.api.ORDERS_PAGE = self.cancel_api.ORDERS_PAGE = int(getattr(owner.config, "live_orders_page", 50) or 50)  # LIVE_ORDERS_PAGE: fewer pages a snapshot (1.136.1)
         self.settling: dict[str, asyncio.Task] = {}
@@ -1950,6 +1961,9 @@ class Controller:
                     continue
                 first = False
                 misses = 0
+                entered = start - self.settings.timing(rolling.key).ahead_minutes * 60_000
+                if self.awaiting.get(rolling.key) == entered and 0 <= self.now() - entered <= 600_000:
+                    self.listing_lags.append(self.now() - entered)  # how long after its entry Predict listed it (sprint_lead_ms)
                 self.awaiting.pop(rolling.key, None)
                 self.note_listing(rolling, start, known_before)
                 self.enqueue(market, slug, wanted, attempts, st)
@@ -2684,10 +2698,25 @@ class Controller:
             due = at + cycle_ms(key)
             if due - LISTING_EARLY_MS <= now <= due + LISTING_LATE_MS:
                 return FAST_POLL_S
+        lead = self.sprint_lead_ms()
         for entered in self.awaiting.values():  # 1.133.1: a card's next window in the range and not listed yet — Predict lists it about a minute after it enters (11-06: 85 s), whatever the last listing's time
-            if 0 <= now - entered <= LISTING_LATE_MS:
+            if lead <= now - entered <= lead + LISTING_LATE_MS:  # 1.154.0: from SPRINT_EARLY_MS before the soonest recent listing delay
                 return FAST_POLL_S
         return min(LISTING_PROBE_S, float(self.settings.poll))  # the listings probed every LISTING_PROBE_S; the older windows re-read at the poll's pace (discovery_loop)
+
+    def pace_line(self) -> str:
+        """The key this mode's requests go out on and its pace (1.154.0): what /preopen says of the budget it shares or has alone."""
+        own = bool(getattr(self.owner.config, "preopen_api_key", ""))
+        per_min = float(getattr(self.owner.config, "predict_rate_per_min", 0) or 0)
+        pace = (f"每分钟最多 {per_min:g} 次（PREDICT_RATE_PER_MIN，读等节拍、下单撤单优先）" if per_min and core.PREDICT_PACING else "不节流")
+        return ("用预挂自己的 API Key（PREOPEN_API_KEY），" if own else "和原策略、盘口共用一个 API Key，") + f"请求{pace}；"
+
+    def sprint_lead_ms(self) -> int:
+        """How long after a window's entry into the range the fast probing starts: SPRINT_EARLY_MS before the soonest of the recent
+        listing delays (listing_lags, MIN_LAGS at least); 0 — from the entry, as before — until there are that many."""
+        if len(self.listing_lags) < MIN_LAGS:
+            return 0
+        return max(0, min(self.listing_lags) - SPRINT_EARLY_MS)
 
     async def discovery_loop(self) -> None:
         """The discovery on its own (1.131.0: the refreshes have their own loop — a batch of reads never delays a listing's find)."""
@@ -2858,6 +2887,10 @@ class Controller:
         if self.listing_deltas:  # each new listing against the moment expected (the last one a cycle on): how well the fast poll is aimed
             deltas = sorted(d / 1000 for d in self.listing_deltas)
             parts.append(f"发布比预计中位 {deltas[len(deltas) // 2]:+.0f} 秒（最早 {deltas[0]:+.0f}、最晚 {deltas[-1]:+.0f}；{len(deltas)} 次）")
+        if self.listing_lags:  # 1.154.0: how long after entering the range a window is listed; the fast probing starts just before the soonest
+            lags = sorted(d / 1000 for d in self.listing_lags)
+            parts.append(f"进入范围到发布中位 {lags[len(lags) // 2]:.0f} 秒（最早 {lags[0]:.0f}；{len(lags)} 次），"
+                         + (f"进入范围 {self.sprint_lead_ms() / 1000:.0f} 秒后开始每 {FAST_POLL_S:g} 秒探测" if self.sprint_lead_ms() else "进入范围就开始快速探测（样本还不够）"))
         return "；".join(parts)
 
     def unquotable(self) -> tuple[list[dict], list[dict]]:
@@ -2951,6 +2984,7 @@ class Controller:
                 f"预留 {self.risk():.2f}U{f' / 限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '，不设上限'}（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉的场次在撤单 {LATE_FILL_MS // 1000} 秒后读到一份没成交才释放）"
                 + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {self.risk() + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，按开场先后补挂中") if pairs_left else "")
                 + (f"\n请求约 {self.request_rate():.1f} 次/秒（最近一分钟）；" if self.request_rate() is not None else "\n")
+                + self.pace_line()
                 + f"账户快照每 {self.account_interval_s():.0f} 秒（{self.account_pages} 页挂单" + (f"，上次读了 {self.account_read_s:.0f} 秒" if self.account_read_s >= 1 else "") + "）"
                 + f"\n扫描：{self.scan_note or '还没扫过'}（发布探测每 {LISTING_PROBE_S:g} 秒，预计发布前后每 {FAST_POLL_S:g} 秒；"
                 + ("分类应答自带下单字段，发现即下单" if self.category_full else "分类应答不带下单字段，每场多读一次详情" if self.category_full is False else "还没读过发布")
