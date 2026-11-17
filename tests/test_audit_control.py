@@ -1138,7 +1138,9 @@ async def ctrl_refresh_wake():
         assert sorted(set(at["read"])) == list(ran) and sent == [0] and feed.calls == 1 and len(feed.limited) == 1, (at["read"], sent)
         assert woke == list(ran), woke  # was [0, 10, 11, …, 19, 20, 30]: woken by every refusal
         assert looks == [0, 5, 10, 15, 20, 25, 30, 35], looks  # was [0, 5, 10, 11, …, 19, 20, 25, 30, 35]: a look a second through the cooldown
-        assert at["hot"] == at["targets"] == [0, *refused, 20, 30], (at["hot"], at["targets"])  # was every one of the forty ticks
+        # was every one of the forty ticks. 1.154.3: the first round's hot set once more after it, on the markets it brought (the
+        # set worked out before it held none: the stream followed nothing and the second round read every market again)
+        assert at["targets"] == [0, *refused, 20, 30] and at["hot"] == [0, 0, *refused, 20, 30], (at["hot"], at["targets"])
         assert at["want"] == [0, *refused, 20, 30], at["want"]  # as before: the stream follows the hot set through the cooldown too
         # the feed's own word for "due", asked by refresh_books and by refresh alike: PREDICT_POLL_SECONDS since a round began.
         # The fortieth second: the round of the thirtieth is ten seconds old

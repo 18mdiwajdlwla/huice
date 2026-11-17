@@ -17,6 +17,14 @@ async def run() -> None:
     m.PREDICT_PACING = True  # the suites run unpaced (offline.py); this one is about the pacing
     try:
         pacer = m.PredictPacer(6000)  # 100 a second: the waits stay short
+        # 1.154.3: a new pacer starts empty — a process just started does not know how much of Predict's minute the one before it
+        # used (a redeploy: the old process's last requests still count there): its first request keeps the pace; the burst is
+        # there once the bucket has filled
+        assert pacer.tokens == 0
+        started = time.monotonic()
+        await pacer.take()
+        assert time.monotonic() - started >= 0.008, "the first request waits for its token"
+        await asyncio.sleep(m.PredictPacer.BURST / 100 + 0.03)  # the bucket fills
         started = time.monotonic()
         for _ in range(int(m.PredictPacer.BURST)):
             await pacer.take()
@@ -47,8 +55,7 @@ async def run() -> None:
         original = L.PredictApi.send
         L.PredictApi.send = send
         try:
-            for _ in range(int(m.PredictPacer.BURST)):
-                await urgent.call("GET", "/a")  # the bucket emptied by reads
+            assert m.predict_pacer("kp").tokens == 0  # the bucket empty (a new pacer)
             started = time.monotonic()
             await urgent.call("POST", "/orders", {}, priority=True)
             assert time.monotonic() - started < 0.05, "a taker's order borrows: at once"
@@ -59,6 +66,13 @@ async def run() -> None:
             L.PredictApi.send = original
         # off: nothing waits
         assert await asyncio.wait_for(m.PredictPacer(0).take(), 0.01) is None
+        # 1.154.3: what a key let through in the last 60 seconds, every client's — counted whether paced or not (/diag)
+        counter = m.PredictPacer(0)
+        for _ in range(5):
+            await counter.take()
+        assert counter.last_minute() == 5
+        counter.sent[0] = counter.sent[0] - 61  # a minute and a second ago: out of it
+        assert counter.last_minute() == 4
         # one pacer a key, its pace PREDICT_RATE_PER_MIN as configured
         m.PREDICT_PACERS.clear()
         m.PREDICT_RATE["per_min"] = 120.0
@@ -69,6 +83,66 @@ async def run() -> None:
         m.PredictFeed(cfg)
         assert m.predict_pacer("k1").per_min == 200.0, "the feed's start sets every key's pace"
         assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline"}).predict_rate_per_min == 220.0, "under Predict's 240 by default"
+        # /diag (1.154.3): each key's minute by name — never the key itself; the pre-open mode's own key only when it is another one
+        m.PREDICT_PACERS.clear()
+        for key, n in (("main-key", 3), ("second-key", 7)):
+            for _ in range(n):
+                m.predict_pacer(key).sent.append(time.monotonic())
+        ns = types.SimpleNamespace(config=types.SimpleNamespace(predict_api_key="main-key", preopen_api_key="second-key"))
+        ns.preopen_own_key = lambda: L.LiveBot.preopen_own_key(ns)
+        ns.book_own_key = lambda: L.LiveBot.book_own_key(ns)
+        line = L.LiveBot.live_key_load(ns)
+        assert line.startswith("主 Key 3 次、预挂专用 Key 7 次（节流每分钟 200 次") and "main-key" not in line and "second-key" not in line, line
+        ns.config.preopen_api_key = "main-key"  # set to the bot's own key: one key, one figure
+        assert L.LiveBot.live_key_load(ns).startswith("主 Key 3 次（"), L.LiveBot.live_key_load(ns)
+        # 1.154.5: the orderbook feed's own key (PREDICT_BOOK_API_KEY), and each 429 with the count the key had let through in the minute
+        # before it (11-17: seven on the bot's key in nine minutes at this pace — is Predict counting as the pacer does?)
+        ns.config.preopen_api_key, ns.config.predict_book_api_key = "second-key", "book-key"
+        for _ in range(5):
+            m.predict_pacer("book-key").sent.append(time.monotonic())
+        main_pacer = m.predict_pacer("main-key")
+        main_pacer.note_429()
+        main_pacer.sent.extend([time.monotonic()] * 4)
+        main_pacer.note_429()
+        ns.KEY_SHARED_BELOW = L.LiveBot.KEY_SHARED_BELOW
+        line = L.LiveBot.live_key_load(ns)
+        # 1.154.6: every 429 with the bot far under Predict's 240 — someone else's requests filled that minute (11-17: a key shared with friends)
+        assert line.startswith("主 Key 7 次（24 小时内 429 2 次，当时前 60 秒 3～7 次，远低于 240：这个 Key 可能还有别的程序或别人在用）、"
+                               "预挂专用 Key 7 次、盘口专用 Key 5 次（节流每分钟 "), line
+        assert "book-key" not in line
+        main_pacer.limits.append((time.monotonic(), 231))  # one at the bot's own full pace: nothing to say about others
+        assert "可能还有别的程序" not in L.LiveBot.live_key_load(ns) and "3～231 次）" in L.LiveBot.live_key_load(ns), L.LiveBot.live_key_load(ns)
+        feed_cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREDICT_API_KEY": "main-key", "PREDICT_BOOK_API_KEY": " book-key "})
+        book_feed = m.PredictFeed(feed_cfg)
+        assert (feed_cfg.predict_book_api_key, book_feed.api_key(), book_feed.headers()) == ("book-key", "book-key", {"x-api-key": "book-key"})
+        assert m.PredictFeed(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREDICT_API_KEY": "main-key"})).headers() == {"x-api-key": "main-key"}
+        paced = []
+        real_pacer = m.predict_pacer
+
+        def watching(key):
+            paced.append(key)
+            return real_pacer(key)
+        real_blocking, m.predict_pacer = m.predict_blocking, watching
+
+        async def answered(fn, *args):
+            return b'{"data": {"bids": [], "asks": []}}'
+        m.predict_blocking = answered
+        try:
+            await book_feed.fetch(m.PREDICT_REST + "/markets/1/orderbook")
+        finally:
+            m.predict_pacer, m.predict_blocking = real_pacer, real_blocking
+        assert paced == ["book-key"], ("the feed's reads on its own key's budget", paced)
+        ns.config.predict_book_api_key = ""
+        # the clients' rates: the pre-open mode's said to be on its own key
+        ns.config.preopen_api_key, ns.live_rate_samples, ns.predict = "second-key", [], None
+        ns.preopen = types.SimpleNamespace(request_rate=lambda: 2.8)
+        assert L.LiveBot.live_request_rates(ns) == ["预挂 2.8（专用 Key）"], L.LiveBot.live_request_rates(ns)
+        # the 429s: the rule taker's own client too, once it is on (or has one to tell)
+        ns.live, ns.preopen = types.SimpleNamespace(api=types.SimpleNamespace(limited=[])), None
+        ns.rules = types.SimpleNamespace(api=types.SimpleNamespace(limited=[time.monotonic() - 10]), settings=types.SimpleNamespace(mode="paper"))
+        assert L.LiveBot.live_limited_counts(ns) == "原策略 0 次、规则吃单 1 次", L.LiveBot.live_limited_counts(ns)
+        ns.rules.settings.mode, ns.rules.api.limited = "off", []
+        assert L.LiveBot.live_limited_counts(ns) == "原策略 0 次", "off with none: not listed"
     finally:
         m.PREDICT_PACING = False
         m.PREDICT_PACERS.clear()

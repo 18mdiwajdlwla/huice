@@ -655,6 +655,9 @@ class PredictApi:
         self.calls = 0
         self.limited: collections.deque = collections.deque(maxlen=500)  # monotonic times of the 429s answered to this client (/diag, 1.138.0)
         self.orders_complete = self.positions_complete = True  # the last list read came whole (every page)
+        # 1.154.7: path -> (requests, rows of a full page) of its last paged read: what Predict really gives a page (LIVE_ORDERS_PAGE asks
+        # for ORDERS_PAGE; a server cap below it would go unseen) and how many pages a read took (the snapshot's pace counts requests)
+        self.paged_stats: dict[str, tuple[int, int]] = {}
 
     def headers(self) -> dict[str, str]:
         out = {}
@@ -706,6 +709,7 @@ class PredictApi:
                 self.blocked_until = max(self.blocked_until, time.monotonic() + max(error.retry_after, self.BACKOFF_SECONDS))
                 if http_status(error) == 429:
                     self.limited.append(time.monotonic())
+                    core.predict_pacer(self.api_key).note_429()  # the key's minute then, for /diag (1.154.5)
             raise
 
     async def authed(self, method: str, path: str, payload: dict | None = None, timeout: int = API_TIMEOUT, priority: bool = False) -> Any:
@@ -835,23 +839,29 @@ class PredictApi:
         rows, after, seen = [], "", set()
         limit = self.ORDERS_PAGES_MAX if not cap else max(1, int(cap))
         pages = limit if not max_pages else max(1, min(limit, int(max_pages)))
+        asked = full = 0  # requests made; rows of a page that had a next one (a full page: Predict's real page size)
         for _ in range(pages):
             q = {**query, "first": self.ORDERS_PAGE}
             if after:
                 q["after"] = after
             data = await self.authed("GET", f"{path}?{core.urllib.parse.urlencode(q)}")
+            asked += 1
             page = self.rows(data)
             rows.extend(page)
             cursor = data.get("cursor") if isinstance(data, dict) else None
             if isinstance(cursor, dict):
                 cursor = cursor.get("after") or cursor.get("next") or cursor.get("endCursor")
             if not cursor or not page or str(cursor) == after:
+                self.__dict__.setdefault("paged_stats", {})[path] = (asked, full)
                 return rows, True
+            full = max(full, len(page))
             if stop_ids:
                 seen.update(str(r.get("id")) for r in page)
                 if stop_ids <= seen:
+                    self.__dict__.setdefault("paged_stats", {})[path] = (asked, full)
                     return rows, False  # every order asked for is on these pages: the rest is not read
             after = str(cursor)
+        self.__dict__.setdefault("paged_stats", {})[path] = (asked, full)
         return rows, False
 
     async def orders(self, status: str = "OPEN", stop_ids: set | None = None, max_pages: int | None = None, **params: Any) -> list[dict]:
@@ -3219,28 +3229,72 @@ class LiveBot(core.Bot):
         working = time.monotonic()
         await asyncio.gather(*(one(tid, trade) for tid, trade in list(active.items()) if tid not in later))
         page = int(getattr(self.live.api, "ORDERS_PAGE", 50) or 50)
-        self.live_sync_detail = {"pages": -(-len(open_rows) // page) if open_rows else 1, "bounded": bounded, "list_s": list_s,
+        # 1.154.7: the pages as requested and the rows Predict really put on a full one (LIVE_ORDERS_PAGE asks for `page`)
+        asked, full = (getattr(self.live.api, "paged_stats", None) or {}).get("/orders", (0, 0)) if not by_market else (0, 0)
+        self.live_sync_detail = {"pages": asked or (-(-len(open_rows) // page) if open_rows else 1), "bounded": bounded, "list_s": list_s,
+                                 "page_rows": full, "page_asked": page,
                                  "markets": len(order_markets) if by_market else 0, "filter": self.live_market_filter,
                                  "reads": reads, "later": len(later), "work_s": time.monotonic() - working, "records": len(active)}
         await self.live_orphan_sweep(now_ms)
 
     def live_request_rates(self) -> list[str]:
-        """The requests a second over the last minute of each Predict client on this API key (the rate limit is the key's):
-        the orderbook feed, this trader, the pre-open mode — for /diag."""
+        """The requests a second over the last minute of each Predict client: the orderbook feed, this trader, the pre-open mode
+        (on a key of its own when PREOPEN_API_KEY is set, 1.154.0: said so) — for /diag."""
         out = []
         samples = self.live_rate_samples
         if len(samples) >= 2 and samples[-1][0] > samples[0][0]:
             out.append(f"原策略 {(samples[-1][1] - samples[0][1]) / (samples[-1][0] - samples[0][0]):.1f}")
         feed = getattr(getattr(self, "predict", None), "rate", None)
         if callable(feed) and (rate := feed()) is not None:
-            out.append(f"盘口 {rate:.1f}")
+            out.append(f"盘口 {rate:.1f}" + ("（专用 Key）" if self.book_own_key() else ""))
         preopen = getattr(self, "preopen", None)
         if preopen is not None and (rate := preopen.request_rate()) is not None:
-            out.append(f"预挂 {rate:.1f}")
+            out.append(f"预挂 {rate:.1f}" + ("（专用 Key）" if self.preopen_own_key() else ""))
         return out
 
+    def preopen_own_key(self) -> str:
+        """PREOPEN_API_KEY when it is a key other than the bot's own (the pre-open mode's requests then count on it alone), else ""."""
+        own = str(getattr(self.config, "preopen_api_key", "") or "")
+        return own if own and own != str(getattr(self.config, "predict_api_key", "") or "") else ""
+
+    KEY_SHARED_BELOW = 200  # a 429 with fewer of this bot's own requests than this in the minute before it: the key is not the bot's alone (/diag)
+
+    def book_own_key(self) -> str:
+        """PREDICT_BOOK_API_KEY when it is a key other than the bot's own (the orderbook feed's requests then count on it), else ""."""
+        own = str(getattr(self.config, "predict_book_api_key", "") or "")
+        return own if own and own != str(getattr(self.config, "predict_api_key", "") or "") else ""
+
+    def live_key_load(self) -> str:
+        """Each API key's requests in the last 60 seconds, every client's on it (core.PredictPacer counts what it lets through),
+        beside the pace and Predict's default limit — /diag (1.154.3): how near each key is to a 429, which the clients' own
+        rates (live_request_rates) only add up to when nothing else is on the key (the rule taker, /diag's own reads are).
+        1.154.5: the orderbook feed's own key too (PREDICT_BOOK_API_KEY), and a key's 429s of the last day with the count it
+        had let through in the minute before each — below Predict's 240, the limit is not counted the way the pacer counts.
+        The keys themselves are never shown."""
+        keys = [("主 Key", str(getattr(self.config, "predict_api_key", "") or ""))]
+        if own := self.preopen_own_key():
+            keys.append(("预挂专用 Key", own))
+        if (book := self.book_own_key()) and book != own:
+            keys.append(("盘口专用 Key", book))
+        parts, day = [], time.monotonic() - 86400
+        for name, key in keys:
+            pacer = core.PREDICT_PACERS.get(key)
+            if pacer is None:
+                continue
+            hits = [n for t, n in getattr(pacer, "limits", ()) if t >= day]
+            # 1.154.6: every 429 with this bot well under Predict's 240 — the rest of the minute was someone else's on the same key
+            # (11-17: the bot's key was shared with friends; the pre-open key, the bot's alone, at the same pace drew none)
+            shared = bool(hits) and max(hits) < self.KEY_SHARED_BELOW
+            parts.append(f"{name} {pacer.last_minute()} 次"
+                         + (f"（24 小时内 429 {len(hits)} 次，当时前 60 秒 {min(hits)}～{max(hits)} 次"
+                            + ("，远低于 240：这个 Key 可能还有别的程序或别人在用" if shared else "") + "）" if hits else ""))
+        if not parts:
+            return ""
+        return "、".join(parts) + f"（节流每分钟 {core.PREDICT_RATE['per_min']:g} 次，Predict 默认上限 240）"
+
     def live_limited_counts(self) -> str:
-        """The 429s answered on this API key in the last 24 hours, by client — /diag (1.138.0): whether the key is over Predict's limit."""
+        """The 429s answered in the last 24 hours, by client — /diag (1.138.0): whether a key is over Predict's limit. In-memory: a
+        restart starts them afresh (the hours shown are the process's when it is younger than a day)."""
         day = time.monotonic() - 86400
         parts = [("原策略", sum(1 for t in getattr(self.live.api, "limited", ()) if t >= day))]
         feed = getattr(getattr(self, "predict", None), "limited", None)
@@ -3249,6 +3303,10 @@ class LiveBot(core.Bot):
         preopen = getattr(self, "preopen", None)
         if preopen is not None:
             parts.append(("预挂", sum(1 for t in getattr(preopen, "limited_at", ()) if preopen.now() - t <= core.DAY_MS)))
+        rules = getattr(self, "rules", None)
+        api = getattr(rules, "api", None)
+        if api is not None and (getattr(getattr(rules, "settings", None), "mode", "off") != "off" or getattr(api, "limited", None)):
+            parts.append(("规则吃单", sum(1 for t in getattr(api, "limited", ()) if t >= day)))  # 1.154.3: its own client, on the bot's key
         return "、".join(f"{name} {n} 次" for name, n in parts)
 
     @staticmethod
@@ -5889,6 +5947,10 @@ class LiveBot(core.Bot):
                 "oldest_cancel_s": max([(now_ms - int((t.get("withdrawn") or {}).get("at") or now_ms)) // 1000 for _, t in live if t["live"].get("state") == "cancelling"], default=None),
                 "unknown_open": [dict(u) for u in self.live_unknown_open], "orphans": [dict(o) for o in self.live_orphans[-20:]], "allowed": c.live_allowed,
                 "orders_complete": bool(getattr(self.live.api, "orders_complete", True)), "positions_complete": bool(getattr(self.live.api, "positions_complete", True)),
+                # 1.154.4: the step's own read stops at this bot's pages on purpose (1.137.1) while the pre-open mode's snapshot shows the
+                # whole account — so a cut read alone is no exception; the page warns when no whole view is younger than whole_max_s
+                "whole_age_s": (now_ms - int(self.live_whole[2])) // 1000 if self.live_whole[2] else None,
+                "whole_max_s": self.LIVE_SNAPSHOT_MAX_AGE_MS // 1000,
                 "gate": (f"未就绪：{self.live.not_ready_why}" if not self.live.ready else self.live_balance_gate() or self.live_send_hold(now_ms)),
                 "balance_age_s": int(time.time() - self.live.balance[2]) if self.live.balance else None, "balance_error": self.live.balance_error,
                 "placed_today": sum(int(t["opened"]) >= since for _, t in live),

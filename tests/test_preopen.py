@@ -592,6 +592,16 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((ctl.account_at, ctl.account_failed, ctl.hold(), ctl.account_read_s), (NOW, "", "", 0.0))
         self.assertEqual([r["id"] for r in ctl.account_rows], ["manual"], "the whole account, for the owner (live_full_list)")
         self.assertIn("原策略 2 分钟后自动撤掉（LIVE_ORPHAN_CANCEL）", ctl.status())
+        # 1.154.7: the snapshot's pages are the requests it made, and /preopen says what Predict really put on a page — a server cap
+        # below LIVE_ORDERS_PAGE (asked for 100, given 50) would otherwise go unseen, the pages reckoned as rows / 100 (half the
+        # requests: the snapshot read twice as often as ACCOUNT_PAGE_S means)
+        api.ORDERS_PAGE, api.paged_stats = 100, {"/orders": (4, 50)}
+        await ctl.account()
+        self.assertEqual((ctl.account_pages, ctl.account_page_rows), (4, 50))
+        self.assertIn("（4 页挂单，每页 50 张（LIVE_ORDERS_PAGE=100 没生效：Predict 每页最多给 50 张）", ctl.status())
+        api.paged_stats = {"/orders": (2, 100)}
+        await ctl.account()
+        self.assertIn("（2 页挂单，每页 100 张）", ctl.status())
         await self.finish(ctl)
 
     async def test_a_windows_levels_are_refreshed_with_one_read(self):

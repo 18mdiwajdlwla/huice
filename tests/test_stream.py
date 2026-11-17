@@ -93,6 +93,36 @@ async def run():
     await feed.refresh({"HSI": HSI_SLUG, "BTC": "will-btc-hit-70000-or-90000-first", "BTC-HIT-10": "what-price-will-bitcoin-hit-in-october-2026"},
                        hot={"HSI", "BTC", "BTC-HIT-10"})
     assert read == ["BTC", "BTC-HIT-10"], read
+    # 1.154.5: a quiet market — not re-sent every second, its age restarted by the heartbeat (15 s) while its topic lives — counts as
+    # pushing up to PREDICT_PUSH_FRESH_MS (20 s): 12 s old, the hot round leaves it alone (with 5 s, read two rounds in three); past
+    # it (a topic gone silent: the heartbeat restarts it no more), read again
+    three = {"HSI": HSI_SLUG, "BTC": "will-btc-hit-70000-or-90000-first", "BTC-HIT-10": "what-price-will-bitcoin-hit-in-october-2026"}
+    pushed_book = feed.books["HSI"]
+    for age, want_read in ((12_000, ["BTC", "BTC-HIT-10"]), (25_000, ["HSI", "BTC", "BTC-HIT-10"])):
+        feed.books["HSI"] = m.dataclasses.replace(pushed_book, fetched_ms=int(time.time() * 1000) - age)
+        read.clear(); feed.refreshed = -1e9
+        for k in three:
+            feed.key_refreshed[k] = time.monotonic()
+        await feed.refresh(three, hot=set(three))
+        assert read == want_read, (age, read)
+    feed.books["HSI"] = pushed_book
+    # ...and the cold round checks a pushed market every PREDICT_PUSH_CHECK_SECONDS (two minutes), not every PREDICT_COLD_POLL_SECONDS
+    colds = []
+
+    async def fake_cold(due, aged=None):
+        colds.append(sorted(due))
+    orig_cold, feed.refresh_cold = feed.refresh_cold, fake_cold
+    for since, want_cold in ((60, []), (130, ["HSI"])):
+        feed.books["HSI"] = m.dataclasses.replace(pushed_book, fetched_ms=int(time.time() * 1000))
+        feed.refreshed, feed.cold_task = -1e9, None
+        for k in three:
+            feed.key_refreshed[k] = time.monotonic()
+        feed.key_refreshed["HSI"] = time.monotonic() - since  # past the cold poll (30 s) either way
+        await feed.refresh(three, hot=set(three))
+        if feed.cold_task is not None:
+            await feed.cold_task
+        assert (colds[-1] if feed.cold_task is not None else []) == want_cold, (since, colds)
+    feed.refresh_cold, feed.books["HSI"] = orig_cold, pushed_book
     feed.refresh_timed = orig_timed
     # an older version is dropped; the same version with other levels is an update all the same (1.104.4: the version does
     # not count every change); a one-sided message replaces that side only; object levels are read too
@@ -178,9 +208,17 @@ async def run():
     assert not off.stream.enabled and off.stream.line() == "关（PREDICT_WS=off）" and m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x"}).predict_ws
     stop2 = asyncio.Event(); run2 = asyncio.create_task(off.stream.run(stop2)); await asyncio.sleep(0.05); stop2.set(); await asyncio.wait_for(run2, 2)
     assert off.stream.connects == 0
-    # the feed's targets for the stream: the hot single markets with a book and the hot ladder levels; no trader: every single market
+    # the feed's targets for the stream: the hot single markets with a book and the hot ladder levels first, then (1.154.5) every other
+    # level with a book — a level nobody is near, a cold ladder's — so the REST rounds leave them to the stream too; no trader: every
+    # single market, no level
     assert feed.stream_targets({"HSI", "BTC-HIT-10"}, {"41"}) == {"7": ("HSI", False), "41": ("BTC-HIT-10", True)}
-    assert feed.stream_targets({"HSI", "BTC-HIT-10"}, set()) == {"7": ("HSI", False)} and feed.stream_targets(None, None) == {"7": ("HSI", False), "8": ("BTC", False)}
+    assert feed.stream_targets({"HSI", "BTC-HIT-10"}, set()) == {"7": ("HSI", False), "41": ("BTC-HIT-10", True)}, "a level nobody is near"
+    assert feed.stream_targets({"HSI"}, set()) == {"7": ("HSI", False), "41": ("BTC-HIT-10", True)}, "a cold ladder's level"
+    assert feed.stream_targets(None, None) == {"7": ("HSI", False), "8": ("BTC", False)}
+    rows10 = feed.ladder_rows["BTC-HIT-10"]
+    rows10["40"] = rows10["41"]  # a second level (its book serves for this)
+    assert list(feed.stream_targets({"HSI", "BTC-HIT-10"}, {"40"})) == ["7", "40", "41"], "the hot level first: the topic cap trims the others"
+    rows10.pop("40")
     # want(): the single markets first, at most PREDICT_WS_MAX_TOPICS
     many = {str(i): (f"L{i}", True) for i in range(100)}
     stream.want({**many, "7": ("HSI", False)})
@@ -211,6 +249,60 @@ async def run():
     async def not_due(targets, force=False, hot=None, hot_rows=None): return False
     bot.predict.refresh = not_due; bot.predict.stream.wanted = {}
     assert await bot.refresh_books(NOW) is False and bot.predict.stream.wanted == {}, "a round not due changes nothing"
+    # 1.154.3: the first round after a start — the feed knows no market before it, so the hot set worked out then is empty; worked
+    # out again on what the round brought, the stream follows the markets at once (11-17: 订阅 0 个市场 a minute after a redeploy,
+    # the second round reading every market over REST again), and with the stream up the next round waits PREDICT_POLL_SECONDS
+    # from then — not due at once (the first round took some 40 s), so the stream's snapshots come before it
+    fresh = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"}), m.Store(":memory:"), FakeMarket(), None)
+    asked_hot = []
+    fresh.predict_hot = lambda now: asked_hot.append(dict(fresh.predict.slugs)) or (set(fresh.predict.slugs), set())
+    fresh.predict_targets = lambda now: {"HSI": HSI_SLUG}
+
+    async def first_round(targets, force=False, hot=None, hot_rows=None):
+        fresh.predict.slugs, fresh.predict.books["HSI"] = dict(targets), feed.books["HSI"]
+        fresh.predict.refreshed = m.time.monotonic() - 40  # the round began 40 s ago
+        return m.Refreshed("ok")
+    fresh.predict.refresh = first_round
+    fresh.predict.stream.ws, fresh.predict.stream.connected_at = object(), m.time.monotonic()  # the stream is up
+    assert isinstance(await fresh.refresh_books(NOW), m.Refreshed)
+    assert asked_hot == [{}, {"HSI": HSI_SLUG}], asked_hot
+    assert fresh.predict.stream.wanted == {"7": ("HSI", False)}, "followed from the first round on, not after a second"
+    assert not fresh.predict.round_due(), "the next round leaves the stream its snapshots first"
+    fresh.predict.refreshed = -1e9
+    assert isinstance(await fresh.refresh_books(NOW), m.Refreshed) and len(asked_hot) == 3, "later rounds: worked out once, before"
+    # 1.154.5: a ladder's level the stream keeps current is read by REST only as a check, every PREDICT_PUSH_CHECK_SECONDS — not by every
+    # hot round (a hot level) nor every PREDICT_COLD_POLL_SECONDS (a cold one); a level not pushed is read as before
+    lad = feed_with_books()
+    lrows = lad.ladder_rows["BTC-HIT-10"]
+    lrows["40"] = m.LadderRow(D("80000"), "40", "BTC ↑ $80k", m.dataclasses.replace(lrows["41"].book, market_id="40"), "", "")
+    lrows["41"] = m.dataclasses.replace(lrows["41"], book=m.dataclasses.replace(lrows["41"].book, fetched_ms=int(time.time() * 1000) - 12_000))
+    lad.stream.ws, lad.stream.connected_at, lad.stream.live = object(), time.monotonic(), {"41"}  # 41 pushed, restarted by a heartbeat 12 s ago
+    assert lad.pushed_rows("BTC-HIT-10") == {"41"}
+    markets10 = [{"id": "41", "conditionId": "", "title": "BTC ↑ $90k"}, {"id": "40", "conditionId": "", "title": "BTC ↑ $80k"}]
+
+    async def listed(slug):
+        return markets10
+    got = []
+
+    async def row_read(key, slug, market):
+        got.append(market["id"])
+        return lad.ladder_rows[key][market["id"]], time.monotonic()
+    lad.resolve_all, lad.ladder_row_gated = listed, row_read
+    slug10, mono = "what-price-will-bitcoin-hit-in-october-2026", time.monotonic()
+    lad.row_refreshed["BTC-HIT-10"] = {"41": mono - 60, "40": mono - 60}
+    await lad.refresh_ladder("BTC-HIT-10", slug10, {"41", "40"})  # the hot round, both levels hot
+    assert got == ["40"], ("the pushed hot level is left to the stream", got)
+    got.clear()
+    await lad.refresh_ladder("BTC-HIT-10", slug10, None)  # a cold ladder's whole read: the pushed level waits for its check
+    assert got == ["40"], got
+    got.clear()
+    lad.row_refreshed["BTC-HIT-10"] = {"41": mono - 130, "40": time.monotonic()}
+    await lad.refresh_ladder("BTC-HIT-10", slug10, set(), aged=True)  # the cold round's aged levels: the pushed one due its check
+    assert got == ["41"], got
+    got.clear()
+    lad.stream.connected_at = 0  # the stream down: nothing counts as pushed — every level read as before
+    await lad.refresh_ladder("BTC-HIT-10", slug10, {"41", "40"})
+    assert sorted(got) == ["40", "41"], got
     print("STREAM_OK")
 
 
