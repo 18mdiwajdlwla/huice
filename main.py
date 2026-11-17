@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.14"
+VERSION = "1.154.15"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -846,7 +846,9 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
      "（盘口变化由推送送来，不等下一次读）；黄金休市 4 档、开盘第一档另设了盘中价格时，开场后规则方向领先也接着吃（1.154.14）。off 关；paper 只记录不下单：按当时盘口记下会买到多少、按 Predict 的结果结算，先看几天再开；"
      "on 真实吃单（需要 LIVE=on；真实交易暂停、今日亏损停机、接口限流冷却时都不下单）"),
     ("RULE_GOLD", "规则吃单：黄金", "on = 做黄金的规则（下面价格设为 0 的那条不做）；off = 黄金一条都不做"),
-    ("RULE_GOLD_SHARES", "黄金：每场最多买多少份", "1～100000：黄金一个 15 分钟场次最多买这么多份（几次吃单合计）；每张单另受 LIVE_MAX_ORDER_USD 限制"),
+    ("RULE_GOLD_SHARES", "黄金：每场最多买多少份", "1～100000：黄金一个 15 分钟场次最多买这么多份（几次吃单合计）。盘口上规则价以内的卖单够多（≥20 份且不少于还能买的 1/4）时，"
+     "一张单就按这一场还能买的全部份数下，到达时有多少吃多少（1.154.15：之前按看到的份数下，还被单笔上限截断，一场要分几口吃）；"
+     "规则吃单的单不再受 LIVE_MAX_ORDER_USD 限制——想每场少买就把这个数改小；账户里 USDT 不够时按买得起的份数下"),
     ("RULE_GOLD_SHUT_CENTS", "黄金休市 4 档：买涨不高于（¢）", "纽约 17:00–17:45、周一至周四 CME 每天休市的 4 个 15 分钟（北京冬令时 06:00–06:45，夏令时 05:00–05:45）："
      "2025-12 至 2026-11 涨占 90%，每月最低 76%（到 2026-05 休市时指数不动、终点等于起点按涨结算；6 月起指数也在动，涨占 84%）。0 = 不做"),
     ("RULE_GOLD_SHUT_LIVE_CENTS", "黄金休市 4 档·盘中：买涨不高于（¢）", "开场后也吃（1.154.14）：这一场开始后到结束前 15 秒，币安指数比这一场的起点高 0.005% 以上"
@@ -865,7 +867,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("RULE_GOLD_1645_CENTS", "黄金休市前一档：买涨不高于（¢）", "纽约 16:45–17:00、周一至周五（北京冬令时 05:45，夏令时 04:45），CME 每天休市前的最后一档："
      "涨占 60%（周二只有 44%，最近三个月 68–90%）；52¢ 每份约 +7¢。按全部时段扫出来的，默认 0 = 不做，建议先只记录"),
     ("RULE_OIL", "规则吃单：原油", "on = 做原油的规则（下面价格设为 0 的那条不做）；off = 原油一条都不做"),
-    ("RULE_OIL_SHARES", "原油：每场最多买多少份", "1～100000：原油一个 15 分钟场次最多买这么多份（几次吃单合计）；每张单另受 LIVE_MAX_ORDER_USD 限制"),
+    ("RULE_OIL_SHARES", "原油：每场最多买多少份", "1～100000：原油一个 15 分钟场次最多买这么多份（几次吃单合计）；一张单最多就是这一场还能买的全部份数，"
+     "不再受 LIVE_MAX_ORDER_USD 限制（1.154.15，同黄金）"),
     ("RULE_OIL_SHUT_CENTS", "原油休市 4 档：买跌不高于（¢）", "原油的同一时段（纽约 17:00–17:45，周一至周四）。指数不动时按涨结算，2026-04 至 11 跌只占 42%："
      "45¢ 买跌每份约亏 3.6¢，所以默认 0 = 不做"),
     ("RULE_OIL_OPEN_CENTS", "原油开盘第一档：买跌不高于（¢）", "原油纽约 18:00、周一至周四重新开盘的第一个 15 分钟（北京冬令时 07:00）；2026 年跌占 59%："
@@ -1306,6 +1309,7 @@ class Store:
     def __init__(self, path: str):
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.path = path  # (the rule taker keeps its orders' journal beside it: rules.RuleTaker.journal, 1.154.15)
         self.conn = sqlite3.connect(path)
         self.conn.execute("PRAGMA journal_mode=WAL")
         # 1.111.0: NORMAL, not FULL — with WAL a committed transaction survives a process crash either way; FULL also fsyncs the
@@ -15017,8 +15021,8 @@ function rulesSection(ru){  // 规则吃单 (1.153.0): each rule's totals, the r
   kids.push($("p","small mut","现在："+({off:"关",paper:"只记录（不下单）",on:"真实吃单"}[ru.mode]||ru.mode)+(mk?"；"+mk:"")+(ru.max_day_usd?"；每天最多 $"+ru.max_day_usd:"")
     +(ru.fast?"；每秒检查时段（北京时间）"+(ru.fast==="off"?"：关":" "+ru.fast):"")  // 1.154.12: RULE_FAST_HOURS
     +(ru.lead_minutes?"；对手提前 "+ru.lead_minutes+" 分钟挂单的时刻前后也每秒检查":"")));  // 1.154.13: RULE_LEAD_MINUTES
-  const sp=ru.speed,ms=v=>v==null?"—":Math.round(v)+" ms";  // 1.154.13: the real orders against the clock
-  if(sp)kids.push($("p","small mut","下单速度（近 30 天真实订单 "+num(sp.orders)+" 张，"+num(sp.filled)+" 张有成交）：盘口变化→推送到达 中位 "+ms(sp.lag)+"、到达→发出 "+ms(sp.own)+"、发出→应答 "+ms(sp.trip)));
+  const sp=ru.speed,bst=(sp&&sp.best)||{},ms=k=>sp[k]==null?"—":Math.round(sp[k])+" ms"+(bst[k]==null?"":"（最快 "+Math.round(bst[k])+"）");  // 1.154.13: the real orders against the clock; 1.154.15: the fastest of each
+  if(sp)kids.push($("p","small mut","下单速度（近 30 天真实订单 "+num(sp.orders)+" 张，"+num(sp.filled)+" 张有成交）：盘口变化→推送到达 中位 "+ms("lag")+"、到达→发出 "+ms("own")+(sp.wake==null?"":"［其中到达→开始处理 "+Math.round(sp.wake)+" ms］")+"、发出→应答 "+ms("trip")));
   if((ru.rules||[]).length)kids.push(table(["规则","买","模式","场次","份数","每份成本","成本","已结算","赢/输","盈亏","待结算"],
     ru.rules.map(r=>[r.name,side(r.side)+(r.cents?" ≤"+r.cents+"¢":r.live_cents?"（盘前不买）":"（已关）")+(r.live_cents?"｜盘中 ≤"+r.live_cents+"¢":""),MODE[r.mode]||r.mode,num(r.windows),num(r.shares),r.shares?cent(r.cost/r.shares):"—",usd(r.cost),
       num(r.settled),r.wins+"/"+r.losses,r.settled?money(r.pnl):"—",num(r.open)])));
