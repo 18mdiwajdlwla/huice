@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.3"
+VERSION = "1.154.4"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -15412,7 +15412,11 @@ function renderExceptions(L,liveOn){const box=$("exlist");box.replaceChildren();
     if(L.oldest_cancel_s!=null&&L.oldest_cancel_s>60)items.push(["warn","有撤单请求发出 "+L.oldest_cancel_s+" 秒仍未得到 Predict 确认：额度照旧占用，每轮重试"]);
     if(L.sync_age_s!=null&&L.sync_age_s>150)items.push(["warn","账户订单已 "+L.sync_age_s+" 秒没有同步成功"]);
     if(L.balance_error)items.push(["warn","余额刷新失败："+L.balance_error+(L.balance_age_s!=null?"（上次成功读取 "+L.balance_age_s+" 秒前）":"")]);
-    if(L.orders_complete===false)items.push(["warn","Predict 的订单列表没有读完整（超过翻页上限）：缺席的订单不按消失处理"]);
+    // 1.154.4: a cut read alone is no exception — each step reads only this bot's own pages on purpose (1.137.1) and the pre-open
+    // mode's account snapshot shows the whole account; the warning is for no whole view for longer than the snapshot may stand in
+    if(L.orders_complete===false&&(L.whole_age_s==null||L.whole_age_s>(L.whole_max_s||600)))
+      items.push(["warn",(L.whole_age_s==null?"还没有完整读到过账户的全部挂单":"账户的全部挂单已 "+Math.round(L.whole_age_s/60)+" 分钟没有完整读到")
+        +"（预挂的账户快照和机器人自己的全量读都没读完整，超过 "+Math.round((L.whole_max_s||600)/60)+" 分钟就提示）：列表里缺席的订单先不当作已撤或已成交，按哈希单独核对"]);
     if(L.positions_complete===false)items.push(["warn","Predict 的持仓列表没有读完整（超过翻页上限）"]);
     if(L.unknown_open&&L.unknown_open.length)items.push(["warn","账户上有 "+L.unknown_open.length+" 张本机器人没有记录的挂单（#"+L.unknown_open.map(u=>u.id).join("、#")+"）：不计入这里的额度；“撤掉账户全部挂单”可一起撤"]);
     if(L.killed)items.push(["bad","今日停止开新仓："+L.killed]);

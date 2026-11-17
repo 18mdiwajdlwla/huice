@@ -467,6 +467,27 @@ async def run():
     assert plain.control_set({"SIM_SKIP": "hsi"})["ok"] and plain.control_set({"SIM_SKIP": ""})["ok"]
     assert plain.store.get("control:env") == {"SIM_SKIP": ""} and plain.config.sim_skip == frozenset(), "1.135.0: the empty choice stands over SIM_SKIP's default (the US cards)"
     assert "values:{[s.key]:null}" in m.CONTROL_PAGE and "ds.overridden&&ds.env" in m.CONTROL_PAGE and "s.saved||s.overridden" in m.CONTROL_PAGE
+    # 1.154.4: 待处理 warns of a cut order list only when no whole view of the account is young enough — each step reads this bot's
+    # own pages on purpose (1.137.1) and the pre-open mode's snapshot shows the whole account (11-17: the warning stood all day,
+    # "超过翻页上限", while the snapshot was minutes old). The page's own renderExceptions, run under Node on a stand-in DOM
+    import shutil, subprocess
+    node = shutil.which("node")
+    if node:
+        page = m.CONTROL_PAGE
+        fn = page[page.index("function renderExceptions("):page.index("function renderLive(")]
+        harness = ("const mk=(t,c,x)=>({t,c,text:x||'',kids:[],append(...a){this.kids.push(...a)},addEventListener(){},"
+                   "set textContent(v){this.text=v},get textContent(){return this.text}});const boxes={};"
+                   "const $=id=>boxes[id]||(boxes[id]=Object.assign(mk('div'),{replaceChildren(){this.kids=[]}}));const el=mk;const data={enabled:true};"
+                   + fn + "const out=[];for(const L of JSON.parse(require('fs').readFileSync(0,'utf8'))){renderExceptions(L,true);"
+                   "out.push(boxes.exlist.kids.map(k=>k.text).join('|'))}console.log(JSON.stringify(out))")
+        cases = [{"orders_complete": False, "whole_age_s": 120, "whole_max_s": 600},   # a cut step, the snapshot two minutes old
+                 {"orders_complete": False, "whole_age_s": 900, "whole_max_s": 600},   # no whole view for fifteen minutes
+                 {"orders_complete": False, "whole_age_s": None, "whole_max_s": 600},  # never seen whole
+                 {"orders_complete": True, "whole_age_s": None, "whole_max_s": 600}]   # this read was whole
+        got = json.loads(subprocess.run([node, "-e", harness], input=json.dumps(cases), capture_output=True, text=True, check=True).stdout)
+        assert got[0] == got[3] == "没有待处理的异常。", got
+        assert got[1].startswith("账户的全部挂单已 15 分钟没有完整读到") and "超过 10 分钟就提示" in got[1] and "按哈希单独核对" in got[1], got
+        assert got[2].startswith("还没有完整读到过账户的全部挂单"), got
     print("CONTROL_OK")
 
 

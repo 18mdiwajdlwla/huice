@@ -5912,6 +5912,10 @@ class LiveBot(core.Bot):
                 "oldest_cancel_s": max([(now_ms - int((t.get("withdrawn") or {}).get("at") or now_ms)) // 1000 for _, t in live if t["live"].get("state") == "cancelling"], default=None),
                 "unknown_open": [dict(u) for u in self.live_unknown_open], "orphans": [dict(o) for o in self.live_orphans[-20:]], "allowed": c.live_allowed,
                 "orders_complete": bool(getattr(self.live.api, "orders_complete", True)), "positions_complete": bool(getattr(self.live.api, "positions_complete", True)),
+                # 1.154.4: the step's own read stops at this bot's pages on purpose (1.137.1) while the pre-open mode's snapshot shows the
+                # whole account — so a cut read alone is no exception; the page warns when no whole view is younger than whole_max_s
+                "whole_age_s": (now_ms - int(self.live_whole[2])) // 1000 if self.live_whole[2] else None,
+                "whole_max_s": self.LIVE_SNAPSHOT_MAX_AGE_MS // 1000,
                 "gate": (f"未就绪：{self.live.not_ready_why}" if not self.live.ready else self.live_balance_gate() or self.live_send_hold(now_ms)),
                 "balance_age_s": int(time.time() - self.live.balance[2]) if self.live.balance else None, "balance_error": self.live.balance_error,
                 "placed_today": sum(int(t["opened"]) >= since for _, t in live),

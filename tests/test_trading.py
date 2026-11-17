@@ -1848,6 +1848,11 @@ async def audit_fixes():
     bbot.live.balance_error = ""
     assert "余额" not in bbot.live_room({}, bmk, "up", 0.55, 100)
     assert bbot.live_status(NOW)["gate"] == "" and bbot.live_status(NOW)["orders_complete"] and bbot.live_status(NOW)["balance_age_s"] >= 700
+    # 1.154.4: the age of the last whole view of the account (this bot's whole read or the pre-open snapshot) for the page's warning
+    bbot.live_whole = (set(), set(), 0)  # never seen whole
+    assert (bbot.live_status(NOW)["whole_age_s"], bbot.live_status(NOW)["whole_max_s"]) == (None, 600), (bbot.live_status(NOW)["whole_age_s"], bbot.live_status(NOW)["whole_max_s"])
+    bbot.live_whole = (set(), set(), NOW - 120_000)
+    assert bbot.live_status(NOW)["whole_age_s"] == 120
     # the emergency stop: paused, every resting order of the strategy asked to be withdrawn, Predict's confirmation reported
     sbot2 = make_bot(SIM_WAYS="maker")
     await sbot2.live_prepare(); await sbot2.live_prefetch(NOW)
