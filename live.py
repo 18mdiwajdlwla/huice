@@ -3245,6 +3245,8 @@ class LiveBot(core.Bot):
         own = str(getattr(self.config, "preopen_api_key", "") or "")
         return own if own and own != str(getattr(self.config, "predict_api_key", "") or "") else ""
 
+    KEY_SHARED_BELOW = 200  # a 429 with fewer of this bot's own requests than this in the minute before it: the key is not the bot's alone (/diag)
+
     def book_own_key(self) -> str:
         """PREDICT_BOOK_API_KEY when it is a key other than the bot's own (the orderbook feed's requests then count on it), else ""."""
         own = str(getattr(self.config, "predict_book_api_key", "") or "")
@@ -3268,8 +3270,12 @@ class LiveBot(core.Bot):
             if pacer is None:
                 continue
             hits = [n for t, n in getattr(pacer, "limits", ()) if t >= day]
+            # 1.154.6: every 429 with this bot well under Predict's 240 — the rest of the minute was someone else's on the same key
+            # (11-17: the bot's key was shared with friends; the pre-open key, the bot's alone, at the same pace drew none)
+            shared = bool(hits) and max(hits) < self.KEY_SHARED_BELOW
             parts.append(f"{name} {pacer.last_minute()} 次"
-                         + (f"（24 小时内 429 {len(hits)} 次，当时前 60 秒 {min(hits)}～{max(hits)} 次）" if hits else ""))
+                         + (f"（24 小时内 429 {len(hits)} 次，当时前 60 秒 {min(hits)}～{max(hits)} 次"
+                            + ("，远低于 240：这个 Key 可能还有别的程序或别人在用" if shared else "") + "）" if hits else ""))
         if not parts:
             return ""
         return "、".join(parts) + f"（节流每分钟 {core.PREDICT_RATE['per_min']:g} 次，Predict 默认上限 240）"

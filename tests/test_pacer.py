@@ -104,9 +104,14 @@ async def run() -> None:
         main_pacer.note_429()
         main_pacer.sent.extend([time.monotonic()] * 4)
         main_pacer.note_429()
+        ns.KEY_SHARED_BELOW = L.LiveBot.KEY_SHARED_BELOW
         line = L.LiveBot.live_key_load(ns)
-        assert line.startswith("主 Key 7 次（24 小时内 429 2 次，当时前 60 秒 3～7 次）、预挂专用 Key 7 次、盘口专用 Key 5 次（节流每分钟 "), line
+        # 1.154.6: every 429 with the bot far under Predict's 240 — someone else's requests filled that minute (11-17: a key shared with friends)
+        assert line.startswith("主 Key 7 次（24 小时内 429 2 次，当时前 60 秒 3～7 次，远低于 240：这个 Key 可能还有别的程序或别人在用）、"
+                               "预挂专用 Key 7 次、盘口专用 Key 5 次（节流每分钟 "), line
         assert "book-key" not in line
+        main_pacer.limits.append((time.monotonic(), 231))  # one at the bot's own full pace: nothing to say about others
+        assert "可能还有别的程序" not in L.LiveBot.live_key_load(ns) and "3～231 次）" in L.LiveBot.live_key_load(ns), L.LiveBot.live_key_load(ns)
         feed_cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREDICT_API_KEY": "main-key", "PREDICT_BOOK_API_KEY": " book-key "})
         book_feed = m.PredictFeed(feed_cfg)
         assert (feed_cfg.predict_book_api_key, book_feed.api_key(), book_feed.headers()) == ("book-key", "book-key", {"x-api-key": "book-key"})
