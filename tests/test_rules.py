@@ -146,7 +146,8 @@ def connected(t, mid, book, age=0.0):
     t.stream.changed.discard(mid)
 
 
-FAST = {"RULE_FAST_HOURS": "01:00-07:00", "RULE_OIL": "off", "RULE_GOLD_OPEN_CENTS": "0", "RULE_GOLD_0515_CENTS": "0"}  # the shut quarter hours alone
+# the per-second hours alone: the shut quarter hours' windows, no makers' moment (RULE_LEAD_MINUTES: its own test)
+FAST = {"RULE_FAST_HOURS": "01:00-07:00", "RULE_LEAD_MINUTES": "0", "RULE_OIL": "off", "RULE_GOLD_OPEN_CENTS": "0", "RULE_GOLD_0515_CENTS": "0"}
 
 
 class RuleTests(unittest.IsolatedAsyncioTestCase):
@@ -979,6 +980,155 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         sizes = sorted(L.from_wei(int(b["data"]["order"]["takerAmount"])) for b in api.sent)
         self.assertEqual(sizes, [5.0, 20.0], "the cap counts the first order while it flies: $15 − 20 × 58¢ leaves 5 shares for the second")
         self.assertTrue(all(o["state"] == "open" for r in t.recs.values() for o in r["orders"]), "the tick waited for both answers")
+
+    async def test_the_makers_moment_is_sprinted(self):
+        """1.154.13 — someone posts five hours before each window and the fastest taker has it. RULE_LEAD_MINUTES (300): each window
+        sprints from a minute before that moment to a quarter hour after — looked at each second, prepared — whatever the
+        per-second hours say, and right at the moment the REST reads beside the pushes are that window's alone, one a second."""
+        t, api, clock, x = taker("on", RULE_FAST_HOURS="off", RULE_OIL="off", RULE_GOLD_OPEN_CENTS="0", RULE_GOLD_0515_CENTS="0")
+        self.assertEqual((t.settings.lead_minutes, m.CONTROL_FORMS["RULE_LEAD_MINUTES"]["group"]), (300, "规则"))
+        starts = [GOLD_0600 + i * 900_000 for i in range(2)]  # 06:00 and 06:15: their moments 01:00 and 01:15
+        for i, start in enumerate(starts):
+            mid = str(901 + i)
+            api.markets[mid] = gold_market(start, mid=901 + i)
+            api.listed.add(api.markets[mid]["categorySlug"])
+            api.books[mid] = {"bids": [], "asks": []}
+        slugs = [api.markets[mid]["categorySlug"] for mid in ("901", "902")]
+        hold, t.verify_tick = t.verify_tick, lambda: None
+        moment = GOLD_0600 - 300 * 60_000  # 01:00:00
+        clock.ms = moment - R.WARM_MS - 1_000
+        await t.tick()
+        self.assertEqual((t.fast, t.warming), (False, None), "00:58:59: nothing yet")
+        self.assertIn("每秒检查时段：关（RULE_FAST_HOURS=off）：推送一有变化就看", t.fast_line(clock.ms))
+        self.assertIn("｜对手提前 300 分钟挂单的时刻前后也每秒检查（RULE_LEAD_MINUTES），下一个 01:00（06:00 的场）", t.fast_line(clock.ms))
+        clock.ms = moment - R.WARM_MS
+        await t.tick()
+        await t.warming
+        self.assertTrue(t.fast and t.sprinting(t.track[slugs[0]], clock.ms) and not t.sprinting(t.track[slugs[1]], clock.ms), "00:59: the 06:00 window sprints")
+        # right at the moment the REST reads are that window's alone, one a second
+        t.verify_tick = hold
+        for mid in ("901", "902"):
+            connected(t, mid, {"bids": [], "asks": []}, age=300)
+        clock.ms = moment - 5_000
+        for slug in slugs:
+            t.track[slug]["rest_at"] = time.monotonic() - 60
+        read = lambda: [c.split("/")[2] for c in api.calls if c.endswith("/orderbook")]
+        n = len(read())
+        for _ in range(3):
+            t.verify_at -= R.VERIFY_EVERY_S
+            t.track[slugs[0]]["rest_at"] -= R.VERIFY_HOT_S
+            t.verify_tick()
+            await t.verifying
+        self.assertEqual(read()[n:], ["901"] * 3, "the hot window alone, again after a second (not three)")
+        t.verify_tick = lambda: None
+        # an offer pushed in the sprint is bought at that look; a quarter hour after the moment the window is as any other again
+        clock.ms = moment + 1_500
+        t.stream.take("901", {"version": 2, "bids": [], "asks": [[0.53, 30]]})
+        await t.tick()
+        self.assertEqual(L.from_wei(int(api.sent[0]["data"]["order"]["takerAmount"])), 30.0)
+        clock.ms = moment + R.SPRINT_MS  # 01:15: the 06:00 window's sprint over — and the 06:15 window's own moment
+        await t.tick()
+        self.assertTrue(t.fast and not t.sprinting(t.track[slugs[0]], clock.ms) and t.sprinting(t.track[slugs[1]], clock.ms))
+        clock.ms = moment + 3 * 900_000 + R.SPRINT_MS  # 02:00: the last shut window's (06:45, its moment 01:45) sprint over
+        await t.tick()
+        self.assertFalse(t.fast)
+        off, _, _, _ = taker("on", RULE_FAST_HOURS="off", RULE_LEAD_MINUTES="0")
+        self.assertEqual((off.settings.lead_minutes, off.moment({"start": GOLD_0600})), (0, 0), "0: no such moment")
+        with self.assertRaises(ValueError):
+            m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "RULE_TAKER": "on", "RULE_LEAD_MINUTES": "2000"})
+
+    async def test_the_race_is_timed(self):
+        """1.154.13: Predict's stamps on the books time the race — when the first offer at the price showed and when it was gone
+        (bought by a faster taker: how long it stood), and an order's own way: the stamp of the book it is sized on, that book's
+        arrival, the request leaving, its answer. /rules and the review page sum them up."""
+        t, api, clock, x = taker("on", **FAST)
+        t.verify_tick = lambda: None
+        mids = {"901": GOLD_0600, "902": GOLD_0600 + 900_000}
+        for mid, start in mids.items():
+            api.markets[mid] = gold_market(start, mid=int(mid))
+            api.listed.add(api.markets[mid]["categorySlug"])
+            api.books[mid] = {"bids": [], "asks": []}
+        slug1, slug2 = (api.markets[mid]["categorySlug"] for mid in ("901", "902"))
+        await t.tick()
+        for mid in mids:
+            connected(t, mid, {"bids": [], "asks": []})
+        wall = int(time.time() * 1000)
+        # 901: an offer at 52¢ shows (Predict's stamp: 300 ms ago) — bought by this taker
+        t.stream.take("901", {"version": 2, "updateTimestampMs": wall - 300, "bids": [], "asks": [[0.52, 25]]})
+        self.assertEqual(t.stream.stamps["901"][0], wall - 300)
+        self.assertTrue(250 <= t.stream.lags[-1] <= 2_000, t.stream.lags)
+        api.fill[1] = 25.0
+        clock.ms += 1_000
+        await t.tick()
+        order = t.record(slug1)["orders"][0]
+        self.assertEqual((order["book_ts"], order["seen_wall"]), t.stream.stamps["901"])
+        self.assertTrue(order["seen_wall"] <= order["sent_wall"] <= order["answered_wall"], order)
+        t.stream.take("901", {"version": 3, "updateTimestampMs": wall + 300, "bids": [], "asks": []})  # the book after this taker's fill: 600 ms after the offer showed
+        # 902: an offer shows; this taker's order goes out, but a faster taker has it 180 ms after it showed (Predict's stamps)
+        t.stream.take("902", {"version": 2, "updateTimestampMs": wall - 250, "bids": [], "asks": [[0.53, 30]]})
+        clock.ms += 1_000
+        await t.tick()
+        self.assertEqual((len(api.sent), R.in_flight(t.record(slug2))), (2, True), "sent, nothing filled")
+        t.stream.take("902", {"version": 3, "updateTimestampMs": wall - 70, "bids": [], "asks": []})
+        clock.ms += 1_000
+        await t.tick()  # this taker's order still on its way: the look buys nothing — the offer's going is seen all the same
+        seen = t.track[slug2]["seen"]
+        self.assertEqual((seen["offer_ts"], seen["gone_ts"], seen["gone_ms"] - seen["offer_ms"]), (wall - 250, wall - 70, 1_000))
+        t.stream.take("902", {"version": 4, "updateTimestampMs": wall - 10, "bids": [[0.40, 5]], "asks": []})  # a later change: not the offer's going
+        clock.ms += 1_000
+        await t.tick()
+        self.assertEqual(seen["gone_ts"], wall - 70, "kept as first seen")
+        # the windows end: the watches are kept; the statistics say what the race was
+        clock.ms = GOLD_0600 + 900_000 - R.STOP_MS
+        await t.tick()
+        st = R.watch_stats(t.recs, "gold_shut", "on", 0)
+        self.assertEqual((st["offered"], st["lost"], st["life"]), (2, 1, 180), "one bought, one lost to a taker 180 ms after it showed")
+        self.assertEqual((st["won"], st["won_life"]), (1, 600), "the one bought: gone 600 ms after it showed, by Predict's stamps")
+        self.assertAlmostEqual(st["offer_lead"], (30 * 60_000 - 1_000 + 45 * 60_000 - 2_000) / 2 / 60_000, 3)
+        sp = R.speed_stats(t.recs, 0)
+        self.assertEqual((sp["orders"], sp["filled"]), (2, 1))
+        self.assertTrue(250 <= sp["lag"] <= 2_000 and 0 <= sp["own"] <= 2_000 and 0 <= sp["trip"] <= 2_000, sp)
+        text = t.status()
+        self.assertIn("下单速度（近 30 天真实订单 2 张，1 张有成交）：盘口变化→推送到达 中位 ", text)
+        self.assertIn("，1 场的卖单没买到就没了（存活中位 0.2 秒），买到的 1 场从卖单出现到被吃掉中位 0.6 秒", text)
+        self.assertIn("，卖单首次出现在开场前中位 37 分钟", text)
+        page = R.review(t.recs, t.settings, clock.ms)
+        self.assertEqual((page["speed"]["orders"], page["lead_minutes"]), (2, 0))
+        row = next(r for r in page["rules"] if r["rule"] == "gold_shut" and r["mode"] == "on")
+        self.assertEqual((row["watch"]["lost"], row["watch"]["life"], row["watch"]["won"], row["watch"]["won_life"]), (1, 180, 1, 600))
+
+    async def test_an_order_costs_no_walk_of_the_records(self):
+        """1.154.13: between an offer showing and the order leaving — the pre-open mode's own bids found by the window's own keys in
+        its ledger (the window's slug, "#<level>": 39,000 records were walked, 17 ms and more), a record renamed "@<attempt>"
+        (withdrawn, final) never one; and the day's P&L for the loss stop summed once a tick, not at each of the order's three
+        checks."""
+        t, api, clock, x = taker("on")
+        start = bj(2026, 11, 17, 18, 15)
+        clock.ms = start - 20 * 60_000
+        slug = f"xau-updown-15m-{start // 1000}"
+        api.markets["903"] = gold_market(start, mid=903)
+        api.listed.add(slug)
+        api.books["903"] = {"bids": [[0.50, 7], [0.48, 15], [0.47, 9]], "asks": [[0.53, 40]]}  # Down offers at 50¢, 52¢ (its own, level 1), 53¢
+
+        class Rows(dict):
+            walked = 0
+
+            def values(self):
+                Rows.walked += 1
+                return super().values()
+        pair = lambda key, price, state: {"slug": key, "price": price, "shares": "15", "phase": "active",
+                                          "orders": {"up": {"state": state, "filled": 0.0}, "down": {"state": state, "filled": 0.0}}}
+        rows = Rows({f"{slug}#1": pair(f"{slug}#1", "0.48", "open"),               # its deeper level: an Up bid at 48¢ = a Down offer at 52¢
+                     f"{slug}@1": pair(f"{slug}@1", "0.50", "final"),              # a withdrawn quote renamed aside: nothing rests of it
+                     **{f"btc-updown-15m-{i}": pair(f"btc-updown-15m-{i}", "0.47", "open") for i in range(50)}})
+        x.owner.preopen = types.SimpleNamespace(ledger=types.SimpleNamespace(rows=rows))
+        self.assertEqual(t.own_asks(slug, "down"), {D("0.52"): D("15")})
+        sums = []
+        x.owner.live_daily_pnl = lambda trades, now: sums.append(now) or 0.0
+        await t.tick()
+        body = api.sent[0]["data"]["order"]
+        self.assertEqual(L.from_wei(int(body["takerAmount"])), 7.0, "the 7 at 50¢ — a cent under its own 52¢ offer leaves 51¢: the 50¢ ones")
+        self.assertEqual((Rows.walked, len(sums)), (0, 1), "no walk of the ledger; the loss stop's sums once for the tick's three checks")
 
     async def test_a_key_of_its_own(self):
         """1.154.12 — RULE_API_KEY: the rule taker's reads, orders and push connection on a key of its own, with its own cooldown:
