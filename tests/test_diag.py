@@ -148,7 +148,10 @@ async def run():
     assert "挂单列表 1 页 0.3s，只读到自己的单，每页 100 张（Predict 按市场过滤" in "\n".join(bot.diag_state(NOW))
     bot.live_sync_detail = {**sync, "page_rows": 0, "page_asked": 100}
     assert "挂单列表 1 页 0.3s，只读到自己的单（Predict 按市场过滤" in "\n".join(bot.diag_state(NOW)), "no full page seen: nothing said"
-    bot.live_sync_detail = None
+    # 1.154.9: the minute's positions check, inside the step's sync too — how long it held it, and how many pages it read
+    bot.live_late_last = {"s": 20.1, "pages": 12}
+    assert "核对 16 条记录 0.5s；每分钟一次的持仓核对上次 20.1s（12 页））" in "\n".join(bot.diag_state(NOW)), "\n".join(bot.diag_state(NOW))
+    bot.live_sync_detail = bot.live_late_last = None
 
     # /diag from Telegram (admin only): a "working on it" note, then the report
     await bot.process_message({"text": "/diag", "chat": {"id": 1}, "from": {"id": 42}, "date": time.time()})

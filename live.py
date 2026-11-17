@@ -2953,10 +2953,14 @@ class LiveBot(core.Bot):
             cancelling = [tid for tid, t in active.items() if t["live"].get("state") == "cancelling"]
             await self.live_sync_orders(active, now_ms)  # with nothing in flight the list is still read now and then: orders this bot did not place
             await self.live_requote_freed(cancelling, now_ms)  # the slots the confirmed cancels freed: quoted again now (once ready), not next step
+        checked, started = self.live_late_checked, time.monotonic()
         try:
             await self.live_late_fills(now_ms)  # 1.119.0: an order that ended with shares unfilled, against the account's positions
         except Exception as error:
             self.live_note_error(f"结束订单核对持仓失败：{core.clean_error(error) or type(error).__name__}")
+        if self.live_late_checked != checked:  # 1.154.9: the minute's positions check ran in this step — how long it held it (/diag)
+            pages = (getattr(self.live.api, "paged_stats", None) or {}).get("/positions", (0, 0))[0]
+            self.live_late_last = {"s": time.monotonic() - started, "pages": pages}
         self.live_redeem_tick(now_ms)  # also on its own timer (live_redeem_loop): the step is not the only way a round starts
 
     LIVE_AUTH_RENEW_S = 900  # the sign-in token is renewed this long before it expires, in the background

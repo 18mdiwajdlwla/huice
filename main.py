@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.8"
+VERSION = "1.154.9"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -5432,6 +5432,7 @@ class PredictPacer:
     an order or a cancel may borrow up to a burst ahead of the reads, so it never queues behind them. The whole key's traffic —
     the orderbook feed, the model trader, the pre-open mode, the rule taker — shares it (predict_pacer, one a key)."""
     BURST = 8.0
+    LOW_RESERVE = 2.0  # 1.154.9: a low read (the orderbook feed's) leaves this many tokens in the bucket for the others — the trader's reads
 
     def __init__(self, per_min: float):
         self.per_min = float(per_min)
@@ -5448,9 +5449,13 @@ class PredictPacer:
         self.tokens = min(self.BURST, self.tokens + (now - self.at) * self.per_min / 60.0)
         self.at = now
 
-    async def take(self, write: bool = False) -> None:
+    async def take(self, write: bool = False, low: bool = False) -> None:
+        """A token for one request: a read waits for a whole one; an order or a cancel (``write``) may borrow up to a burst ahead;
+        a ``low`` read (1.154.9: the orderbook feed's — its rounds ask for dozens at once) leaves LOW_RESERVE behind, so the
+        trader's reads on the same key go first: 11-17 14:41, 主 Key 220 次 a minute, the trader's sync (its order reads, the
+        minute's positions pages) queued 22 s behind the book rounds."""
         if self.per_min > 0 and PREDICT_PACING:
-            need = 1.0 - self.BURST if write else 1.0  # what must be in the bucket for this one to go
+            need = 1.0 - self.BURST if write else 1.0 + (self.LOW_RESERVE if low else 0.0)  # what must be in the bucket for this one to go
             while True:
                 self.refill()
                 if self.tokens >= need - 1e-9:
@@ -6049,6 +6054,7 @@ class PredictFeed:
         self.key_ms: dict[str, int] = {}                         # item key -> how long its last refresh took
         self.round_info: dict[str, Any] = {}                     # the last hot round: keys, ladder levels read, the slowest key (for /diag)
         self.book_asked: dict[str, float] = {}                   # item key -> monotonic time the stored book was asked for
+        self.absent_at: dict[str, float] = {}                    # item key -> monotonic time its book was answered 404 (1.154.9: PREDICT_ABSENT_SECONDS)
         self.row_asked: dict[str, dict[str, float]] = {}         # item key -> market id -> the same, for a ladder's levels
         self.blocked_until = 0.0                                 # monotonic: after a 429, no request before this
         self.calls = 0                                           # requests sent (/diag: the request rate on the API key, 1.137.2)
@@ -6081,7 +6087,8 @@ class PredictFeed:
         if left > 0:
             raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
         if url.startswith(PREDICT_REST):
-            await predict_pacer(self.api_key()).take()  # the key's budget, shared with the trading clients (1.154.0) unless the feed has its own (1.154.5)
+            # the key's budget, shared with the trading clients (1.154.0) unless the feed has its own (1.154.5); behind their reads (1.154.9)
+            await predict_pacer(self.api_key()).take(low=True)
         async with self.gate:
             # 1.150.0: a cooldown that began while this request waited for its slot (another read's 429) is honoured here too,
             # as live.py's send() does since 1.138.0: nothing queued behind the PREDICT_PARALLEL in flight goes out into it.
@@ -6604,7 +6611,15 @@ class PredictFeed:
             # out of a 买1 that did not hold them, and the lane withdrew the order it had just placed (own_on_book); the
             # cancelled order's ghost counted as somebody's 买1 (Bot.sim_own_resting). The landing stays fetched_ms, its age
             asked, asked_ms = time.monotonic(), int(time.time() * 1000)
-            bids, asks, _ = await self.orderbook(market)
+            try:
+                bids, asks, _ = await self.orderbook(market)
+            except RemoteError as error:
+                if "HTTP 404" not in str(error):
+                    raise
+                # 1.154.9: no book to read (HTTP 404 "Orderbook not found") — an answer, asked again in PREDICT_ABSENT_SECONDS (refresh)
+                self.absent_at[key] = time.monotonic()
+                raise RemoteError(f"Predict 上这个市场没有盘口（{clean_error(error)}），{int(PREDICT_ABSENT_SECONDS // 60)} 分钟后再看") from None
+            self.absent_at.pop(key, None)
             if asked < self.book_asked.get(key, -1e18):
                 # a later request's book is stored already (the cold round's slow read landing after the hot round's): this
                 # answer would put the book back in time under a newer read time (1.83.2) — dropped, the express lane not woken
@@ -6654,7 +6669,7 @@ class PredictFeed:
         for key in list(self.errors):
             if key not in targets:
                 self.errors.pop(key)
-        for table in (self.ladders, self.ladder_rows, self.row_refreshed, self.key_ms, self.row_asked, self.book_asked):
+        for table in (self.ladders, self.ladder_rows, self.row_refreshed, self.key_ms, self.row_asked, self.book_asked, self.absent_at):
             for key in [k for k in table if k not in targets]:
                 table.pop(key)
         self.slugs = dict(targets)
@@ -6688,10 +6703,12 @@ class PredictFeed:
             book = self.books.get(key)
             return (hot is not None and key not in self.ladder_keys and book is not None and bool(self.stream.connected_at)
                     and str(book.market_id) in self.stream.live and 0 <= wall - int(book.fetched_ms or 0) <= PREDICT_PUSH_FRESH_MS)
+        def absent(key: str) -> bool:  # 1.154.9: its book answered 404 a moment ago — asked again in PREDICT_ABSENT_SECONDS, not every round
+            return now - self.absent_at.get(key, -1e9) < PREDICT_ABSENT_SECONDS
         due = {key: slug for key, slug in targets.items()
-               if (hot is None or key in hot or (key not in self.books and key not in self.ladders)) and not pushing(key)}
+               if (hot is None or key in hot or (key not in self.books and key not in self.ladders)) and not pushing(key) and not absent(key)}
         # 1.154.5: a pushed single market is checked by REST every PREDICT_PUSH_CHECK_SECONDS, a cold one read every PREDICT_COLD_POLL_SECONDS
-        cold_due = {key: slug for key, slug in targets.items() if key not in due
+        cold_due = {key: slug for key, slug in targets.items() if key not in due and not absent(key)
                     and now - self.key_refreshed.get(key, -1e9) >= (max(cold, PREDICT_PUSH_CHECK_SECONDS) if pushing(key) else cold)}
         read = await asyncio.gather(*(self.refresh_timed(key, slug, hot_rows if hot is not None else None) for key, slug in due.items()))
         for key in due:
@@ -6709,7 +6726,8 @@ class PredictFeed:
         for key in [k for k in self.key_refreshed if k not in targets]:
             self.key_refreshed.pop(key, None)
         # a market not listed yet is an answer, not a failure
-        failed = [f"{key}：{error}" for key, error in self.errors.items() if key in targets and "还没有这个市场" not in error]
+        failed = [f"{key}：{error}" for key, error in self.errors.items()
+                  if key in targets and "还没有这个市场" not in error and "没有盘口" not in error]  # 1.154.9: no book (404) is an answer too
         return refreshed(failed, len(targets) - len(failed))
 
 
@@ -6728,6 +6746,8 @@ PREDICT_PUSH_FRESH_MS = 20_000              # a market pushing on this connectio
 #                                             516 s over 24 topics); its age restarts at each heartbeat (15 s, touch) while its topic lives, so with 5 s it
 #                                             counted as pushing a third of the time and the hot round read it again two rounds in three, on a key that was
 #                                             full. A topic gone silent is not restarted (touch) and ages past this: read again, as before
+PREDICT_ABSENT_SECONDS = 120.0              # 1.154.9: a single market whose book Predict answers 404 ("Orderbook not found") is asked again this often —
+#                                             not every round as a key with no book yet (11-17: NVDA-2027, BNB-2027 every ten seconds); no failure either
 PREDICT_PUSH_CHECK_SECONDS = 120.0          # 1.154.5: a pushed market (a single one, a ladder's level) is checked by REST this often (the cold round) —
 #                                             not every PREDICT_COLD_POLL_SECONDS: 11-17, "REST 覆盖推送 36 次，其中盘口不同 0 次"
 
@@ -6994,6 +7014,10 @@ class PredictStream:
             # while the REST read found the book changed under them — the version does not count every change
             self.repeated += 1
             self.heard[mid] = asked  # the topic still brings this market's book (touch)
+            # 1.154.9: ...and it is pushed on this connection — the snapshot a subscription brings first, equal to the REST book read
+            # just before it, used to leave a quiet market out of `live` for good: never "pushing", read by every hot round (11-17:
+            # 订阅 75 个、在推 55 个, 18 markets a round)
+            self.live.add(mid)
             self.refresh_age(key, level, mid)
             return
         stamp = data.get("updateTimestampMs")
@@ -24863,7 +24887,9 @@ class Bot:
                                                            if sync.get("page_rows") else ""))
                                + ("" if sync.get("filter") is None else "（Predict 按市场过滤：" + ("支持" if sync["filter"] else "不支持，按页读") + "）")
                                + f"、按哈希单读 {sync['reads']} 张" + (f"（另 {sync['later']} 张轮到再读）" if sync["later"] else "")
-                               + f"、核对 {sync['records']} 条记录 {sync['work_s']:.1f}s）")
+                               + f"、核对 {sync['records']} 条记录 {sync['work_s']:.1f}s"
+                               # 1.154.9: the minute's positions check, in the step too (its pages: the pre-open mode's positions)
+                               + (f"；每分钟一次的持仓核对上次 {late['s']:.1f}s（{late['pages']} 页）" if (late := getattr(self, "live_late_last", None)) else "") + "）")
                 rates = getattr(self, "live_request_rates", None)
                 if name == "模拟交易" and rates and (rate_list := rates()):
                     # 1.154.3: not "the same API key" any more — the pre-open mode may have its own (PREOPEN_API_KEY); each key's
