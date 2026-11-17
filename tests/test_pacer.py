@@ -62,6 +62,17 @@ async def run() -> None:
             started = time.monotonic()
             await patient.call("POST", "/orders", {}, priority=True)
             assert time.monotonic() - started >= 0.08, "a placement made ahead of time waits for the pace"
+            # 1.154.11: a low client (the pre-open mode's placements and re-reads) yields to a plain one on the key (its account snapshot)
+            m.PREDICT_PACERS.clear()
+            yielding, snapshot, done = L.PredictApi("https://x", "kq", None), L.PredictApi("https://x", "kq", None), []
+            yielding.low = yielding.patient = True
+
+            async def one(client, name, method, priority):
+                await client.call(method, "/x", {} if method == "POST" else None, priority=priority)
+                done.append(name)
+            await asyncio.gather(one(yielding, "placement", "POST", True), one(yielding, "re-read", "GET", False),
+                                 one(snapshot, "snapshot page", "GET", False))
+            assert done[0] == "snapshot page", done
         finally:
             L.PredictApi.send = original
         # 1.154.9: a low read (the orderbook feed's: dozens a round) leaves LOW_RESERVE tokens behind — the trader's read, asked after
@@ -116,11 +127,14 @@ async def run() -> None:
         ns.KEY_SHARED_BELOW = L.LiveBot.KEY_SHARED_BELOW
         line = L.LiveBot.live_key_load(ns)
         # 1.154.6: every 429 with the bot far under Predict's 240 — someone else's requests filled that minute (11-17: a key shared with friends)
-        assert line.startswith("主 Key 7 次（24 小时内 429 2 次，当时前 60 秒 3～7 次，远低于 240：这个 Key 可能还有别的程序或别人在用）、"
+        assert line.startswith("主 Key 7 次（24 小时内 429 2 次，当时前 60 秒 3～7 次、中位 5 次，远低于 240：这个 Key 可能还有别的程序或别人在用）、"
                                "预挂专用 Key 7 次、盘口专用 Key 5 次（节流每分钟 "), line
         assert "book-key" not in line
-        main_pacer.limits.append((time.monotonic(), 231))  # one at the bot's own full pace: nothing to say about others
-        assert "可能还有别的程序" not in L.LiveBot.live_key_load(ns) and "3～231 次）" in L.LiveBot.live_key_load(ns), L.LiveBot.live_key_load(ns)
+        # 1.154.11: judged by the median — one 429 at the bot's own full pace (11-17 17:24: 90 at 135～211) keeps the note
+        main_pacer.limits.append((time.monotonic(), 231))
+        assert "3～231 次、中位 7 次，远低于 240：这个 Key 可能还有别的程序" in L.LiveBot.live_key_load(ns), L.LiveBot.live_key_load(ns)
+        main_pacer.limits.extend([(time.monotonic(), 232), (time.monotonic(), 233)])  # most at the bot's own full pace: nothing to say
+        assert "可能还有别的程序" not in L.LiveBot.live_key_load(ns) and "3～233 次、中位 231 次）" in L.LiveBot.live_key_load(ns), L.LiveBot.live_key_load(ns)
         feed_cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREDICT_API_KEY": "main-key", "PREDICT_BOOK_API_KEY": " book-key "})
         book_feed = m.PredictFeed(feed_cfg)
         assert (feed_cfg.predict_book_api_key, book_feed.api_key(), book_feed.headers()) == ("book-key", "book-key", {"x-api-key": "book-key"})
@@ -165,6 +179,11 @@ async def run() -> None:
     assert (own.api.patient, own.cancel_api.patient, own.bulk_api.patient) == (True, False, False), "its placements wait, its cancels do not"
     own.api.blocked_until = time.monotonic() + 30
     assert own.cancel_api.blocked_until > time.monotonic() and ctl.owner.live.api.blocked_until == 0.0, "its 429 pauses its own clients alone"
+    # 1.154.11: the account snapshot on a client of its own on that key, its reads ahead of the mode's others (the placement client's
+    # reads and patient orders leave the pacer's reserve: low); its cooldown the same as theirs
+    assert own.snap_api.api_key == "second-key" and own.snapshot_client() is own.snap_api and own.snap_api.ORDERS_PAGE == own.api.ORDERS_PAGE
+    assert (own.api.low, own.cancel_api.low, own.bulk_api.low, own.snap_api.low) == (True, False, False, False)
+    assert own.snap_api.blocked_until > time.monotonic(), "one cooldown for the mode's clients"
     plain = p.Controller(controller(PREDICT_API_KEY="main-key")[0].owner)
     assert plain.api.api_key == "main-key"
     # the listing probes: fast only from SPRINT_EARLY_MS before the soonest recent listing delay (none known: from the entry)

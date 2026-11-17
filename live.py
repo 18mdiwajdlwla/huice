@@ -642,6 +642,8 @@ class PredictApi:
     BACKOFF_SECONDS = 20
     patient = False        # 1.154.1: this client's orders wait for the key's pace like a read (core.PredictPacer) — the pre-open mode's
     #                        placements, made hours ahead: they leave the burst to the orders that cannot wait (a taker, a cancel)
+    low = False            # 1.154.11: this client's reads (and patient orders) leave the key's reserve to the others (PredictPacer.LOW_RESERVE) —
+    #                        the pre-open mode's placements and re-reads, behind its account snapshot's pages
 
     def __init__(self, base: str, api_key: str, wallet: Wallet | None):
         self.base, self.api_key, self.wallet = base.rstrip("/"), api_key, wallet
@@ -678,7 +680,8 @@ class PredictApi:
             payload = {}
         # 1.154.0: the key's request budget first (core.PredictPacer): a read waits for its token; an order or a cancel may borrow a
         # burst ahead of the reads — and Predict's 429, with its twenty seconds of silence for every client on the key, is not met
-        await core.predict_pacer(self.api_key).take(priority and not self.patient)
+        write = priority and not self.patient
+        await core.predict_pacer(self.api_key).take(write, low=self.low and not write)
         self.calls += 1
         if priority:
             self.writes_inflight += 1
@@ -3288,11 +3291,13 @@ class LiveBot(core.Bot):
             if pacer is None:
                 continue
             hits = [n for t, n in getattr(pacer, "limits", ()) if t >= day]
-            # 1.154.6: every 429 with this bot well under Predict's 240 — the rest of the minute was someone else's on the same key
-            # (11-17: the bot's key was shared with friends; the pre-open key, the bot's alone, at the same pace drew none)
-            shared = bool(hits) and max(hits) < self.KEY_SHARED_BELOW
+            # 1.154.6: the 429s with this bot well under Predict's 240 — the rest of the minute was someone else's on the same key
+            # (11-17: the bot's key was shared with friends; the pre-open key, the bot's alone, at the same pace drew none).
+            # 1.154.11: judged by the median, not the highest — 17:24, 90 of them at 135～211 (one at 211 kept the note away)
+            mid = core.median(sorted(hits)) if hits else 0
+            shared = bool(hits) and mid < self.KEY_SHARED_BELOW
             parts.append(f"{name} {pacer.last_minute()} 次"
-                         + (f"（24 小时内 429 {len(hits)} 次，当时前 60 秒 {min(hits)}～{max(hits)} 次"
+                         + (f"（24 小时内 429 {len(hits)} 次，当时前 60 秒 {min(hits)}～{max(hits)} 次、中位 {mid:g} 次"
                             + ("，远低于 240：这个 Key 可能还有别的程序或别人在用" if shared else "") + "）" if hits else ""))
         if not parts:
             return ""

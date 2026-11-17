@@ -1397,7 +1397,14 @@ class Controller:
         # the cancel client's slots (four batches of hundreds held them for seconds)
         self.bulk_api = safe_api(live.API_BASES[owner.config.live_chain], key, owner.live.wallet, None, shared)
         self.cancel_made = self.cancel_api  # the batches go through bulk_api while the cancel client is this one (the tests put their own in)
-        self.api.ORDERS_PAGE = self.cancel_api.ORDERS_PAGE = int(getattr(owner.config, "live_orders_page", 50) or 50)  # LIVE_ORDERS_PAGE: fewer pages a snapshot (1.136.1)
+        # 1.154.11: the account snapshot on a client of its own, its page reads ahead of the mode's other reads on the key (those, and the
+        # placements made hours ahead, leave the pacer's reserve: PredictApi.low) — 11-17 17:24: 242 pages (24,000 open orders) took 481 s
+        # a read, a page every two seconds behind the placements and re-reads, and the snapshot went stale (账户快照过期，不再发送: every
+        # placement held). snapshot_client(): this one, unless the tests put their own client in as the api
+        self.snap_api = safe_api(live.API_BASES[owner.config.live_chain], key, owner.live.wallet, None, shared)
+        self.api_made = self.api
+        self.api.low = True
+        self.api.ORDERS_PAGE = self.cancel_api.ORDERS_PAGE = self.snap_api.ORDERS_PAGE = int(getattr(owner.config, "live_orders_page", 50) or 50)  # LIVE_ORDERS_PAGE: fewer pages a snapshot (1.136.1)
         self.settling: dict[str, asyncio.Task] = {}
         self.settle_gate = asyncio.Semaphore(2)
         self.reconcile_gate = asyncio.Semaphore(2)  # the withdrawn pairs' final reads (launch_reconcile) have their own two: thousands of them never starve the monitors and settlements (1.141.0)
@@ -1545,13 +1552,18 @@ class Controller:
                 return f"账户快照上次读取失败（{self.account_failed}），正在重读"
             # 1.154.8: how far the first read has come — 8,000 open orders are some 80 pages; the status re-reads and the known windows'
             # re-reads wait for it (first_snapshot_pending), the listing probes go on (what they find waits here, ahead of the backlog)
-            pages = int((getattr(self.api, "__dict__", {}).get("paging") or {}).get("/orders", 0) or 0)
+            pages = int((getattr(self.snapshot_client(), "__dict__", {}).get("paging") or {}).get("/orders", 0) or 0)
             since = (self.now() - self.account_started_ms) // 1000 if self.account_started_ms else 0
             return "账户快照还没有读到（启动后第一次读取中" + (f"：已 {since} 秒、读了 {pages} 页挂单" if since or pages else "") + "）"
         if self.now() - self.account_at > self.account_stale_ms():
             return (f"账户快照过期（{(self.now() - self.account_at) // 1000} 秒前读到，每 {self.account_interval_s():.0f} 秒读一次"
                     + (f"，上次读了 {self.account_read_s:.0f} 秒" if self.account_read_s >= 1 else "") + "）")
         return self.cooldown()
+
+    def snapshot_client(self) -> Any:
+        """The client the account snapshot reads through (1.154.11): its own (snap_api, ahead of the mode's other reads on the key),
+        unless the api was put in from outside (the tests): then that one, as before."""
+        return self.snap_api if self.api is getattr(self, "api_made", None) else self.api
 
     def first_snapshot_pending(self) -> bool:
         """Whether the first account snapshot since the start is still to come (1.154.8): every placement waits for it (hold), so
@@ -1562,7 +1574,7 @@ class Controller:
 
     def page_rows_note(self) -> str:
         """The rows Predict really gives a page of the open-order list, beside what LIVE_ORDERS_PAGE asks (1.154.7), for /preopen."""
-        asked = int(getattr(self.api, "ORDERS_PAGE", 50) or 50)
+        asked = int(getattr(self.snapshot_client(), "ORDERS_PAGE", 50) or 50)
         got = int(self.account_page_rows or 0)
         if not got:
             return ""
@@ -1737,18 +1749,19 @@ class Controller:
         import live
         fetched = self.now()
         self.account_started_ms = fetched  # 1.154.8: the hold's progress note
+        client = self.snapshot_client()  # 1.154.11: its own, ahead of the mode's other reads
         try:
-            rows = await self.api.orders("OPEN")
-            page = int(getattr(self.api, "ORDERS_PAGE", 50) or 50)
+            rows = await client.orders("OPEN")
+            page = int(getattr(client, "ORDERS_PAGE", 50) or 50)
             # 1.154.7: the pages counted as requested, and the rows Predict really put on a full page (LIVE_ORDERS_PAGE asks for `page`;
             # a cap of the server's below it would halve nothing, and the pages reckoned as rows / page would read the snapshot twice
             # as often as ACCOUNT_PAGE_S means to)
-            asked, full = (getattr(self.api, "paged_stats", None) or {}).get("/orders", (0, 0))
+            asked, full = (getattr(client, "paged_stats", None) or {}).get("/orders", (0, 0))
             if full:
                 self.account_page_rows = full
             pages_read = asked or -(-len(rows) // page)
-            if not self.api.orders_complete:
-                raise core.RemoteError(f"账户挂单分页未读取完整（读了 {len(rows)} 条、{pages_read} 页仍没到底，上限 {getattr(self.api, 'ORDERS_PAGES_MAX', '?')} 页），暂停新增订单")
+            if not client.orders_complete:
+                raise core.RemoteError(f"账户挂单分页未读取完整（读了 {len(rows)} 条、{pages_read} 页仍没到底，上限 {getattr(client, 'ORDERS_PAGES_MAX', '?')} 页），暂停新增订单")
             self.account_pages = max(1, pages_read)
             other = self.unmanaged_rows(rows)
             known_core = {str(t.get("live", {}).get("order_id")) for t in self.owner.sim_trades().values() if isinstance(t.get("live"), dict)}
@@ -2820,7 +2833,7 @@ class Controller:
             def count(client: Any) -> int:  # a fake's calls are a list
                 made = getattr(client, "calls", 0)
                 return len(made) if isinstance(made, list) else int(made or 0)
-            calls = sum(count(client) for client in {id(x): x for x in (self.api, self.cancel_api, self.bulk_client())}.values())
+            calls = sum(count(client) for client in {id(x): x for x in (self.api, self.cancel_api, self.bulk_client(), self.snapshot_client())}.values())
             if not self.rate_samples or now - self.rate_samples[-1][0] >= 500:
                 self.rate_samples.append((now, calls))
             await self.check_cards(now)
