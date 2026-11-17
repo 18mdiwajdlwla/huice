@@ -1368,6 +1368,7 @@ class Controller:
         key = own_key or owner.config.predict_api_key
         shared = None if own_key else getattr(owner.live, "api", None)  # the bot's own client: one rate-limit cooldown for all on the key
         self.api = safe_api(live.API_BASES[owner.config.live_chain], key, owner.live.wallet, self.before_send, shared)
+        self.api.patient = True  # 1.154.1: its placements (hours ahead) wait for the key's pace like a read; its cancels (cancel_api, bulk_api) do not
         shared = shared or self.api  # (its own key: its three clients share one cooldown among themselves)
         # A separate request gate leaves cancellation capacity available even when
         # placement requests are queued or their HTTP responses are slow.

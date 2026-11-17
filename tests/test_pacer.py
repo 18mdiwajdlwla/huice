@@ -33,6 +33,30 @@ async def run() -> None:
         started = time.monotonic()
         await pacer.take()
         assert time.monotonic() - started >= 0.07, "a read pays the writes' debt back first"
+        # 1.154.1: a patient client's orders (the pre-open mode's placements) wait like a read; a taker's or a cancel does not
+        import live as L
+        m.PREDICT_PACERS.clear()
+        m.PREDICT_RATE["per_min"] = 600.0  # 10 a second
+        sent = []
+
+        async def send(self, method, path, payload, timeout):
+            sent.append((self.patient, time.monotonic()))
+            return b"{}"
+        urgent, patient = L.PredictApi("https://x", "kp", None), L.PredictApi("https://x", "kp", None)
+        patient.patient = True
+        original = L.PredictApi.send
+        L.PredictApi.send = send
+        try:
+            for _ in range(int(m.PredictPacer.BURST)):
+                await urgent.call("GET", "/a")  # the bucket emptied by reads
+            started = time.monotonic()
+            await urgent.call("POST", "/orders", {}, priority=True)
+            assert time.monotonic() - started < 0.05, "a taker's order borrows: at once"
+            started = time.monotonic()
+            await patient.call("POST", "/orders", {}, priority=True)
+            assert time.monotonic() - started >= 0.08, "a placement made ahead of time waits for the pace"
+        finally:
+            L.PredictApi.send = original
         # off: nothing waits
         assert await asyncio.wait_for(m.PredictPacer(0).take(), 0.01) is None
         # one pacer a key, its pace PREDICT_RATE_PER_MIN as configured
@@ -55,6 +79,7 @@ async def run() -> None:
     ctl, _, _ = controller(PREOPEN_API_KEY="second-key", PREDICT_API_KEY="main-key")
     own = p.Controller(ctl.owner)
     assert {own.api.api_key, own.cancel_api.api_key, own.bulk_api.api_key} == {"second-key"}
+    assert (own.api.patient, own.cancel_api.patient, own.bulk_api.patient) == (True, False, False), "its placements wait, its cancels do not"
     own.api.blocked_until = time.monotonic() + 30
     assert own.cancel_api.blocked_until > time.monotonic() and ctl.owner.live.api.blocked_until == 0.0, "its 429 pauses its own clients alone"
     plain = p.Controller(controller(PREDICT_API_KEY="main-key")[0].owner)

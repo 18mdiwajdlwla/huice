@@ -640,6 +640,8 @@ class PredictApi:
     READ_PARALLEL = 3      # ...of which the reads may hold this many: two slots always stay free for an order or a cancel (1.138.2: 3 — the
     #                        sync's per-order reads, six a step, two at a time, were half its second)
     BACKOFF_SECONDS = 20
+    patient = False        # 1.154.1: this client's orders wait for the key's pace like a read (core.PredictPacer) — the pre-open mode's
+    #                        placements, made hours ahead: they leave the burst to the orders that cannot wait (a taker, a cancel)
 
     def __init__(self, base: str, api_key: str, wallet: Wallet | None):
         self.base, self.api_key, self.wallet = base.rstrip("/"), api_key, wallet
@@ -673,7 +675,7 @@ class PredictApi:
             payload = {}
         # 1.154.0: the key's request budget first (core.PredictPacer): a read waits for its token; an order or a cancel may borrow a
         # burst ahead of the reads — and Predict's 429, with its twenty seconds of silence for every client on the key, is not met
-        await core.predict_pacer(self.api_key).take(priority)
+        await core.predict_pacer(self.api_key).take(priority and not self.patient)
         self.calls += 1
         if priority:
             self.writes_inflight += 1
