@@ -156,6 +156,15 @@ async def run() -> None:
             m.predict_pacer, m.predict_blocking = real_pacer, real_blocking
         assert paced == ["book-key"], ("the feed's reads on its own key's budget", paced)
         ns.config.predict_book_api_key = ""
+        # 1.154.12: the rule taker's own key (RULE_API_KEY) has its line too
+        ns.config.rule_api_key = "rule-key"
+        for _ in range(2):
+            m.predict_pacer("rule-key").sent.append(time.monotonic())
+        assert "、规则吃单专用 Key 2 次（节流每分钟 " in L.LiveBot.live_key_load(ns) and "rule-key" not in L.LiveBot.live_key_load(ns), L.LiveBot.live_key_load(ns)
+        ns.config.rule_api_key = "main-key"  # the bot's own key again: no line of its own
+        assert "规则吃单专用 Key" not in L.LiveBot.live_key_load(ns)
+        ns.config.rule_api_key = ""
+        assert m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "RULE_API_KEY": " rk "}).rule_api_key == "rk"
         # the clients' rates: the pre-open mode's said to be on its own key
         ns.config.preopen_api_key, ns.live_rate_samples, ns.predict = "second-key", [], None
         ns.preopen = types.SimpleNamespace(request_rate=lambda: 2.8)

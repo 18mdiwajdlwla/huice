@@ -6,6 +6,7 @@ import datetime as dt
 import hashlib
 import json
 import sys
+import time
 import types
 import unittest
 from decimal import Decimal as D
@@ -101,8 +102,10 @@ class Api:
 
 
 def taker(mode="on", **env):
+    # RULE_FAST_HOURS off unless a test asks: the suite's clock (05:30 Beijing) is inside the default per-second hours (01:00–07:00, 1.154.12),
+    # and these tests are about the cadence outside them
     cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "STATE_DB": ":memory:", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64,
-                             "RULE_TAKER": mode, "LIVE_MAX_ORDER_USD": "500", "LIVE_MAX_DAILY_LOSS_USD": "100", **env})
+                             "RULE_TAKER": mode, "LIVE_MAX_ORDER_USD": "500", "LIVE_MAX_DAILY_LOSS_USD": "100", "RULE_FAST_HOURS": "off", **env})
     clock = types.SimpleNamespace(ms=NOW)
     wallet = types.SimpleNamespace(maker="0x" + "1" * 40,
                                    sign_order=lambda order, *flags: ("0x" + hashlib.sha256(json.dumps(order, sort_keys=True).encode()).hexdigest(), "0xsig"))
@@ -130,6 +133,20 @@ async def run_until(t, clock, ms, step=500):
         await t.tick()
         clock.ms += step
     await t.tick()
+
+
+def connected(t, mid, book, age=0.0):
+    """The push connection up and holding this market's book, pushed ``age`` seconds ago (a quiet market's is not sent again)."""
+    t.stream.ws = t.stream.ws or object()
+    t.stream.last_frame = time.monotonic()
+    t.stream.subscribed.add(mid)
+    t.stream.take(mid, book)
+    bids, asks, at = t.stream.books[mid]
+    t.stream.books[mid] = (bids, asks, at - age)
+    t.stream.changed.discard(mid)
+
+
+FAST = {"RULE_FAST_HOURS": "01:00-07:00", "RULE_OIL": "off", "RULE_GOLD_OPEN_CENTS": "0", "RULE_GOLD_0515_CENTS": "0"}  # the shut quarter hours alone
 
 
 class RuleTests(unittest.IsolatedAsyncioTestCase):
@@ -183,12 +200,29 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             m.Config.from_env({**base, "RULE_TAKER": "maybe"})
         self.assertEqual(m.Config.from_env({**base, "RULE_GOLD_SHUT_CENTS": "99"}).rules.price("gold_shut"), 58, "off: read leniently")
-        keys = {"RULE_TAKER", "RULE_MAX_DAY_USD", *m.RULE_SETTING_KEYS.values(), *(k for pair in m.RULE_MARKET_KEYS.values() for k in pair)}
+        keys = {"RULE_TAKER", "RULE_MAX_DAY_USD", "RULE_FAST_HOURS", *m.RULE_SETTING_KEYS.values(), *(k for pair in m.RULE_MARKET_KEYS.values() for k in pair)}
         self.assertTrue(keys <= m.CONTROL_KEY_SET and all(m.CONTROL_FORMS[k]["group"] == "规则" for k in keys))
+        # 1.154.12: the per-second hours on the control page — a text setting, every preset a value the settings take
+        form = m.CONTROL_FORMS["RULE_FAST_HOURS"]
+        self.assertEqual((form["kind"], form["presets"][:2], form["captions"]["off"]), ("text", ["off", "01:00-07:00"], "不做每秒检查"))
+        for preset in form["presets"]:
+            self.assertEqual(m.day_spans_text(m.Config.from_env({**base, "RULE_TAKER": "on", "RULE_FAST_HOURS": preset}).rules.fast), preset)
         bot = types.SimpleNamespace(config=m.Config.from_env({**base, "RULE_TAKER": "paper", "RULE_OIL_SHUT_CENTS": "45"}))
         value = lambda key: m.Bot.control_value(bot, key)
         self.assertEqual((value("RULE_TAKER"), value("RULE_OIL_SHUT_CENTS"), value("RULE_GOLD_SHARES"), value("RULE_GOLD_SHUT_CENTS"), value("RULE_OIL"), value("RULE_MAX_DAY_USD")),
                          ("paper", "45", "50", "58", "on", "0"))
+        self.assertEqual(value("RULE_FAST_HOURS"), "01:00-07:00")
+        # ...saved from the page like the others: taken at once, a wrong one refused with the reason, off switches the hours off
+        saver = m.Bot(m.Config.from_env({**base, "RULE_TAKER": "paper", "WEB_CONTROL_KEY": "k" * 12}), m.Store(":memory:"),
+                      types.SimpleNamespace(now_ms=lambda: NOW), None)
+        answer = saver.control_set({"RULE_FAST_HOURS": "00:55-02:00"})
+        self.assertTrue(answer["ok"] and "RULE_FAST_HOURS=00:55-02:00（原 01:00-07:00）" in answer["message"], answer)
+        self.assertEqual(saver.config.rules.fast, ((55, 120),))
+        refused = saver.control_set({"RULE_FAST_HOURS": "凌晨一点"})
+        self.assertTrue(not refused["ok"] and "RULE_FAST_HOURS 写成 01:00-07:00 这样" in refused["message"] and saver.config.rules.fast == ((55, 120),), refused)
+        self.assertTrue(saver.control_set({"RULE_FAST_HOURS": "off"})["ok"] and saver.config.rules.fast == ())
+        self.assertEqual((R.review({}, saver.config.rules, NOW)["fast"], R.review({}, m.Config.from_env({**base, "RULE_TAKER": "on"}).rules, NOW)["fast"]),
+                         ("off", "01:00-07:00"), "the review page's 规则吃单 says the hours")
         self.assertIn("规则吃单在真实交易模块里", m.Bot.cmd_rules(bot, None))
 
     async def test_paper_records_what_it_would_have_bought(self):
@@ -689,6 +723,283 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         api2.create_order = limited
         await t2.tick()
         self.assertEqual(t2.record(slug)["orders"][0]["state"], "not_sent", "429: not one of MAX_REJECTS")
+
+    def test_per_second_hours_setting(self):
+        """1.154.12 — RULE_FAST_HOURS: the Beijing hours in which every listed window is looked at each second (凌晨 1 点后每秒检查),
+        01:00–07:00 by default; several spans, one over midnight, the whole day, off; a wrong value refused while the taker is on."""
+        cfg = lambda **env: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", **env}).rules
+        day = lambda h, mi: bj(2026, 11, 18, h, mi)
+        s = cfg(RULE_TAKER="on")
+        self.assertEqual((s.fast, m.day_spans_text(s.fast)), (((60, 420),), "01:00-07:00"))
+        self.assertEqual([s.fast_at(day(h, mi)) for h, mi in ((0, 59), (1, 0), (6, 59), (7, 0))], [False, True, True, False])
+        self.assertEqual((s.fast_in(day(0, 59)), s.fast_in(day(3, 0)), s.fast_in(day(7, 0))), (60_000, 0, 18 * 3_600_000))
+        over = cfg(RULE_TAKER="on", RULE_FAST_HOURS="23:00～02:00, 13-14:30")
+        self.assertEqual((over.fast, m.day_spans_text(over.fast)), (((1380, 120), (780, 870)), "23:00-02:00,13:00-14:30"))
+        self.assertEqual([over.fast_at(day(h, mi)) for h, mi in ((22, 59), (23, 0), (0, 30), (1, 59), (2, 0), (13, 0), (14, 30))],
+                         [False, True, True, True, False, True, False])
+        off = cfg(RULE_TAKER="on", RULE_FAST_HOURS="off")
+        self.assertEqual((off.fast, off.fast_in(day(1, 0)), off.fast_at(day(1, 0)), m.day_spans_text(off.fast)), ((), None, False, "off"))
+        whole = cfg(RULE_TAKER="on", RULE_FAST_HOURS="00:00-24:00")
+        self.assertTrue(all(whole.fast_at(day(h, 0)) for h in (0, 12, 23)))
+        for bad in ("7", "25:00-26:00", "01:00-01:00", "01:70-02:00", "一点到七点"):
+            with self.assertRaises(ValueError, msg=bad):
+                cfg(RULE_TAKER="on", RULE_FAST_HOURS=bad)
+        self.assertEqual(cfg(RULE_TAKER="off", RULE_FAST_HOURS="7").fast, ((60, 420),), "off: read leniently, as the other rule settings are")
+
+    async def test_per_second_hours_look_every_second_at_the_book_in_hand(self):
+        """1.154.12: in the hours every listed window is looked at each second — on the book the push connection holds, which the
+        connection vouches for while it lives (a quiet market's book is not sent again), no REST read a look; an offer at the
+        rule's price is bought at that look with no request before the order. Outside them the cadence of before."""
+        t, api, clock, x = taker("on", **FAST)
+        t.verify_tick = lambda: None  # the REST reads beside the pushes: their own test below
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.70, 30]]}
+        reads = lambda: sum(1 for c in api.calls if c.endswith("/orderbook"))
+        await t.tick()  # 05:30, in the hours: the market found; nothing in hand yet — read once
+        w = t.track[slug]
+        self.assertEqual((t.fast, reads(), api.sent), (True, 1, []))
+        connected(t, "901", {"bids": [], "asks": [[0.70, 30]]}, age=300)  # pushed five minutes ago, the connection alive
+        # ...and a look costs next to nothing: the order gate (it sums the day's P&L over every record) worked out once a tick, the
+        # pre-open mode's ledger walked only when something is offered at the price
+        gates, walks, plain_block, plain_own = [], [], t.block, t.own_asks
+        t.block = lambda usd: gates.append(usd) or plain_block(usd)
+        t.own_asks = lambda slug, side: walks.append(slug) or plain_own(slug, side)
+        for mid, start in (("902", GOLD_0600 + 900_000), ("903", GOLD_0600 + 1_800_000)):  # two more windows, quiet too
+            api.markets[mid] = gold_market(start, mid=int(mid))
+            t.track[api.markets[mid]["categorySlug"]].update(market=api.markets[mid], open_ms=NOW, listed_ms=NOW)
+            connected(t, mid, {"bids": [], "asks": [[0.70, 30]]}, age=300)
+        looked = []
+        for _ in range(5):
+            clock.ms += 1_000
+            await t.tick()
+            looked.append(w["look_ms"])
+        self.assertEqual(looked, [NOW + 1_000 * i for i in range(1, 6)], "every second")
+        self.assertEqual((reads(), api.sent, t.fast_looks), (1, [], 1 + 5 * 3), "on the book in hand: no read a look")
+        self.assertEqual((gates, walks), ([0.0] * 5, []), "three windows a tick: the gate once, the ledger not at all")
+        t.block, t.own_asks = plain_block, plain_own
+        for mid in ("902", "903"):
+            t.track.pop(api.markets[mid]["categorySlug"])
+        t.planned_ms = clock.ms  # (not planned again in this test: the two stay out)
+        details = sum(1 for c in api.calls if not c.endswith("/orderbook"))
+        t.stream.take("901", {"version": 3, "bids": [], "asks": [[0.52, 25]]})  # an offer at the rule's price, pushed
+        await t.tick()
+        self.assertEqual(L.from_wei(int(api.sent[0]["data"]["order"]["takerAmount"])), 25.0)
+        self.assertEqual((reads(), sum(1 for c in api.calls if not c.endswith("/orderbook"))), (1, details), "no request before the order")
+        self.assertIn("每秒检查时段（北京时间）：01:00-07:00｜进行中：每秒看 1 场（已看 17 次）；推送正常；REST 核对 0 次", t.status())
+        # the connection gone quiet (no frame for ALIVE_S): the book in hand stands only while young — then the look waits for a REST read
+        t.stream.last_frame = time.monotonic() - R.ALIVE_S - 1
+        bids, asks, at = t.stream.books["901"]
+        t.stream.books["901"] = (bids, asks, at - 300)
+        t.record(slug)["orders"][0]["state"] = "final"  # (the first order done with, nothing of it filled: the window still to buy)
+        clock.ms += 1_000
+        await t.tick()
+        self.assertEqual(w["word"], "每秒检查：等盘口（推送还没送到，REST 轮流读取中）")
+        self.assertEqual((reads(), len(api.sent)), (1, 1), "read a moment ago: not again at every look")
+        w["rest_at"] -= R.FAST_STALE_S  # ...and none since: read here, once
+        api.books["901"] = {"bids": [], "asks": [[0.70, 30]]}
+        clock.ms += 1_000
+        await t.tick()
+        self.assertEqual((reads(), w["word"]), (2, "盘口没有 ≤58¢ 的涨（最低 70¢）"))
+        # outside the hours: every SLOW_S, as before
+        t2, api2, clock2, _ = taker("on", **FAST)
+        clock2.ms = bj(2026, 11, 17, 8, 0)
+        nxt = bj(2026, 11, 18, 6, 0)
+        api2.markets["911"] = gold_market(nxt, mid=911)
+        api2.listed.add(api2.markets["911"]["categorySlug"])
+        api2.books["911"] = {"bids": [], "asks": [[0.70, 30]]}
+        await t2.tick()
+        w2 = t2.track[api2.markets["911"]["categorySlug"]]
+        clock2.ms += 1_000
+        await t2.tick()
+        self.assertEqual((t2.fast, w2["look_ms"], t2.fast_looks), (False, bj(2026, 11, 17, 8, 0), 0))
+        self.assertIn("每秒检查时段（北京时间）：01:00-07:00｜下一次 01:00 开始，提前 1 分钟准备", t2.status())
+
+    async def test_per_second_hours_rest_reads_beside_the_pushes(self):
+        """1.154.12: in the hours one window's book is read over REST at a time beside the pushes — the longest unread first, one a
+        second at most, none again within three (every window read every second would be the key's whole budget); a change the
+        push did not bring wakes the taker and is bought; a push that came after the read was asked for stays the newer; a window
+        bought in full is read no more. On a key of its own (RULE_API_KEY) three reads a second."""
+        t, api, clock, x = taker("on", **FAST, RULE_GOLD_SHARES="25")
+        hold, t.verify_tick = t.verify_tick, lambda: None
+        mids = ["901", "902", "903"]
+        for i, mid in enumerate(mids):
+            api.markets[mid] = gold_market(GOLD_0600 + i * 900_000, mid=int(mid))
+            api.listed.add(api.markets[mid]["categorySlug"])
+            api.books[mid] = {"bids": [], "asks": [[0.70, 30]]}
+        await t.tick()
+        t.verify_tick = hold
+        slugs = {mid: api.markets[mid]["categorySlug"] for mid in mids}
+        for i, mid in enumerate(mids):
+            connected(t, mid, {"bids": [], "asks": [[0.70, 30]]}, age=300)
+            t.track[slugs[mid]]["rest_at"] = time.monotonic() - 30 + 10 * i  # 901 read longest ago
+        read = lambda: [c.split("/")[2] for c in api.calls if c.endswith("/orderbook")]
+        n = len(read())
+        t.verify_tick()
+        await t.verifying
+        self.assertEqual(read()[n:], ["901"], "the longest unread first")
+        t.verify_tick()
+        self.assertTrue(t.verifying.done() and len(read()) == n + 1, "one a second at most")
+        for want in ("902", "903"):
+            t.verify_at -= R.VERIFY_EVERY_S
+            t.verify_tick()
+            await t.verifying
+            self.assertEqual(read()[-1], want)
+        t.verify_at -= R.VERIFY_EVERY_S
+        t.verify_tick()
+        self.assertEqual((len(read()), t.verifies, t.verify_diffs), (n + 3, 3, 0), "each read within the last three seconds: none again yet")
+        # a change the push did not bring: seen by the read, the taker woken, the offer bought
+        api.books["902"] = {"bids": [], "asks": [[0.52, 25]]}
+        t.track[slugs["902"]]["rest_at"] -= R.VERIFY_AGAIN_S
+        t.verify_at -= R.VERIFY_EVERY_S
+        t.verify_tick()
+        await t.verifying
+        self.assertEqual((t.verify_diffs, "902" in t.stream.changed, t.stream.pushed.is_set()), (1, True, True))
+        api.fill[1] = 25.0
+        await t.tick()
+        self.assertEqual((len(api.sent), L.from_wei(int(api.sent[0]["data"]["order"]["takerAmount"]))), (1, 25.0))
+        self.assertIn("REST 核对 4 次，1 次发现推送没送到的变化", t.status())
+        # a push that came after the read was asked for is the newer: the read is dropped
+        before = t.stream.held("903")
+        self.assertFalse(t.stream.merge("903", (), (), time.monotonic() - 5 - 300))
+        t.stream.take("903", {"version": 9, "bids": [], "asks": [[0.66, 5]]})
+        self.assertFalse(t.stream.merge("903", (), (), time.monotonic() - 5))
+        self.assertEqual((t.stream.held("903")[:2] == before[:2], t.stream.held("903")[1][0][0]), (False, D("0.66")))
+        # bought in full (25 of 25): that window is read no more — the other two take the turns
+        for slug in slugs.values():
+            t.track[slug]["rest_at"] = time.monotonic() - 60
+        seen = []
+        for _ in range(4):
+            t.verify_at -= R.VERIFY_EVERY_S
+            for slug in slugs.values():
+                t.track[slug]["rest_at"] -= R.VERIFY_AGAIN_S
+            t.verify_tick()
+            await t.verifying
+            seen.append(read()[-1])
+        self.assertEqual(sorted(set(seen)), ["901", "903"], seen)
+        # not while no order could go out (the pause): nothing read
+        x.state.paused = "测试暂停"
+        n = len(read())
+        t.verify_at -= R.VERIFY_EVERY_S
+        t.verify_tick()
+        self.assertEqual(len(read()), n)
+        # a key of the taker's own: three reads a second, a window again after one
+        own, _, _, _ = taker("on", **FAST, RULE_API_KEY="rule-key")
+        self.assertTrue(own.own_key)
+        self.assertEqual((R.VERIFY_EVERY_OWN_S, R.VERIFY_AGAIN_OWN_S), (0.34, 1.0))
+
+    async def test_per_second_hours_are_prepared_a_minute_before(self):
+        """1.154.12 (凌晨 1 点前 1 分钟开始准备): from WARM_MS before the hours — and every WARM_EVERY_MS through them — the sign-in and
+        the exchange allowance are in hand and a market not yet seen open for matching is read once more, so the first offer's
+        order goes out with no request before it; on paper nothing of the account is asked."""
+        allowance, auth = [], []
+
+        async def asked(key):
+            allowance.append(key)
+            return 10 ** 30
+        t, api, clock, x = taker("on", **FAST)
+        x.owner.live.chain.allowance = asked
+
+        async def signed_in():
+            auth.append(clock.ms)
+        api.ensure_auth = signed_in
+        t.verify_tick = lambda: None
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        api.markets["901"] = gold_market(GOLD_0600, status="MATCHING_NOT_ENABLED")
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.70, 30]]}
+        details, plain_market = [], api.market
+
+        async def market(mid):
+            details.append(mid)
+            return await plain_market(mid)
+        api.market = market
+        asked_of = lambda: (sum(1 for c in api.calls if c.endswith("/orderbook")), len(details))  # this window's book and details read
+        start = bj(2026, 11, 17, 1, 0)
+        clock.ms = start - R.WARM_MS - 1_000  # 00:58:59
+        await t.tick()
+        w = t.track[slug]
+        self.assertEqual((t.fast, t.warming, w["open_ms"], allowance, auth), (False, None, 0, [], []), "not yet")
+        self.assertIn("｜下一次 01:00 开始，提前 1 分钟准备", t.fast_line(clock.ms))
+        api.markets["901"]["tradingStatus"] = "OPEN"  # matching opened since the listing was read
+        clock.ms = start - R.WARM_MS  # 00:59:00
+        await t.tick()
+        await t.warming
+        self.assertEqual((t.fast, w["open_ms"], len(allowance), auth), (False, clock.ms, 1, [clock.ms]), "a minute before: ready")
+        self.assertIn("，正在准备（登录、授权额度、撮合状态、推送订阅）", t.fast_line(clock.ms))
+        clock.ms = start  # 01:00:00
+        connected(t, "901", {"bids": [], "asks": [[0.52, 25]]})
+        before = asked_of()
+        await t.tick()
+        await t.warming
+        self.assertEqual((t.fast, len(api.sent), asked_of(), len(allowance)), (True, 1, before, 2),
+                         "the first offer's order with no request before it (the allowance renewed beside it, not for it)")
+        clock.ms += R.WARM_EVERY_MS
+        await t.tick()
+        await t.warming
+        self.assertEqual((len(allowance), len(auth)), (3, 4), "renewed through the hours (the sign-in checked by the order itself too: no request while it stands)")
+        # on paper: the windows' markets made ready, nothing of the account asked
+        allowance.clear(); auth.clear()
+        paper, papi, pclock, px = taker("paper", **FAST)
+        px.owner.live.chain.allowance = asked
+        papi.ensure_auth = signed_in
+        papi.markets["901"] = gold_market(GOLD_0600, status="MATCHING_NOT_ENABLED")
+        papi.listed.add(slug)
+        pclock.ms = start - R.WARM_MS - 1_000
+        await paper.tick()
+        papi.markets["901"]["tradingStatus"] = "OPEN"
+        pclock.ms = start - R.WARM_MS
+        await paper.tick()
+        await paper.warming
+        self.assertEqual((paper.track[slug]["open_ms"], allowance, auth), (pclock.ms, [], []))
+
+    async def test_orders_for_several_windows_go_out_side_by_side(self):
+        """1.154.12: offers showing on several windows at once — each window's order is on its way before another's answer is in
+        (they went one after another, a round trip each); the day's cap still counts the first while it is on its way."""
+        t, api, clock, x = taker("on", **FAST, RULE_MAX_DAY_USD="15")
+        t.verify_tick = lambda: None
+        for i, mid in enumerate(("901", "902")):
+            api.markets[mid] = gold_market(GOLD_0600 + i * 900_000, mid=int(mid))
+            api.listed.add(api.markets[mid]["categorySlug"])
+            api.books[mid] = {"bids": [], "asks": [[0.51, 20]]}
+        flying, most, plain = [], [], api.create_order
+
+        async def slow(body):
+            flying.append(1)
+            most.append(len(flying))
+            await asyncio.sleep(0.02)
+            try:
+                return await plain(body)
+            finally:
+                flying.pop()
+        api.create_order = slow
+        await t.tick()
+        self.assertEqual((len(api.sent), max(most)), (2, 2), "both on their way together")
+        sizes = sorted(L.from_wei(int(b["data"]["order"]["takerAmount"])) for b in api.sent)
+        self.assertEqual(sizes, [5.0, 20.0], "the cap counts the first order while it flies: $15 − 20 × 58¢ leaves 5 shares for the second")
+        self.assertTrue(all(o["state"] == "open" for r in t.recs.values() for o in r["orders"]), "the tick waited for both answers")
+
+    async def test_a_key_of_its_own(self):
+        """1.154.12 — RULE_API_KEY: the rule taker's reads, orders and push connection on a key of its own, with its own cooldown:
+        a 429 on the bot's key (11-17: ninety in 2.3 hours, twenty seconds each) no longer stops it. Without one: the bot's key
+        and one cooldown with the bot's own client, as before."""
+        _, _, _, x = taker("on", RULE_API_KEY=" rule-key ", PREDICT_API_KEY="main-key")
+        own = R.RuleTaker(x.owner)  # (the helper's taker has the tests' stand-in client: this one its real client)
+        self.assertEqual((own.key, own.own_key, own.api.api_key, own.stream.headers()), ("rule-key", True, "rule-key", {"x-api-key": "rule-key"}))
+        x.owner.live.api.blocked_until = time.monotonic() + 30  # the bot's own client in its cooldown
+        self.assertLessEqual(own.cooling(), 0, "its own key: not paused by the bot's")
+        own.api.blocked_until = time.monotonic() + 30
+        self.assertGreater(own.cooling(), 0)
+        self.assertIn("｜请求用规则吃单自己的 Key（RULE_API_KEY）", own.fast_line(NOW))
+        _, _, _, y = taker("on", PREDICT_API_KEY="main-key")
+        plain = R.RuleTaker(y.owner)
+        self.assertEqual((plain.key, plain.own_key, plain.api.api_key, plain.stream.headers()), ("main-key", False, "main-key", {"x-api-key": "main-key"}))
+        y.owner.live.api.blocked_until = time.monotonic() + 30
+        self.assertGreater(plain.cooling(), 0, "one cooldown with the bot's own client")
+        self.assertNotIn("RULE_API_KEY", plain.fast_line(NOW))
+        _, _, _, z = taker("on", RULE_API_KEY="main-key", PREDICT_API_KEY="main-key")  # set to the bot's own key: not a key of its own
+        self.assertFalse(R.RuleTaker(z.owner).own_key)
 
     async def test_off_finishes_what_is_open_and_plans_nothing(self):
         t, api, clock, x = taker("on")

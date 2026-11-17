@@ -477,11 +477,11 @@ async def browser_check(bot, data):
         await page.evaluate("data.live=null;unrecorded()")
         assert await page.is_hidden("#unrecbox")
         # 1.153.0: 规则吃单 in 复盘分析 — each rule's totals (the real and the paper apart) and the windows bought
-        await page.evaluate("""rulesSection({mode:"paper",markets:{gold:{on:true,shares:50,name:"黄金"},oil:{on:false,shares:50,name:"原油"}},max_day_usd:200,rules:[{rule:"gold_shut",name:"黄金休市 4 档",side:"up",cents:58,mode:"paper",windows:3,
+        await page.evaluate("""rulesSection({mode:"paper",markets:{gold:{on:true,shares:50,name:"黄金"},oil:{on:false,shares:50,name:"原油"}},max_day_usd:200,fast:"01:00-07:00",rules:[{rule:"gold_shut",name:"黄金休市 4 档",side:"up",cents:58,mode:"paper",windows:3,
           shares:150,cost:78.9,settled:2,wins:2,losses:0,pnl:46.1,open:1,watch:{watched:20,offered:12,offer_avg:35.5,best_mid:0.51,open_lead:142}}],recent:[{slug:"xau-updown-15m-1",rule:"gold_shut",name:"黄金休市 4 档",
           window:"黄金 15分涨跌 06:00–06:15",start_ms:Date.now(),side:"up",mode:"paper",shares:50,avg:0.526,cost:26.3,result:"up",pnl:23.2}]})""")
         rtxt = await page.text_content("#a-rules")
-        for want in ("只记录（不下单）", "黄金 开（每场最多 50 份）、原油 关", "每天最多 $200", "盘口观察（近 30 天）", "35.5", "中位 142 秒", "黄金休市 4 档", "涨 ≤58¢", "+$46.10", "2/0", "黄金 15分涨跌 06:00–06:15", "52.6¢", "+$23.20"):
+        for want in ("只记录（不下单）", "黄金 开（每场最多 50 份）、原油 关", "每天最多 $200", "每秒检查时段（北京时间） 01:00-07:00", "盘口观察（近 30 天）", "35.5", "中位 142 秒", "黄金休市 4 档", "涨 ≤58¢", "+$46.10", "2/0", "黄金 15分涨跌 06:00–06:15", "52.6¢", "+$23.20"):
             assert want in rtxt, (want, rtxt)
         assert await page.get_attribute("#h-rules", "data-k") == "ruletaker", "its own fold key: 统计与风险's 规则 keeps rules"
         # 1.113.0: the daily summary is one line per day until that line is clicked (its kind / way lines then show; a second
