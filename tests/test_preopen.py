@@ -1521,6 +1521,31 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue("未结清：1 场" in text and "状态未知的订单：1 张" in text and "up unknown" in notes[-1][1], text)
         await self.finish(ctl)
 
+    async def test_a_fill_on_one_side_never_withdraws_the_other(self):
+        """11-17 (the operator's question: 47¢ 的涨成交了，47¢ 的跌会不会被撤？): no. A fill on one side — the whole order, or part of it
+        before its end — leaves the other side resting until it fills too or the window's cancel time; only a side that ends with
+        nothing filled (Predict refused, cancelled or expired it) has the other side of its level withdrawn (一边未成交即结束)."""
+        for case in ("filled", "part then cancelled", "nothing filled"):
+            ctl, api, clock = controller()
+            c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+            await ctl.place_pair(c)
+            pair = ctl.ledger.rows[c["slug"]]
+            up, down = pair["orders"]["up"], pair["orders"]["down"]
+            row = api.rows[up["hash"]]
+            amount = int(row["amount"])
+            row.update({"filled": dict(status="FILLED", amountFilled=str(amount)),
+                        "part then cancelled": dict(status="CANCELLED", amountFilled=str(amount // 5)),
+                        "nothing filled": dict(status="CANCELLED", amountFilled="0")}[case])
+            clock.ms += 10_000; ctl.account_at = clock.ms; ctl.listed_ids = set()
+            await ctl.monitor_pair(pair)
+            if case == "nothing filled":
+                self.assertEqual((api.removed, pair.get("reason")), ([down["id"]], "一边未成交即结束，撤掉另一边"), case)
+                self.assertIn(pair["phase"], {"closing", "closed"}, case)
+            else:
+                self.assertTrue(up["filled"] > 0, case)
+                self.assertEqual((api.removed, pair["phase"], down["state"]), ([], "active", "open"), case)
+            await self.finish(ctl)
+
     async def test_default_is_off_and_normal_strategy_held_only_while_the_mode_runs_for_real(self):
         cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline"})
         self.assertFalse(p.Settings.from_config(cfg).enabled)

@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.11"
+VERSION = "1.154.12"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -631,6 +631,34 @@ RULE_DEFAULT_CENTS = {"gold_shut": 58, "gold_open": 50, "gold_0515": 58, "gold_0
 
 
 RULE_MARKET_KEYS = {"gold": ("RULE_GOLD", "RULE_GOLD_SHARES"), "oil": ("RULE_OIL", "RULE_OIL_SHARES")}  # 1.153.1: each market's switch and size
+RULE_FAST_DEFAULT = "01:00-07:00"  # 1.154.12: RULE_FAST_HOURS — the Beijing hours in which the rule taker looks at every listed window each second
+
+
+def day_spans(text: str, name: str = "RULE_FAST_HOURS") -> tuple[tuple[int, int], ...]:
+    """Spans of the Beijing day, as minutes after midnight: "01:00-07:00" → ((60, 420),); several, comma-separated; one whose end
+    is before its beginning runs over midnight ("23:00-02:00"); "off" (or nothing): none. ValueError says what is wrong."""
+    text = str(text or "").strip().lower()
+    if text in {"", "off", "0", "关"}:
+        return ()
+    out = []
+    for part in re.split(r"[,，;；\s]+", text):
+        if not part:
+            continue
+        got = re.fullmatch(r"(\d{1,2})(?:[:：](\d{2}))?\s*(?:-|–|—|~|～|至|到)\s*(\d{1,2})(?:[:：](\d{2}))?", part)
+        if not got:
+            raise ValueError(f"{name} 写成 01:00-07:00 这样（北京时间，可写多段用逗号分开；off = 不做），现在是“{part}”")
+        a, b = int(got.group(1)) * 60 + int(got.group(2) or 0), int(got.group(3)) * 60 + int(got.group(4) or 0)
+        b = b or 1440  # an end at 00:00 is the day's end
+        if not (0 <= a < 1440 and 0 < b <= 1440 and int(got.group(2) or 0) < 60 and int(got.group(4) or 0) < 60) or a == b:
+            raise ValueError(f"{name} 的时间要在 00:00～24:00 之间，开始和结束不能相同，现在是“{part}”")
+        out.append((a, b))
+    return tuple(out)
+
+
+def day_spans_text(spans: tuple) -> str:
+    """The spans as the setting is written: 01:00-07:00,13:00-14:00; "off" for none."""
+    clock = lambda minutes: f"{minutes // 60:02d}:{minutes % 60:02d}"
+    return ",".join(f"{clock(a)}-{clock(b)}" for a, b in spans) or "off"
 
 
 @dataclass(frozen=True)
@@ -645,10 +673,25 @@ class RuleSettings:
     markets: frozenset = frozenset(RULE_MARKET_KEYS)
     shares: tuple = (("gold", 50), ("oil", 50))
     max_day_usd: float = 0.0
+    fast: tuple = ((60, 420),)  # RULE_FAST_HOURS (1.154.12): the Beijing hours of the per-second looks, minutes after midnight (day_spans)
 
     @property
     def enabled(self) -> bool:
         return self.mode != "off"
+
+    def fast_at(self, now_ms: int) -> bool:
+        """Whether ``now_ms`` falls in the per-second hours (Beijing time; a span whose end is before its beginning runs over midnight)."""
+        tod = (now_ms + 8 * 3_600_000) % DAY_MS
+        return any((a * 60_000 <= tod < b * 60_000) if a < b else (tod >= a * 60_000 or tod < b * 60_000) for a, b in self.fast)
+
+    def fast_in(self, now_ms: int) -> int | None:
+        """The ms until the per-second hours next begin: 0 inside them, None when there are none."""
+        if not self.fast:
+            return None
+        if self.fast_at(now_ms):
+            return 0
+        tod = (now_ms + 8 * 3_600_000) % DAY_MS
+        return min((a * 60_000 - tod) % DAY_MS for a, _ in self.fast)
 
     def price(self, key: str) -> int:
         return int(dict(self.cents).get(key, 0))
@@ -678,13 +721,14 @@ class RuleSettings:
         default = str(e.get("RULE_SHARES", "50")).strip() or "50"
         shares = {m: int(str(e.get(name, default)).strip() or 0) for m, (_, name) in RULE_MARKET_KEYS.items()}
         max_day = float(str(e.get("RULE_MAX_DAY_USD", "0")).strip() or 0)
+        fast = day_spans(e.get("RULE_FAST_HOURS", RULE_FAST_DEFAULT))
         if any(v not in {"on", "off"} for v in switches.values()):
             raise ValueError("RULE_GOLD、RULE_OIL 只能是 on 或 off")
         if (any(not (c == 0 or 1 <= c <= 95) for c in cents.values()) or any(not 1 <= n <= 100_000 for n in shares.values())
                 or not 0 <= max_day <= 1_000_000):
             raise ValueError("RULE_*_CENTS 是 0（不做这条规则）或 1～95（¢，最高买价）；RULE_GOLD_SHARES、RULE_OIL_SHARES 每场最多买 1～100000 份；"
                              "RULE_MAX_DAY_USD 0～1000000（每天最多花多少，0 = 不限）")
-        return cls(mode, tuple(cents.items()), frozenset(m for m, v in switches.items() if v == "on"), tuple(shares.items()), max_day)
+        return cls(mode, tuple(cents.items()), frozenset(m for m, v in switches.items() if v == "on"), tuple(shares.items()), max_day, fast)
 
 
 CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
@@ -805,6 +849,10 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("RULE_OIL_0045_CENTS", "原油纽约 00:45：买跌不高于（¢）", "原油纽约 00:45–01:00、周一至周五（北京冬令时 13:45，夏令时 12:45）：2026-04 至 11 跌占 62%，"
      "每个月 50–76%；50¢ 每份约 +11¢。按全部时段扫出来的、显著性刚到边，默认 0 = 不做，建议先只记录"),
     ("RULE_MAX_DAY_USD", "规则吃单：每天最多花多少（$）", "0～1000000：黄金、原油合计，一天（北京时间）下单的金额（成交的按成交价、还没结果的按全额）到这个数就不再买；0 = 不限"),
+    ("RULE_FAST_HOURS", "规则吃单：每秒检查的时段（北京时间）", "写成 01:00-07:00（可写多段，用逗号分开；结束早于开始 = 跨过半夜；off = 不做）。这段时间里，已发布的规则场次每秒看一次盘口，"
+     "符合规则价就立刻下单，几场同时出现时一起发；开始前 1 分钟先准备好（登录、授权额度、撮合状态、推送订阅）。盘口靠推送，变化约 0.3 秒到；"
+     "另外每秒用 REST 轮流核对一场，推送断了也能在几秒内看到（规则吃单有自己的 Key——RULE_API_KEY——时每秒核对 3 场）。"
+     "时段外照旧：推送一有变化就看，另外每 30 秒读一次、开场前 15 分钟每 2 秒"),
 )
 CONTROL_KEY_SET = frozenset(k for k, _, _ in CONTROL_KEYS)
 # One-click combinations for the control page (一键搭配): the strategy settings only. What to trade (SIM_MARKETS, SIM_SKIP),
@@ -979,6 +1027,8 @@ class Config:
     live_orders_page: int = 50         # LIVE_ORDERS_PAGE: orders per page when the account's open list is read (a page is a round trip; 1.112.1)
     predict_rate_per_min: float = 220.0  # PREDICT_RATE_PER_MIN: every API key's requests paced to this many a minute (PredictPacer, 1.154.0); 0 = no pacing
     preopen_api_key: str = ""          # PREOPEN_API_KEY: a second Predict API key for the pre-open mode alone — its own request budget (1.154.0)
+    rule_api_key: str = ""             # RULE_API_KEY: a Predict API key for the rule taker alone (its reads, orders and push) — its own budget and its own
+    #                                    429 cooldown: the bot's key's cooldowns no longer blind it (1.154.12); unset: PREDICT_API_KEY
     predict_book_api_key: str = ""     # PREDICT_BOOK_API_KEY: a Predict API key for the orderbook feed alone (its REST reads and push) — its own budget,
     #                                    so the model trader's orders and sync never queue behind the book reads (1.154.5); unset: PREDICT_API_KEY
     live_max_open_usd: float = 500.0   # LIVE_MAX_OPEN_USD: filled positions plus resting orders, at cost
@@ -1203,6 +1253,7 @@ class Config:
             predict_rate_per_min=float(bounded_int(e, "PREDICT_RATE_PER_MIN", 220, 0, 100_000)),
             preopen_api_key=str(e.get("PREOPEN_API_KEY", "")).strip(),
             predict_book_api_key=str(e.get("PREDICT_BOOK_API_KEY", "")).strip(),
+            rule_api_key=str(e.get("RULE_API_KEY", "")).strip(),
             live_max_open_usd=parse_bounded(e, "LIVE_MAX_OPEN_USD", "500", 1, 100_000_000),
             live_max_daily_loss_usd=parse_bounded(e, "LIVE_MAX_DAILY_LOSS_USD", "200", 0, 100_000_000),
             live_auto_redeem=not off(e.get("LIVE_AUTO_REDEEM", "on")),
@@ -11906,6 +11957,8 @@ CONTROL_FORMS: dict[str, dict] = {
     "RULE_OIL": {"kind": "choice", "group": "规则", "options": [["on", "on 开"], ["off", "off 关"]]},
     "RULE_OIL_SHARES": {"kind": "number", "group": "规则", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
     "RULE_MAX_DAY_USD": {"kind": "number", "group": "规则", "presets": ["0", "50", "100", "200", "500", "1000"], "unit": "$", "zero": "不限"},
+    "RULE_FAST_HOURS": {"kind": "text", "group": "规则", "presets": ["off", "01:00-07:00", "00:00-07:00", "00:55-02:00", "00:00-24:00"], "unit": "",
+                        "captions": {"off": "不做每秒检查", "01:00-07:00": "凌晨 1 点到早上 7 点", "00:00-24:00": "全天"}},
     "SIM_EDGE_CENTS": {"kind": "number", "group": "策略", "presets": ["3", "5", "8", "10", "15", "20"], "unit": "¢"},
     "SIM_SHARES": {"kind": "number", "group": "策略", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
     "SIM_TAKER_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "10", "20", "50", "100", "200"], "unit": "份", "zero": "同每次份数"},
@@ -14930,7 +14983,8 @@ function evSection(ev){  // 模型 EV 对实际盈亏 (1.140.0): the poker track
 function rulesSection(ru){  // 规则吃单 (1.153.0): each rule's totals, the real and the paper apart, and the last windows bought
   const MODE={on:"真实",paper:"只记录"},RES={up:"涨",down:"跌",split:"平"},side=s=>s==="up"?"涨":"跌",kids=[];
   const mk=Object.values(ru.markets||{}).map(x=>x.name+(x.on?" 开（每场最多 "+num(x.shares)+" 份）":" 关")).join("、");
-  kids.push($("p","small mut","现在："+({off:"关",paper:"只记录（不下单）",on:"真实吃单"}[ru.mode]||ru.mode)+(mk?"；"+mk:"")+(ru.max_day_usd?"；每天最多 $"+ru.max_day_usd:"")));
+  kids.push($("p","small mut","现在："+({off:"关",paper:"只记录（不下单）",on:"真实吃单"}[ru.mode]||ru.mode)+(mk?"；"+mk:"")+(ru.max_day_usd?"；每天最多 $"+ru.max_day_usd:"")
+    +(ru.fast?"；每秒检查时段（北京时间）"+(ru.fast==="off"?"：关":" "+ru.fast):"")));  // 1.154.12: RULE_FAST_HOURS
   if((ru.rules||[]).length)kids.push(table(["规则","买","模式","场次","份数","每份成本","成本","已结算","赢/输","盈亏","待结算"],
     ru.rules.map(r=>[r.name,side(r.side)+(r.cents?" ≤"+r.cents+"¢":"（已关）"),MODE[r.mode]||r.mode,num(r.windows),num(r.shares),r.shares?cent(r.cost/r.shares):"—",usd(r.cost),
       num(r.settled),r.wins+"/"+r.losses,r.settled?money(r.pnl):"—",num(r.open)])));
@@ -24173,6 +24227,7 @@ class Bot:
                   "RULE_TAKER": c.rules.mode, "RULE_MAX_DAY_USD": plain(c.rules.max_day_usd), **{name: str(c.rules.price(key)) for key, name in RULE_SETTING_KEYS.items()},
                   **{switch: flag(c.rules.on(mk)) for mk, (switch, _) in RULE_MARKET_KEYS.items()},
                   **{size: str(c.rules.shares_of(mk)) for mk, (_, size) in RULE_MARKET_KEYS.items()},
+                  "RULE_FAST_HOURS": day_spans_text(c.rules.fast),
                   "SOURCES_OFF": ",".join(sorted(c.sources_off)), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
                   "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait), "LIVE_TAKER_PRICE": c.live_taker_price,

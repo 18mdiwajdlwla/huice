@@ -3285,6 +3285,9 @@ class LiveBot(core.Bot):
             keys.append(("预挂专用 Key", own))
         if (book := self.book_own_key()) and book != own:
             keys.append(("盘口专用 Key", book))
+        rule = str(getattr(self.config, "rule_api_key", "") or "")  # 1.154.12: the rule taker's own (RULE_API_KEY)
+        if rule and rule not in {key for _, key in keys}:
+            keys.append(("规则吃单专用 Key", rule))
         parts, day = [], time.monotonic() - 86400
         for name, key in keys:
             pacer = core.PREDICT_PACERS.get(key)
