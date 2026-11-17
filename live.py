@@ -1830,6 +1830,9 @@ class LiveBot(core.Bot):
         self.preopen_factory: Any = None  # the tests' stand-in controller class
         self.preopen_lock = asyncio.Lock()
         self.handlers["/preopen"] = self.cmd_preopen  # the status, on / off, pause / resume, and the read-only probe of the listing
+        self.rules: Any = None  # 规则吃单 (rules.RuleTaker, 1.153.0): started with the process (rules_start), whatever RULE_TAKER says — off it only finishes its records
+        self.rules_task: asyncio.Task | None = None
+        self.handlers["/rules"] = self.cmd_rules
 
     # --- readiness -------------------------------------------------------------------------------------------------------
     async def live_prepare(self) -> list[str]:
@@ -2090,8 +2093,8 @@ class LiveBot(core.Bot):
         record = self.live_kill_record()
         if not cap or (record and not record.get("resumed")):
             return  # no limit set; or tripped today and standing
-        own, pre = self.live_daily_pnl(trades, now_ms), self.preopen_pnl()
-        pnl = own + pre  # the pre-open mode's day counted too (1.125.0)
+        own, pre = self.live_daily_pnl(trades, now_ms), self.side_pnl()
+        pnl = own + pre  # the pre-open mode's day counted too (1.125.0), and the rule taker's (1.153.0)
         if record and record.get("resumed_pnl") is None:  # resumed by a version that kept no figure: counted from this look on
             self.store.put("live:killed", {**record, "resumed_pnl": pnl})
             return
@@ -2429,7 +2432,7 @@ class LiveBot(core.Bot):
             return f"今日停止开新仓：{killed}"
         # recomputed now, not a flag saved a step ago — after /live resume too (1.150.0: against the line the resume left,
         # live_loss_floor; the check used to be skipped for the rest of a day whose stop was lifted by hand)
-        if (cap := c.live_max_daily_loss_usd) and (pnl := self.live_daily_pnl(trades, now_ms) + self.preopen_pnl()) <= self.live_loss_floor(cap):
+        if (cap := c.live_max_daily_loss_usd) and (pnl := self.live_daily_pnl(trades, now_ms) + self.side_pnl()) <= self.live_loss_floor(cap):
             return f"今日已结算亏损 {money(pnl)} 已达 LIVE_MAX_DAILY_LOSS_USD ${cap:g}"
         if not self.live.ready:
             return f"真实交易未就绪：{self.live.not_ready_why}"
@@ -3506,8 +3509,8 @@ class LiveBot(core.Bot):
         for tid, t in self.sim_trades().items():
             if isinstance(t.get("live"), dict) and t.get("status") in {"filled", "resting", "settled"} and float(t.get("shares") or 0) > 1e-9:
                 recs.setdefault(key_of(t), []).append((tid, t))
-        preopen = self.preopen_filled()
-        busy = self.preopen_unverified()  # 1.131.5: a pre-open order's fills not read yet there — not compared
+        preopen = self.side_filled()
+        busy = self.side_unverified()  # 1.131.5: a pre-open order's fills not read yet there — not compared (1.153.0: and a rule taker's)
         gaps, same = [], []
         for k in set(held) | set(recs):
             if k in busy:
@@ -3529,7 +3532,7 @@ class LiveBot(core.Bot):
                  + (f"；上次自动核对 {(now_ms - self.live_late_checked) // 1000} 秒前" if self.live_late_checked > 0 else "")]
         for _, name, shares, price, recorded, po, gap, r in gaps[:self.REPORT_GROUPS]:
             lines.append(f"{name}：账户 {shares:g} 份" + (f"（均价 {core.cents(price)}）" if price is not None else "") + f"，记录 {recorded:g} 份"
-                         + (f"，预挂 {po:g} 份" if po else "") + f"，差 {gap:+g} 份")
+                         + (f"，预挂/规则吃单 {po:g} 份" if po else "") + f"，差 {gap:+g} 份")
             for tid, t in r[:self.REPORT_RECORDS]:
                 st = t["live"]
                 lines.append(f"  · {t.get('label', '')} {core.cents(float(t['price']))}×{float(t.get('order') or 0):g}：{t['status']}，成交 {float(t.get('shares') or 0):g} 份，"
@@ -3610,10 +3613,10 @@ class LiveBot(core.Bot):
         for tid, t in live:
             k = key_of(t)
             recorded[k] = recorded.get(k, 0.0) + float(t.get("shares") or 0)
-        po = self.preopen_filled()
-        for k, shares in po.items():  # the pre-open mode's fills: held for a reason, not fills of these orders (1.125.0)
+        po = self.side_filled()
+        for k, shares in po.items():  # the pre-open mode's fills: held for a reason, not fills of these orders (1.125.0; the rule taker's, 1.153.0)
             recorded[k] = recorded.get(k, 0.0) + shares
-        busy = self.preopen_unverified()  # 1.131.5: a pre-open order there whose fills are not read yet — the excess may be its own
+        busy = self.side_unverified()  # 1.131.5: a pre-open order there whose fills are not read yet — the excess may be its own
         # (a) the shares held beyond the records, onto the order they came from: the orders' own records first — whichever shows fills
         # beyond its record (1.120.3: a KOSPI fill at 21¢ and an SK Hynix one at 10¢ had each been put on a 1¢ sweep order placed
         # after them, the newest to end) — else the order the position's price or time names, else, once the records have had
@@ -4426,7 +4429,7 @@ class LiveBot(core.Bot):
         #   on the other side — is no longer on the account, and taking its fills off would hide this order's own fill.
         # Either way the record waits, reserved: for the ledger to read the order, else for Predict's word or an operator
         # (/live release) — never a guess in either direction. Without the mode's fills or orders here nothing changes.
-        busy, po = self.preopen_unverified(), self.preopen_filled()
+        busy, po = self.side_unverified(), self.side_filled()
         if (mid, index_set) in busy:
             self.live_positions_busy = "这一边有开盘前预挂订单的成交还没读完，多出的份数可能是它的：读完再核对"
             return None
@@ -4459,7 +4462,7 @@ class LiveBot(core.Bot):
             if isinstance(st, dict):
                 k = (str((st.get("want") or {}).get("market_id") or t.get("market_id") or ""), int((st.get("want") or {}).get("index_set") or 0))
                 out[k] = out.get(k, 0.0) + float(t.get("shares") or 0)
-        for k, shares in self.preopen_filled().items():
+        for k, shares in self.side_filled().items():
             out[k] = out.get(k, 0.0) + shares
         return out
 
@@ -4498,7 +4501,7 @@ class LiveBot(core.Bot):
             if status:
                 h["status"] = status
         out = []
-        busy = self.preopen_unverified()
+        busy = self.side_unverified()
         for k, h in held.items():
             if (self.store.get(f"live:redeemed:{k[0]}:{k[1]}") or {}).get("lost"):
                 continue  # resolved against it (live_redeem): worth nothing, no holding to explain
@@ -5703,7 +5706,7 @@ class LiveBot(core.Bot):
                 # 恢复 button) ends a pause, and an operator ending one had no word that the day's loss stop went with it.
                 # The two parts are kept as well (1.150.0, Audit XR-RESUME-PREOPEN-ANCHOR): only for the next stop's text, which
                 # says so when the pre-open part has changed meaning since (a crash, LIVE≠on, /preopen off hides its gain).
-                own, pre = self.live_daily_pnl(self.sim_trades(), now_ms), self.preopen_pnl()
+                own, pre = self.live_daily_pnl(self.sim_trades(), now_ms), self.side_pnl()
                 pnl = own + pre
                 self.store.put("live:killed", {**record, "resumed": True, "resumed_at": now_ms, "resumed_pnl": pnl,
                                                "resumed_own": own, "resumed_preopen": pre})
@@ -5775,6 +5778,8 @@ class LiveBot(core.Bot):
         self.live.config = config
         if before != config.live_mode:
             self.live_mode_changed(before, config.live_mode)
+        if getattr(self, "rules", None) is not None:  # 1.153.0: RULE_* as saved on the control page, from the next tick
+            self.rules.configure(config.rules)
         with contextlib.suppress(RuntimeError):  # no loop yet (the start-up apply): run() applies them
             # the pre-open mode follows PREOPEN_* as saved on the control page: started, stopped, or restarted on new settings
             asyncio.get_running_loop().create_task(self.preopen_apply(), name="preopen-apply")
@@ -5866,7 +5871,7 @@ class LiveBot(core.Bot):
                 "exposure": self.live_exposure(trades), "daily_pnl": (own_pnl := self.live_daily_pnl(trades, now_ms)),
                 # the stop (live_check_kill / live_send_block) compares the model trader's day PLUS the pre-open mode's against
                 # LIVE_MAX_DAILY_LOSS_USD (1.125.0): the page shows that same sum (day_pnl), daily_pnl stays the model trader's own
-                "preopen_pnl": (pre_pnl := self.preopen_pnl()), "day_pnl": own_pnl + pre_pnl,
+                "preopen_pnl": (pre_pnl := self.preopen_pnl()), "rules_pnl": (rule_pnl := self.rules_pnl()), "day_pnl": own_pnl + pre_pnl + rule_pnl,
                 "caps": {"order": c.live_max_order_usd, "open": c.live_max_open_usd, "daily_loss": c.live_max_daily_loss_usd},
                 "loss_floor": self.live_resumed_floor(),  # 1.150.0: where the loss stop stands after today's /live resume (None: at the cap)
                 "resting": sum(t["status"] == "resting" for _, t in live),
@@ -6338,10 +6343,10 @@ class LiveBot(core.Bot):
         # the stop (live_check_kill / live_send_block) compares the model trader's day plus the pre-open mode's against
         # LIVE_MAX_DAILY_LOSS_USD (1.125.0), so the line shows the same number (and the split when the pre-open part is non-zero):
         # showing only the model trader's part read e.g. −$15 of a −$50 cap while the stop had tripped at a combined −$55
-        own, pre = self.live_daily_pnl(trades, now_ms), self.preopen_pnl()
+        own, pre, rule = self.live_daily_pnl(trades, now_ms), self.preopen_pnl(), self.rules_pnl()
         floor = self.live_resumed_floor()  # 1.150.0: after /live resume the stop stands a cap's worth further down: said, beside the cap
-        lines.append(f"持仓+挂单 ${exposure:,.2f} / ${self.config.live_max_open_usd:g}｜今日已结算盈亏 {money(own + pre)}"
-                     + (f"（原策略 {money(own)} + 预挂 {money(pre)}）" if pre else "")
+        lines.append(f"持仓+挂单 ${exposure:,.2f} / ${self.config.live_max_open_usd:g}｜今日已结算盈亏 {money(own + pre + rule)}"
+                     + (f"（原策略 {money(own)}" + (f" + 预挂 {money(pre)}" if pre else "") + (f" + 规则吃单 {money(rule)}" if rule else "") + "）" if pre or rule else "")
                      + f"（上限 −${self.config.live_max_daily_loss_usd:g}" + (f"；今天手动恢复过，停机线 {money(floor)}" if floor is not None else "")
                      + f"）｜挂单中 {resting}｜今日下单 {placed_today}｜失败 {failed_today}")
         lines.append(self.live_redeem_status_line())
@@ -6739,11 +6744,73 @@ class LiveBot(core.Bot):
 
     async def run(self) -> int:
         await self.preopen_apply()  # PREOPEN_15M as the environment and the control page's saved values say at the start
+        self.rules_start()
         try:
             return await self._run_live()
         finally:
             self.stopping.set()
+            await self.rules_stop()
             await self.preopen_stop("进程停止", keep=True)  # the orders stay on the book: the signed expiry is the backstop, the next process takes them over
+
+    # --- 规则吃单 (rules.py, 1.153.0) ------------------------------------------------------------------------------------------
+    def rules_start(self) -> None:
+        """The rule taker's loop, one per process: with RULE_TAKER off it only follows its records' orders and results."""
+        if self.rules_task is not None and not self.rules_task.done():
+            return
+        from rules import RuleTaker
+        self.rules = RuleTaker(self)
+        self.rules_task = asyncio.create_task(self.rules.run(), name="rules")
+
+    async def rules_stop(self) -> None:
+        taker, task = self.rules, self.rules_task
+        if taker is None or task is None:
+            return
+        taker.stop.set()
+        await asyncio.wait([task], timeout=10)
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        self.rules_task = None
+
+    def rules_records(self) -> dict[str, dict]:
+        """The rule taker's records: its own (kept in memory), or the store's while none runs."""
+        import rules
+        taker = getattr(self, "rules", None)  # (a bot the tests build without __init__ has none)
+        return taker.recs if taker is not None else rules.records(self.store)
+
+    def rules_pnl(self) -> float:
+        """The rule taker's real P&L settled today (Beijing): counted with the model trader's and the pre-open mode's against
+        LIVE_MAX_DAILY_LOSS_USD (side_pnl)."""
+        import rules
+        return rules.day_pnl(self.rules_records(), rules.day_of(self.market.now_ms()))
+
+    def side_pnl(self) -> float:
+        """The day's P&L of the strategies beside the model trader: the pre-open mode's and the rule taker's (1.153.0)."""
+        return self.preopen_pnl() + self.rules_pnl()
+
+    def side_filled(self) -> dict[tuple[str, int], float]:
+        """The shares the other strategies' records explain, by (market id, index set): the pre-open mode's fills and the rule
+        taker's real ones (1.153.0) — the positions check counts them as recorded, never adopts them onto the model trader's."""
+        import rules
+        out = dict(self.preopen_filled())
+        for k, shares in rules.filled_by_outcome(self.rules_records(), self.market.now_ms()).items():
+            out[k] = out.get(k, 0.0) + shares
+        return out
+
+    def side_unverified(self) -> set[tuple[str, int]]:
+        """The outcomes where an order of the other strategies has fills not read for certain yet: the positions check leaves
+        them alone meanwhile (the pre-open mode's, 1.131.5; the rule taker's, 1.153.0)."""
+        import rules
+        return set(self.preopen_unverified()) | rules.unverified(self.rules_records())
+
+    def rules_review(self) -> dict | None:
+        import rules
+        return rules.review(self.rules_records(), self.config.rules, self.market.now_ms())
+
+    def cmd_rules(self, req: core.Request) -> str:
+        if getattr(self, "rules", None) is None:
+            return "规则吃单没有运行（真实交易模块启动后自动运行）"
+        return self.rules.status()
 
     def live_redeem_loop_start(self) -> None:
         """The redeem's own timer (live_redeem_loop), one per process, started by _run_live whatever LIVE says at the start."""

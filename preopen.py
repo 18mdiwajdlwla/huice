@@ -1490,7 +1490,7 @@ class Controller:
         if reason := self.owner.live_paused() or self.owner.live_killed():
             return reason
         cap = c.live_max_daily_loss_usd
-        if cap and self.daily_pnl() + self.owner.live_daily_pnl(self.owner.sim_trades(), self.now()) <= -cap:
+        if cap and self.daily_pnl() + self.owner.live_daily_pnl(self.owner.sim_trades(), self.now()) + float(getattr(self.owner, "rules_pnl", lambda: 0.0)()) <= -cap:  # the rule taker's day too (1.153.0)
             return "已达到今日真实亏损上限"
         return ""
 

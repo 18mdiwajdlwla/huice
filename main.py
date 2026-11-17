@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.152.2"
+VERSION = "1.153.0"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -621,6 +621,49 @@ class PreopenSettings:
         return config.preopen
 
 
+# 1.153.0: 规则吃单 (rules.py) — each rule's price setting (cents, 0 = the rule off) and its default
+RULE_SETTING_KEYS = {"gold_shut": "RULE_GOLD_SHUT_CENTS", "gold_open": "RULE_GOLD_OPEN_CENTS", "gold_0515": "RULE_GOLD_0515_CENTS",
+                     "oil_shut": "RULE_OIL_SHUT_CENTS", "oil_open": "RULE_OIL_OPEN_CENTS"}
+RULE_DEFAULT_CENTS = {"gold_shut": 58, "gold_open": 50, "gold_0515": 58, "oil_shut": 0, "oil_open": 55}  # oil_shut 0: ties settle Up, Down won 42% (1.153.0)
+
+
+@dataclass(frozen=True)
+class RuleSettings:
+    """规则吃单 (rules.py): RULE_TAKER off | paper (只记录，不下单) | on (真实吃单, with LIVE=on), each rule's highest price in cents
+    (RULE_*_CENTS, 0 = that rule off) and the most shares bought a window (RULE_SHARES). Validated when on or paper; read
+    leniently when off, as PreopenSettings is."""
+    mode: str = "off"
+    cents: tuple = tuple(RULE_DEFAULT_CENTS.items())
+    shares: int = 50
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode != "off"
+
+    def price(self, key: str) -> int:
+        return int(dict(self.cents).get(key, 0))
+
+    @classmethod
+    def from_env(cls, e: Mapping, force: bool = False) -> "RuleSettings":
+        mode = str(e.get("RULE_TAKER", "off")).strip().lower()
+        try:
+            return cls.parse(e, mode)
+        except ValueError:
+            if mode != "off" or force:
+                raise
+            return cls()
+
+    @classmethod
+    def parse(cls, e: Mapping, mode: str) -> "RuleSettings":
+        if mode not in {"off", "paper", "on"}:
+            raise ValueError("RULE_TAKER 只能是 off、paper（只记录不下单）或 on（真实吃单）")
+        cents = {key: int(str(e.get(name, RULE_DEFAULT_CENTS[key])).strip() or 0) for key, name in RULE_SETTING_KEYS.items()}
+        shares = int(str(e.get("RULE_SHARES", "50")).strip() or 0)
+        if any(not (c == 0 or 1 <= c <= 95) for c in cents.values()) or not 1 <= shares <= 100_000:
+            raise ValueError("RULE_*_CENTS 是 0（不做这条规则）或 1～95（¢，最高买价）；RULE_SHARES 每场最多买 1～100000 份")
+        return cls(mode, tuple(cents.items()), shares)
+
+
 CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("LIVE", "真实交易模式", "off 只记账 / pause 登录 Predict、可自检和挂单测试、不开新仓 / on 真实下单（pause、on 需要已配置 PREDICT_PRIVATE_KEY）"),
     ("SIM_EDGE_CENTS", "触发买入的净优势（¢/份）", "0.5～50"),
@@ -714,6 +757,20 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
      "新场次一发布就挂（0.5 秒内），排在 49¢ 买单队伍最前面；24 小时最多 288 场，每场两边各 49¢ × 每次份数，预挂资金上限不够时最晚发布的几场挂不上（预挂状态写“已发布未挂”）。"
      "3～1440：调小就只挂快开场的几场，少占资金、少读接口，但新场次要等进了范围才挂，排在先挂的人后面"),
     ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "0～1000000，0 = 不限（默认）：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金，成交时才扣款；余额够一场双边就挂）；设了上限时每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放，/preopen 会算出把已发布的全部挂上需要多少"),
+    # 1.153.0: 规则吃单 (rules.py) — the gold / oil windows the backtest found mispriced (README「规则吃单」)
+    ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段：开场前盘口出现规则价格以下的指定方向就直接吃单（1.153.0）。off 关；paper 只记录不下单："
+     "按当时盘口记下会买到多少、按 Predict 的结果结算，先看几天再开；on 真实吃单（需要 LIVE=on；真实交易暂停、今日亏损停机、接口限流冷却时都不下单）"),
+    ("RULE_GOLD_SHUT_CENTS", "黄金休市 4 档：买涨不高于（¢）", "纽约 17:00–17:45、周一至周四 CME 每天休市的 4 个 15 分钟（北京冬令时 06:00–06:45，夏令时 05:00–05:45）："
+     "指数不动，终点等于起点按涨结算；2025-12 至 2026-11 涨占 90%，每月最低 76%。0 = 不做"),
+    ("RULE_GOLD_OPEN_CENTS", "黄金开盘第一档：买跌不高于（¢）", "纽约 18:00、周一至周四每天重新开盘的第一个 15 分钟（北京冬令时 07:00，夏令时 06:00）；"
+     "周一早上那场（周末后开盘）跌只占 41%，不做。2026 年周二至周五跌占 58%，近半年 78%，但前几个月是涨多：0 = 不做"),
+    ("RULE_GOLD_0515_CENTS", "黄金纽约 05:15：买跌不高于（¢）", "纽约 05:15–05:30、周一至周五（北京冬令时 18:15，夏令时 17:15）：伦敦上午定盘前，2026 年跌占 65%，"
+     "前后几档只有 38–55%；按纽约时间算，夏令时是北京 17:15 那场（北京 18:15 那时跌只占 52%）。0 = 不做"),
+    ("RULE_OIL_SHUT_CENTS", "原油休市 4 档：买跌不高于（¢）", "原油的同一时段（纽约 17:00–17:45，周一至周四）。指数不动时按涨结算，2026-04 至 11 跌只占 42%："
+     "45¢ 买跌每份约亏 3.6¢，所以默认 0 = 不做"),
+    ("RULE_OIL_OPEN_CENTS", "原油开盘第一档：买跌不高于（¢）", "原油纽约 18:00、周一至周四重新开盘的第一个 15 分钟（北京冬令时 07:00）；2026 年跌占 59%："
+     "55¢ 每份约赚 3¢，50¢ 约 8¢。0 = 不做"),
+    ("RULE_SHARES", "规则吃单：每场最多买多少份", "1～100000：一个 15 分钟场次最多买这么多份（几次吃单合计）；每张单另受 LIVE_MAX_ORDER_USD 限制"),
 )
 CONTROL_KEY_SET = frozenset(k for k, _, _ in CONTROL_KEYS)
 # One-click combinations for the control page (一键搭配): the strategy settings only. What to trade (SIM_MARKETS, SIM_SKIP),
@@ -896,6 +953,7 @@ class Config:
     web_control_key: str = field(default="", repr=False)  # WEB_CONTROL_KEY: the control page's secret; "" = the page is read-only
     env: dict = field(default_factory=dict, repr=False, compare=False)  # the variables this was read from (runtime changes re-read it)
     preopen: PreopenSettings = field(default_factory=PreopenSettings)  # the pre-open quoting mode (preopen.py), the control page's values included
+    rules: RuleSettings = field(default_factory=RuleSettings)  # 规则吃单 (rules.py, 1.153.0), the control page's values included
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -986,6 +1044,7 @@ class Config:
                            parse_dates(e.get("CME_EARLY_DAYS", DEFAULT_SPECIAL_DAYS["CME_EARLY"]), "CME_EARLY_DAYS"),
                            parse_dates(e.get("CME_CLOSED_DAYS", DEFAULT_SPECIAL_DAYS["CME_CLOSED"]), "CME_CLOSED_DAYS"))
         preopen = PreopenSettings.from_env(e)
+        rules = RuleSettings.from_env(e)
         if preopen.enabled:  # a stock card the pre-open mode quotes: its exchange ticker (the limit / halt guard's quote) even when the pair is not in SYMBOLS (1.134.0: 智谱)
             for spec in WINDOW_UPDOWN_MARKETS:
                 if spec.exchange and spec.key in preopen.markets and spec.symbol not in tickers:
@@ -993,7 +1052,7 @@ class Config:
         return cls(
             token=e.get("TELEGRAM_BOT_TOKEN", "").strip(),
             admin_id=bounded_int(e, "ADMIN_USER_ID", 0, 0, 10**15),
-            symbols=symbols, db_path=e.get("STATE_DB", "./data/bot.sqlite3"), preopen=preopen,
+            symbols=symbols, db_path=e.get("STATE_DB", "./data/bot.sqlite3"), preopen=preopen, rules=rules,
             threshold=threshold,
             cooldown=bounded_int(e, "ALERT_COOLDOWN_SECONDS", 300, 0, 86400),
             poll=bounded_int(e, "POLL_SECONDS", 5, 3, 3600),
@@ -11656,6 +11715,13 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_BTC5_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "30", "60", "120", "240", "1440"], "unit": "分钟", "zero": "跟所有卡一样",
                                    "captions": {"1440": "挂满：一发布就挂"}},  # 1.152.2: every listed window, each placed the moment it is listed
     "PREOPEN_MAX_OPEN_USD": {"kind": "number", "group": "预挂", "presets": ["0", "1000", "5000", "7000", "20000"], "unit": "$", "zero": "不限"},
+    "RULE_TAKER": {"kind": "choice", "group": "规则", "options": [["off", "off 关"], ["paper", "paper 只记录不下单"], ["on", "on 真实吃单（需要 LIVE=on）"]]},
+    "RULE_GOLD_SHUT_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "55", "58", "60", "65"], "unit": "¢", "zero": "不做"},
+    "RULE_GOLD_OPEN_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "45", "48", "50", "52"], "unit": "¢", "zero": "不做"},
+    "RULE_GOLD_0515_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "50", "55", "58"], "unit": "¢", "zero": "不做"},
+    "RULE_OIL_SHUT_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "35", "40", "45"], "unit": "¢", "zero": "不做"},
+    "RULE_OIL_OPEN_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "45", "50", "55"], "unit": "¢", "zero": "不做"},
+    "RULE_SHARES": {"kind": "number", "group": "规则", "presets": ["10", "20", "50", "100", "200"], "unit": "份"},
     "SIM_EDGE_CENTS": {"kind": "number", "group": "策略", "presets": ["3", "5", "8", "10", "15", "20"], "unit": "¢"},
     "SIM_SHARES": {"kind": "number", "group": "策略", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
     "SIM_TAKER_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "10", "20", "50", "100", "200"], "unit": "份", "zero": "同每次份数"},
@@ -14310,6 +14376,7 @@ details.hint{margin:4px 0 8px}details.hint>summary{display:inline-flex;align-ite
 <details class="fold" data-k="sessions"><summary><h3>按时段</h3></summary><div id="a-sessions"></div><details class="hint"><summary>说明</summary><p>按下单时标的所在的时段（交易所当地时间）；成交后市场走向 = 盘口中间价 − 成交价，每份，持续为负 = 这个时段的成交常是别人在出货；没有开盘时段的市场（加密）记在“无交易时段”。</p></details></details>
 <details class="fold" data-k="windows" id="h-windows" hidden><summary><h3>15 分钟涨跌</h3></summary><div id="a-windows" hidden></div><details class="hint" id="p-windows" hidden><summary>说明</summary><p>只算 15 分钟窗口的记录：按窗口开始的整点（北京时间，两张卡都有时分开写），和按下单时离窗口结束还有几分钟。胜率低于平均公平价、成交后 1 / 5 分钟市价持续为负的那一行，就是模型在那个时段或那个时点看错的地方。</p></details></details>
 <details class="fold" data-k="preopen" id="h-preopen" hidden><summary><h3>开盘前预挂</h3></summary><div id="a-preopen" hidden></div><details class="hint" id="p-preopen" hidden><summary>说明</summary><p>开盘前预挂模式（PREOPEN_15M）自己的记录，不受上面的筛选条影响：每场涨、跌两边各一张固定价买单，成交的那一边按官方结果结算（赢 = 1 − 价格、输 = −价格，每份，平局按 0.5）。记录 = 一次报价（同一场重新报价算两条），场次 = 不同的窗口；没成交就撤掉的场次不算输赢。按日期、开始时间都是场次开始的北京时间。</p></details></details>
+<details class="fold" data-k="ruletaker" id="h-rules" hidden><summary><h3>规则吃单</h3></summary><div id="a-rules"></div><details class="hint"><summary>说明</summary><p>黄金、原油 15 分钟的几个固定时段（控制台“规则吃单”一组，RULE_TAKER）：开场前盘口出现规则价格以下的指定方向就吃单，每场最多 RULE_SHARES 份。真实吃单和只记录（paper：按当时盘口记下会买到多少，不下单）分开算；成本含吃单手续费，按 Predict 的结果结算。不受上面的筛选条影响。</p></details></details>
 <details class="fold" data-k="makers"><summary><h3>挂单效率</h3></summary><div id="a-makers"></div></details>
 <details class="fold" data-k="blocked"><summary><h3>被拦下的机会</h3></summary><div id="a-blocked"></div><details class="hint"><summary>说明</summary><p>组上限（SIM_GROUP_USD）最近一周拦下的买入：市场已出结果的，按每笔份数（SIM_SHARES）算若当时买入的盈亏——长期为正说明上限偏紧。</p></details></details></div></section>
 <section class="box" id="statsbox"><div class="hd" id="statshd"><h2>统计与风险</h2><span class="sum" id="statsum"></span><button type="button" class="lnk" id="foldstats">展开</button></div>
@@ -14676,12 +14743,22 @@ function evSection(ev){  // 模型 EV 对实际盈亏 (1.140.0): the poker track
   const gt=rows=>table(["分组","笔数","模型预期","实际","实际 − 预期","偏离","判断"],rows.map(g=>[g.name,g.bets,money(g.ev),pn(g.pnl),pn(g.pnl-g.ev),evZ(g),vb(g)]));
   if((ev.strategies||[]).length)el.append($("div","sub","按策略"),gt(ev.strategies));
   if((ev.cards||[]).length)el.append($("div","sub","按市场"),gt(ev.cards))}
+function rulesSection(ru){  // 规则吃单 (1.153.0): each rule's totals, the real and the paper apart, and the last windows bought
+  const MODE={on:"真实",paper:"只记录"},RES={up:"涨",down:"跌",split:"平"},side=s=>s==="up"?"涨":"跌",kids=[];
+  kids.push($("p","small mut","现在："+({off:"关",paper:"只记录（不下单）",on:"真实吃单"}[ru.mode]||ru.mode)+"，每场最多 "+num(ru.shares)+" 份"));
+  if((ru.rules||[]).length)kids.push(table(["规则","买","模式","场次","份数","每份成本","成本","已结算","赢/输","盈亏","待结算"],
+    ru.rules.map(r=>[r.name,side(r.side)+(r.cents?" ≤"+r.cents+"¢":"（已关）"),MODE[r.mode]||r.mode,num(r.windows),num(r.shares),r.shares?cent(r.cost/r.shares):"—",usd(r.cost),
+      num(r.settled),r.wins+"/"+r.losses,r.settled?money(r.pnl):"—",num(r.open)])));
+  const rec=ru.recent||[];
+  if(rec.length)kids.push(...bigTable("最近的场次（北京时间）",table(["场次","规则","买","份数","均价","成本","结果","盈亏","模式"],
+    rec.map(r=>[dayKey(r.start_ms).slice(5)+" "+(r.window||""),r.name,side(r.side),num(r.shares),cent(r.avg),usd(r.cost),RES[r.result]||"待结算",r.pnl==null?"—":money(r.pnl),MODE[r.mode]||r.mode])),rec.length));
+  document.getElementById("a-rules").replaceChildren(...kids)}
 function analysis(){  // per setting, per underlying, per net edge and fair price at the order, per part of the underlying's day, the 15-minute windows, the pre-open quotes, the resting orders' record, the refused buys' outcomes: folded away
   const S=src(),hd=document.getElementById("anasum");filterLine(document.getElementById("anafilt"),S);
   document.getElementById("anaat").textContent=okAt?"已刷新 "+clock(okAt):"";
   const ids=["a-versions","a-items","a-edges","a-fairs","a-sessions","a-makers","a-blocked"];
   if(S.a===null){ids.forEach(id=>document.getElementById(id).replaceChildren($("p","small mut",S.err?"按筛选读取失败："+S.err:"按筛选读取中…")));
-    ["h-windows","a-windows","p-windows","h-preopen","a-preopen","p-preopen","h-ev","a-ev","p-ev"].forEach(id=>{document.getElementById(id).hidden=true});hd.textContent=S.label;
+    ["h-windows","a-windows","p-windows","h-preopen","a-preopen","p-preopen","h-rules","h-ev","a-ev","p-ev"].forEach(id=>{document.getElementById(id).hidden=true});hd.textContent=S.label;
     document.getElementById("anabody").hidden=!anaOpen;document.getElementById("foldana").textContent=anaOpen?"收起":"展开";return}
   const a=S.a,put=(id,rows,extra)=>{const el=document.getElementById(id);el.replaceChildren(rows&&rows.length?anaTable(rows,extra):$("p","small mut","还没有记录"))};
   versions(a);put("a-items",a.items);put("a-edges",a.edges);put("a-fairs",a.fairs);
@@ -14692,6 +14769,8 @@ function analysis(){  // per setting, per underlying, per net edge and fair pric
     document.getElementById("a-windows").replaceChildren(...bigTable("按窗口开始（北京时间）",anaTable(w.hours,ex),w.hours.length),$("div","sub","按下单时离窗口结束"),anaTable(w.left||[],ex),$("div","sub","按方向（涨 / 跌各算）"),anaTable(w.sides||[],ex))}
   const po=a.preopen,pos=!!(po&&po.total&&po.total.records);["h-preopen","a-preopen","p-preopen"].forEach(id=>{document.getElementById(id).hidden=!pos});
   if(pos)preopenSection(po);
+  const ru=a.rules,rus=!!(ru&&((ru.rules||[]).length||(ru.recent||[]).length));document.getElementById("h-rules").hidden=!rus;
+  if(rus)rulesSection(ru);
   const ev=a.ev,evs=!!(ev&&ev.total&&ev.total.bets);["h-ev","a-ev","p-ev"].forEach(id=>{document.getElementById(id).hidden=!evs});
   if(evs)evSection(ev);
   const mk=a.makers||{},mb=document.getElementById("a-makers");mb.replaceChildren();
@@ -15108,7 +15187,7 @@ function switchMode(v){if(data.live&&v===data.live.mode)return;
   const ask={on:"切到 LIVE=on 后，模拟交易的每个决定都会在 Predict 真实下单。继续？",off:"切到 LIVE=off 会撤掉未成交的真实挂单并回到只记账（已有持仓继续跟踪到结算）。继续？",pause:"切到 LIVE=pause：登录 Predict、可自检和挂单测试，不开新仓。继续？"}[v];
   if(ask&&!confirm(ask))return;act({action:"mode",value:v})}
 $("modebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b||b.disabled)return;switchMode(b.dataset.mode)});
-const GROUPS=[["策略","策略"],["风控","真实交易风控"],["预挂","开盘前预挂（15 分钟市场）"],["高级","高级参数"]];
+const GROUPS=[["策略","策略"],["风控","真实交易风控"],["预挂","开盘前预挂（15 分钟市场）"],["规则","规则吃单（黄金、原油固定时段）"],["高级","高级参数"]];
 function fmt(s,v){return s.unit==="$"?"$"+v:s.unit==="¢"?v+"¢":s.unit?v+" "+s.unit:v}
 function capOf(s,v){return s.captions&&s.captions[v]?"（"+s.captions[v]+"）":""}  // a preset's own name: 1440 分钟（挂满） (1.152.2)
 function selected(s){return new Set(s.kind==="multi"?(s.value==="all"?s.options.map(o=>o[0]):s.value.split(",")):[s.value])}
@@ -16181,6 +16260,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("live", "真实交易（LIVE=on）：钱包、余额、真实订单、持仓与风控；暂停/恢复/撤单/领取；fills 把账户持仓和记录逐项核对", "pause|resume|cancel all|redeem|redeem check|redeem forget 市场号|check|fills",
             "LIVE=on 时模拟交易的每个决定都会在 Predict 真实下单；/live pause 停止开新仓，/live resume 恢复"),
     Command("preopen", "15 分钟市场开盘前双边预挂（PREOPEN_15M=on，真实交易）：状态；check 体检（限流、卡住的撤单、最近问题）；pause / resume 暂停恢复；probe 只读探测市场列表", "check|pause|resume|probe"),
+    Command("rules", "规则吃单（RULE_TAKER，真实交易模块里）：黄金、原油几个固定时段开场前按规则价吃单——状态、每条规则的下一场、今天的成交"),
     Command("diag", "逐个检测数据源（币安/交易所/上证/A50/恒指/KOSPI/HL/汇率），找出哪里出问题"),
     Command("speed", "指数查价测速（开盘时用）：每个指数数据源每秒查一次、各 30 秒，看请求要多久、指数多久一变、会不会被拒，给出最快能多久查一次", "0.5",
             "不带参数每 1 秒查一次；/speed 0.5 每 0.5 秒（0.5～5）。同一网站一次只测一个源，连续失败 3 次或被拒就停下，不会把服务器 IP 弄进黑名单"),
@@ -16552,7 +16632,7 @@ class Bot:
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
             "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag, "/speed": self.cmd_speed, "/calib": self.cmd_calib, "/samples": self.cmd_samples,
             "/journal": self.cmd_journal, "/summary": self.cmd_summary, "/markout": self.cmd_markout, "/market": self.cmd_market,
-            "/book": self.cmd_book, "/sim": self.cmd_sim, "/edge": self.cmd_edge, "/live": self.cmd_live, "/preopen": self.cmd_preopen,
+            "/book": self.cmd_book, "/sim": self.cmd_sim, "/edge": self.cmd_edge, "/live": self.cmd_live, "/preopen": self.cmd_preopen, "/rules": self.cmd_rules,
         }
 
     def settings(self) -> dict:
@@ -22277,10 +22357,15 @@ class Bot:
                 "versions": sim_by_version(trades, marks),  # 1.107.0: a setting changed, its values side by side
                 "windows": sim_by_window(trades, marks),    # 1.107.0: the 15-minute windows by start hour and by minutes left
                 "preopen": self.preopen_review(),           # 1.128.0: the pre-open mode's own quotes (LiveBot; None without it)
+                "rules": self.rules_review(),               # 1.153.0: 规则吃单's records (LiveBot; None without it)
                 "ev": self.sim_ev(trades, preopen=not flt)}  # 1.140.0: the model's EV against the settled P&L, day by day (the pre-open fills counted in when unfiltered)
 
     def preopen_review(self) -> dict | None:
         """The review page's 开盘前预挂 section: the pre-open mode's ledger (preopen.review); None here, where there is no mode."""
+        return None
+
+    def rules_review(self) -> dict | None:
+        """The review page's 规则吃单 section (rules.review); None here, where there is no real trading module."""
         return None
 
     def preopen_rows(self) -> list[dict]:
@@ -22705,6 +22790,9 @@ class Bot:
         if not self.config.sim or not self.config.predict:
             return Reply("模拟交易已关闭（SIM=off 或 PREDICT=off）。")
         return Reply(self.sim_text(), html=True)
+
+    def cmd_rules(self, req: Request) -> Any:
+        return "规则吃单在真实交易模块里：设置 PREDICT_PRIVATE_KEY 启动真实交易模块后，控制台“规则吃单”一组开启（RULE_TAKER=paper 只记录、on 真实吃单）"
 
     def cmd_preopen(self, req: Request) -> Any:
         return "开盘前预挂模式在真实交易模块里：设置 PREDICT_PRIVATE_KEY 启动真实交易模块后，PREOPEN_15M=on 开启，/preopen probe 只读探测"
@@ -23888,6 +23976,7 @@ class Bot:
                   "PREOPEN_BTC5_CANCEL_SECONDS": str(c.preopen.btc5_cancel_seconds), "PREOPEN_BTC5_EXPIRY_SECONDS": str(c.preopen.btc5_expiry_seconds),
                   "PREOPEN_BTC5_ENTRY_SECONDS": str(c.preopen.btc5_entry_seconds), "PREOPEN_BTC5_AHEAD_MINUTES": str(c.preopen.btc5_ahead_minutes),
                   "PREOPEN_MAX_OPEN_USD": plain(c.preopen.max_open_usd), "PREOPEN_EXCLUSIVE": flag(c.preopen.exclusive),
+                  "RULE_TAKER": c.rules.mode, "RULE_SHARES": str(c.rules.shares), **{name: str(c.rules.price(key)) for key, name in RULE_SETTING_KEYS.items()},
                   "SOURCES_OFF": ",".join(sorted(c.sources_off)), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
                   "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait), "LIVE_TAKER_PRICE": c.live_taker_price,

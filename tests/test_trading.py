@@ -636,6 +636,22 @@ async def run():
     assert (lad["name"], lad["url"], lad["value"], lad["status"], lad["price"], lad["shares"]) == (
         "Will $PONS FDV hit $20M before November 2026? / No", "https://predict.fun/zh-cn/market/what-fdv-will-pons-hit-before-nov-2026", 10.75, "WON", None, 10.7535), lad
     assert next(r for r in bot.live_unrecorded_positions() if r["market_id"] == "777")["value"] is None, "no valueUsd: no value, not $0"
+    # 1.153.0: a real 规则吃单 fill there is recorded — not 账户里有、记录里没有, not adopted; a paper one explains nothing
+    rule_rec = {"slug": "xau-updown-15m-1", "rule": "gold_shut", "side": "down", "mode": "on", "market_id": "778", "index_set": 2, "start_ms": NOW,
+                "orders": [{"state": "final", "shares": 20.0, "filled": 10.7535, "limit": 0.58, "avg": 0.51, "fee": 0.0098}], "pnl": None}
+    bot.store.put("rule:xau-updown-15m-1", {**rule_rec, "mode": "paper"})
+    assert any(r["market_id"] == "778" for r in bot.live_unrecorded_positions()), "a paper record holds nothing on the account"
+    bot.store.put("rule:xau-updown-15m-1", rule_rec)
+    assert not any(r["market_id"] == "778" for r in bot.live_unrecorded_positions()) and bot.side_filled()[("778", 2)] == 10.7535
+    bot.store.put("rule:xau-updown-15m-1", {**rule_rec, "orders": [{**rule_rec["orders"][0], "state": "open"}]})
+    assert ("778", 2) in bot.side_unverified(), "an order whose fills are not final: the check leaves the outcome alone"
+    today = dt.datetime.fromtimestamp(bot.market.now_ms() / 1000, m.BEIJING).date().isoformat()
+    bot.store.put("rule:xau-updown-15m-1", {**rule_rec, "pnl": -5.5, "settled_day": today})
+    assert bot.rules_pnl() == -5.5 and bot.side_pnl() == bot.preopen_pnl() - 5.5, "the day's loss stop counts it"
+    review = bot.rules_review()
+    assert (review["recent"][0]["name"], review["recent"][0]["pnl"], review["rules"][0]["losses"]) == ("黄金休市 4 档", -5.5, 1), review
+    assert "规则吃单没有运行" in bot.cmd_rules(None)
+    bot.store.delete_keys(["rule:xau-updown-15m-1"])
     bot.live_positions = (list(fake.positions_rows), time.time())
     bot.store.put("live:redeemed:777:1", {"at": NOW, "lost": True})
     assert not any(r["market_id"] == "777" for r in bot.live_unrecorded_positions()), "1.131.3: resolved against it — no holding"
