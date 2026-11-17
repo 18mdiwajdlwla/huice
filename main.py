@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.2"
+VERSION = "1.154.3"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -5432,9 +5432,12 @@ class PredictPacer:
 
     def __init__(self, per_min: float):
         self.per_min = float(per_min)
-        self.tokens = self.BURST
+        # 1.154.3: empty at first, not a burst ahead — a process just started does not know how much of Predict's minute the one
+        # before it used (a redeploy: the old process's last requests still count there), so its first ones keep the pace
+        self.tokens = 0.0
         self.at = time.monotonic()
         self.waited = 0.0  # seconds the reads have waited for a token, in all (/diag)
+        self.sent: collections.deque = collections.deque(maxlen=4096)  # monotonic times of the requests let through (/diag: the key's minute)
 
     def refill(self) -> None:
         now = time.monotonic()
@@ -5442,17 +5445,22 @@ class PredictPacer:
         self.at = now
 
     async def take(self, write: bool = False) -> None:
-        if self.per_min <= 0 or not PREDICT_PACING:
-            return
-        need = 1.0 - self.BURST if write else 1.0  # what must be in the bucket for this one to go
-        while True:
-            self.refill()
-            if self.tokens >= need - 1e-9:
-                self.tokens -= 1.0
-                return
-            wait = (need - self.tokens) * 60.0 / self.per_min
-            self.waited += wait
-            await asyncio.sleep(wait)
+        if self.per_min > 0 and PREDICT_PACING:
+            need = 1.0 - self.BURST if write else 1.0  # what must be in the bucket for this one to go
+            while True:
+                self.refill()
+                if self.tokens >= need - 1e-9:
+                    self.tokens -= 1.0
+                    break
+                wait = (need - self.tokens) * 60.0 / self.per_min
+                self.waited += wait
+                await asyncio.sleep(wait)
+        self.sent.append(time.monotonic())
+
+    def last_minute(self) -> int:
+        """The requests let through on the key in the last 60 seconds, every client's (what Predict's per-minute limit counts)."""
+        cut = time.monotonic() - 60.0
+        return sum(1 for t in self.sent if t >= cut)
 
 
 PREDICT_PACERS: dict[str, PredictPacer] = {}
@@ -24799,7 +24807,12 @@ class Bot:
                                + f"、核对 {sync['records']} 条记录 {sync['work_s']:.1f}s）")
                 rates = getattr(self, "live_request_rates", None)
                 if name == "模拟交易" and rates and (rate_list := rates()):
-                    detail += "｜Predict 请求每秒（最近一分钟，同一个 API key）：" + "、".join(rate_list)
+                    # 1.154.3: not "the same API key" any more — the pre-open mode may have its own (PREOPEN_API_KEY); each key's
+                    # whole minute follows (live_key_load), the rule taker's and /diag's own reads included
+                    detail += "｜Predict 请求每秒（最近一分钟）：" + "、".join(rate_list)
+                load = getattr(self, "live_key_load", None)
+                if name == "模拟交易" and load and (keys := load()):
+                    detail += "｜每个 Key 最近 60 秒的请求：" + keys
                 limited = getattr(self, "live_limited_counts", None)
                 if name == "模拟交易" and limited:
                     detail += "｜24 小时内被限流（429）：" + limited()
@@ -25103,6 +25116,7 @@ class Bot:
             # a feed that answered "not due" — nine times in ten at the default ten seconds
             return False
         hot = rows = None
+        learning = not self.predict.slugs  # the first round since the start: the feed knows none of its markets yet (1.154.3)
         if self.config.sim:
             try:
                 hot, rows = self.predict_hot(now_ms)
@@ -25120,6 +25134,21 @@ class Bot:
         if isinstance(result, Refreshed) and result.status != "failed" and self.config.sim:
             self.sim_wake = True
         if result is not False:
+            if learning and hot is not None and self.predict.slugs:
+                # 1.154.3: the hot set worked out before the first round held none of its markets (the feed learns them as it
+                # reads), so the stream subscribed to nothing and the second round read every market over REST once more — at a
+                # start, on top of the trader's first sync and the rule taker's first look (11-17 13:13: 订阅 0 个市场 a minute
+                # after a redeploy, and a 429 on the key in that minute). Worked out again on the books this round brought, the
+                # stream follows them from the first round on; the second round reads only what the stream does not push.
+                try:
+                    hot, rows = self.predict_hot(self.market.now_ms())
+                except Exception as error:  # the stream follows the old (empty) set; the next round sets it right
+                    self.log_limited("predict-hot", f"分级轮询计算失败：{clean_error(error) or type(error).__name__}")
+                else:
+                    if self.predict.stream.connected:
+                        # ...and the next round is PREDICT_POLL_SECONDS from now, not from this round's start (some 40 s ago at a
+                        # start): it would be due at once, before the stream's first snapshots — and read those markets again
+                        self.predict.refreshed = time.monotonic()
             self.predict.stream.want(self.predict.stream_targets(hot, rows))  # the stream follows the round's hot set (1.86.0)
         return result
 

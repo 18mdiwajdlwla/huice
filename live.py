@@ -3225,8 +3225,8 @@ class LiveBot(core.Bot):
         await self.live_orphan_sweep(now_ms)
 
     def live_request_rates(self) -> list[str]:
-        """The requests a second over the last minute of each Predict client on this API key (the rate limit is the key's):
-        the orderbook feed, this trader, the pre-open mode — for /diag."""
+        """The requests a second over the last minute of each Predict client: the orderbook feed, this trader, the pre-open mode
+        (on a key of its own when PREOPEN_API_KEY is set, 1.154.0: said so) — for /diag."""
         out = []
         samples = self.live_rate_samples
         if len(samples) >= 2 and samples[-1][0] > samples[0][0]:
@@ -3236,11 +3236,30 @@ class LiveBot(core.Bot):
             out.append(f"盘口 {rate:.1f}")
         preopen = getattr(self, "preopen", None)
         if preopen is not None and (rate := preopen.request_rate()) is not None:
-            out.append(f"预挂 {rate:.1f}")
+            out.append(f"预挂 {rate:.1f}" + ("（专用 Key）" if self.preopen_own_key() else ""))
         return out
 
+    def preopen_own_key(self) -> str:
+        """PREOPEN_API_KEY when it is a key other than the bot's own (the pre-open mode's requests then count on it alone), else ""."""
+        own = str(getattr(self.config, "preopen_api_key", "") or "")
+        return own if own and own != str(getattr(self.config, "predict_api_key", "") or "") else ""
+
+    def live_key_load(self) -> str:
+        """Each API key's requests in the last 60 seconds, every client's on it (core.PredictPacer counts what it lets through),
+        beside the pace and Predict's default limit — /diag (1.154.3): how near each key is to a 429, which the clients' own
+        rates (live_request_rates) only add up to when nothing else is on the key (the rule taker, /diag's own reads are).
+        The keys themselves are never shown."""
+        keys = [("主 Key", str(getattr(self.config, "predict_api_key", "") or ""))]
+        if own := self.preopen_own_key():
+            keys.append(("预挂专用 Key", own))
+        parts = [f"{name} {pacer.last_minute()} 次" for name, key in keys if (pacer := core.PREDICT_PACERS.get(key)) is not None]
+        if not parts:
+            return ""
+        return "、".join(parts) + f"（节流每分钟 {core.PREDICT_RATE['per_min']:g} 次，Predict 默认上限 240）"
+
     def live_limited_counts(self) -> str:
-        """The 429s answered on this API key in the last 24 hours, by client — /diag (1.138.0): whether the key is over Predict's limit."""
+        """The 429s answered in the last 24 hours, by client — /diag (1.138.0): whether a key is over Predict's limit. In-memory: a
+        restart starts them afresh (the hours shown are the process's when it is younger than a day)."""
         day = time.monotonic() - 86400
         parts = [("原策略", sum(1 for t in getattr(self.live.api, "limited", ()) if t >= day))]
         feed = getattr(getattr(self, "predict", None), "limited", None)
@@ -3249,6 +3268,10 @@ class LiveBot(core.Bot):
         preopen = getattr(self, "preopen", None)
         if preopen is not None:
             parts.append(("预挂", sum(1 for t in getattr(preopen, "limited_at", ()) if preopen.now() - t <= core.DAY_MS)))
+        rules = getattr(self, "rules", None)
+        api = getattr(rules, "api", None)
+        if api is not None and (getattr(getattr(rules, "settings", None), "mode", "off") != "off" or getattr(api, "limited", None)):
+            parts.append(("规则吃单", sum(1 for t in getattr(api, "limited", ()) if t >= day)))  # 1.154.3: its own client, on the bot's key
         return "、".join(f"{name} {n} 次" for name, n in parts)
 
     @staticmethod

@@ -211,6 +211,27 @@ async def run():
     async def not_due(targets, force=False, hot=None, hot_rows=None): return False
     bot.predict.refresh = not_due; bot.predict.stream.wanted = {}
     assert await bot.refresh_books(NOW) is False and bot.predict.stream.wanted == {}, "a round not due changes nothing"
+    # 1.154.3: the first round after a start — the feed knows no market before it, so the hot set worked out then is empty; worked
+    # out again on what the round brought, the stream follows the markets at once (11-17: 订阅 0 个市场 a minute after a redeploy,
+    # the second round reading every market over REST again), and with the stream up the next round waits PREDICT_POLL_SECONDS
+    # from then — not due at once (the first round took some 40 s), so the stream's snapshots come before it
+    fresh = m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "HSI_FUTURES": "off", "KOSPI_INDEX": "off"}), m.Store(":memory:"), FakeMarket(), None)
+    asked_hot = []
+    fresh.predict_hot = lambda now: asked_hot.append(dict(fresh.predict.slugs)) or (set(fresh.predict.slugs), set())
+    fresh.predict_targets = lambda now: {"HSI": HSI_SLUG}
+
+    async def first_round(targets, force=False, hot=None, hot_rows=None):
+        fresh.predict.slugs, fresh.predict.books["HSI"] = dict(targets), feed.books["HSI"]
+        fresh.predict.refreshed = m.time.monotonic() - 40  # the round began 40 s ago
+        return m.Refreshed("ok")
+    fresh.predict.refresh = first_round
+    fresh.predict.stream.ws, fresh.predict.stream.connected_at = object(), m.time.monotonic()  # the stream is up
+    assert isinstance(await fresh.refresh_books(NOW), m.Refreshed)
+    assert asked_hot == [{}, {"HSI": HSI_SLUG}], asked_hot
+    assert fresh.predict.stream.wanted == {"7": ("HSI", False)}, "followed from the first round on, not after a second"
+    assert not fresh.predict.round_due(), "the next round leaves the stream its snapshots first"
+    fresh.predict.refreshed = -1e9
+    assert isinstance(await fresh.refresh_books(NOW), m.Refreshed) and len(asked_hot) == 3, "later rounds: worked out once, before"
     print("STREAM_OK")
 
 
