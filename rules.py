@@ -22,6 +22,7 @@ import contextlib
 import dataclasses
 import datetime as dt
 import hashlib
+import json
 import logging
 import time
 from decimal import Decimal as D
@@ -41,6 +42,7 @@ PROBE_FAST_S, PROBE_SLOW_S = 2.0, 30.0  # ...every PROBE_FAST_S until PROBE_LATE
 PROBE_LATE_MS = 5 * 60_000
 NEAR_MS = 15 * 60_000         # the last stretch before the start: the status and the book read every FAST_S (matching opens then)
 FAST_S, SLOW_S, CLOSED_SLOW_S = 2.0, 30.0, 60.0  # the book of an open market (fast near the start), a market not yet open for matching
+OFFER_STATUS_S = 10.0         # 1.153.1: an offer at the rule's price on a market not yet open for matching: its status read this often (it buys the moment it opens)
 STOP_MS = 10_000              # nothing placed this close to the start: the rule is about the window before it begins
 EXPIRY_BEFORE_S = 5           # an order's signed expiry: this long before the start...
 MIN_LIFE_S = 65               # ...or this long after it is built, whichever is later (no order in this bot is signed for under a minute)
@@ -94,6 +96,7 @@ def ny_0515(start_ms: int) -> bool:
 @dataclasses.dataclass(frozen=True)
 class Rule:
     key: str                       # its price setting (RuleSettings, RULE_SETTING_KEYS) and the records' "rule"
+    market: str                    # "gold" / "oil": the switch and the size it goes by (RULE_GOLD / RULE_OIL, RULE_*_SHARES; 1.153.1)
     card: str                      # the card whose windows it buys (WINDOW_UPDOWN_MARKETS)
     side: str                      # "up" / "down"
     name: str                      # 黄金休市 4 档
@@ -106,13 +109,19 @@ class Rule:
 
 
 RULES: tuple[Rule, ...] = (
-    Rule("gold_shut", "XAU-15M", "up", "黄金休市 4 档", "纽约 17:00–17:45，周一至周四（北京冬令时 06:00–06:45、夏令时 05:00–05:45）", daily_break),
-    Rule("gold_open", "XAU-15M", "down", "黄金开盘第一档", "纽约 18:00，周一至周四（北京冬令时 07:00、夏令时 06:00；周一早上那场不做）", daily_reopen),
-    Rule("gold_0515", "XAU-15M", "down", "黄金纽约 05:15", "纽约 05:15，周一至周五（北京冬令时 18:15、夏令时 17:15）", ny_0515),
-    Rule("oil_shut", "CL-15M", "down", "原油休市 4 档", "纽约 17:00–17:45，周一至周四（北京冬令时 06:00–06:45、夏令时 05:00–05:45）", daily_break),
-    Rule("oil_open", "CL-15M", "down", "原油开盘第一档", "纽约 18:00，周一至周四（北京冬令时 07:00、夏令时 06:00；周一早上那场不做）", daily_reopen),
+    Rule("gold_shut", "gold", "XAU-15M", "up", "黄金休市 4 档", "纽约 17:00–17:45，周一至周四（北京冬令时 06:00–06:45、夏令时 05:00–05:45）", daily_break),
+    Rule("gold_open", "gold", "XAU-15M", "down", "黄金开盘第一档", "纽约 18:00，周一至周四（北京冬令时 07:00、夏令时 06:00；周一早上那场不做）", daily_reopen),
+    Rule("gold_0515", "gold", "XAU-15M", "down", "黄金纽约 05:15", "纽约 05:15，周一至周五（北京冬令时 18:15、夏令时 17:15）", ny_0515),
+    Rule("oil_shut", "oil", "CL-15M", "down", "原油休市 4 档", "纽约 17:00–17:45，周一至周四（北京冬令时 06:00–06:45、夏令时 05:00–05:45）", daily_break),
+    Rule("oil_open", "oil", "CL-15M", "down", "原油开盘第一档", "纽约 18:00，周一至周四（北京冬令时 07:00、夏令时 06:00；周一早上那场不做）", daily_reopen),
 )
 RULE_OF = {r.key: r for r in RULES}
+MARKET_NAMES = {"gold": "黄金", "oil": "原油"}
+
+
+def live_rule(settings: Any, rule: Rule) -> bool:
+    """Whether a rule trades now by the settings: its market switched on and a price set."""
+    return settings.on(rule.market) and settings.price(rule.key) > 0
 
 
 def card_of(rule: Rule) -> Any:
@@ -211,6 +220,21 @@ def unverified(recs: dict[str, dict]) -> set[tuple[str, int]]:
     return {(str(r.get("market_id") or ""), int(r.get("index_set") or 0)) for r in recs.values() if r.get("mode") == "on" and in_flight(r)}
 
 
+def spent_on(recs: dict[str, dict], day: str, mode: str) -> float:
+    """What the orders placed on a Beijing day cost, the mode's own records (paper's and the real ones apart): the fills at their
+    price and fee, and the whole of an order whose word is not final (RULE_MAX_DAY_USD)."""
+    total = 0.0
+    for rec in recs.values():
+        if rec.get("mode") != mode:
+            continue
+        for o in rec.get("orders") or []:
+            if day_of(int(o.get("at") or 0)) != day:
+                continue
+            unit = float(o.get("avg") or o.get("limit") or 0) + float(o.get("fee") or 0)
+            total += (float(o.get("filled") or 0) if o.get("state") in FINAL_STATES else float(o.get("shares") or 0)) * unit
+    return total
+
+
 def day_pnl(recs: dict[str, dict], day: str) -> float:
     """The real records' P&L settled on a Beijing day: counted with the model trader's against LIVE_MAX_DAILY_LOSS_USD."""
     return sum(float(r.get("pnl") or 0) for r in recs.values() if r.get("mode") == "on" and r.get("settled_day") == day)
@@ -225,20 +249,190 @@ def review(recs: dict[str, dict], settings: Any, now_ms: int) -> dict | None:
     for rule in RULES:
         for mode in ("on", "paper"):
             mine = [r for r in recs.values() if r.get("rule") == rule.key and r.get("mode") == mode and filled(r) > DUST]
-            if not mine and (mode == "paper" or settings.price(rule.key) <= 0):
+            if not mine and (mode == "paper" or not live_rule(settings, rule)):
                 continue
             done = [r for r in mine if r.get("pnl") is not None]
-            rows.append({"rule": rule.key, "name": rule.name, "side": rule.side, "cents": settings.price(rule.key), "when": rule.when,
+            rows.append({"rule": rule.key, "name": rule.name, "side": rule.side, "cents": settings.price(rule.key) if live_rule(settings, rule) else 0, "when": rule.when,
                          "mode": mode, "windows": len(mine), "shares": round(sum(filled(r) for r in mine), 4),
                          "cost": round(sum(cost(r) for r in mine), 4), "settled": len(done),
                          "wins": sum(1 for r in done if float(r["pnl"]) > DUST), "losses": sum(1 for r in done if float(r["pnl"]) < -DUST),
                          "pnl": round(sum(float(r["pnl"]) for r in done), 4), "open": len(mine) - len(done)})
     last = sorted((r for r in recs.values() if filled(r) > DUST), key=lambda r: -int(r.get("start_ms") or 0))[:60]
-    return {"mode": settings.mode, "shares": settings.shares, "rules": rows,
+    return {"mode": settings.mode, "markets": {m: {"on": settings.on(m), "shares": settings.shares_of(m), "name": n} for m, n in MARKET_NAMES.items()},
+            "max_day_usd": settings.max_day_usd, "rules": rows,
             "recent": [{"slug": r.get("slug"), "rule": r.get("rule"), "name": (RULE_OF.get(r.get("rule")) or RULES[0]).name,
                         "window": r.get("name"), "start_ms": r.get("start_ms"), "side": r.get("side"), "mode": r.get("mode"),
                         "shares": round(filled(r), 4), "avg": round(avg_price(r), 4), "cost": round(cost(r), 4),
                         "result": r.get("result") or "", "pnl": r.get("pnl")} for r in last]}
+
+
+# --- the pushed books ------------------------------------------------------------------------------------------------------------
+class RuleStream:
+    """Predict's WebSocket for the rule taker's own windows (1.153.1): each listed window's book pushed the moment it changes
+    (predictOrderbook/<market id>; main.PredictStream's protocol: subscribe / unsubscribe by request, the heartbeat echoed), so an
+    offer at a rule's price is bought at once — not at the next read. A connection of its own beside the model trader's (whose
+    subscriptions follow the cards on its page). While it is down, or a book has not come lately, the taker reads it over REST."""
+    FRESH_S = 20.0               # a pushed book stands for this long (the server sends a book again every second or so)
+    SILENT_S = 45.0              # no frame for this long (three heartbeats): the connection is made anew
+    BACKOFF = (2.0, 120.0)       # the wait before a new connection, doubled per failure
+    SYNC_S = 30.0                # the subscriptions brought in step at least this often (at once when the wants change)
+
+    def __init__(self, taker: "RuleTaker", connect: Any = None):
+        self.taker = taker
+        self.connect = connect or core.ws_connect
+        self.wanted: set[str] = set()        # market ids to have pushed
+        self.subscribed: set[str] = set()
+        self.books: dict[str, tuple] = {}    # market id -> (bids, asks, monotonic time of the push)
+        self.versions: dict[str, int] = {}
+        self.changed: set[str] = set()       # markets whose book changed since the taker last looked
+        self.pushed = asyncio.Event()        # ...set as one comes: the taker's loop wakes at once
+        self.wake = asyncio.Event()
+        self.pending: dict[int, tuple[str, str]] = {}
+        self.request_id = 0
+        self.ws: Any = None
+        self.connects = 0
+        self.frames = 0
+        self.error = ""
+        self.backoff = self.BACKOFF[0]
+
+    def want(self, ids: set[str]) -> None:
+        if ids != self.wanted:
+            self.wanted = set(ids)
+            self.wake.set()
+
+    def book(self, mid: str) -> tuple | None:
+        """(bids, asks) as last pushed while the connection lives, None when there is none fresh (the REST read stands in)."""
+        got = self.books.get(mid)
+        if got is None or self.ws is None or time.monotonic() - got[2] > self.FRESH_S:
+            return None
+        return got[0], got[1]
+
+    def stopped(self) -> bool:
+        return self.taker.stop.is_set() or self.taker.owner.stopping.is_set()
+
+    async def pause(self, seconds: float) -> None:
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self.taker.stop.wait(), seconds)
+
+    def headers(self) -> dict[str, str]:
+        key = getattr(self.taker.owner.config, "predict_api_key", "")
+        return {"x-api-key": key} if key else {}
+
+    async def run(self) -> None:
+        while not self.stopped():
+            if not self.wanted:
+                self.wake.clear()
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self.wake.wait(), 5.0)
+                continue
+            try:
+                ws = await self.connect(core.PREDICT_WS_URL, self.headers())
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self.error = core.clean_error(error) or type(error).__name__
+                await self.pause(self.backoff)
+                self.backoff = min(self.backoff * 2, self.BACKOFF[1])
+                continue
+            since = time.monotonic()
+            self.ws, self.connects = ws, self.connects + 1
+            self.subscribed.clear(); self.pending.clear(); self.versions.clear(); self.books.clear()
+            why = ""
+            try:
+                why = await self.session(ws)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                why = core.clean_error(error) or type(error).__name__
+            finally:
+                self.ws = None
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(ws.close(), 1.0)
+            if self.stopped():
+                return
+            self.error = why or "连接结束"
+            self.backoff = self.BACKOFF[0] if time.monotonic() - since >= 60 else min(self.backoff * 2, self.BACKOFF[1])
+            await self.pause(self.backoff)
+
+    async def session(self, ws: Any) -> str:
+        tasks = {asyncio.create_task(self.read(ws)), asyncio.create_task(self.sync_loop(ws)), asyncio.create_task(self.taker.stop.wait())}
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            task = next(iter(done))
+            if self.stopped():
+                return ""
+            error = task.exception()
+            return (core.clean_error(error) or type(error).__name__) if error else (task.result() or "连接结束")
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def read(self, ws: Any) -> str:
+        while True:
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=self.SILENT_S)
+            except asyncio.TimeoutError:
+                return f"{self.SILENT_S:.0f} 秒没有收到任何帧"
+            self.frames += 1
+            await self.handle(ws, raw)
+
+    async def sync_loop(self, ws: Any) -> str:
+        while True:
+            self.wake.clear()
+            for mid in sorted(self.wanted - self.subscribed):
+                await self.request(ws, "subscribe", mid)
+                self.subscribed.add(mid)
+            for mid in sorted(self.subscribed - self.wanted):
+                await self.request(ws, "unsubscribe", mid)
+                self.subscribed.discard(mid)
+                self.books.pop(mid, None)
+                self.versions.pop(mid, None)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.wake.wait(), self.SYNC_S)
+
+    async def request(self, ws: Any, method: str, mid: str) -> None:
+        self.request_id += 1
+        self.pending[self.request_id] = (method, mid)
+        await ws.send(json.dumps({"method": method, "requestId": self.request_id, "params": [core.PREDICT_WS_TOPIC + mid]}))
+
+    async def handle(self, ws: Any, raw: Any) -> None:
+        try:
+            msg = json.loads(raw)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(msg, dict):
+            return
+        if msg.get("type") == "R":
+            with contextlib.suppress(TypeError, ValueError):
+                method, mid = self.pending.pop(int(msg.get("requestId")), ("", ""))
+                if mid and (msg.get("success") is False or (msg.get("success") is None and msg.get("error"))):
+                    if method == "subscribe":
+                        self.subscribed.discard(mid)  # asked for again at the next sync
+                    self.error = f"{method} {mid}：{msg.get('error') or '拒绝'}"
+        elif msg.get("type") == "M":
+            topic = str(msg.get("topic") or "")
+            if topic == core.PREDICT_WS_HEARTBEAT:
+                await ws.send(json.dumps({"method": "heartbeat", "data": msg.get("data")}))
+            elif topic.startswith(core.PREDICT_WS_TOPIC):
+                self.take(topic[len(core.PREDICT_WS_TOPIC):], msg.get("data"))
+
+    def take(self, mid: str, data: Any) -> None:
+        """A pushed book: kept (an older version dropped, a side left out keeps its own), and the taker woken when it changed."""
+        if mid not in self.subscribed or not isinstance(data, dict):
+            return
+        version = data.get("version")
+        if isinstance(version, (int, float)) and not isinstance(version, bool):
+            if version < self.versions.get(mid, -1):
+                return
+            self.versions[mid] = int(version)
+        old = self.books.get(mid)
+        bids = core.predict_levels(data.get("bids"), True) if isinstance(data.get("bids"), list) else (old[0] if old else ())
+        asks = core.predict_levels(data.get("asks"), False) if isinstance(data.get("asks"), list) else (old[1] if old else ())
+        self.books[mid] = (bids, asks, time.monotonic())
+        if old is None or (bids, asks) != (old[0], old[1]):
+            self.changed.add(mid)
+            self.pushed.set()
 
 
 # --- the taker --------------------------------------------------------------------------------------------------------------------
@@ -265,6 +459,7 @@ class RuleTaker:
         self.alive = True
         self.reads = 0
         self.recs: dict[str, dict] = records(owner.store)  # the records, kept in memory: only this taker writes them
+        self.stream = RuleStream(self)  # the listed windows' books pushed as they change (1.153.1)
 
     # -- plumbing --
     def now(self) -> int:
@@ -350,6 +545,7 @@ class RuleTaker:
 
     # -- the loop --
     async def run(self) -> None:
+        streaming = asyncio.create_task(self.stream.run(), name="rules-stream")
         try:
             while not self.stop.is_set() and not self.owner.stopping.is_set():
                 try:
@@ -358,10 +554,25 @@ class RuleTaker:
                     raise
                 except Exception as error:
                     self.note(core.clean_error(error) or type(error).__name__)
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(self.stop.wait(), TICK_S)
+                await self.rest()
         finally:
             self.alive = False
+            streaming.cancel()
+            await asyncio.gather(streaming, return_exceptions=True)
+
+    async def rest(self) -> None:
+        """Until the next tick: TICK_S, or less — a pushed book that changed wakes the loop at once (an offer bought within
+        the moment it shows)."""
+        self.stream.pushed.clear()
+        if self.stream.changed:
+            return
+        waits = {asyncio.ensure_future(self.stop.wait()), asyncio.ensure_future(self.stream.pushed.wait())}
+        try:
+            await asyncio.wait(waits, timeout=TICK_S, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for w in waits:
+                w.cancel()
+            await asyncio.gather(*waits, return_exceptions=True)
 
     async def tick(self) -> None:
         now = self.now()
@@ -379,6 +590,7 @@ class RuleTaker:
                 except Exception as error:
                     w["word"] = f"读取失败：{core.clean_error(error) or type(error).__name__}"
                     self.note(f"{slug}：{w['word']}")
+        self.stream.want({str(w["market"]["id"]) for w in self.track.values() if w["market"] is not None})
         await self.follow()
         await self.settle()
 
@@ -388,7 +600,7 @@ class RuleTaker:
         want: dict[str, tuple[str, int]] = {}
         if self.settings.mode != "off":
             for rule in RULES:
-                if self.settings.price(rule.key) > 0:
+                if live_rule(self.settings, rule):  # its market switched on (RULE_GOLD / RULE_OIL) and a price set
                     for start in windows(rule, now + STOP_MS, now + HORIZON_MS):
                         want[card_of(rule).slug_of(start)] = (rule.key, start)
         for slug in list(self.track):
@@ -396,7 +608,7 @@ class RuleTaker:
                 self.track.pop(slug)
         for slug, (key, start) in want.items():
             self.track.setdefault(slug, {"rule": key, "start": start, "market": None, "listed_ms": 0, "open_ms": 0, "probe_ms": 0,
-                                         "look_ms": 0, "word": ""})
+                                         "look_ms": 0, "status_ms": 0, "offer": False, "word": ""})
         old = [slug for slug, r in self.recs.items()
                if int(r.get("start_ms") or 0) < now - KEEP_DAYS * core.DAY_MS and not in_flight(r) and (r.get("pnl") is not None or filled(r) <= DUST)]
         if old:
@@ -405,8 +617,9 @@ class RuleTaker:
                 self.recs.pop(slug, None)
 
     def due(self, w: dict, now: int) -> bool:
-        """Whether the window is to be looked at this tick (its cadence: the listing looked for around its moment, the matching
-        status until it opens, the book once it has — every FAST_S near the start)."""
+        """Whether the window is to be looked at this tick: at once when its pushed book changed (1.153.1); else by its cadence —
+        the listing looked for around its moment, every FAST_S in the last NEAR_MS, every OFFER_STATUS_S while an offer at the
+        price waits for matching to open, the rest every SLOW_S (CLOSED_SLOW_S before matching opens)."""
         start, near = w["start"], w["start"] - now <= NEAR_MS
         if w["market"] is None:
             expected = start - LISTED_AHEAD_MS
@@ -414,10 +627,15 @@ class RuleTaker:
                 return False
             every = PROBE_FAST_S if now <= expected + PROBE_LATE_MS or near else PROBE_SLOW_S
             return now - w["probe_ms"] >= every * 1000
-        every = FAST_S if near else SLOW_S if w["open_ms"] else CLOSED_SLOW_S
+        if str(w["market"]["id"]) in self.stream.changed and now >= w["look_ms"]:
+            return True
+        every = FAST_S if near else OFFER_STATUS_S if (w["offer"] and not w["open_ms"]) else SLOW_S if w["open_ms"] else CLOSED_SLOW_S
         return now - w["look_ms"] >= every * 1000
 
     async def look(self, slug: str, w: dict) -> None:
+        """One look at a window before its start: its market found as Predict lists it; its book (pushed, or read); the offers at
+        the rule's price (the pre-open mode's own bids taken out); matching's status read when there is something to buy and
+        it has not opened; then the take — up to the market's RULE_*_SHARES a window and RULE_MAX_DAY_USD a day."""
         now = self.now()
         rule = RULE_OF[w["rule"]]
         if w["start"] - now <= STOP_MS:
@@ -426,8 +644,9 @@ class RuleTaker:
         if not self.due(w, now):
             return
         rec = self.record(slug)
-        if rec is not None and (held(rec) >= self.settings.shares - DUST or in_flight(rec)):
-            w["word"] = "这一场已买满" if not in_flight(rec) else "上一张单还没有结果"
+        size = self.settings.shares_of(rule.market)
+        if rec is not None and (held(rec) >= size - DUST or in_flight(rec)):
+            w["word"] = f"这一场已买满 {size:g} 份" if not in_flight(rec) else "上一张单还没有结果"
             return
         if rec is not None and self.settings.mode == "paper" and any(o.get("paper") for o in rec["orders"]):
             w["word"] = "只记录：这一场已记过（只记一次：没真买，盘口上的单还在，再记就重复了）"
@@ -451,32 +670,49 @@ class RuleTaker:
                 w["word"] = f"市场标题和场次对不上：{problem}"
                 w["probe_ms"] = now + 10 * 60_000  # looked at again in ten minutes, not every two seconds
                 return
-            w["market"], w["listed_ms"] = market, now
+            w["market"], w["listed_ms"], w["status_ms"] = market, now, now  # the listing's own read carries the status
+            if str(market.get("tradingStatus") or "").upper() == "OPEN":
+                w["open_ms"] = now
         w["look_ms"] = now
-        if not w["open_ms"]:
-            if w["listed_ms"] != now:  # the listing's own read is fresh; later, the details are read for the status
-                self.reads += 1
-                w["market"] = {**await self.api.market(str(w["market"]["id"])), "categorySlug": slug}
-            if str(w["market"].get("tradingStatus") or "").upper() != "OPEN":
-                w["word"] = f"已发布，撮合未开启（{w['market'].get('tradingStatus') or '?'}）"
-                return
-            w["open_ms"] = now
-        self.reads += 1
-        bids, asks = await self.book(str(w["market"]["id"]))
+        mid = str(w["market"]["id"])
+        self.stream.changed.discard(mid)
+        pushed = self.stream.book(mid)
+        if pushed is None:
+            self.reads += 1
+        bids, asks = pushed if pushed is not None else await self.book(mid)
         limit = D(self.settings.price(rule.key)) / 100
         own = self.own_asks(slug, rule.side)  # the pre-open mode's own bids there: never bought from (the account trading with itself)
         levels = [(p, q - own.get(p, D(0))) for p, q in offered(bids, asks, rule.side, limit) if q - own.get(p, D(0)) > 0]
-        best = offered(bids, asks, rule.side, D("0.99"))[:1]
+        w["offer"] = bool(levels)
         if not levels:
+            best = offered(bids, asks, rule.side, D("0.99"))[:1]
             w["word"] = f"盘口没有 ≤{int(limit * 100)}¢ 的{rule.word}" + (f"（最低 {float(best[0][0]) * 100:g}¢）" if best else "（没人卖）")
             return
-        room = D(str(self.settings.shares)) - D(str(held(rec) if rec else 0.0))
+        if not w["open_ms"]:
+            near = w["start"] - now <= NEAR_MS
+            if now - w["status_ms"] >= (FAST_S if near else OFFER_STATUS_S) * 1000:
+                w["status_ms"] = now
+                self.reads += 1
+                w["market"] = {**await self.api.market(mid), "categorySlug": slug}
+                if str(w["market"].get("tradingStatus") or "").upper() == "OPEN":
+                    w["open_ms"] = now
+            if not w["open_ms"]:
+                w["word"] = (f"盘口已有 ≤{int(limit * 100)}¢ 的{rule.word} {sum(q for _, q in levels):g} 份，等撮合开启就买"
+                             f"（现在 {w['market'].get('tradingStatus') or '?'}）")
+                return
+        room = D(str(size)) - D(str(held(rec) if rec else 0.0))
         take = min(sum(q for _, q in levels), room)
         if self.settings.mode == "on":
             take = min(take, D(str(self.owner.config.live_max_order_usd)) / limit)  # LIVE_MAX_ORDER_USD per order
+        if self.settings.max_day_usd:
+            left = self.settings.max_day_usd - spent_on(self.recs, day_of(now), self.settings.mode)
+            take = min(take, D(str(max(left, 0.0))) / limit)
+            if left < 1.0:
+                w["word"] = f"今天已花 ${self.settings.max_day_usd - left:,.2f}，到了每天上限 ${self.settings.max_day_usd:g}（RULE_MAX_DAY_USD）"
+                return
         take = take.to_integral_value(rounding="ROUND_FLOOR")
         if take < 1 or float(take * limit) < 1.0:  # Predict's minimum order ($1, live.MIN_ORDER_USD)
-            w["word"] = f"盘口 ≤{int(limit * 100)}¢ 的{rule.word}只有 {sum(q for _, q in levels):g} 份，不够一张最小订单"
+            w["word"] = f"盘口 ≤{int(limit * 100)}¢ 的{rule.word}只有 {sum(q for _, q in levels):g} 份，不够一张最小订单（或额度剩得不够）"
             return
         if self.settings.mode == "paper":
             self.paper(slug, w, rule, levels, take, limit, rec)
@@ -710,17 +946,23 @@ class RuleTaker:
     def status(self) -> str:
         now, s = self.now(), self.settings
         recs = self.recs
-        lines = [f"规则吃单：{MODES.get(s.mode, s.mode)}（RULE_TAKER={s.mode}）｜每场最多 {s.shares:g} 份｜下单到开场前 {STOP_MS // 1000} 秒"]
+        lines = [f"规则吃单：{MODES.get(s.mode, s.mode)}（RULE_TAKER={s.mode}）｜只在开场前吃，盘口一有就买，到开场前 {STOP_MS // 1000} 秒"
+                 + (f"｜每天最多花 ${s.max_day_usd:g}（今天已花 ${spent_on(recs, day_of(now), s.mode):,.2f}）" if s.max_day_usd else "")
+                 + f"｜推送 {'已连接' if self.stream.ws is not None else '未连接' + ('（' + self.stream.error + '）' if self.stream.error else '')}"]
         if s.mode == "on" and (why := self.block(0.0)):
             lines.append(f"⏸ 现在不下单：{why}")
-        for rule in RULES:
-            cents = s.price(rule.key)
-            if cents <= 0:
-                lines.append(f"· {rule.name}：不做（价格设为 0）")
+        for market, name in MARKET_NAMES.items():
+            lines.append(f"{name}：{'开' if s.on(market) else '关'}" + (f"｜每场最多 {s.shares_of(market):g} 份" if s.on(market) else "（这个市场的规则都不做）"))
+            if not s.on(market):
                 continue
-            nxt = min((w for w in self.track.values() if w["rule"] == rule.key), key=lambda w: w["start"], default=None)
-            lines.append(f"· {rule.name} 买{rule.word} ≤{cents}¢：{rule.when}"
-                         + (f"｜下一场 {bj(nxt['start'])}{('：' + nxt['word']) if nxt['word'] else ''}" if nxt else ""))
+            for rule in (r for r in RULES if r.market == market):
+                cents = s.price(rule.key)
+                if cents <= 0:
+                    lines.append(f"· {rule.name}：不做（价格设为 0）")
+                    continue
+                nxt = min((w for w in self.track.values() if w["rule"] == rule.key), key=lambda w: w["start"], default=None)
+                lines.append(f"· {rule.name} 买{rule.word} ≤{cents}¢：{rule.when}"
+                             + (f"｜下一场 {bj(nxt['start'])}{('：' + nxt['word']) if nxt['word'] else ''}" if nxt else ""))
         today = day_of(now)
         mine = [r for r in recs.values() if day_of(int(r.get("start_ms") or 0)) == today and filled(r) > DUST]
         if mine:

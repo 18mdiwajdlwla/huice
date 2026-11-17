@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.153.0"
+VERSION = "1.153.1"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -627,14 +627,21 @@ RULE_SETTING_KEYS = {"gold_shut": "RULE_GOLD_SHUT_CENTS", "gold_open": "RULE_GOL
 RULE_DEFAULT_CENTS = {"gold_shut": 58, "gold_open": 50, "gold_0515": 58, "oil_shut": 0, "oil_open": 55}  # oil_shut 0: ties settle Up, Down won 42% (1.153.0)
 
 
+RULE_MARKET_KEYS = {"gold": ("RULE_GOLD", "RULE_GOLD_SHARES"), "oil": ("RULE_OIL", "RULE_OIL_SHARES")}  # 1.153.1: each market's switch and size
+
+
 @dataclass(frozen=True)
 class RuleSettings:
-    """规则吃单 (rules.py): RULE_TAKER off | paper (只记录，不下单) | on (真实吃单, with LIVE=on), each rule's highest price in cents
-    (RULE_*_CENTS, 0 = that rule off) and the most shares bought a window (RULE_SHARES). Validated when on or paper; read
-    leniently when off, as PreopenSettings is."""
+    """规则吃单 (rules.py): RULE_TAKER off | paper (只记录，不下单) | on (真实吃单, with LIVE=on); each market on or off by itself
+    (RULE_GOLD, RULE_OIL, 1.153.1) with the most shares bought a window (RULE_GOLD_SHARES, RULE_OIL_SHARES; RULE_SHARES, 1.153.0's
+    one figure, is the default of both); each rule's highest price in cents (RULE_*_CENTS, 0 = that rule off); the most spent a
+    Beijing day, the rules together (RULE_MAX_DAY_USD, 0 = no cap). Validated when on or paper; read leniently when off, as
+    PreopenSettings is."""
     mode: str = "off"
     cents: tuple = tuple(RULE_DEFAULT_CENTS.items())
-    shares: int = 50
+    markets: frozenset = frozenset(RULE_MARKET_KEYS)
+    shares: tuple = (("gold", 50), ("oil", 50))
+    max_day_usd: float = 0.0
 
     @property
     def enabled(self) -> bool:
@@ -642,6 +649,12 @@ class RuleSettings:
 
     def price(self, key: str) -> int:
         return int(dict(self.cents).get(key, 0))
+
+    def on(self, market: str) -> bool:
+        return market in self.markets
+
+    def shares_of(self, market: str) -> int:
+        return int(dict(self.shares).get(market, 0))
 
     @classmethod
     def from_env(cls, e: Mapping, force: bool = False) -> "RuleSettings":
@@ -658,10 +671,17 @@ class RuleSettings:
         if mode not in {"off", "paper", "on"}:
             raise ValueError("RULE_TAKER 只能是 off、paper（只记录不下单）或 on（真实吃单）")
         cents = {key: int(str(e.get(name, RULE_DEFAULT_CENTS[key])).strip() or 0) for key, name in RULE_SETTING_KEYS.items()}
-        shares = int(str(e.get("RULE_SHARES", "50")).strip() or 0)
-        if any(not (c == 0 or 1 <= c <= 95) for c in cents.values()) or not 1 <= shares <= 100_000:
-            raise ValueError("RULE_*_CENTS 是 0（不做这条规则）或 1～95（¢，最高买价）；RULE_SHARES 每场最多买 1～100000 份")
-        return cls(mode, tuple(cents.items()), shares)
+        switches = {m: str(e.get(switch, "on")).strip().lower() for m, (switch, _) in RULE_MARKET_KEYS.items()}
+        default = str(e.get("RULE_SHARES", "50")).strip() or "50"
+        shares = {m: int(str(e.get(name, default)).strip() or 0) for m, (_, name) in RULE_MARKET_KEYS.items()}
+        max_day = float(str(e.get("RULE_MAX_DAY_USD", "0")).strip() or 0)
+        if any(v not in {"on", "off"} for v in switches.values()):
+            raise ValueError("RULE_GOLD、RULE_OIL 只能是 on 或 off")
+        if (any(not (c == 0 or 1 <= c <= 95) for c in cents.values()) or any(not 1 <= n <= 100_000 for n in shares.values())
+                or not 0 <= max_day <= 1_000_000):
+            raise ValueError("RULE_*_CENTS 是 0（不做这条规则）或 1～95（¢，最高买价）；RULE_GOLD_SHARES、RULE_OIL_SHARES 每场最多买 1～100000 份；"
+                             "RULE_MAX_DAY_USD 0～1000000（每天最多花多少，0 = 不限）")
+        return cls(mode, tuple(cents.items()), frozenset(m for m, v in switches.items() if v == "on"), tuple(shares.items()), max_day)
 
 
 CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
@@ -758,19 +778,24 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
      "3～1440：调小就只挂快开场的几场，少占资金、少读接口，但新场次要等进了范围才挂，排在先挂的人后面"),
     ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "0～1000000，0 = 不限（默认）：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金，成交时才扣款；余额够一场双边就挂）；设了上限时每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放，/preopen 会算出把已发布的全部挂上需要多少"),
     # 1.153.0: 规则吃单 (rules.py) — the gold / oil windows the backtest found mispriced (README「规则吃单」)
-    ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段：开场前盘口出现规则价格以下的指定方向就直接吃单（1.153.0）。off 关；paper 只记录不下单："
-     "按当时盘口记下会买到多少、按 Predict 的结果结算，先看几天再开；on 真实吃单（需要 LIVE=on；真实交易暂停、今日亏损停机、接口限流冷却时都不下单）"),
+    ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段，只在开场前吃：Predict 撮合开启后到开场前 10 秒，盘口一出现规则价以内的指定方向就立即买"
+     "（盘口变化由推送送来，不等下一次读）。off 关；paper 只记录不下单：按当时盘口记下会买到多少、按 Predict 的结果结算，先看几天再开；"
+     "on 真实吃单（需要 LIVE=on；真实交易暂停、今日亏损停机、接口限流冷却时都不下单）"),
+    ("RULE_GOLD", "规则吃单：黄金", "on = 做黄金的三条规则（下面三项价格设为 0 的那条不做）；off = 黄金一条都不做"),
+    ("RULE_GOLD_SHARES", "黄金：每场最多买多少份", "1～100000：黄金一个 15 分钟场次最多买这么多份（几次吃单合计）；每张单另受 LIVE_MAX_ORDER_USD 限制"),
     ("RULE_GOLD_SHUT_CENTS", "黄金休市 4 档：买涨不高于（¢）", "纽约 17:00–17:45、周一至周四 CME 每天休市的 4 个 15 分钟（北京冬令时 06:00–06:45，夏令时 05:00–05:45）："
      "指数不动，终点等于起点按涨结算；2025-12 至 2026-11 涨占 90%，每月最低 76%。0 = 不做"),
     ("RULE_GOLD_OPEN_CENTS", "黄金开盘第一档：买跌不高于（¢）", "纽约 18:00、周一至周四每天重新开盘的第一个 15 分钟（北京冬令时 07:00，夏令时 06:00）；"
      "周一早上那场（周末后开盘）跌只占 41%，不做。2026 年周二至周五跌占 58%，近半年 78%，但前几个月是涨多：0 = 不做"),
     ("RULE_GOLD_0515_CENTS", "黄金纽约 05:15：买跌不高于（¢）", "纽约 05:15–05:30、周一至周五（北京冬令时 18:15，夏令时 17:15）：伦敦上午定盘前，2026 年跌占 65%，"
      "前后几档只有 38–55%；按纽约时间算，夏令时是北京 17:15 那场（北京 18:15 那时跌只占 52%）。0 = 不做"),
+    ("RULE_OIL", "规则吃单：原油", "on = 做原油的两条规则（下面两项价格设为 0 的那条不做）；off = 原油一条都不做"),
+    ("RULE_OIL_SHARES", "原油：每场最多买多少份", "1～100000：原油一个 15 分钟场次最多买这么多份（几次吃单合计）；每张单另受 LIVE_MAX_ORDER_USD 限制"),
     ("RULE_OIL_SHUT_CENTS", "原油休市 4 档：买跌不高于（¢）", "原油的同一时段（纽约 17:00–17:45，周一至周四）。指数不动时按涨结算，2026-04 至 11 跌只占 42%："
      "45¢ 买跌每份约亏 3.6¢，所以默认 0 = 不做"),
     ("RULE_OIL_OPEN_CENTS", "原油开盘第一档：买跌不高于（¢）", "原油纽约 18:00、周一至周四重新开盘的第一个 15 分钟（北京冬令时 07:00）；2026 年跌占 59%："
      "55¢ 每份约赚 3¢，50¢ 约 8¢。0 = 不做"),
-    ("RULE_SHARES", "规则吃单：每场最多买多少份", "1～100000：一个 15 分钟场次最多买这么多份（几次吃单合计）；每张单另受 LIVE_MAX_ORDER_USD 限制"),
+    ("RULE_MAX_DAY_USD", "规则吃单：每天最多花多少（$）", "0～1000000：黄金、原油合计，一天（北京时间）下单的金额（成交的按成交价、还没结果的按全额）到这个数就不再买；0 = 不限"),
 )
 CONTROL_KEY_SET = frozenset(k for k, _, _ in CONTROL_KEYS)
 # One-click combinations for the control page (一键搭配): the strategy settings only. What to trade (SIM_MARKETS, SIM_SKIP),
@@ -11721,7 +11746,11 @@ CONTROL_FORMS: dict[str, dict] = {
     "RULE_GOLD_0515_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "50", "55", "58"], "unit": "¢", "zero": "不做"},
     "RULE_OIL_SHUT_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "35", "40", "45"], "unit": "¢", "zero": "不做"},
     "RULE_OIL_OPEN_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "45", "50", "55"], "unit": "¢", "zero": "不做"},
-    "RULE_SHARES": {"kind": "number", "group": "规则", "presets": ["10", "20", "50", "100", "200"], "unit": "份"},
+    "RULE_GOLD": {"kind": "choice", "group": "规则", "options": [["on", "on 开"], ["off", "off 关"]]},
+    "RULE_GOLD_SHARES": {"kind": "number", "group": "规则", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
+    "RULE_OIL": {"kind": "choice", "group": "规则", "options": [["on", "on 开"], ["off", "off 关"]]},
+    "RULE_OIL_SHARES": {"kind": "number", "group": "规则", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
+    "RULE_MAX_DAY_USD": {"kind": "number", "group": "规则", "presets": ["0", "50", "100", "200", "500", "1000"], "unit": "$", "zero": "不限"},
     "SIM_EDGE_CENTS": {"kind": "number", "group": "策略", "presets": ["3", "5", "8", "10", "15", "20"], "unit": "¢"},
     "SIM_SHARES": {"kind": "number", "group": "策略", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
     "SIM_TAKER_SHARES": {"kind": "number", "group": "策略", "presets": ["0", "10", "20", "50", "100", "200"], "unit": "份", "zero": "同每次份数"},
@@ -14745,7 +14774,8 @@ function evSection(ev){  // 模型 EV 对实际盈亏 (1.140.0): the poker track
   if((ev.cards||[]).length)el.append($("div","sub","按市场"),gt(ev.cards))}
 function rulesSection(ru){  // 规则吃单 (1.153.0): each rule's totals, the real and the paper apart, and the last windows bought
   const MODE={on:"真实",paper:"只记录"},RES={up:"涨",down:"跌",split:"平"},side=s=>s==="up"?"涨":"跌",kids=[];
-  kids.push($("p","small mut","现在："+({off:"关",paper:"只记录（不下单）",on:"真实吃单"}[ru.mode]||ru.mode)+"，每场最多 "+num(ru.shares)+" 份"));
+  const mk=Object.values(ru.markets||{}).map(x=>x.name+(x.on?" 开（每场最多 "+num(x.shares)+" 份）":" 关")).join("、");
+  kids.push($("p","small mut","现在："+({off:"关",paper:"只记录（不下单）",on:"真实吃单"}[ru.mode]||ru.mode)+(mk?"；"+mk:"")+(ru.max_day_usd?"；每天最多 $"+ru.max_day_usd:"")));
   if((ru.rules||[]).length)kids.push(table(["规则","买","模式","场次","份数","每份成本","成本","已结算","赢/输","盈亏","待结算"],
     ru.rules.map(r=>[r.name,side(r.side)+(r.cents?" ≤"+r.cents+"¢":"（已关）"),MODE[r.mode]||r.mode,num(r.windows),num(r.shares),r.shares?cent(r.cost/r.shares):"—",usd(r.cost),
       num(r.settled),r.wins+"/"+r.losses,r.settled?money(r.pnl):"—",num(r.open)])));
@@ -23976,7 +24006,9 @@ class Bot:
                   "PREOPEN_BTC5_CANCEL_SECONDS": str(c.preopen.btc5_cancel_seconds), "PREOPEN_BTC5_EXPIRY_SECONDS": str(c.preopen.btc5_expiry_seconds),
                   "PREOPEN_BTC5_ENTRY_SECONDS": str(c.preopen.btc5_entry_seconds), "PREOPEN_BTC5_AHEAD_MINUTES": str(c.preopen.btc5_ahead_minutes),
                   "PREOPEN_MAX_OPEN_USD": plain(c.preopen.max_open_usd), "PREOPEN_EXCLUSIVE": flag(c.preopen.exclusive),
-                  "RULE_TAKER": c.rules.mode, "RULE_SHARES": str(c.rules.shares), **{name: str(c.rules.price(key)) for key, name in RULE_SETTING_KEYS.items()},
+                  "RULE_TAKER": c.rules.mode, "RULE_MAX_DAY_USD": plain(c.rules.max_day_usd), **{name: str(c.rules.price(key)) for key, name in RULE_SETTING_KEYS.items()},
+                  **{switch: flag(c.rules.on(mk)) for mk, (switch, _) in RULE_MARKET_KEYS.items()},
+                  **{size: str(c.rules.shares_of(mk)) for mk, (_, size) in RULE_MARKET_KEYS.items()},
                   "SOURCES_OFF": ",".join(sorted(c.sources_off)), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
                   "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait), "LIVE_TAKER_PRICE": c.live_taker_price,

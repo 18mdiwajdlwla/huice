@@ -162,18 +162,26 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
     def test_settings_and_control_page(self):
         base = {"TELEGRAM_BOT_TOKEN": "offline"}
         c = m.Config.from_env(base).rules
-        self.assertEqual((c.mode, c.price("gold_shut"), c.price("gold_open"), c.price("gold_0515"), c.price("oil_shut"), c.price("oil_open"), c.shares),
-                         ("off", 58, 50, 58, 0, 55, 50))
+        self.assertEqual((c.mode, c.price("gold_shut"), c.price("gold_open"), c.price("gold_0515"), c.price("oil_shut"), c.price("oil_open")),
+                         ("off", 58, 50, 58, 0, 55))
+        self.assertEqual((c.on("gold"), c.on("oil"), c.shares_of("gold"), c.shares_of("oil"), c.max_day_usd), (True, True, 50, 50, 0.0))
+        c = m.Config.from_env({**base, "RULE_TAKER": "on", "RULE_OIL": "off", "RULE_SHARES": "30", "RULE_GOLD_SHARES": "100", "RULE_MAX_DAY_USD": "250"}).rules
+        self.assertEqual((c.on("gold"), c.on("oil"), c.shares_of("gold"), c.shares_of("oil"), c.max_day_usd), (True, False, 100, 30, 250.0),
+                         "1.153.0's RULE_SHARES is the default of both")
+        for bad in ({"RULE_GOLD": "maybe"}, {"RULE_OIL_SHARES": "0"}, {"RULE_MAX_DAY_USD": "-1"}):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                m.Config.from_env({**base, "RULE_TAKER": "paper", **bad})
         with self.assertRaises(ValueError):
             m.Config.from_env({**base, "RULE_TAKER": "on", "RULE_GOLD_SHUT_CENTS": "99"})
         with self.assertRaises(ValueError):
             m.Config.from_env({**base, "RULE_TAKER": "maybe"})
         self.assertEqual(m.Config.from_env({**base, "RULE_GOLD_SHUT_CENTS": "99"}).rules.price("gold_shut"), 58, "off: read leniently")
-        keys = {"RULE_TAKER", "RULE_SHARES", *m.RULE_SETTING_KEYS.values()}
+        keys = {"RULE_TAKER", "RULE_MAX_DAY_USD", *m.RULE_SETTING_KEYS.values(), *(k for pair in m.RULE_MARKET_KEYS.values() for k in pair)}
         self.assertTrue(keys <= m.CONTROL_KEY_SET and all(m.CONTROL_FORMS[k]["group"] == "规则" for k in keys))
         bot = types.SimpleNamespace(config=m.Config.from_env({**base, "RULE_TAKER": "paper", "RULE_OIL_SHUT_CENTS": "45"}))
         value = lambda key: m.Bot.control_value(bot, key)
-        self.assertEqual((value("RULE_TAKER"), value("RULE_OIL_SHUT_CENTS"), value("RULE_SHARES"), value("RULE_GOLD_SHUT_CENTS")), ("paper", "45", "50", "58"))
+        self.assertEqual((value("RULE_TAKER"), value("RULE_OIL_SHUT_CENTS"), value("RULE_GOLD_SHARES"), value("RULE_GOLD_SHUT_CENTS"), value("RULE_OIL"), value("RULE_MAX_DAY_USD")),
+                         ("paper", "45", "50", "58", "on", "0"))
         self.assertIn("规则吃单在真实交易模块里", m.Bot.cmd_rules(bot, None))
 
     async def test_paper_records_what_it_would_have_bought(self):
@@ -192,9 +200,9 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(t.track[slug]["word"], "还没发布", "half an hour out, a day past its listing moment: looked for every 30 s")
         clock.ms += 28_000
         await t.tick()
-        self.assertTrue(t.track[slug]["word"].startswith("已发布，撮合未开启"), t.track[slug])
+        self.assertEqual(t.track[slug]["word"], "盘口已有 ≤58¢ 的涨 70 份，等撮合开启就买（现在 MATCHING_NOT_ENABLED）")
         mkt["tradingStatus"] = "OPEN"
-        clock.ms += 61_000
+        clock.ms += int(R.OFFER_STATUS_S * 1000)  # an offer waiting: the status read every OFFER_STATUS_S, bought the moment it opens
         await t.tick()
         rec = t.record(slug)
         self.assertIsNotNone(rec)
@@ -205,7 +213,7 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         clock.ms += 61_000
         await t.tick()
         self.assertEqual(len(t.record(slug)["orders"]), 1, "bought up to RULE_SHARES: no more")
-        self.assertEqual(t.track[slug]["word"], "这一场已买满")
+        self.assertEqual(t.track[slug]["word"], "这一场已买满 50 份")
         self.assertEqual(R.filled_by_outcome(t.recs, clock.ms), {}, "paper: no position to explain")
         # the result: Up won
         clock.ms = rec["end_ms"] + R.SETTLE_AFTER_MS
@@ -420,6 +428,116 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
             await t.tick()
         self.assertEqual(len(api.sent), R.MAX_REJECTS)
         self.assertIn(f"拒绝了 {R.MAX_REJECTS} 次", t.track[slug]["word"])
+
+    async def test_each_market_on_its_own_with_its_own_size(self):
+        """RULE_GOLD / RULE_OIL switch a market's rules on or off by themselves; RULE_GOLD_SHARES / RULE_OIL_SHARES size each."""
+        t, api, clock, x = taker("on", RULE_OIL="off", RULE_GOLD_SHARES="20")
+        await t.tick()
+        self.assertTrue(t.track and all(R.RULE_OF[w["rule"]].market == "gold" for w in t.track.values()), "oil switched off: none of its windows")
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.51, 300]]}
+        clock.ms += int(R.SLOW_S * 1000)
+        await t.tick()
+        self.assertEqual(L.from_wei(int(api.sent[0]["data"]["order"]["takerAmount"])), 20.0, "RULE_GOLD_SHARES")
+        t.configure(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "RULE_TAKER": "on", "RULE_GOLD": "off"}).rules)
+        await t.tick()
+        self.assertTrue(t.track and all(R.RULE_OF[w["rule"]].market == "oil" for w in t.track.values()), "gold off, oil on: only oil's windows")
+        status = t.status()
+        self.assertIn("黄金：关", status)
+        self.assertIn("原油：开｜每场最多 50 份", status)
+
+    async def test_the_day_is_capped(self):
+        """RULE_MAX_DAY_USD: the orders placed in a Beijing day — fills at their price and fee, open ones in full at the limit —
+        stop at the cap."""
+        t, api, clock, x = taker("on", RULE_MAX_DAY_USD="20")
+        s1, s2 = (f"xau-updown-15m-{GOLD_0600 // 1000}", f"xau-updown-15m-{(GOLD_0600 + 15 * 60_000) // 1000}")
+        api.markets["901"], api.markets["902"] = gold_market(GOLD_0600), gold_market(GOLD_0600 + 15 * 60_000, mid=902)
+        api.listed |= {s1, s2}
+        api.books["901"] = {"bids": [], "asks": [[0.51, 100]]}
+        api.books["902"] = {"bids": [], "asks": [[0.51, 100]]}
+        api.fill[1] = api.fill[2] = 34.0
+        api.price = 0.51
+        await t.tick()
+        self.assertEqual(L.from_wei(int(api.sent[0]["data"]["order"]["takerAmount"])), 34.0, "$20 at the 58¢ limit: 34 shares")
+        self.assertIn("到了每天上限", t.track[s2]["word"], "the first order open: counted in full at its limit")
+        clock.ms += R.FILL_READ_MS
+        await t.tick()
+        clock.ms += int(R.SLOW_S * 1000)
+        await t.tick()
+        # 34 × (51¢ + fee) = $17.67 spent: $2.33 left, 4 shares at the 58¢ limit
+        self.assertEqual(L.from_wei(int(api.sent[1]["data"]["order"]["takerAmount"])), 4.0)
+        clock.ms += R.FILL_READ_MS
+        await t.tick()
+        clock.ms += int(R.SLOW_S * 1000)
+        await t.tick()
+        self.assertEqual(len(api.sent), 2)
+        self.assertIn("到了每天上限", t.track[s2]["word"])
+        self.assertIn("每天最多花 $20", t.status())
+
+    async def test_an_offer_is_bought_the_moment_matching_opens(self):
+        """An offer at the rule's price before matching opens: the status read every OFFER_STATUS_S (every FAST_S near the
+        start), and bought in that same look once it says OPEN."""
+        t, api, clock, x = taker("on")
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        mkt = api.markets["901"] = gold_market(GOLD_0600, status="MATCHING_NOT_ENABLED")
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+        await t.tick()
+        self.assertEqual((api.sent, t.track[slug]["offer"]), ([], True))
+        clock.ms += int(R.OFFER_STATUS_S * 1000) - 1
+        await t.tick()
+        self.assertEqual(sum(1 for c in api.calls if c.endswith("/orderbook")), 1, "not looked at again before OFFER_STATUS_S")
+        mkt["tradingStatus"] = "OPEN"
+        clock.ms += 1
+        await t.tick()
+        self.assertEqual(len(api.sent), 1)
+
+    async def test_a_pushed_offer_is_bought_at_once(self):
+        """The listed windows' books come pushed (RuleStream): a book that changed wakes the loop and its window is looked at
+        at once — no waiting for the read cadence, no REST read of the book while the push is fresh."""
+        t, api, clock, x = taker("on")
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.70, 30]]}
+        await t.tick()
+        self.assertEqual((api.sent, t.stream.wanted), ([], {"901"}), "listed: its book wanted pushed")
+        sent: list = []
+        frames: asyncio.Queue = asyncio.Queue()
+
+        class Socket:
+            async def send(self, text): sent.append(json.loads(text))
+            async def recv(self): return await frames.get()
+            async def close(self): pass
+
+        async def connect(url, headers):
+            self.assertEqual(url, m.PREDICT_WS_URL)
+            return Socket()
+        t.stream.connect = connect
+        streaming = asyncio.create_task(t.stream.run())
+        for _ in range(50):
+            await asyncio.sleep(0)
+        self.assertEqual(sent[0], {"method": "subscribe", "requestId": 1, "params": ["predictOrderbook/901"]})
+        await frames.put(json.dumps({"type": "R", "requestId": 1, "success": True}))
+        await frames.put(json.dumps({"type": "M", "topic": "heartbeat", "data": 7}))
+        await frames.put(json.dumps({"type": "M", "topic": "predictOrderbook/901", "data": {"version": 2, "bids": [], "asks": [[0.52, 25]]}}))
+        for _ in range(50):
+            await asyncio.sleep(0)
+        self.assertIn({"method": "heartbeat", "data": 7}, sent)
+        self.assertTrue(t.stream.pushed.is_set() and "901" in t.stream.changed)
+        reads = sum(1 for c in api.calls if c.endswith("/orderbook"))
+        clock.ms += 1_000  # a second on: far from its read cadence (SLOW_S), looked at because the push changed it
+        await t.tick()
+        self.assertEqual(L.from_wei(int(api.sent[0]["data"]["order"]["takerAmount"])), 25.0)
+        self.assertEqual(sum(1 for c in api.calls if c.endswith("/orderbook")), reads, "the pushed book, not a REST read")
+        await frames.put(json.dumps({"type": "M", "topic": "predictOrderbook/901", "data": {"version": 1, "bids": [], "asks": [[0.40, 99]]}}))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        self.assertEqual(t.stream.book("901")[1], ((D("0.52"), D("25")),), "an older version is dropped")
+        t.stop.set()
+        await asyncio.wait_for(streaming, 2)
 
     async def test_off_finishes_what_is_open_and_plans_nothing(self):
         t, api, clock, x = taker("on")
