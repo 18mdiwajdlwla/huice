@@ -1,6 +1,9 @@
 """Imported first by every suite: any real HTTP request fails at once, so results never depend on the network."""
 import http.client
+import os
 import urllib.request
+
+os.environ["PREDICT_PACING"] = "off"  # the request pacer (main.PredictPacer, 1.154.0) waits on the clock: the suites run unpaced
 
 
 def _no_network(request, *args, **kwargs):

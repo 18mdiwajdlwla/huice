@@ -764,7 +764,9 @@ https://predict.fun/zh-cn/market/hang-seng-index-up-or-down-on-october-5-2026?re
 | `LIVE` | `off` | 真实交易模式的**初始值**：`off` 只记账；`pause` 登录 Predict、链上校验、读余额授权，`/live` 自检与挂单测试、撤单、领取都可用，但**不开新仓**；`on` 真实下单。只要配置了 `PREDICT_PRIVATE_KEY`，真实交易模块就一直加载，运行中用 `/live mode off|pause|on` 或控制台的模式按钮切换，立即生效并保存（重启沿用，环境变量不必再改）。`off` 状态下重启（每次部署都会重启）不登录 Predict、不自动领取，赢的持仓发 `/live redeem` 领（1.150.0 起 `/live` 的自动领取一行和切到 off 的通知都写明）。都需要 `SIM=on`、`PREDICT=on` |
 | `PREDICT_PRIVATE_KEY` | 无 | 签名用的私钥，64 位十六进制（0x 可省）。两种填法：**A.** 用 Predict 网站账户交易：网站账户设置里“导出私钥 / Export wallet”得到的 Privy 钱包私钥（它的地址和充值地址不是同一个，这是正常的）；**B.** 用自己的普通钱包交易：那个钱包的私钥，建议新建一个机器人专用钱包 |
 | `PREDICT_ACCOUNT` | 空 | 填法 A 必填：网站账户设置里的**充值地址**（0x 开头 40 位，USDT 和份额都在这个地址上）；填法 B 留空。启动和 `--live-check` 会在链上核对这把私钥是不是该账户的控制钥匙，对不上就不下单并说明原因 |
-| `PREDICT_API_KEY` | 空 | Predict 开发者 API Key，在开发者控制台 <https://developers.predict.fun> 申请；主网所有接口都要它（默认限额每分钟 240 次请求，本机器人远低于此） |
+| `PREDICT_API_KEY` | 空 | Predict 开发者 API Key，在开发者控制台 <https://developers.predict.fun> 申请；主网所有接口都要它（默认限额每分钟 240 次请求：预挂全开、每场多档时会顶到上限，见下两行） |
+| `PREDICT_RATE_PER_MIN` | `220` | 每个 API Key 每分钟最多发多少次请求（1.154.0，`0` = 不节流）。之前不节流，一超 240 次 Predict 就回 429，同一个 Key 上的所有请求停 20 秒：账户快照从第一页重读、预挂“暂不新挂”、排队越积越长。现在每个请求先领一个名额：读等节拍，下单和撤单可以先借（最多 8 个），不排在读的后面；预挂的下单（提前几小时挂的）和读一样等节拍（1.154.1），先借的名额留给原策略的吃单、规则吃单和所有撤单。已经挂着的单成交不受影响（撮合在 Predict），盘口推送也不受影响。Predict 给你的 Key 提高了限额就按新限额略低一点设 |
+| `PREOPEN_API_KEY` | 空 | 开盘前预挂专用的第二个 API Key（1.154.0）：在开发者控制台再申请一个，填在这里，预挂的请求（几千张单、快照的几百页）就用它自己的每分钟额度，和原策略、盘口分开，限流也互不影响。不填 = 和其他部分共用 `PREDICT_API_KEY`。Predict 的限额是按 Key 算的话，相当于额度翻倍；`/diag` 的“限流”行看两边还有没有 429 |
 | `PREDICT_CHAIN_ID` | `56` | 56 BNB 主网，97 BNB 测试网（下单走 `api-testnet.predict.fun`，不需要 API Key；但卡片和盘口仍来自主网市场，测试网只能验证签名和下单链路，不能完整回放策略） |
 | `BSC_RPC_URL` | 公共节点 | 读余额、授权，发授权/领取交易的 JSON-RPC 节点 |
 | `LIVE_TAKER_WAIT_SECONDS` | `60` | 吃单的限价单挂出后，这么多秒内没成交的部分撤掉；公平价变到限价高于“门槛低 2¢”算出的封顶价时提前撤（1.90.0 之前按门槛本身算，公平价抖几毫就撤）（旧变量 `LIVE_TAKER`、`LIVE_SLIPPAGE_BPS` 已取消，写了也不起作用） |

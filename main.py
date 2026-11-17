@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.153.3"
+VERSION = "1.154.1"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -977,6 +977,8 @@ class Config:
     live_taker_retry: int = 30         # LIVE_TAKER_RETRY_SECONDS: ...whose taker filled nothing (the timer, the bot's own re-judgement) or was dropped at the re-check
     live_max_order_usd: float = 100.0  # LIVE_MAX_ORDER_USD: the most one order may cost
     live_orders_page: int = 50         # LIVE_ORDERS_PAGE: orders per page when the account's open list is read (a page is a round trip; 1.112.1)
+    predict_rate_per_min: float = 220.0  # PREDICT_RATE_PER_MIN: every API key's requests paced to this many a minute (PredictPacer, 1.154.0); 0 = no pacing
+    preopen_api_key: str = ""          # PREOPEN_API_KEY: a second Predict API key for the pre-open mode alone — its own request budget (1.154.0)
     live_max_open_usd: float = 500.0   # LIVE_MAX_OPEN_USD: filled positions plus resting orders, at cost
     live_max_daily_loss_usd: float = 200.0  # LIVE_MAX_DAILY_LOSS_USD: realised loss per Beijing day that stops new orders; 0 = no limit
     live_auto_redeem: bool = True      # LIVE_AUTO_REDEEM: redeem resolved positions for USDT on-chain
@@ -1196,6 +1198,8 @@ class Config:
             live_taker_retry=bounded_int(e, "LIVE_TAKER_RETRY_SECONDS", 30, 1, 3600),
             live_max_order_usd=parse_bounded(e, "LIVE_MAX_ORDER_USD", "100", 1, 1_000_000),
             live_orders_page=bounded_int(e, "LIVE_ORDERS_PAGE", 50, 10, 500),
+            predict_rate_per_min=float(bounded_int(e, "PREDICT_RATE_PER_MIN", 220, 0, 100_000)),
+            preopen_api_key=str(e.get("PREOPEN_API_KEY", "")).strip(),
             live_max_open_usd=parse_bounded(e, "LIVE_MAX_OPEN_USD", "500", 1, 100_000_000),
             live_max_daily_loss_usd=parse_bounded(e, "LIVE_MAX_DAILY_LOSS_USD", "200", 0, 100_000_000),
             live_auto_redeem=not off(e.get("LIVE_AUTO_REDEEM", "on")),
@@ -5412,6 +5416,56 @@ def predict_pool() -> ThreadPoolExecutor:
 async def predict_blocking(fn: Any, *args: Any) -> Any:
     """A blocking Predict request on Predict's own thread pool: never queued behind a hanging quote feed."""
     return await asyncio.get_running_loop().run_in_executor(predict_pool(), fn, *args)
+
+
+PREDICT_PACING = os.environ.get("PREDICT_PACING", "on").strip().lower() != "off"  # the offline tests switch it off (tests/offline.py)
+
+
+class PredictPacer:
+    """An API key's request budget (1.154.0): Predict allows a key so many requests a minute (240 by default) and answers more
+    with a 429 — and each 429 stopped every request on the key for twenty seconds: the account snapshot started over from its
+    first page, the pre-open mode placed nothing ("暂不新挂"), and its queue grew (11-17: 1,145 listed windows unplaced). Every
+    request on the key now takes a token first (PREDICT_RATE_PER_MIN a minute, a burst of BURST): a read waits for a whole one;
+    an order or a cancel may borrow up to a burst ahead of the reads, so it never queues behind them. The whole key's traffic —
+    the orderbook feed, the model trader, the pre-open mode, the rule taker — shares it (predict_pacer, one a key)."""
+    BURST = 8.0
+
+    def __init__(self, per_min: float):
+        self.per_min = float(per_min)
+        self.tokens = self.BURST
+        self.at = time.monotonic()
+        self.waited = 0.0  # seconds the reads have waited for a token, in all (/diag)
+
+    def refill(self) -> None:
+        now = time.monotonic()
+        self.tokens = min(self.BURST, self.tokens + (now - self.at) * self.per_min / 60.0)
+        self.at = now
+
+    async def take(self, write: bool = False) -> None:
+        if self.per_min <= 0 or not PREDICT_PACING:
+            return
+        need = 1.0 - self.BURST if write else 1.0  # what must be in the bucket for this one to go
+        while True:
+            self.refill()
+            if self.tokens >= need - 1e-9:
+                self.tokens -= 1.0
+                return
+            wait = (need - self.tokens) * 60.0 / self.per_min
+            self.waited += wait
+            await asyncio.sleep(wait)
+
+
+PREDICT_PACERS: dict[str, PredictPacer] = {}
+PREDICT_RATE = {"per_min": 220.0}  # PREDICT_RATE_PER_MIN, set by Config (Bot.apply_config): every key's pace
+
+
+def predict_pacer(key: str) -> PredictPacer:
+    """The pacer of an API key (one for every client on it); its pace follows PREDICT_RATE_PER_MIN."""
+    pacer = PREDICT_PACERS.get(key)
+    if pacer is None:
+        pacer = PREDICT_PACERS[key] = PredictPacer(PREDICT_RATE["per_min"])
+    pacer.per_min = PREDICT_RATE["per_min"]
+    return pacer
 PREDICT_BACKOFF_SECONDS = 20    # after a 429 without retry_after: how long every Predict request waits
 PREDICT_META_SECONDS = 600     # outcome names / status of a ladder market are re-read this often
 PREDICT_META_KEEP_SECONDS = 86400  # FEED-CACHE-GROWTH: a market no card follows any more loses its details/fee after a day untouched
@@ -5942,6 +5996,7 @@ class PredictFeed:
 
     def __init__(self, config: Config):
         self.config = config
+        PREDICT_RATE["per_min"] = float(getattr(config, "predict_rate_per_min", 220.0))  # the key's pace (PredictPacer, 1.154.0)
         self.markets: dict[str, tuple[dict | None, float]] = {}  # slug -> (market or None = not listed, when)
         self.book_keys: dict[str, str] = {}                      # market id -> id/conditionId that answered
         self.books: dict[str, PredictBook] = {}                  # item key -> latest book
@@ -6003,6 +6058,8 @@ class PredictFeed:
         left = self.blocked_until - time.monotonic()
         if left > 0:
             raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
+        if url.startswith(PREDICT_REST):
+            await predict_pacer(self.config.predict_api_key).take()  # the key's budget, shared with the trading clients (1.154.0)
         async with self.gate:
             # 1.150.0: a cooldown that began while this request waited for its slot (another read's 429) is honoured here too,
             # as live.py's send() does since 1.138.0: nothing queued behind the PREDICT_PARALLEL in flight goes out into it.
@@ -23954,6 +24011,7 @@ class Bot:
         before = self.config
         self.config = config
         self.predict.config = config  # the orderbook feed keeps its own reference (PREDICT_POLL_SECONDS)
+        PREDICT_RATE["per_min"] = float(config.predict_rate_per_min)  # PREDICT_RATE_PER_MIN as saved (1.154.0)
         SOURCE_HEALTH.off = config.sources_off  # the quote feeds read the switch from here
         # 1.150.0 (audit CTRL-CONFIG-RUNTIME): three more things were built from the start-up configuration and kept it until
         # the next restart. PREOPEN_15M / PREOPEN_MARKETS add the exchange ticker of a stock card the pre-open mode quotes
