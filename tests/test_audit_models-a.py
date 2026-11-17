@@ -3,6 +3,10 @@ import asyncio, sys, math, time, types, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP)
 import main as m
+# 1.154.10: NVIDIA 160/210 was taken off the page (TOUCH_SETTLED: Predict answers its book 404); the stock touch card stays,
+# and this suite lists the market again as its fixture
+if m.touch_spec("NVDA-2027") not in m.TOUCH_MARKETS:
+    m.TOUCH_MARKETS = (*m.TOUCH_MARKETS, m.touch_spec("NVDA-2027"))
 import live as L
 D = m.D
 
@@ -1174,7 +1178,7 @@ for at, closed in ((NVC_CLOSE - 1, False), (NVC_CLOSE, True), (NVC_NEXT - 1, Tru
     assert bot.sim_withdraw_reason(rec, None, at) == (NVC_WHY if closed else ""), (at, bot.sim_withdraw_reason(rec, None, at))
 # not a taker's record; not the crypto first-touch cards, which trade around the clock
 assert bot.sim_withdraw_reason({**rec, "maker": False}, None, NVC_CLOSE) == ""
-for key in ("BNB-2027", "BTC-2027"):
+for key in ("BTC-2027", "SOL"):  # (1.154.10: BNB 600/800 taken off)
     spec = bot.touches[key].spec
     assert type(bot.touches[key]) is m.TouchMarket and spec.deadline_ms > NVC_NEXT
     assert bot.sim_withdraw_reason({**rec, "market": spec.slug, "slug": spec.slug, "key": key, "settle": {"deadline": spec.deadline_ms}}, None, NVC_CLOSE) == ""
