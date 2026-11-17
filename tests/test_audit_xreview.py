@@ -189,7 +189,7 @@ async def resume_preopen_anchor():
     assert why, "the conservative re-trip is kept"
     # ... and says what moved, not a loss that never happened
     assert "之后又亏 $60.00" not in why, why
-    assert "原策略 −$110.00" in why and "预挂 +$60.00" in why and "预挂 +$0.00" in why and "预挂未运行" in why, why
+    assert "原策略 −$110.00" in why and "预挂和规则吃单 +$60.00" in why and "预挂和规则吃单 +$0.00" in why and "预挂未运行" in why, why  # 1.153.3: the rule taker's day in the same part
     assert why in bot.notes[-1], bot.notes
     assert rec.get("resumed_own") == -110.0 and rec.get("resumed_preopen") == 60.0, rec  # the parts kept with the resume
 
@@ -2119,8 +2119,8 @@ async def winddown_gain():
     bot.preopen.winding = "预挂模式已关闭"  # switched off: winding down, its controller alive
     assert bot.preopen_active() and bot.preopen_pnl() == 0.0, bot.preopen_pnl()
     bot.live_check_kill(trades, NOW + 1000)
-    assert bot.live_killed() == ("今日已结算亏损 −$110.00 达到 LIVE_MAX_DAILY_LOSS_USD $50，手动恢复时 −$50.00（原策略 −$110.00、预挂 +$60.00），"
-                                 "现在原策略 −$110.00、预挂 +$0.00（预挂已关闭、正在收尾：当日盈利不计入）"), bot.live_killed()
+    assert bot.live_killed() == ("今日已结算亏损 −$110.00 达到 LIVE_MAX_DAILY_LOSS_USD $50，手动恢复时 −$50.00（原策略 −$110.00、预挂和规则吃单 +$60.00），"
+                                 "现在原策略 −$110.00、预挂和规则吃单 +$0.00（预挂已关闭、正在收尾：当日盈利不计入）"), bot.live_killed()
     # a resume taken DURING the wind-down anchors on what counts (−$110, line −$160), not on the gain about to drop out: when
     # the controller ends, no false re-trip (before: anchored at −$50, line −$100, tripped again a minute on with no trade)
     bot, trades = bot_with(60.0)
