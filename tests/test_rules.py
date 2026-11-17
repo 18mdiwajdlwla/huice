@@ -147,6 +147,12 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(R.ny_0515(bj(2026, 11, 17, 18, 15)) and R.ny_0515(bj(2026, 7, 14, 17, 15)))
         self.assertFalse(R.ny_0515(bj(2026, 7, 14, 18, 15)), "summer: Beijing 18:15 is 06:15 New York")
         self.assertFalse(R.ny_0515(bj(2026, 11, 21, 18, 15)), "Saturday: CME shut")
+        # 1.153.2: the slot scan's three, in New York time like the rest
+        g0500, g1645, o0045 = (R.RULE_OF[k].matches for k in ("gold_0500", "gold_1645", "oil_0045"))
+        self.assertTrue(g0500(bj(2026, 11, 17, 18, 0)) and g0500(bj(2026, 7, 14, 17, 0)) and not g0500(bj(2026, 7, 14, 18, 0)))
+        self.assertTrue(g1645(bj(2026, 11, 18, 5, 45)) and g1645(bj(2026, 11, 21, 5, 45)), "Friday's last before the weekend counts")
+        self.assertFalse(g1645(bj(2026, 11, 27, 5, 45)), "Thanksgiving: shut from noon")
+        self.assertTrue(o0045(bj(2026, 11, 17, 13, 45)) and not o0045(bj(2026, 11, 22, 13, 45)), "Sunday: shut")
         week = R.windows(R.RULE_OF["gold_shut"], bj(2026, 11, 16, 0), bj(2026, 11, 23, 0))
         self.assertEqual(len(week), 16)  # Tuesday to Friday mornings, four each
         self.assertEqual({R.bj(s, False) for s in week}, {"06:00", "06:15", "06:30", "06:45"})
@@ -163,7 +169,8 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         base = {"TELEGRAM_BOT_TOKEN": "offline"}
         c = m.Config.from_env(base).rules
         self.assertEqual((c.mode, c.price("gold_shut"), c.price("gold_open"), c.price("gold_0515"), c.price("oil_shut"), c.price("oil_open")),
-                         ("off", 58, 50, 58, 0, 55))
+                         ("off", 58, 50, 58, 0, 50), "1.153.2: oil's reopen at 50¢")
+        self.assertEqual((c.price("gold_0500"), c.price("gold_1645"), c.price("oil_0045")), (0, 0, 0), "the scan's three: off until tried")
         self.assertEqual((c.on("gold"), c.on("oil"), c.shares_of("gold"), c.shares_of("oil"), c.max_day_usd), (True, True, 50, 50, 0.0))
         c = m.Config.from_env({**base, "RULE_TAKER": "on", "RULE_OIL": "off", "RULE_SHARES": "30", "RULE_GOLD_SHARES": "100", "RULE_MAX_DAY_USD": "250"}).rules
         self.assertEqual((c.on("gold"), c.on("oil"), c.shares_of("gold"), c.shares_of("oil"), c.max_day_usd), (True, False, 100, 30, 250.0),
@@ -538,6 +545,34 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(t.stream.book("901")[1], ((D("0.52"), D("25")),), "an older version is dropped")
         t.stop.set()
         await asyncio.wait_for(streaming, 2)
+
+    async def test_each_watch_is_kept_for_tuning(self):
+        """1.153.2: each watched window's watch kept on its record at its end — the lowest offer of the side, the most shares
+        offered at the price at once, when matching opened — one bought from and one that never offered at the price alike."""
+        t, api, clock, x = taker("paper")
+        s1, s2 = f"xau-updown-15m-{GOLD_0600 // 1000}", f"xau-updown-15m-{(GOLD_0600 + 15 * 60_000) // 1000}"
+        mkt = api.markets["901"] = gold_market(GOLD_0600, status="MATCHING_NOT_ENABLED")
+        api.markets["902"] = gold_market(GOLD_0600 + 15 * 60_000, mid=902)
+        api.listed |= {s1, s2}
+        api.books["901"] = {"bids": [], "asks": [[0.51, 30], [0.55, 12]]}
+        api.books["902"] = {"bids": [], "asks": [[0.62, 80]]}
+        await t.tick()
+        mkt["tradingStatus"] = "OPEN"
+        clock.ms = GOLD_0600 - 20 * 60_000  # forty minutes on: the status read, bought
+        await t.tick()
+        self.assertEqual(R.filled(t.record(s1)), 42.0)
+        clock.ms = GOLD_0600 + 15 * 60_000 - R.STOP_MS  # both windows past their end of watch
+        await t.tick()
+        w1, w2 = t.record(s1)["seen"], t.record(s2)["seen"]
+        self.assertEqual((w1["best"], w1["offer_max"], w1["open_ms"] > 0, w1["start_ms"]), (0.51, 42.0, True, GOLD_0600))
+        self.assertEqual((w2["best"], w2["offer_max"], t.record(s2)["orders"]), (0.62, 0.0, []), "no offer at the price: watched, nothing bought")
+        st = R.watch_stats(t.recs, "gold_shut", "paper", 0)
+        self.assertEqual((st["watched"], st["offered"], st["offer_avg"], round(st["best_mid"], 4)), (2, 1, 42.0, 0.565))
+        self.assertEqual(st["open_lead"], (20 * 60 + 45 * 60) / 2, "opened 20 minutes before the first's start, at listing for the second")
+        self.assertIn("近 30 天看了 2 场，1 场有 ≤58¢ 的卖单（平均 42 份），最低卖价中位 56¢，撮合开启在开场前中位 1950 秒", t.status())
+        row = next(r for r in R.review(t.recs, t.settings, clock.ms)["rules"] if r["rule"] == "gold_shut" and r["mode"] == "paper")
+        self.assertEqual(row["watch"]["watched"], 2)
+        self.assertEqual(R.filled_by_outcome(t.recs, clock.ms), {}, "a watch-only record holds nothing")
 
     async def test_off_finishes_what_is_open_and_plans_nothing(self):
         t, api, clock, x = taker("on")

@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.153.1"
+VERSION = "1.153.2"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -623,8 +623,11 @@ class PreopenSettings:
 
 # 1.153.0: 规则吃单 (rules.py) — each rule's price setting (cents, 0 = the rule off) and its default
 RULE_SETTING_KEYS = {"gold_shut": "RULE_GOLD_SHUT_CENTS", "gold_open": "RULE_GOLD_OPEN_CENTS", "gold_0515": "RULE_GOLD_0515_CENTS",
-                     "oil_shut": "RULE_OIL_SHUT_CENTS", "oil_open": "RULE_OIL_OPEN_CENTS"}
-RULE_DEFAULT_CENTS = {"gold_shut": 58, "gold_open": 50, "gold_0515": 58, "oil_shut": 0, "oil_open": 55}  # oil_shut 0: ties settle Up, Down won 42% (1.153.0)
+                     "gold_0500": "RULE_GOLD_0500_CENTS", "gold_1645": "RULE_GOLD_1645_CENTS",
+                     "oil_shut": "RULE_OIL_SHUT_CENTS", "oil_open": "RULE_OIL_OPEN_CENTS", "oil_0045": "RULE_OIL_0045_CENTS"}
+# oil_shut 0: ties settle Up, Down won 42% (1.153.0); oil_open 50 (1.153.2, was 55: +3¢ a share there, +8¢ at 50); the three the slot scan
+# found (1.153.2) off until tried on paper
+RULE_DEFAULT_CENTS = {"gold_shut": 58, "gold_open": 50, "gold_0515": 58, "gold_0500": 0, "gold_1645": 0, "oil_shut": 0, "oil_open": 50, "oil_0045": 0}
 
 
 RULE_MARKET_KEYS = {"gold": ("RULE_GOLD", "RULE_GOLD_SHARES"), "oil": ("RULE_OIL", "RULE_OIL_SHARES")}  # 1.153.1: each market's switch and size
@@ -781,7 +784,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段，只在开场前吃：Predict 撮合开启后到开场前 10 秒，盘口一出现规则价以内的指定方向就立即买"
      "（盘口变化由推送送来，不等下一次读）。off 关；paper 只记录不下单：按当时盘口记下会买到多少、按 Predict 的结果结算，先看几天再开；"
      "on 真实吃单（需要 LIVE=on；真实交易暂停、今日亏损停机、接口限流冷却时都不下单）"),
-    ("RULE_GOLD", "规则吃单：黄金", "on = 做黄金的三条规则（下面三项价格设为 0 的那条不做）；off = 黄金一条都不做"),
+    ("RULE_GOLD", "规则吃单：黄金", "on = 做黄金的规则（下面价格设为 0 的那条不做）；off = 黄金一条都不做"),
     ("RULE_GOLD_SHARES", "黄金：每场最多买多少份", "1～100000：黄金一个 15 分钟场次最多买这么多份（几次吃单合计）；每张单另受 LIVE_MAX_ORDER_USD 限制"),
     ("RULE_GOLD_SHUT_CENTS", "黄金休市 4 档：买涨不高于（¢）", "纽约 17:00–17:45、周一至周四 CME 每天休市的 4 个 15 分钟（北京冬令时 06:00–06:45，夏令时 05:00–05:45）："
      "指数不动，终点等于起点按涨结算；2025-12 至 2026-11 涨占 90%，每月最低 76%。0 = 不做"),
@@ -789,12 +792,18 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
      "周一早上那场（周末后开盘）跌只占 41%，不做。2026 年周二至周五跌占 58%，近半年 78%，但前几个月是涨多：0 = 不做"),
     ("RULE_GOLD_0515_CENTS", "黄金纽约 05:15：买跌不高于（¢）", "纽约 05:15–05:30、周一至周五（北京冬令时 18:15，夏令时 17:15）：伦敦上午定盘前，2026 年跌占 65%，"
      "前后几档只有 38–55%；按纽约时间算，夏令时是北京 17:15 那场（北京 18:15 那时跌只占 52%）。0 = 不做"),
-    ("RULE_OIL", "规则吃单：原油", "on = 做原油的两条规则（下面两项价格设为 0 的那条不做）；off = 原油一条都不做"),
+    ("RULE_GOLD_0500_CENTS", "黄金纽约 05:00：买涨不高于（¢）", "纽约 05:00–05:15、周一至周五（北京冬令时 18:00，夏令时 17:00），就在 05:15 那档之前："
+     "2025-12 至 2026-11 涨占 62%（上半年 57%、下半年 66%；3 月、5 月是跌多）；52¢ 每份约 +9¢。按全部时段扫出来的，默认 0 = 不做，建议先只记录"),
+    ("RULE_GOLD_1645_CENTS", "黄金休市前一档：买涨不高于（¢）", "纽约 16:45–17:00、周一至周五（北京冬令时 05:45，夏令时 04:45），CME 每天休市前的最后一档："
+     "涨占 60%（周二只有 44%，最近三个月 68–90%）；52¢ 每份约 +7¢。按全部时段扫出来的，默认 0 = 不做，建议先只记录"),
+    ("RULE_OIL", "规则吃单：原油", "on = 做原油的规则（下面价格设为 0 的那条不做）；off = 原油一条都不做"),
     ("RULE_OIL_SHARES", "原油：每场最多买多少份", "1～100000：原油一个 15 分钟场次最多买这么多份（几次吃单合计）；每张单另受 LIVE_MAX_ORDER_USD 限制"),
     ("RULE_OIL_SHUT_CENTS", "原油休市 4 档：买跌不高于（¢）", "原油的同一时段（纽约 17:00–17:45，周一至周四）。指数不动时按涨结算，2026-04 至 11 跌只占 42%："
      "45¢ 买跌每份约亏 3.6¢，所以默认 0 = 不做"),
     ("RULE_OIL_OPEN_CENTS", "原油开盘第一档：买跌不高于（¢）", "原油纽约 18:00、周一至周四重新开盘的第一个 15 分钟（北京冬令时 07:00）；2026 年跌占 59%："
-     "55¢ 每份约赚 3¢，50¢ 约 8¢。0 = 不做"),
+     "50¢ 每份约赚 8¢（默认，1.153.2；55¢ 只剩约 3¢）。0 = 不做"),
+    ("RULE_OIL_0045_CENTS", "原油纽约 00:45：买跌不高于（¢）", "原油纽约 00:45–01:00、周一至周五（北京冬令时 13:45，夏令时 12:45）：2026-04 至 11 跌占 62%，"
+     "每个月 50–76%；50¢ 每份约 +11¢。按全部时段扫出来的、显著性刚到边，默认 0 = 不做，建议先只记录"),
     ("RULE_MAX_DAY_USD", "规则吃单：每天最多花多少（$）", "0～1000000：黄金、原油合计，一天（北京时间）下单的金额（成交的按成交价、还没结果的按全额）到这个数就不再买；0 = 不限"),
 )
 CONTROL_KEY_SET = frozenset(k for k, _, _ in CONTROL_KEYS)
@@ -11744,8 +11753,11 @@ CONTROL_FORMS: dict[str, dict] = {
     "RULE_GOLD_SHUT_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "55", "58", "60", "65"], "unit": "¢", "zero": "不做"},
     "RULE_GOLD_OPEN_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "45", "48", "50", "52"], "unit": "¢", "zero": "不做"},
     "RULE_GOLD_0515_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "50", "55", "58"], "unit": "¢", "zero": "不做"},
+    "RULE_GOLD_0500_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "50", "52", "55"], "unit": "¢", "zero": "不做"},
+    "RULE_GOLD_1645_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "50", "52", "55"], "unit": "¢", "zero": "不做"},
     "RULE_OIL_SHUT_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "35", "40", "45"], "unit": "¢", "zero": "不做"},
     "RULE_OIL_OPEN_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "45", "50", "55"], "unit": "¢", "zero": "不做"},
+    "RULE_OIL_0045_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "45", "50", "52"], "unit": "¢", "zero": "不做"},
     "RULE_GOLD": {"kind": "choice", "group": "规则", "options": [["on", "on 开"], ["off", "off 关"]]},
     "RULE_GOLD_SHARES": {"kind": "number", "group": "规则", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
     "RULE_OIL": {"kind": "choice", "group": "规则", "options": [["on", "on 开"], ["off", "off 关"]]},
@@ -14779,6 +14791,10 @@ function rulesSection(ru){  // 规则吃单 (1.153.0): each rule's totals, the r
   if((ru.rules||[]).length)kids.push(table(["规则","买","模式","场次","份数","每份成本","成本","已结算","赢/输","盈亏","待结算"],
     ru.rules.map(r=>[r.name,side(r.side)+(r.cents?" ≤"+r.cents+"¢":"（已关）"),MODE[r.mode]||r.mode,num(r.windows),num(r.shares),r.shares?cent(r.cost/r.shares):"—",usd(r.cost),
       num(r.settled),r.wins+"/"+r.losses,r.settled?money(r.pnl):"—",num(r.open)])));
+  const wt=(ru.rules||[]).filter(r=>r.watch&&r.watch.watched);  // 1.153.2: what the watches saw — is a price or a size off?
+  if(wt.length)kids.push($("div","sub","盘口观察（近 30 天）"),table(["规则","模式","看了几场","有规则价以内卖单","平均可买份数","最低卖价中位","撮合开启在开场前"],
+    wt.map(r=>[r.name,MODE[r.mode]||r.mode,num(r.watch.watched),num(r.watch.offered),r.watch.offer_avg==null?"—":num(r.watch.offer_avg),
+      r.watch.best_mid==null?"—":cent(r.watch.best_mid),r.watch.open_lead==null?"—":"中位 "+Math.round(r.watch.open_lead)+" 秒"])));
   const rec=ru.recent||[];
   if(rec.length)kids.push(...bigTable("最近的场次（北京时间）",table(["场次","规则","买","份数","均价","成本","结果","盈亏","模式"],
     rec.map(r=>[dayKey(r.start_ms).slice(5)+" "+(r.window||""),r.name,side(r.side),num(r.shares),cent(r.avg),usd(r.cost),RES[r.result]||"待结算",r.pnl==null?"—":money(r.pnl),MODE[r.mode]||r.mode])),rec.length));

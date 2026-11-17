@@ -24,6 +24,7 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import statistics
 import time
 from decimal import Decimal as D
 from typing import Any, Callable
@@ -86,11 +87,20 @@ def daily_reopen(start_ms: int) -> bool:
     return bool(ending) and ending[0][1] - ending[0][0] <= 65 * 60_000
 
 
-def ny_0515(start_ms: int) -> bool:
-    """The quarter hour from 05:15 New York (北京冬令时 18:15，夏令时 17:15), Monday to Friday, CME open: before the London
-    morning fix (10:30 London) gold has leaned down (2026: Down 65%, the quarter hours around it 38–55%)."""
-    weekday, hour, minute = et_parts(start_ms)
-    return weekday <= 4 and (hour, minute) == (5, 15) and not core.market_shuts("cme", start_ms, start_ms + 15 * 60_000)
+def ny_slot(hour: int, minute: int) -> Callable[[int], bool]:
+    """The quarter hour from hour:minute New York, Monday to Friday, CME open through it (a holiday's shut and the weekend's
+    left out)."""
+    def matches(start_ms: int) -> bool:
+        weekday, h, mi = et_parts(start_ms)
+        return weekday <= 4 and (h, mi) == (hour, minute) and not core.market_shuts("cme", start_ms, start_ms + 15 * 60_000)
+    matches.__name__ = f"ny_{hour:02d}{minute:02d}"
+    return matches
+
+
+# 05:15 New York (北京冬令时 18:15，夏令时 17:15): before the London morning fix (10:30 London) gold has leaned down (2025-12 to
+# 2026-11: Down 65%, both halves of the year); the slot scan (1.153.2) found two more of gold's slots and one of oil's leaning
+# the same way in both halves — 05:00 Up 62%, 16:45 (the last before the daily shut) Up 60%, oil's 00:45 Down 62% — off by default
+ny_0515 = ny_slot(5, 15)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -112,7 +122,10 @@ RULES: tuple[Rule, ...] = (
     Rule("gold_shut", "gold", "XAU-15M", "up", "黄金休市 4 档", "纽约 17:00–17:45，周一至周四（北京冬令时 06:00–06:45、夏令时 05:00–05:45）", daily_break),
     Rule("gold_open", "gold", "XAU-15M", "down", "黄金开盘第一档", "纽约 18:00，周一至周四（北京冬令时 07:00、夏令时 06:00；周一早上那场不做）", daily_reopen),
     Rule("gold_0515", "gold", "XAU-15M", "down", "黄金纽约 05:15", "纽约 05:15，周一至周五（北京冬令时 18:15、夏令时 17:15）", ny_0515),
+    Rule("gold_0500", "gold", "XAU-15M", "up", "黄金纽约 05:00", "纽约 05:00，周一至周五（北京冬令时 18:00、夏令时 17:00）", ny_slot(5, 0)),
+    Rule("gold_1645", "gold", "XAU-15M", "up", "黄金休市前一档", "纽约 16:45，周一至周五（北京冬令时 05:45、夏令时 04:45）", ny_slot(16, 45)),
     Rule("oil_shut", "oil", "CL-15M", "down", "原油休市 4 档", "纽约 17:00–17:45，周一至周四（北京冬令时 06:00–06:45、夏令时 05:00–05:45）", daily_break),
+    Rule("oil_0045", "oil", "CL-15M", "down", "原油纽约 00:45", "纽约 00:45，周一至周五（北京冬令时 13:45、夏令时 12:45）", ny_slot(0, 45)),
     Rule("oil_open", "oil", "CL-15M", "down", "原油开盘第一档", "纽约 18:00，周一至周四（北京冬令时 07:00、夏令时 06:00；周一早上那场不做）", daily_reopen),
 )
 RULE_OF = {r.key: r for r in RULES}
@@ -240,6 +253,20 @@ def day_pnl(recs: dict[str, dict], day: str) -> float:
     return sum(float(r.get("pnl") or 0) for r in recs.values() if r.get("mode") == "on" and r.get("settled_day") == day)
 
 
+def watch_stats(recs: dict[str, dict], rule: str, mode: str, since_ms: int) -> dict:
+    """What the watches of a rule's windows saw since ``since_ms`` (RuleTaker.watch, 1.153.2): the windows watched, those that
+    offered the rule's side at its price, the shares offered at once on average there, the median lowest offer of the side, the
+    median lead of matching's opening over the start (seconds)."""
+    seen = [r["seen"] for r in recs.values() if r.get("rule") == rule and r.get("mode") == mode and isinstance(r.get("seen"), dict)
+            and int(r["seen"].get("start_ms") or 0) >= since_ms]
+    offered = [x for x in seen if float(x.get("offer_max") or 0) > 0]
+    mid = lambda xs: statistics.median(xs) if xs else None
+    return {"watched": len(seen), "offered": len(offered),
+            "offer_avg": round(sum(float(x["offer_max"]) for x in offered) / len(offered), 2) if offered else None,
+            "best_mid": mid([float(x["best"]) for x in seen if x.get("best") is not None]),
+            "open_lead": mid([(int(x["start_ms"]) - int(x["open_ms"])) / 1000 for x in seen if x.get("open_ms")])}
+
+
 def review(recs: dict[str, dict], settings: Any, now_ms: int) -> dict | None:
     """The review page's 规则吃单: each rule's totals (windows bought, shares, cost, settled P&L, wins and losses, open), the
     paper and the real apart, and the last records; None when nothing is recorded and the mode is off."""
@@ -249,14 +276,15 @@ def review(recs: dict[str, dict], settings: Any, now_ms: int) -> dict | None:
     for rule in RULES:
         for mode in ("on", "paper"):
             mine = [r for r in recs.values() if r.get("rule") == rule.key and r.get("mode") == mode and filled(r) > DUST]
-            if not mine and (mode == "paper" or not live_rule(settings, rule)):
+            stats = watch_stats(recs, rule.key, mode, now_ms - 30 * core.DAY_MS)
+            if not mine and not stats["watched"] and (mode == "paper" or not live_rule(settings, rule)):
                 continue
             done = [r for r in mine if r.get("pnl") is not None]
             rows.append({"rule": rule.key, "name": rule.name, "side": rule.side, "cents": settings.price(rule.key) if live_rule(settings, rule) else 0, "when": rule.when,
                          "mode": mode, "windows": len(mine), "shares": round(sum(filled(r) for r in mine), 4),
                          "cost": round(sum(cost(r) for r in mine), 4), "settled": len(done),
                          "wins": sum(1 for r in done if float(r["pnl"]) > DUST), "losses": sum(1 for r in done if float(r["pnl"]) < -DUST),
-                         "pnl": round(sum(float(r["pnl"]) for r in done), 4), "open": len(mine) - len(done)})
+                         "pnl": round(sum(float(r["pnl"]) for r in done), 4), "open": len(mine) - len(done), "watch": stats})
     last = sorted((r for r in recs.values() if filled(r) > DUST), key=lambda r: -int(r.get("start_ms") or 0))[:60]
     return {"mode": settings.mode, "markets": {m: {"on": settings.on(m), "shares": settings.shares_of(m), "name": n} for m, n in MARKET_NAMES.items()},
             "max_day_usd": settings.max_day_usd, "rules": rows,
@@ -605,7 +633,9 @@ class RuleTaker:
                         want[card_of(rule).slug_of(start)] = (rule.key, start)
         for slug in list(self.track):
             if slug not in want:
-                self.track.pop(slug)
+                w = self.track.pop(slug)
+                if w["start"] - now <= STOP_MS:  # its end reached between two looks: its watch kept all the same
+                    self.keep_watch(slug, w)
         for slug, (key, start) in want.items():
             self.track.setdefault(slug, {"rule": key, "start": start, "market": None, "listed_ms": 0, "open_ms": 0, "probe_ms": 0,
                                          "look_ms": 0, "status_ms": 0, "offer": False, "word": ""})
@@ -640,6 +670,7 @@ class RuleTaker:
         rule = RULE_OF[w["rule"]]
         if w["start"] - now <= STOP_MS:
             self.track.pop(slug, None)
+            self.keep_watch(slug, w)
             return
         if not self.due(w, now):
             return
@@ -673,6 +704,7 @@ class RuleTaker:
             w["market"], w["listed_ms"], w["status_ms"] = market, now, now  # the listing's own read carries the status
             if str(market.get("tradingStatus") or "").upper() == "OPEN":
                 w["open_ms"] = now
+            self.watch(w)["listed_ms"] = now
         w["look_ms"] = now
         mid = str(w["market"]["id"])
         self.stream.changed.discard(mid)
@@ -684,8 +716,9 @@ class RuleTaker:
         own = self.own_asks(slug, rule.side)  # the pre-open mode's own bids there: never bought from (the account trading with itself)
         levels = [(p, q - own.get(p, D(0))) for p, q in offered(bids, asks, rule.side, limit) if q - own.get(p, D(0)) > 0]
         w["offer"] = bool(levels)
+        best = offered(bids, asks, rule.side, D("0.99"))[:1]
+        self.note_offers(w, levels, best, now)
         if not levels:
-            best = offered(bids, asks, rule.side, D("0.99"))[:1]
             w["word"] = f"盘口没有 ≤{int(limit * 100)}¢ 的{rule.word}" + (f"（最低 {float(best[0][0]) * 100:g}¢）" if best else "（没人卖）")
             return
         if not w["open_ms"]:
@@ -696,6 +729,7 @@ class RuleTaker:
                 w["market"] = {**await self.api.market(mid), "categorySlug": slug}
                 if str(w["market"].get("tradingStatus") or "").upper() == "OPEN":
                     w["open_ms"] = now
+                    self.watch(w)["open_ms"] = now
             if not w["open_ms"]:
                 w["word"] = (f"盘口已有 ≤{int(limit * 100)}¢ 的{rule.word} {sum(q for _, q in levels):g} 份，等撮合开启就买"
                              f"（现在 {w['market'].get('tradingStatus') or '?'}）")
@@ -738,6 +772,36 @@ class RuleTaker:
                 if left > 0:
                     out[1 - price] = out.get(1 - price, D(0)) + left
         return out
+
+    @staticmethod
+    def watch(w: dict) -> dict:
+        """What the window's watch saw (1.153.2), kept on its record at the end: the lowest offer of the rule's side at any price
+        (best), the most shares offered at the rule's price at once (offer_max) and when first (offer_ms), when it was listed and
+        when matching was first seen open — what /rules and the review page sum up to show whether a price or a size is off."""
+        return w.setdefault("seen", {"best": None, "offer_max": 0.0, "offer_ms": 0, "listed_ms": 0, "open_ms": 0})
+
+    def note_offers(self, w: dict, levels: list, best: list, now: int) -> None:
+        seen = self.watch(w)
+        if best:
+            seen["best"] = min(float(best[0][0]), seen["best"] if seen["best"] is not None else 1.0)
+        total = float(sum(q for _, q in levels))
+        if total > seen["offer_max"]:
+            seen["offer_max"] = total
+        if total > 0 and not seen["offer_ms"]:
+            seen["offer_ms"] = now
+        if w["open_ms"] and not seen["open_ms"]:
+            seen["open_ms"] = w["open_ms"]
+
+    def keep_watch(self, slug: str, w: dict) -> None:
+        """The window's watch onto its record as it ends (one made for it when nothing was bought, so the windows that offered
+        nothing — or nothing at the price — are counted too)."""
+        seen = w.get("seen")
+        if not seen or not seen.get("listed_ms") or w["market"] is None or self.settings.mode == "off":
+            return
+        rule = RULE_OF[w["rule"]]
+        rec = self.record(slug) or self.new_record(slug, w, rule, 0)
+        rec["seen"] = {**seen, "start_ms": w["start"], "cents": self.settings.price(rule.key)}
+        self.save(rec)
 
     async def book(self, market_id: str) -> tuple[tuple, tuple]:
         answer = await self.api.call("GET", f"/markets/{core.urllib.parse.quote(market_id)}/orderbook")
@@ -961,8 +1025,13 @@ class RuleTaker:
                     lines.append(f"· {rule.name}：不做（价格设为 0）")
                     continue
                 nxt = min((w for w in self.track.values() if w["rule"] == rule.key), key=lambda w: w["start"], default=None)
+                st = watch_stats(recs, rule.key, s.mode, now - 30 * core.DAY_MS) if s.mode != "off" else {"watched": 0}
                 lines.append(f"· {rule.name} 买{rule.word} ≤{cents}¢：{rule.when}"
-                             + (f"｜下一场 {bj(nxt['start'])}{('：' + nxt['word']) if nxt['word'] else ''}" if nxt else ""))
+                             + (f"｜下一场 {bj(nxt['start'])}{('：' + nxt['word']) if nxt['word'] else ''}" if nxt else "")
+                             + (f"｜近 30 天看了 {st['watched']} 场，{st['offered']} 场有 ≤{cents}¢ 的卖单"
+                                + (f"（平均 {st['offer_avg']:g} 份）" if st["offer_avg"] else "")
+                                + (f"，最低卖价中位 {st['best_mid'] * 100:.0f}¢" if st["best_mid"] is not None else "")
+                                + (f"，撮合开启在开场前中位 {st['open_lead']:.0f} 秒" if st["open_lead"] is not None else "") if st["watched"] else ""))
         today = day_of(now)
         mine = [r for r in recs.values() if day_of(int(r.get("start_ms") or 0)) == today and filled(r) > DUST]
         if mine:
