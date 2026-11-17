@@ -1443,6 +1443,16 @@ async def run():
     assert ([r["id"] for r in await api.orders("OPEN", stop_ids={"a"})], api.orders_complete) == (["a", "b"], False)
     assert ([r["id"] for r in await api.orders("OPEN", stop_ids={"zzz"}, max_pages=2)], api.orders_complete) == (["a", "b", "c"], False)
     assert ([r["id"] for r in await api.orders("OPEN", stop_ids={"d"})], api.orders_complete) == (["a", "b", "c", "d"], True), "the last page ends the list: whole"
+    # 1.154.7: each read's requests and the rows of a full page (one that had a next) — what Predict really gives a page, whatever
+    # LIVE_ORDERS_PAGE asked for (ORDERS_PAGE 50 here, the pages of two and one: a server's cap shows as such)
+    await api.orders("OPEN")
+    assert api.paged_stats["/orders"] == (3, 2), api.paged_stats
+    await api.orders("OPEN", stop_ids={"a"})
+    assert api.paged_stats["/orders"] == (1, 2), "stopped on the first page: one request, a full one"
+    first_page, pages[""] = pages[""], {"data": [{"id": "a"}], "cursor": None}
+    await api.orders("OPEN")
+    assert api.paged_stats["/orders"] == (1, 0), "one page and no next: no full page seen"
+    pages[""] = first_page
     # 1.137.2: no cut full read while the pre-open mode runs; resting maker orders the bounded list did not show are read by their
     # hash in rotation, LIVE_TRACK_READS a step, each at most every LIVE_TRACK_READ_MS, the longest unread first
     sbot.live_full_cut, sbot.live_full_at_ms = True, -10 ** 15

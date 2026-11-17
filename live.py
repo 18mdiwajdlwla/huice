@@ -655,6 +655,9 @@ class PredictApi:
         self.calls = 0
         self.limited: collections.deque = collections.deque(maxlen=500)  # monotonic times of the 429s answered to this client (/diag, 1.138.0)
         self.orders_complete = self.positions_complete = True  # the last list read came whole (every page)
+        # 1.154.7: path -> (requests, rows of a full page) of its last paged read: what Predict really gives a page (LIVE_ORDERS_PAGE asks
+        # for ORDERS_PAGE; a server cap below it would go unseen) and how many pages a read took (the snapshot's pace counts requests)
+        self.paged_stats: dict[str, tuple[int, int]] = {}
 
     def headers(self) -> dict[str, str]:
         out = {}
@@ -836,23 +839,29 @@ class PredictApi:
         rows, after, seen = [], "", set()
         limit = self.ORDERS_PAGES_MAX if not cap else max(1, int(cap))
         pages = limit if not max_pages else max(1, min(limit, int(max_pages)))
+        asked = full = 0  # requests made; rows of a page that had a next one (a full page: Predict's real page size)
         for _ in range(pages):
             q = {**query, "first": self.ORDERS_PAGE}
             if after:
                 q["after"] = after
             data = await self.authed("GET", f"{path}?{core.urllib.parse.urlencode(q)}")
+            asked += 1
             page = self.rows(data)
             rows.extend(page)
             cursor = data.get("cursor") if isinstance(data, dict) else None
             if isinstance(cursor, dict):
                 cursor = cursor.get("after") or cursor.get("next") or cursor.get("endCursor")
             if not cursor or not page or str(cursor) == after:
+                self.__dict__.setdefault("paged_stats", {})[path] = (asked, full)
                 return rows, True
+            full = max(full, len(page))
             if stop_ids:
                 seen.update(str(r.get("id")) for r in page)
                 if stop_ids <= seen:
+                    self.__dict__.setdefault("paged_stats", {})[path] = (asked, full)
                     return rows, False  # every order asked for is on these pages: the rest is not read
             after = str(cursor)
+        self.__dict__.setdefault("paged_stats", {})[path] = (asked, full)
         return rows, False
 
     async def orders(self, status: str = "OPEN", stop_ids: set | None = None, max_pages: int | None = None, **params: Any) -> list[dict]:
@@ -3220,7 +3229,10 @@ class LiveBot(core.Bot):
         working = time.monotonic()
         await asyncio.gather(*(one(tid, trade) for tid, trade in list(active.items()) if tid not in later))
         page = int(getattr(self.live.api, "ORDERS_PAGE", 50) or 50)
-        self.live_sync_detail = {"pages": -(-len(open_rows) // page) if open_rows else 1, "bounded": bounded, "list_s": list_s,
+        # 1.154.7: the pages as requested and the rows Predict really put on a full one (LIVE_ORDERS_PAGE asks for `page`)
+        asked, full = (getattr(self.live.api, "paged_stats", None) or {}).get("/orders", (0, 0)) if not by_market else (0, 0)
+        self.live_sync_detail = {"pages": asked or (-(-len(open_rows) // page) if open_rows else 1), "bounded": bounded, "list_s": list_s,
+                                 "page_rows": full, "page_asked": page,
                                  "markets": len(order_markets) if by_market else 0, "filter": self.live_market_filter,
                                  "reads": reads, "later": len(later), "work_s": time.monotonic() - working, "records": len(active)}
         await self.live_orphan_sweep(now_ms)

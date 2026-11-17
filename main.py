@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.6"
+VERSION = "1.154.7"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -24856,7 +24856,11 @@ class Bot:
                 sync = getattr(self, "live_sync_detail", None)
                 if name == "模拟交易" and sync:  # 1.137.2: what the sync's seconds went to
                     detail += (f"（同步内：挂单列表" + (f"按市场读 {sync['markets']} 个市场 {sync['list_s']:.1f}s" if sync.get("markets")
-                                                        else f" {sync['pages']} 页 {sync['list_s']:.1f}s" + ("，只读到自己的单" if sync["bounded"] else "，全量"))
+                                                        else f" {sync['pages']} 页 {sync['list_s']:.1f}s" + ("，只读到自己的单" if sync["bounded"] else "，全量")
+                                                        # 1.154.7: what Predict really puts on a page, beside what LIVE_ORDERS_PAGE asks
+                                                        + ((f"，每页 {sync['page_rows']} 张" + ("" if sync["page_rows"] >= sync.get("page_asked", 0)
+                                                                                               else f"（LIVE_ORDERS_PAGE={sync.get('page_asked')} 没生效：Predict 每页最多给 {sync['page_rows']} 张）"))
+                                                           if sync.get("page_rows") else ""))
                                + ("" if sync.get("filter") is None else "（Predict 按市场过滤：" + ("支持" if sync["filter"] else "不支持，按页读") + "）")
                                + f"、按哈希单读 {sync['reads']} 张" + (f"（另 {sync['later']} 张轮到再读）" if sync["later"] else "")
                                + f"、核对 {sync['records']} 条记录 {sync['work_s']:.1f}s）")

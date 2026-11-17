@@ -1348,6 +1348,7 @@ class Controller:
         self.awaiting: dict[str, int] = {}  # card -> when its next window (beyond the known listing, not listed yet) entered the range: the sprint runs from then (1.133.1)
         self.listing_lags: collections.deque = collections.deque(maxlen=LISTING_LAGS)  # ms from a window's entry into the range to its listing seen (sprint_lead_ms)
         self.account_pages = 1  # pages the last open-order snapshot took: its pace and staleness follow (ACCOUNT_PAGE_S)
+        self.account_page_rows = 0  # the rows Predict put on a full page of it (1.154.7): what LIVE_ORDERS_PAGE really got; 0 = no full page seen yet
         self.account_rows: list[dict] = []  # the last complete snapshot's rows: the owner's whole-account view when its own read is cut (LiveBot.live_full_list, 1.136.2)
         self.account_read_s = 0.0  # how long the last complete snapshot read took: the staleness allows for it (1.136.1)
         self.account_failed = ""  # why the last snapshot read failed, until one succeeds (the hold names it: 1.136.1)
@@ -1533,6 +1534,14 @@ class Controller:
                     + (f"，上次读了 {self.account_read_s:.0f} 秒" if self.account_read_s >= 1 else "") + "）")
         return self.cooldown()
 
+    def page_rows_note(self) -> str:
+        """The rows Predict really gives a page of the open-order list, beside what LIVE_ORDERS_PAGE asks (1.154.7), for /preopen."""
+        asked = int(getattr(self.api, "ORDERS_PAGE", 50) or 50)
+        got = int(self.account_page_rows or 0)
+        if not got:
+            return ""
+        return f"，每页 {got} 张" + ("" if got >= asked else f"（LIVE_ORDERS_PAGE={asked} 没生效：Predict 每页最多给 {got} 张）")
+
     def account_interval_s(self) -> float:
         """How often the account snapshot is read: the poll, or ACCOUNT_PAGE_S a page when the open orders fill more pages
         than that allows (1.134.1: 23 pages every five seconds was most of the request volume)."""
@@ -1704,9 +1713,16 @@ class Controller:
         try:
             rows = await self.api.orders("OPEN")
             page = int(getattr(self.api, "ORDERS_PAGE", 50) or 50)
+            # 1.154.7: the pages counted as requested, and the rows Predict really put on a full page (LIVE_ORDERS_PAGE asks for `page`;
+            # a cap of the server's below it would halve nothing, and the pages reckoned as rows / page would read the snapshot twice
+            # as often as ACCOUNT_PAGE_S means to)
+            asked, full = (getattr(self.api, "paged_stats", None) or {}).get("/orders", (0, 0))
+            if full:
+                self.account_page_rows = full
+            pages_read = asked or -(-len(rows) // page)
             if not self.api.orders_complete:
-                raise core.RemoteError(f"账户挂单分页未读取完整（读了 {len(rows)} 条、{-(-len(rows) // page)} 页仍没到底，上限 {getattr(self.api, 'ORDERS_PAGES_MAX', '?')} 页），暂停新增订单")
-            self.account_pages = max(1, -(-len(rows) // page))
+                raise core.RemoteError(f"账户挂单分页未读取完整（读了 {len(rows)} 条、{pages_read} 页仍没到底，上限 {getattr(self.api, 'ORDERS_PAGES_MAX', '?')} 页），暂停新增订单")
+            self.account_pages = max(1, pages_read)
             other = self.unmanaged_rows(rows)
             known_core = {str(t.get("live", {}).get("order_id")) for t in self.owner.sim_trades().values() if isinstance(t.get("live"), dict)}
             rule_ids, rule_hashes = getattr(self.owner, "rules_known", lambda: (set(), set()))()  # the rule taker's orders (1.153.3)
@@ -3008,7 +3024,8 @@ class Controller:
                 + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {self.risk() + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，按开场先后补挂中") if pairs_left else "")
                 + (f"\n请求约 {self.request_rate():.1f} 次/秒（最近一分钟）；" if self.request_rate() is not None else "\n")
                 + self.pace_line()
-                + f"账户快照每 {self.account_interval_s():.0f} 秒（{self.account_pages} 页挂单" + (f"，上次读了 {self.account_read_s:.0f} 秒" if self.account_read_s >= 1 else "") + "）"
+                + f"账户快照每 {self.account_interval_s():.0f} 秒（{self.account_pages} 页挂单" + self.page_rows_note()
+                + (f"，上次读了 {self.account_read_s:.0f} 秒" if self.account_read_s >= 1 else "") + "）"
                 + f"\n扫描：{self.scan_note or '还没扫过'}（发布探测每 {LISTING_PROBE_S:g} 秒，预计发布前后每 {FAST_POLL_S:g} 秒；"
                 + ("分类应答自带下单字段，发现即下单" if self.category_full else "分类应答不带下单字段，每场多读一次详情" if self.category_full is False else "还没读过发布")
                 + (f"；冲刺中：{'、'.join(sorted(k for k, t in self.awaiting.items() if 0 <= self.now() - t <= LISTING_LATE_MS))} 的下一场已进范围、等发布"
