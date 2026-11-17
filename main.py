@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.12"
+VERSION = "1.154.13"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -674,6 +674,8 @@ class RuleSettings:
     shares: tuple = (("gold", 50), ("oil", 50))
     max_day_usd: float = 0.0
     fast: tuple = ((60, 420),)  # RULE_FAST_HOURS (1.154.12): the Beijing hours of the per-second looks, minutes after midnight (day_spans)
+    lead_minutes: int = 300     # RULE_LEAD_MINUTES (1.154.13): how long before a window's start the makers post their orders (5 hours, 11-17) — the
+    #                             rule taker sprints around that moment of every window (rules.RuleTaker.sprinting); 0 = no such moment
 
     @property
     def enabled(self) -> bool:
@@ -722,13 +724,16 @@ class RuleSettings:
         shares = {m: int(str(e.get(name, default)).strip() or 0) for m, (_, name) in RULE_MARKET_KEYS.items()}
         max_day = float(str(e.get("RULE_MAX_DAY_USD", "0")).strip() or 0)
         fast = day_spans(e.get("RULE_FAST_HOURS", RULE_FAST_DEFAULT))
+        lead = int(str(e.get("RULE_LEAD_MINUTES", "300")).strip() or 0)
+        if not 0 <= lead <= 1440:
+            raise ValueError("RULE_LEAD_MINUTES 0～1440（对手提前多少分钟挂单，规则吃单在那一刻前后每秒检查；0 = 不按这个时刻）")
         if any(v not in {"on", "off"} for v in switches.values()):
             raise ValueError("RULE_GOLD、RULE_OIL 只能是 on 或 off")
         if (any(not (c == 0 or 1 <= c <= 95) for c in cents.values()) or any(not 1 <= n <= 100_000 for n in shares.values())
                 or not 0 <= max_day <= 1_000_000):
             raise ValueError("RULE_*_CENTS 是 0（不做这条规则）或 1～95（¢，最高买价）；RULE_GOLD_SHARES、RULE_OIL_SHARES 每场最多买 1～100000 份；"
                              "RULE_MAX_DAY_USD 0～1000000（每天最多花多少，0 = 不限）")
-        return cls(mode, tuple(cents.items()), frozenset(m for m, v in switches.items() if v == "on"), tuple(shares.items()), max_day, fast)
+        return cls(mode, tuple(cents.items()), frozenset(m for m, v in switches.items() if v == "on"), tuple(shares.items()), max_day, fast, lead)
 
 
 CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
@@ -853,6 +858,9 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
      "符合规则价就立刻下单，几场同时出现时一起发；开始前 1 分钟先准备好（登录、授权额度、撮合状态、推送订阅）。盘口靠推送，变化约 0.3 秒到；"
      "另外每秒用 REST 轮流核对一场，推送断了也能在几秒内看到（规则吃单有自己的 Key——RULE_API_KEY——时每秒核对 3 场）。"
      "时段外照旧：推送一有变化就看，另外每 30 秒读一次、开场前 15 分钟每 2 秒"),
+    ("RULE_LEAD_MINUTES", "规则吃单：对手提前多少分钟挂单", "0～1440，默认 300（5 小时）：有人在每场开场前这么久把单挂出来（06:00 的场 01:00 挂）。每个规则场次在这个时刻的前 1 分钟到后 15 分钟"
+     "每秒检查，并先做好准备；时刻前 10 秒到后 2 分钟里这一场的盘口每秒用 REST 读一次（推送之外的第二条路）。按场次算，不受上面时段和夏令时影响；0 = 不按这个时刻。"
+     "/rules 会写出卖单实际出现在开场前多久，可以对着调"),
 )
 CONTROL_KEY_SET = frozenset(k for k, _, _ in CONTROL_KEYS)
 # One-click combinations for the control page (一键搭配): the strategy settings only. What to trade (SIM_MARKETS, SIM_SKIP),
@@ -11957,6 +11965,8 @@ CONTROL_FORMS: dict[str, dict] = {
     "RULE_OIL": {"kind": "choice", "group": "规则", "options": [["on", "on 开"], ["off", "off 关"]]},
     "RULE_OIL_SHARES": {"kind": "number", "group": "规则", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
     "RULE_MAX_DAY_USD": {"kind": "number", "group": "规则", "presets": ["0", "50", "100", "200", "500", "1000"], "unit": "$", "zero": "不限"},
+    "RULE_LEAD_MINUTES": {"kind": "number", "group": "规则", "presets": ["0", "240", "300", "360"], "unit": "分钟", "zero": "不按这个时刻",
+                          "captions": {"300": "5 小时"}},
     "RULE_FAST_HOURS": {"kind": "text", "group": "规则", "presets": ["off", "01:00-07:00", "00:00-07:00", "00:55-02:00", "00:00-24:00"], "unit": "",
                         "captions": {"off": "不做每秒检查", "01:00-07:00": "凌晨 1 点到早上 7 点", "00:00-24:00": "全天"}},
     "SIM_EDGE_CENTS": {"kind": "number", "group": "策略", "presets": ["3", "5", "8", "10", "15", "20"], "unit": "¢"},
@@ -14984,14 +14994,20 @@ function rulesSection(ru){  // 规则吃单 (1.153.0): each rule's totals, the r
   const MODE={on:"真实",paper:"只记录"},RES={up:"涨",down:"跌",split:"平"},side=s=>s==="up"?"涨":"跌",kids=[];
   const mk=Object.values(ru.markets||{}).map(x=>x.name+(x.on?" 开（每场最多 "+num(x.shares)+" 份）":" 关")).join("、");
   kids.push($("p","small mut","现在："+({off:"关",paper:"只记录（不下单）",on:"真实吃单"}[ru.mode]||ru.mode)+(mk?"；"+mk:"")+(ru.max_day_usd?"；每天最多 $"+ru.max_day_usd:"")
-    +(ru.fast?"；每秒检查时段（北京时间）"+(ru.fast==="off"?"：关":" "+ru.fast):"")));  // 1.154.12: RULE_FAST_HOURS
+    +(ru.fast?"；每秒检查时段（北京时间）"+(ru.fast==="off"?"：关":" "+ru.fast):"")  // 1.154.12: RULE_FAST_HOURS
+    +(ru.lead_minutes?"；对手提前 "+ru.lead_minutes+" 分钟挂单的时刻前后也每秒检查":"")));  // 1.154.13: RULE_LEAD_MINUTES
+  const sp=ru.speed,ms=v=>v==null?"—":Math.round(v)+" ms";  // 1.154.13: the real orders against the clock
+  if(sp)kids.push($("p","small mut","下单速度（近 30 天真实订单 "+num(sp.orders)+" 张，"+num(sp.filled)+" 张有成交）：盘口变化→推送到达 中位 "+ms(sp.lag)+"、到达→发出 "+ms(sp.own)+"、发出→应答 "+ms(sp.trip)));
   if((ru.rules||[]).length)kids.push(table(["规则","买","模式","场次","份数","每份成本","成本","已结算","赢/输","盈亏","待结算"],
     ru.rules.map(r=>[r.name,side(r.side)+(r.cents?" ≤"+r.cents+"¢":"（已关）"),MODE[r.mode]||r.mode,num(r.windows),num(r.shares),r.shares?cent(r.cost/r.shares):"—",usd(r.cost),
       num(r.settled),r.wins+"/"+r.losses,r.settled?money(r.pnl):"—",num(r.open)])));
   const wt=(ru.rules||[]).filter(r=>r.watch&&r.watch.watched);  // 1.153.2: what the watches saw — is a price or a size off?
-  if(wt.length)kids.push($("div","sub","盘口观察（近 30 天）"),table(["规则","模式","看了几场","有规则价以内卖单","平均可买份数","最低卖价中位","撮合开启在开场前"],
+  if(wt.length)kids.push($("div","sub","盘口观察（近 30 天）"),table(["规则","模式","看了几场","有规则价以内卖单","平均可买份数","最低卖价中位","撮合开启在开场前","卖单出现在开场前","没买到就没了","买到的"],
     wt.map(r=>[r.name,MODE[r.mode]||r.mode,num(r.watch.watched),num(r.watch.offered),r.watch.offer_avg==null?"—":num(r.watch.offer_avg),
-      r.watch.best_mid==null?"—":cent(r.watch.best_mid),r.watch.open_lead==null?"—":"中位 "+Math.round(r.watch.open_lead)+" 秒"])));
+      r.watch.best_mid==null?"—":cent(r.watch.best_mid),r.watch.open_lead==null?"—":"中位 "+Math.round(r.watch.open_lead)+" 秒",
+      r.watch.offer_lead==null?"—":"中位 "+Math.round(r.watch.offer_lead)+" 分钟",  // 1.154.13: the makers' lead, and the offers a faster taker had
+      r.watch.lost?num(r.watch.lost)+" 场"+(r.watch.life==null?"":"（存活中位 "+(r.watch.life/1000).toFixed(1)+" 秒）"):"—",
+      r.watch.won?num(r.watch.won)+" 场"+(r.watch.won_life==null?"":"（出现到被吃掉中位 "+(r.watch.won_life/1000).toFixed(1)+" 秒）"):"—"])));
   const rec=ru.recent||[];
   if(rec.length)kids.push(...bigTable("最近的场次（北京时间）",table(["场次","规则","买","份数","均价","成本","结果","盈亏","模式"],
     rec.map(r=>[dayKey(r.start_ms).slice(5)+" "+(r.window||""),r.name,side(r.side),num(r.shares),cent(r.avg),usd(r.cost),RES[r.result]||"待结算",r.pnl==null?"—":money(r.pnl),MODE[r.mode]||r.mode])),rec.length));
@@ -24227,7 +24243,7 @@ class Bot:
                   "RULE_TAKER": c.rules.mode, "RULE_MAX_DAY_USD": plain(c.rules.max_day_usd), **{name: str(c.rules.price(key)) for key, name in RULE_SETTING_KEYS.items()},
                   **{switch: flag(c.rules.on(mk)) for mk, (switch, _) in RULE_MARKET_KEYS.items()},
                   **{size: str(c.rules.shares_of(mk)) for mk, (_, size) in RULE_MARKET_KEYS.items()},
-                  "RULE_FAST_HOURS": day_spans_text(c.rules.fast),
+                  "RULE_FAST_HOURS": day_spans_text(c.rules.fast), "RULE_LEAD_MINUTES": str(c.rules.lead_minutes),
                   "SOURCES_OFF": ",".join(sorted(c.sources_off)), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
                   "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait), "LIVE_TAKER_PRICE": c.live_taker_price,
