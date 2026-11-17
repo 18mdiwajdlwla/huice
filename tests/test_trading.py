@@ -627,6 +627,16 @@ async def run():
     bot.live_positions = (list(fake.positions_rows), time.time())
     unrec = bot.journal_payload()["live"]["unrecorded"]
     assert any(r["name"] == "谁知道 11-06 / Up" and abs(r["shares"] - 36) < 1e-6 and r["price"] == 0.03 for r in unrec), unrec
+    # 1.152.2: a ladder's level is titled "$20M" alone — named by its question, linked to its page, valued at what Predict says it is worth
+    ladder = {"id": "pl", "market": {"id": 778, "title": "$20M", "question": "Will $PONS FDV hit $20M before November 2026?",
+                                     "categorySlug": "what-fdv-will-pons-hit-before-nov-2026"},
+              "outcome": {"name": "No", "indexSet": 2, "status": "won"}, "amount": str(107535 * WEI // 10000), "valueUsd": "10.7535"}
+    bot.live_positions = ([*fake.positions_rows, ladder], time.time())
+    lad = next(r for r in bot.live_unrecorded_positions() if r["market_id"] == "778")
+    assert (lad["name"], lad["url"], lad["value"], lad["status"], lad["price"], lad["shares"]) == (
+        "Will $PONS FDV hit $20M before November 2026? / No", "https://predict.fun/zh-cn/market/what-fdv-will-pons-hit-before-nov-2026", 10.75, "WON", None, 10.7535), lad
+    assert next(r for r in bot.live_unrecorded_positions() if r["market_id"] == "777")["value"] is None, "no valueUsd: no value, not $0"
+    bot.live_positions = (list(fake.positions_rows), time.time())
     bot.store.put("live:redeemed:777:1", {"at": NOW, "lost": True})
     assert not any(r["market_id"] == "777" for r in bot.live_unrecorded_positions()), "1.131.3: resolved against it — no holding"
     bot.store.delete_keys(["live:redeemed:777:1"])

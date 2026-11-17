@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.152.1"
+VERSION = "1.152.2"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -710,7 +710,9 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_BTC5_CANCEL_SECONDS", "BTC 5 分钟：开场前几秒撤单", "只管 BTC 5 分钟卡（1.152.0）；0 = 跟上面所有卡的一样。至少比它自己的到期多 5 秒、至多 900"),
     ("PREOPEN_BTC5_EXPIRY_SECONDS", "BTC 5 分钟：签名开场前几秒到期", "只管 BTC 5 分钟卡；0 = 跟上面所有卡的一样。5～600：撤单发不出去时的兜底，到期后不再撮合"),
     ("PREOPEN_BTC5_ENTRY_SECONDS", "BTC 5 分钟：距开场不足几秒不再新挂", "只管 BTC 5 分钟卡；0 = 跟上面所有卡的一样。至少比它自己的撤单时间多 60 秒、至多 3600"),
-    ("PREOPEN_BTC5_AHEAD_MINUTES", "BTC 5 分钟：只挂几分钟内开始的场次", "只管 BTC 5 分钟卡；0 = 跟上面所有卡的一样。3～1440：调小就只挂快开场的几场，少占资金、少读接口"),
+    ("PREOPEN_BTC5_AHEAD_MINUTES", "BTC 5 分钟：只挂几分钟内开始的场次", "只管 BTC 5 分钟卡；0 = 跟上面所有卡的一样。1440 = 挂满：Predict 发布的场次全部挂上，"
+     "新场次一发布就挂（0.5 秒内），排在 49¢ 买单队伍最前面；24 小时最多 288 场，每场两边各 49¢ × 每次份数，预挂资金上限不够时最晚发布的几场挂不上（预挂状态写“已发布未挂”）。"
+     "3～1440：调小就只挂快开场的几场，少占资金、少读接口，但新场次要等进了范围才挂，排在先挂的人后面"),
     ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "0～1000000，0 = 不限（默认）：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金，成交时才扣款；余额够一场双边就挂）；设了上限时每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放，/preopen 会算出把已发布的全部挂上需要多少"),
 )
 CONTROL_KEY_SET = frozenset(k for k, _, _ in CONTROL_KEYS)
@@ -11644,14 +11646,15 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_DEEP_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "60", "120", "240", "1440"], "unit": "分钟", "zero": "和第一档一样"},
     "PREOPEN_LIMIT_GAP_PCT": {"kind": "number", "group": "预挂", "presets": ["0", "1", "2", "3", "5"], "unit": "%", "zero": "不管涨跌停"},
     "PREOPEN_OPEN_QUIET_MINUTES": {"kind": "number", "group": "预挂", "presets": ["15", "30", "60"], "unit": "分钟", "zero": "按 15 算（第一场固定不挂）"},
-    "PREOPEN_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["60", "120", "240", "720", "1440"], "unit": "分钟"},
+    "PREOPEN_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["60", "120", "240", "720", "1440"], "unit": "分钟", "captions": {"1440": "挂满"}},
     "PREOPEN_CANCEL_SECONDS": {"kind": "number", "group": "预挂", "presets": ["10", "15", "20", "30", "60"], "unit": "秒"},
     "PREOPEN_EXPIRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["5", "10", "15", "30"], "unit": "秒"},
     "PREOPEN_ENTRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["90", "120", "180", "300"], "unit": "秒"},
     "PREOPEN_BTC5_CANCEL_SECONDS": {"kind": "number", "group": "预挂", "presets": ["0", "10", "15", "20", "30"], "unit": "秒", "zero": "跟所有卡一样"},
     "PREOPEN_BTC5_EXPIRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["0", "5", "10", "15"], "unit": "秒", "zero": "跟所有卡一样"},
     "PREOPEN_BTC5_ENTRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["0", "90", "120", "180", "300"], "unit": "秒", "zero": "跟所有卡一样"},
-    "PREOPEN_BTC5_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "30", "60", "120", "240"], "unit": "分钟", "zero": "跟所有卡一样"},
+    "PREOPEN_BTC5_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "30", "60", "120", "240", "1440"], "unit": "分钟", "zero": "跟所有卡一样",
+                                   "captions": {"1440": "挂满：一发布就挂"}},  # 1.152.2: every listed window, each placed the moment it is listed
     "PREOPEN_MAX_OPEN_USD": {"kind": "number", "group": "预挂", "presets": ["0", "1000", "5000", "7000", "20000"], "unit": "$", "zero": "不限"},
     "SIM_EDGE_CENTS": {"kind": "number", "group": "策略", "presets": ["3", "5", "8", "10", "15", "20"], "unit": "¢"},
     "SIM_SHARES": {"kind": "number", "group": "策略", "presets": ["10", "20", "50", "100", "200", "500"], "unit": "份"},
@@ -14284,13 +14287,12 @@ dd{margin:0;word-break:break-word;font-variant-numeric:tabular-nums}
 .note{font-size:12.5px;background:var(--chip);border-radius:10px;padding:8px 10px;border-left:3px solid var(--warn)}.note.bad{border-left-color:var(--hot)}
 footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:var(--faint);font-size:12px}
 .evchart{width:100%;height:auto;display:block;margin:6px 0 2px;background:var(--chip);border-radius:10px}.evchart .grid{stroke:var(--line2)}.evchart .zero{stroke:var(--faint);stroke-dasharray:3 3}.evchart text{font-size:10px;fill:var(--faint)}.evchart .band{fill:var(--best-soft);opacity:.35}.evchart .ev{fill:none;stroke:var(--muted);stroke-width:1.5;stroke-dasharray:5 4}.evchart .pnl{fill:none;stroke:var(--best);stroke-width:2}.evchart circle.pnl{fill:var(--best)}.evchart circle.ev{fill:var(--muted)}
+.ulist{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:2px 12px}.ulist .urow{padding:8px 0;border-bottom:1px solid var(--line2);font-size:13px;line-height:1.5}.ulist .urow:last-child{border-bottom:0}.ulist .urow>a,.ulist .urow>span{overflow-wrap:anywhere}.ulist .urow .small{margin-top:2px}
 details.hint{margin:4px 0 8px}details.hint>summary{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--muted);cursor:pointer;list-style:none;user-select:none;padding:2px 0}details.hint>summary::-webkit-details-marker{display:none}details.hint>summary:before{content:"ⓘ"}details.hint>summary:after{content:"▸";font-size:10px}details.hint[open]>summary:after{content:"▾"}details.hint[open]>summary{color:var(--text)}details.hint>p{margin:3px 0 0;font-size:12.5px;color:var(--muted);line-height:1.6}details.fold{border-top:1px solid var(--line2)}details.fold>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:8px;padding:10px 0;user-select:none}details.fold>summary::-webkit-details-marker{display:none}details.fold>summary:before{content:"▸";color:var(--muted);font-size:11px;width:10px;flex:0 0 auto}details.fold[open]>summary:before{content:"▾"}details.fold>summary h3{margin:0;font-size:13.5px;color:var(--text)}details.fold[open]{padding-bottom:10px}details.fold.sub{border-top:0}details.fold.sub>summary{padding:6px 0 4px;font-size:12px;color:var(--muted);font-weight:600}details.fold.sub[open]{padding-bottom:4px}details.cust{display:contents}details.cust>summary{list-style:none;display:inline-flex;align-items:center;cursor:pointer;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}details.cust>summary::-webkit-details-marker{display:none}details.cust>summary:after{content:" ▾";font-size:10px}details.cust[open]>summary{border-color:var(--best);color:var(--best)}details.cust .tcust{flex-basis:100%}details.menu{display:inline-block;position:relative}details.menu>summary{list-style:none}details.menu>summary::-webkit-details-marker{display:none}details.menu .mlist{position:absolute;z-index:8;top:calc(100% + 4px);left:0;display:flex;flex-direction:column;gap:2px;min-width:160px;padding:6px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow2)}details.menu .mlist a{padding:7px 10px;border-radius:8px;color:var(--text);text-decoration:none;font-size:13px}details.menu .mlist a:hover{background:var(--chip)}.tbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:2px 0 10px}.tbar .tq.on{border-color:var(--best);color:var(--best);background:var(--best-bg)}ul.notes{margin:4px 0 10px;padding-left:20px;font-size:13px;line-height:1.55}ul.notes li{margin:2px 0}.tbar select,.tbar input,.tbar button{font:inherit;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}.tbar button{cursor:pointer}.tcust{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}.tsum{font-size:13px;margin:2px 0 4px}.tcu{color:var(--up)}.tcd{color:var(--down)}.tdots{display:flex;flex-direction:column;gap:3px;margin:10px 0 6px}.trow{display:flex;align-items:flex-start;gap:8px;font-size:11px;color:var(--muted)}.trow .tl{width:70px;flex:none;font-variant-numeric:tabular-nums;line-height:13px}.trow .tcells{display:flex;flex-wrap:wrap;gap:3px}.tdot{width:12px;height:12px;border-radius:50%;display:inline-block;flex:none;vertical-align:-2px;box-sizing:border-box}.tdot.u{background:var(--up)}.tdot.d{background:var(--down)}.tdot.f{background:var(--faint)}.tdot.n{opacity:.42}.tdot.x{border:1.5px solid var(--line)}.tdot.bad{box-shadow:0 0 0 2px var(--warn)}.tlegend .tdot{margin:0 4px 0 8px}.tdots .tdot{cursor:pointer}.tdots.only .tdot:not(.bad){opacity:.15}.tdot.sel{outline:2px solid var(--text);outline-offset:1px}.tdet{font-size:12.5px;background:var(--chip);border-radius:10px;padding:7px 10px;margin:4px 0}.tdays tr.pick{cursor:pointer}.tdays tr.on td{background:var(--best-bg)}
 </style></head><body><div class="wrap">
 <header><div class="ttl"><h1 id="title">交易复盘</h1><div class="meta" id="meta">加载中…</div></div><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button></header>
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><details class="menu" id="exports"><summary class="btn">导出 ▾</summary><div class="mlist"><a id="csv" href="journal.csv" download="交易日记.csv">交易日记 CSV</a><a id="scsv" href="summary.csv" download="复盘汇总.csv">复盘汇总 CSV</a><a id="mcsv" href="samples.csv" download="模型样本.csv">模型样本 CSV</a><a id="json" href="journal.json?full=1" download="交易日记.json">交易日记 JSON</a></div></details></div>
 <div class="tiles" id="tiles"></div>
-<section class="box" id="unrecbox" hidden><div class="hd"><h2>账户里有、记录里没有的持仓</h2><span class="sum" id="unrecsum"></span></div>
-<div class="body" id="unrecbody"></div><details class="hint" id="unrecnote" hidden><summary>说明</summary><p>按最近一次读到的 Predict 持仓，减去记录和开盘前预挂的份数；多出来的多半是没有记录的挂单成交了（手动单、丢失跟踪的单）。每分钟一次的持仓核对会把它补记到同一方向最近结束的订单上，没有这样的订单就留在这里；/live fills 给出逐项对照。</p></details></section>
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
 <div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>按市场 · <span id="scrng">今天</span> <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbar" id="cbar"><button type="button" class="tq on" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><button type="button" class="tq" data-r="all">全部</button><details class="cust" id="ccust"><summary>自定义</summary><span class="tcust"><input type="date" id="cfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="cto" aria-label="结束日期"><button type="button" id="cgo">查看</button></span></details></div><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><details class="hint"><summary>说明</summary><p>选的日子（北京时间）里下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；开盘前预挂（两边挂）单独成行，名字后带“· 开盘前预挂”，按场次开始的日期算，下单时预期按五五开算。<b>偏离</b> = 实际盈亏比下单时预期差了几个 σ（σ 按下单时的概率算）：±2σ 以内可能只是运气，低于 −2σ 就不像运气了，是这个市场有问题。点一行看明细：原策略是这段时间的每一笔；开盘前预挂是钱亏在哪——只成交一边时那边赢几成、按开始时间、按成交时距开场、按方向和价格档。</p><p>按下单日期（北京时间）统计，开盘前预挂的场次按场次开始的日期计入当天，点开那一天有单独的“开盘前预挂”一行；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></details></div></section>
 <section class="box" id="tallybox"><div class="hd" id="tallyhd"><h2>市场涨跌统计</h2><span class="sum" id="tallysum"></span><button type="button" class="lnk" id="foldtally">收起</button></div>
@@ -14315,6 +14317,8 @@ details.hint{margin:4px 0 8px}details.hint>summary{display:inline-flex;align-ite
 <h3 id="h-groups" hidden>分组</h3><div class="tbl" id="groups" hidden></div>
 <h3 id="h-risk" hidden>共同风险</h3><div id="risk" hidden></div>
 <details class="fold" data-k="rules"><summary><h3>规则</h3></summary><p class="small mut" id="intro"></p></details></div></section>
+<section class="box" id="unrecbox" hidden><div class="hd" id="unrechd"><h2>账户里有、记录里没有的持仓</h2><span class="sum" id="unrecsum"></span><button type="button" class="lnk" id="foldunrec">展开</button></div>
+<div class="body" id="unrecbody" hidden><p class="small mut" id="unrecread"></p><div id="unrectbl"></div><details class="hint"><summary>说明</summary><p>按最近一次读到的 Predict 持仓，减去记录和开盘前预挂的份数；多出来的多半是没有记录的挂单成交了（手动单、丢失跟踪的单）。每分钟一次的持仓核对会把它补记到同一方向最近结束的订单上，没有这样的订单就留在这里；/live fills 给出逐项对照。市场名点开是它在 Predict 的页面；现值按 Predict 给的持仓市值折算到多出的份数；Predict 的持仓接口不给均价，所以不写均价。这一栏默认收起，点标题展开。</p></details></div></section>
 <div class="search"><input type="search" id="q" placeholder="搜市场、订单号、价格（21）、份数（298.73）、状态…" autocomplete="off"><span class="small mut" id="qn"></span></div>
 <div class="filters" id="filters"></div>
 <div class="list" id="list"></div>
@@ -14358,6 +14362,7 @@ const details={};  // trade id -> its whole record, fetched when the trade is op
 try{statsOpen=localStorage.getItem("jrnstats")==="1"}catch(e){}
 let sumOpen=true;try{sumOpen=localStorage.getItem("jrnsum")!=="0"}catch(e){}  // the daily summary: open unless folded by hand
 let anaOpen=false;try{anaOpen=localStorage.getItem("jrnana")==="1"}catch(e){}  // the analysis tables: folded unless opened by hand
+let unrecOpen=false;try{unrecOpen=localStorage.getItem("jrnunrec")==="1"}catch(e){}  // 账户里有、记录里没有的持仓: folded unless opened by hand (1.152.2)
 const base=location.pathname.replace(/\/journal\/?$/,"");
 document.getElementById("back").href=base;document.getElementById("ctl").href=base+"/control";
 document.getElementById("csv").href=base+"/journal.csv";document.getElementById("scsv").href=base+"/summary.csv";document.getElementById("json").href=base+"/journal.json?full=1";document.getElementById("mcsv").href=base+"/samples.csv";  // also right under /journal/ (CTRL-MCSV: the 导出模型样本 link too, else /journal/samples.csv 404s)
@@ -14791,10 +14796,18 @@ function render(){
   const nodes=[];let day="";page.forEach(t=>{const k=dayKey(t.opened);if(k!==day){day=k;nodes.push(dayHead(t.opened,byDay.get(k)))}nodes.push(row(t))});
   document.getElementById("list").replaceChildren(...(nodes.length?nodes:[$("p","mut",data.trades.length?"没有符合条件的交易":"还没有交易")]));
   more(all.length)}
-function unrecorded(){  // the positions the account holds beyond the records (1.130.3), and the orders without a record
-  const L=data.live||{},rows=L.unrecorded||[],box=document.getElementById("unrecbox");box.hidden=!rows.length&&!L.unknown_orders;document.getElementById("unrecnote").hidden=box.hidden;if(box.hidden)return;
-  document.getElementById("unrecsum").textContent=(L.unknown_orders?"账户上还有 "+L.unknown_orders+" 张没有记录的挂单；":"")+(L.positions_at?"持仓读于 "+when(L.positions_at):"还没读过持仓");
-  document.getElementById("unrecbody").replaceChildren(rows.length?table(["市场 / 方向","账户多出的份数","Predict 均价","持仓时间"],rows.map(r=>[r.name,num(r.shares),r.price==null?"—":cent(r.price),r.at?when(r.at):"—"])):$("p","small mut","持仓和记录一致"))}
+const UNREC_RESULT={WON:"已结算：赢",WIN:"已结算：赢",WINNER:"已结算：赢",LOST:"已结算：输",LOSE:"已结算：输",LOSER:"已结算：输"};
+function unrecorded(){  // the positions the account holds beyond the records (1.130.3), and the orders without a record: 1.152.2 below 统计与风险, folded
+  const L=data.live||{},rows=L.unrecorded||[],box=document.getElementById("unrecbox");box.hidden=!rows.length&&!L.unknown_orders;if(box.hidden)return;
+  const valued=rows.filter(r=>r.value!=null),worth=valued.reduce((s,r)=>s+r.value,0);
+  document.getElementById("unrecsum").textContent=[rows.length?rows.length+" 个":"",valued.length?"现值 "+usd(worth):"",L.unknown_orders?"挂单 "+L.unknown_orders+" 张":""].filter(Boolean).join(" · ");
+  document.getElementById("unrecbody").hidden=!unrecOpen;document.getElementById("foldunrec").textContent=unrecOpen?"收起":"展开";
+  document.getElementById("unrecread").textContent=(L.unknown_orders?"账户上还有 "+L.unknown_orders+" 张没有记录的挂单。":"")+(L.positions_at?"持仓读于 "+when(L.positions_at):"还没读过持仓");
+  const list=$("div","ulist");  // one position a row: its market (named in full, linked to Predict) above, the figures below — a phone shows them all
+  rows.forEach(r=>{const it=$("div","urow");let nm=$("span","",r.name);if(r.url){nm=$("a","",r.name);nm.href=r.url;nm.target="_blank";nm.rel="noopener"}
+    it.append(nm,$("div","small mut",["账户多出 "+num(r.shares)+" 份",r.value!=null?"现值 "+usd(r.value):"",r.price!=null?"Predict 均价 "+cent(r.price):"",  // Predict's positions carry no average price: said only when a row states one
+      r.status?UNREC_RESULT[r.status]||r.status:"",r.at?"持仓时间 "+when(r.at):""].filter(Boolean).join(" · ")));list.append(it)});
+  document.getElementById("unrectbl").replaceChildren(rows.length?list:$("p","small mut","持仓和记录一致"))}
 let okAt=0,dead=false;
 function two(n){return String(n).padStart(2,"0")}
 function clock(ms){const d=new Date(ms);return two(d.getHours())+":"+two(d.getMinutes())+":"+two(d.getSeconds())}
@@ -14825,6 +14838,8 @@ async function load(){  // the list: light rows, the open trades and the last fe
   try{const r=await fetch(a.href,{cache:"no-store",headers:{"X-Control-Key":key}});if(!r.ok)throw new Error("HTTP "+r.status);const u=URL.createObjectURL(await r.blob());
     const t=document.createElement("a");t.href=u;t.download=a.getAttribute("download");document.body.append(t);t.click();t.remove();setTimeout(()=>URL.revokeObjectURL(u),5000)}
   catch(err){alert("导出失败："+err.message)}})});
+document.getElementById("unrechd").addEventListener("click",()=>{unrecOpen=!unrecOpen;try{localStorage.setItem("jrnunrec",unrecOpen?"1":"0")}catch(e){}
+  document.getElementById("unrecbody").hidden=!unrecOpen;document.getElementById("foldunrec").textContent=unrecOpen?"收起":"展开"});
 document.getElementById("statshd").addEventListener("click",()=>{statsOpen=!statsOpen;try{localStorage.setItem("jrnstats",statsOpen?"1":"0")}catch(e){}
   document.getElementById("statsbody").hidden=!statsOpen;document.getElementById("foldstats").textContent=statsOpen?"收起":"展开"});
 document.getElementById("q").addEventListener("input",e=>{qF=e.target.value.trim();shown=PAGE;render()});
@@ -15095,6 +15110,7 @@ function switchMode(v){if(data.live&&v===data.live.mode)return;
 $("modebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b||b.disabled)return;switchMode(b.dataset.mode)});
 const GROUPS=[["策略","策略"],["风控","真实交易风控"],["预挂","开盘前预挂（15 分钟市场）"],["高级","高级参数"]];
 function fmt(s,v){return s.unit==="$"?"$"+v:s.unit==="¢"?v+"¢":s.unit?v+" "+s.unit:v}
+function capOf(s,v){return s.captions&&s.captions[v]?"（"+s.captions[v]+"）":""}  // a preset's own name: 1440 分钟（挂满） (1.152.2)
 function selected(s){return new Set(s.kind==="multi"?(s.value==="all"?s.options.map(o=>o[0]):s.value.split(",")):[s.value])}
 function pick(s,v){
   if(s.key==="LIVE")return data.live?switchMode(v):act({action:"set",values:{LIVE:v}});
@@ -15105,13 +15121,13 @@ function card(s){
   if(s.kind==="detail")return null;  // drawn inside another card as its market chips (DETAIL)
   const c=el("div","set");c.dataset.key=s.key;
   const t=el("div","ttl");t.append(el("b","",s.label));
-  const now=el("span","now","当前 "+(s.kind==="number"?fmt(s,s.value):s.none&&s.value===s.none?"无（一键全关）":s.value)+" ");
+  const now=el("span","now","当前 "+(s.kind==="number"?fmt(s,s.value)+capOf(s,s.value):s.none&&s.value===s.none?"无（一键全关）":s.value)+" ");
   now.append(s.saved||s.overridden?el("span","badge saved","已保存"):el("span","badge",s.env?"环境变量 "+s.env:"默认值"));
   if(MAKER_MODES.has(s.key)&&s.value!=="0"&&(data.settings.find(x=>x.key==="SIM_WAYS")||{}).value==="taker")now.append(" ",el("span","badge warn","挂单没开，不生效"));
   t.append(now);c.append(t);
   c.append(el("div","hint",s.hint));
   const sel=selected(s),o=el("div","opts");
-  (s.kind==="number"||s.kind==="text"?s.presets.map(v=>[v,v===""?(s.empty||"清空"):fmt(s,v)+(s.zero&&v==="0"?"（"+s.zero+"）":"")]):s.options).forEach(([v,cap])=>{
+  (s.kind==="number"||s.kind==="text"?s.presets.map(v=>[v,v===""?(s.empty||"清空"):fmt(s,v)+(s.zero&&v==="0"?"（"+s.zero+"）":"")+capOf(s,v)]):s.options).forEach(([v,cap])=>{
     const b=el("button","opt"+(sel.has(v)?" sel":""),cap);b.dataset.v=v;b.disabled=!data.enabled;b.addEventListener("click",()=>pick(s,v));o.append(b)});
   c.append(o);
   if(s.kind==="multi"&&s.none){const a=el("div","opts");  // 1.136.0: every card on or off in one click (none = no card, the mode stays on)

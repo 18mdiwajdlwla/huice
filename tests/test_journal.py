@@ -458,6 +458,24 @@ async def browser_check(bot, data):
         assert await page.is_visible("#statsbody") and "模型预期（下单时）" in await page.inner_text("#statsbody") and await page.is_visible("#groups")
         await page.click("#statshd")
         assert await page.is_hidden("#statsbody")
+        # 1.152.2: 账户里有、记录里没有的持仓 sits below 统计与风险, folded to one line; opened, the market is named in full and linked,
+        # with its value and result — and no 均价 / 持仓时间 columns when Predict gave none (they were all "—")
+        assert await page.is_hidden("#unrecbox"), "a paper bot: nothing to show"
+        await page.evaluate("""data.live={unrecorded:[{name:"Will $PONS FDV hit $20M before November 2026? / No",shares:10.7535,price:null,at:0,value:10.75,
+          url:"https://predict.fun/zh-cn/market/what-fdv-will-pons-hit-before-nov-2026",status:"WON",market_id:"778",index_set:2}],unknown_orders:2,positions_at:Date.now()};unrecorded()""")
+        assert await page.is_visible("#unrecbox") and await page.is_hidden("#unrecbody") and await page.inner_text("#foldunrec") == "展开"
+        assert await page.inner_text("#unrecsum") == "1 个 · 现值 $10.75 · 挂单 2 张", await page.inner_text("#unrecsum")
+        assert await page.evaluate("!!(document.getElementById('statsbox').compareDocumentPosition(document.getElementById('unrecbox'))&Node.DOCUMENT_POSITION_FOLLOWING)")
+        await page.click("#unrechd")
+        assert await page.is_visible("#unrecbody") and await page.inner_text("#foldunrec") == "收起" and await page.evaluate("localStorage.getItem('jrnunrec')") == "1"
+        assert await page.locator("#unrectbl .urow").count() == 1 and await page.inner_text("#unrectbl .urow a") == "Will $PONS FDV hit $20M before November 2026? / No"
+        assert await page.get_attribute("#unrectbl .urow a", "href") == "https://predict.fun/zh-cn/market/what-fdv-will-pons-hit-before-nov-2026"
+        assert await page.inner_text("#unrectbl .urow .small") == "账户多出 10.7535 份 · 现值 $10.75 · 已结算：赢", "no 均价 nor 持仓时间 when Predict gave none"
+        assert "账户上还有 2 张没有记录的挂单" in await page.inner_text("#unrecread")
+        await page.click("#unrechd")
+        assert await page.is_hidden("#unrecbody") and await page.evaluate("localStorage.getItem('jrnunrec')") == "0"
+        await page.evaluate("data.live=null;unrecorded()")
+        assert await page.is_hidden("#unrecbox")
         # 1.113.0: the daily summary is one line per day until that line is clicked (its kind / way lines then show; a second
         # click folds them); 今日按市场 has a refresh button and says when the data was read
         days = page.locator("#summary tr.dayrow")

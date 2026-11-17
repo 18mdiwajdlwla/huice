@@ -4465,7 +4465,12 @@ class LiveBot(core.Bot):
 
     def live_unrecorded_positions(self) -> list[dict]:
         """The positions the account holds beyond the records, from the last positions read (live_positions): the review
-        page's 账户里有、记录里没有的持仓 (1.130.3). Dust left out."""
+        page's 账户里有、记录里没有的持仓 (1.130.3). Dust left out.
+
+        1.152.2: named by the market's question when its title is shorter (a level of a ladder is titled "$20M" alone: the
+        page listed "$20M / No" without saying which market), linked to its page on Predict, with what the excess is worth now
+        (the row's valueUsd, pro rata) and the outcome's result once there is one. Predict's positions carry no average
+        price: ``price`` stays None unless a row states one, and the page leaves the column out then."""
         rows, _ = self.live_positions
         recorded = self.live_recorded_by_outcome()
         held: dict[tuple[str, int], dict] = {}
@@ -4473,13 +4478,25 @@ class LiveBot(core.Bot):
             market = row.get("market") if isinstance(row.get("market"), dict) else {}
             outcome = row.get("outcome") if isinstance(row.get("outcome"), dict) else {}
             k = (str(market.get("id") or row.get("marketId") or ""), int(outcome.get("indexSet") or 0))
-            h = held.setdefault(k, {"name": f"{market.get('title') or market.get('question') or market.get('slug') or k[0]} / {outcome.get('name') or outcome.get('title') or k[1]}",
-                                    "shares": 0.0, "price": None, "at": 0})
-            h["shares"] += self.position_shares(row)
+            title, question = str(market.get("title") or "").strip(), str(market.get("question") or "").strip()
+            h = held.setdefault(k, {"name": f"{(question if len(question) > len(title) else title) or market.get('slug') or k[0]} / {outcome.get('name') or outcome.get('title') or k[1]}",
+                                    "shares": 0.0, "price": None, "at": 0, "value": None, "url": "", "status": ""})
+            shares = self.position_shares(row)
+            h["shares"] += shares
             price = self.position_price(row)
             if price is not None:
                 h["price"] = price
             h["at"] = max(h["at"], self.position_time(row))
+            with contextlib.suppress(TypeError, ValueError):
+                value = float(row.get("valueUsd") if row.get("valueUsd") not in (None, "") else row.get("value"))
+                if math.isfinite(value) and value >= 0:
+                    h["value"] = (h["value"] or 0.0) + value
+            slug = str(market.get("categorySlug") or "").strip()
+            if slug and not h["url"]:
+                h["url"] = core.predict_url(slug)
+            status = str(outcome.get("status") or "").strip().upper()
+            if status:
+                h["status"] = status
         out = []
         busy = self.preopen_unverified()
         for k, h in held.items():
@@ -4489,7 +4506,8 @@ class LiveBot(core.Bot):
                 continue  # a pre-open order there whose fills are not read yet: likely its own (1.131.5)
             excess = h["shares"] - recorded.get(k, 0.0)
             if excess > self.LIVE_DUST_SHARES:
-                out.append({**h, "shares": round(excess, 4), "market_id": k[0], "index_set": k[1]})
+                value = None if h["value"] is None or h["shares"] <= 0 else round(h["value"] * excess / h["shares"], 2)
+                out.append({**h, "shares": round(excess, 4), "value": value, "market_id": k[0], "index_set": k[1]})
         return sorted(out, key=lambda r: -r["shares"])
 
     def live_counts_miss(self, st: dict, since: int) -> bool:
