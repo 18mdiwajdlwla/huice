@@ -637,12 +637,18 @@ async def run():
         "Will $PONS FDV hit $20M before November 2026? / No", "https://predict.fun/zh-cn/market/what-fdv-will-pons-hit-before-nov-2026", 10.75, "WON", None, 10.7535), lad
     assert next(r for r in bot.live_unrecorded_positions() if r["market_id"] == "777")["value"] is None, "no valueUsd: no value, not $0"
     # 1.153.0: a real 规则吃单 fill there is recorded — not 账户里有、记录里没有, not adopted; a paper one explains nothing
+    import rules as RL
+    gross = 10.7535 / (1 - RL.fee_share(0.51, 200))  # bought; Predict keeps the fee in shares: 10.7535 held (1.153.3)
     rule_rec = {"slug": "xau-updown-15m-1", "rule": "gold_shut", "side": "down", "mode": "on", "market_id": "778", "index_set": 2, "start_ms": NOW,
-                "orders": [{"state": "final", "shares": 20.0, "filled": 10.7535, "limit": 0.58, "avg": 0.51, "fee": 0.0098}], "pnl": None}
+                "orders": [{"state": "final", "shares": 20.0, "filled": gross, "limit": 0.58, "avg": 0.51, "fee_bps": 200, "id": "R1", "hash": "0xr1"}], "pnl": None}
     bot.store.put("rule:xau-updown-15m-1", {**rule_rec, "mode": "paper"})
     assert any(r["market_id"] == "778" for r in bot.live_unrecorded_positions()), "a paper record holds nothing on the account"
     bot.store.put("rule:xau-updown-15m-1", rule_rec)
-    assert not any(r["market_id"] == "778" for r in bot.live_unrecorded_positions()) and bot.side_filled()[("778", 2)] == 10.7535
+    assert not any(r["market_id"] == "778" for r in bot.live_unrecorded_positions()) and abs(bot.side_filled()[("778", 2)] - 10.7535) < 1e-9
+    # 1.153.3: its order on the account's open list is the bot's own — never announced as one nobody here placed
+    bot.live_note_unknown([{"id": "R1", "status": "OPEN", "amount": "1"}, {"id": "X9", "status": "OPEN", "amount": "1"}], NOW)
+    assert [u["id"] for u in bot.live_unknown_open] == ["X9"], bot.live_unknown_open
+    bot.live_note_unknown([], NOW)
     bot.store.put("rule:xau-updown-15m-1", {**rule_rec, "orders": [{**rule_rec["orders"][0], "state": "open"}]})
     assert ("778", 2) in bot.side_unverified(), "an order whose fills are not final: the check leaves the outcome alone"
     today = dt.datetime.fromtimestamp(bot.market.now_ms() / 1000, m.BEIJING).date().isoformat()

@@ -1691,7 +1691,8 @@ class Controller:
             self.account_pages = max(1, -(-len(rows) // page))
             other = self.unmanaged_rows(rows)
             known_core = {str(t.get("live", {}).get("order_id")) for t in self.owner.sim_trades().values() if isinstance(t.get("live"), dict)}
-            strangers = [r for r in other if str(r.get("id")) not in known_core]
+            rule_ids, rule_hashes = getattr(self.owner, "rules_known", lambda: (set(), set()))()  # the rule taker's orders (1.153.3)
+            strangers = [r for r in other if str(r.get("id")) not in known_core | rule_ids and live.order_hash_of(r) not in rule_hashes]
             unmanaged = len(strangers)
             detail = [order_brief(r) for r in strangers[:5]]  # /preopen check names them (1.132.1)
             reserved = 0.0

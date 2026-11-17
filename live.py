@@ -2111,8 +2111,8 @@ class LiveBot(core.Bot):
                     # is left as it is (conservative: it only ever stops sooner); the text now says where the change came from — the
                     # two parts at the resume and now — instead of a loss figure. A pre-open part that did not move, or a record of a
                     # resume that kept no parts, keeps the plain wording.
-                    why += (f"，手动恢复时 {money(found)}（原策略 {money(float(was_own))}、预挂 {money(float(was_pre))}），"
-                            f"现在原策略 {money(own)}、预挂 {money(pre)}")
+                    why += (f"，手动恢复时 {money(found)}（原策略 {money(float(was_own))}、预挂和规则吃单 {money(float(was_pre))}），"
+                            f"现在原策略 {money(own)}、预挂和规则吃单 {money(pre)}")
                     if not self.preopen_active():
                         why += "（预挂未运行：当日盈利不计入）"
                     elif getattr(self.preopen, "winding", ""):
@@ -3973,6 +3973,8 @@ class LiveBot(core.Bot):
         trades = self.sim_trades()
         known_ids = {str(t["live"].get("order_id")) for t in trades.values() if isinstance(t.get("live"), dict) and t["live"].get("order_id")}
         known_hashes = {str(t["live"].get("hash") or "").lower() for t in trades.values() if isinstance(t.get("live"), dict)}
+        rule_ids, rule_hashes = self.rules_known()  # 1.153.3: the rule taker's orders are this bot's own
+        known_ids, known_hashes = known_ids | rule_ids, known_hashes | rule_hashes
         unknown = [r for r in open_rows if str(r.get("id")) not in known_ids and (order_hash_of(r) or "-") not in known_hashes]
         seen = {u["id"] for u in self.live_unknown_open}
         self.live_unknown_open = [{"id": str(r.get("id")), "hash": order_hash_of(r), "status": str(r.get("status") or ""),
@@ -6777,6 +6779,11 @@ class LiveBot(core.Bot):
         import rules
         taker = getattr(self, "rules", None)  # (a bot the tests build without __init__ has none)
         return taker.recs if taker is not None else rules.records(self.store)
+
+    def rules_known(self) -> tuple[set[str], set[str]]:
+        """The rule taker's real orders' ids and hashes (rules.RuleTaker.known): never an "unrecorded" order of the account's."""
+        import rules
+        return rules.known_orders(self.rules_records(), self.market.now_ms())
 
     def rules_pnl(self) -> float:
         """The rule taker's real P&L settled today (Beijing): counted with the model trader's and the pre-open mode's against

@@ -44,10 +44,16 @@ PROBE_LATE_MS = 5 * 60_000
 NEAR_MS = 15 * 60_000         # the last stretch before the start: the status and the book read every FAST_S (matching opens then)
 FAST_S, SLOW_S, CLOSED_SLOW_S = 2.0, 30.0, 60.0  # the book of an open market (fast near the start), a market not yet open for matching
 OFFER_STATUS_S = 10.0         # 1.153.1: an offer at the rule's price on a market not yet open for matching: its status read this often (it buys the moment it opens)
-STOP_MS = 10_000              # nothing placed this close to the start: the rule is about the window before it begins
-EXPIRY_BEFORE_S = 5           # an order's signed expiry: this long before the start...
-MIN_LIFE_S = 65               # ...or this long after it is built, whichever is later (no order in this bot is signed for under a minute)
+STOP_MS = 15_000              # nothing placed this close to the start: the rule is about the window before it begins
+EXPIRY_BEFORE_S = 5           # an order's signed expiry: this long before the start, always — a cancel that cannot get through leaves
+#                               nothing matchable once the window runs (1.153.3: an order sent in the last 70 s was signed for 65 s,
+#                               valid up to a minute into the window)
+SEND_MIN_LEFT_MS = 5_000      # ...and none is sent with less than this left to it
 FILL_READ_MS = 1_500          # an order is read this long after its answer; what has not filled then is withdrawn
+LATE_FILL_MS = 60_000         # an order off the book is final only by a read this long after it left: an earlier one may not show its
+#                               last matches yet (the pre-open mode's LATE_FILL_MS; 1.153.3 — the first read after the cancel ended it,
+#                               a later fill was never booked and the window's cap could be passed)
+REST_MIN_S = 0.1              # the loop never goes round without a wait (1.153.3)
 FOLLOW_EVERY_MS = 1_000       # a withdrawn order read again this often until Predict's word is final...
 UNKNOWN_EVERY_MS = 10_000     # ...an order whose placement's answer went missing, looked for by its hash this often
 GIVE_UP_MS = 15 * 60_000      # ...and given up as never placed this long after its signed expiry
@@ -182,8 +188,53 @@ def walk(levels: list[tuple[D, D]], shares: D) -> D:
 
 
 # --- the records ----------------------------------------------------------------------------------------------------------------
+def rid(slug: str, mode: str) -> str:
+    """A record's id (its store key after PREFIX): the window's slug for a real one, ``paper:<slug>`` for a paper one — one record
+    a window and a mode (1.153.3: a switch between paper and on in a window's life put real orders on the paper record and paper
+    fills on the real one)."""
+    return slug if mode == "on" else f"{mode}:{slug}"
+
+
 def records(store: Any) -> dict[str, dict]:
     return {k.removeprefix(PREFIX): v for k, v in store.items(PREFIX) if isinstance(v, dict)}
+
+
+def sorted_out(recs: dict[str, dict]) -> tuple[dict[str, dict], list[str]]:
+    """The records each under its own id (rid), a record mixing paper and real orders split in two (1.153.3); the old ids no
+    longer used."""
+    out: dict[str, dict] = {}
+    for rec in recs.values():
+        orders = rec.get("orders") or []
+        for mode, mine in (("on", [o for o in orders if not o.get("paper")]), ("paper", [o for o in orders if o.get("paper")])):
+            if not mine and rec.get("mode") != mode:
+                continue
+            key = rid(str(rec.get("slug") or ""), mode)
+            if key in out:
+                out[key]["orders"].extend(mine)
+            else:
+                out[key] = {**rec, "mode": mode, "orders": list(mine)}
+                if rec.get("mode") != mode:
+                    out[key].pop("seen", None)
+                    out[key].update(pnl=None, result="")  # settled again on its own orders
+    return out, [k for k in recs if k not in out]
+
+
+def records_differ(a: dict, b: dict) -> bool:
+    return a != b
+
+
+def fee_share(avg: float, bps: int) -> float:
+    """The part of a taker's shares Predict keeps as its fee: the fee (rate × min(p, 1 − p) a share) is taken in shares, not
+    USDT (README 1.119.1 / 1.150.0: 97.74 bought, 96.30 held)."""
+    return bps / 10_000 * min(avg, 1 - avg) / avg if avg > 0 else 0.0
+
+
+def order_avg(o: dict) -> float:
+    return float(o.get("avg") or o.get("limit") or 0)
+
+
+def order_bps(o: dict) -> int:
+    return int(o.get("fee_bps") if o.get("fee_bps") is not None else 200)
 
 
 def filled(rec: dict) -> float:
@@ -191,8 +242,14 @@ def filled(rec: dict) -> float:
 
 
 def cost(rec: dict) -> float:
-    """What the fills cost, the taker fee in: each order's shares at its average price (its limit while Predict states none)."""
-    return sum(float(o.get("filled") or 0) * (float(o.get("avg") or o.get("limit") or 0) + float(o.get("fee") or 0)) for o in rec.get("orders") or [])
+    """What the fills cost in USDT: each order's shares at its average price (its limit while Predict states none). The fee is paid
+    in shares (net), not here (1.153.3: it was added to the price as well)."""
+    return sum(float(o.get("filled") or 0) * order_avg(o) for o in rec.get("orders") or [])
+
+
+def net(rec: dict) -> float:
+    """The shares the account holds of the fills: those bought less the fee Predict takes in shares."""
+    return sum(float(o.get("filled") or 0) * (1 - fee_share(order_avg(o), order_bps(o))) for o in rec.get("orders") or [])
 
 
 def avg_price(rec: dict) -> float:
@@ -221,7 +278,7 @@ def filled_by_outcome(recs: dict[str, dict], now_ms: int, days: int = 30) -> dic
     for rec in recs.values():
         if rec.get("mode") != "on" or int(rec.get("start_ms") or 0) < now_ms - days * core.DAY_MS:
             continue
-        shares = filled(rec)
+        shares = net(rec)  # what the account holds: the fee is taken in shares (1.153.3)
         if shares > DUST:
             k = (str(rec.get("market_id") or ""), int(rec.get("index_set") or 0))
             out[k] = out.get(k, 0.0) + shares
@@ -234,8 +291,8 @@ def unverified(recs: dict[str, dict]) -> set[tuple[str, int]]:
 
 
 def spent_on(recs: dict[str, dict], day: str, mode: str) -> float:
-    """What the orders placed on a Beijing day cost, the mode's own records (paper's and the real ones apart): the fills at their
-    price and fee, and the whole of an order whose word is not final (RULE_MAX_DAY_USD)."""
+    """What the orders placed on a Beijing day cost in USDT, the mode's own records (paper's and the real ones apart): the fills at
+    their price, and the whole of an order whose word is not final at its limit (RULE_MAX_DAY_USD)."""
     total = 0.0
     for rec in recs.values():
         if rec.get("mode") != mode:
@@ -243,9 +300,26 @@ def spent_on(recs: dict[str, dict], day: str, mode: str) -> float:
         for o in rec.get("orders") or []:
             if day_of(int(o.get("at") or 0)) != day:
                 continue
-            unit = float(o.get("avg") or o.get("limit") or 0) + float(o.get("fee") or 0)
-            total += (float(o.get("filled") or 0) if o.get("state") in FINAL_STATES else float(o.get("shares") or 0)) * unit
+            if o.get("state") in FINAL_STATES:
+                total += float(o.get("filled") or 0) * order_avg(o)
+            else:
+                total += float(o.get("shares") or 0) * float(o.get("limit") or 0)
     return total
+
+
+def known_orders(recs: dict[str, dict], now_ms: int) -> tuple[set[str], set[str]]:
+    """The real orders' ids and hashes of the last two days: the bot's checks of the account's open orders take them as its own
+    (1.153.3: a rule order caught on the list was announced as one nobody here placed)."""
+    ids, hashes, since = set(), set(), now_ms - 2 * core.DAY_MS
+    for rec in recs.values():
+        if rec.get("mode") != "on" or int(rec.get("start_ms") or 0) < since:
+            continue
+        for o in rec.get("orders") or []:
+            if o.get("id"):
+                ids.add(str(o["id"]))
+            if o.get("hash"):
+                hashes.add(str(o["hash"]).lower())
+    return ids, hashes
 
 
 def day_pnl(recs: dict[str, dict], day: str) -> float:
@@ -364,7 +438,7 @@ class RuleStream:
                 continue
             since = time.monotonic()
             self.ws, self.connects = ws, self.connects + 1
-            self.subscribed.clear(); self.pending.clear(); self.versions.clear(); self.books.clear()
+            self.subscribed.clear(); self.pending.clear(); self.versions.clear(); self.books.clear(); self.changed.clear()
             why = ""
             try:
                 why = await self.session(ws)
@@ -416,6 +490,7 @@ class RuleStream:
                 self.subscribed.discard(mid)
                 self.books.pop(mid, None)
                 self.versions.pop(mid, None)
+                self.changed.discard(mid)
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self.wake.wait(), self.SYNC_S)
 
@@ -486,7 +561,14 @@ class RuleTaker:
         self.stop = asyncio.Event()
         self.alive = True
         self.reads = 0
-        self.recs: dict[str, dict] = records(owner.store)  # the records, kept in memory: only this taker writes them
+        self.recs: dict[str, dict] = {}  # the records by id (rid), kept in memory: only this taker writes them
+        recs, gone = sorted_out(records(owner.store))
+        for key, rec in recs.items():
+            if records_differ(rec, (owner.store.get(PREFIX + key) or {})):
+                owner.store.put(PREFIX + key, rec)
+        if gone:
+            owner.store.delete_keys([PREFIX + k for k in gone])
+        self.recs = recs
         self.stream = RuleStream(self)  # the listed windows' books pushed as they change (1.153.1)
 
     # -- plumbing --
@@ -497,12 +579,17 @@ class RuleTaker:
     def store(self) -> Any:
         return self.owner.store
 
-    def record(self, slug: str) -> dict | None:
-        return self.recs.get(slug)
+    def record(self, slug: str, mode: str | None = None) -> dict | None:
+        """The window's record of the mode (the mode in force by default)."""
+        return self.recs.get(rid(slug, mode or self.settings.mode))
 
     def save(self, rec: dict) -> None:
-        self.recs[rec["slug"]] = rec
-        self.store.put(PREFIX + rec["slug"], rec)
+        key = rid(rec["slug"], rec["mode"])
+        self.recs[key] = rec
+        self.store.put(PREFIX + key, rec)
+
+    def known(self) -> tuple[set[str], set[str]]:
+        return known_orders(self.recs, self.now())
 
     def note(self, text: str) -> None:
         self.error = text
@@ -564,8 +651,8 @@ class RuleTaker:
         order = next((o for o in rec.get("orders") or [] if o.get("hash") == digest), None)
         if order is None:
             return "订单记录不见了"
-        if self.now() > int(rec.get("start_ms") or 0) - STOP_MS // 2:
-            return "已到开场，不再发送"
+        if int(order.get("expires") or 0) * 1000 - self.now() < SEND_MIN_LEFT_MS:
+            return "距订单到期不足 5 秒（开场前 5 秒到期），不再发送"
         return self.block(float(order.get("shares") or 0) * float(order.get("limit") or 0))
 
     def today_pnl(self) -> float:
@@ -592,11 +679,9 @@ class RuleTaker:
         """Until the next tick: TICK_S, or less — a pushed book that changed wakes the loop at once (an offer bought within
         the moment it shows)."""
         self.stream.pushed.clear()
-        if self.stream.changed:
-            return
         waits = {asyncio.ensure_future(self.stop.wait()), asyncio.ensure_future(self.stream.pushed.wait())}
-        try:
-            await asyncio.wait(waits, timeout=TICK_S, return_when=asyncio.FIRST_COMPLETED)
+        try:  # 1.153.3: always a wait, however short — a change no look took used to send the loop round without one, the bot frozen
+            await asyncio.wait(waits, timeout=REST_MIN_S if self.stream.changed else TICK_S, return_when=asyncio.FIRST_COMPLETED)
         finally:
             for w in waits:
                 w.cancel()
@@ -607,6 +692,10 @@ class RuleTaker:
         if now - self.planned_ms >= PLAN_EVERY_MS:
             self.plan(now)
             self.planned_ms = now
+        watched = {str(w["market"]["id"]) for w in self.track.values() if w["market"] is not None}
+        self.stream.changed &= watched  # a change of a window no longer watched is nobody's to take (1.153.3)
+        if self.settings.mode == "off" or self.cooling() > 0:
+            self.stream.changed.clear()  # nothing looked at now: the next look reads the book as it stands then
         if self.settings.mode != "off":
             for slug, w in sorted(list(self.track.items()), key=lambda kv: kv[1]["start"]):
                 if self.stop.is_set() or self.cooling() > 0:
@@ -639,12 +728,12 @@ class RuleTaker:
         for slug, (key, start) in want.items():
             self.track.setdefault(slug, {"rule": key, "start": start, "market": None, "listed_ms": 0, "open_ms": 0, "probe_ms": 0,
                                          "look_ms": 0, "status_ms": 0, "offer": False, "word": ""})
-        old = [slug for slug, r in self.recs.items()
+        old = [key for key, r in self.recs.items()
                if int(r.get("start_ms") or 0) < now - KEEP_DAYS * core.DAY_MS and not in_flight(r) and (r.get("pnl") is not None or filled(r) <= DUST)]
         if old:
-            self.store.delete_keys([PREFIX + slug for slug in old])
-            for slug in old:
-                self.recs.pop(slug, None)
+            self.store.delete_keys([PREFIX + key for key in old])
+            for key in old:
+                self.recs.pop(key, None)
 
     def due(self, w: dict, now: int) -> bool:
         """Whether the window is to be looked at this tick: at once when its pushed book changed (1.153.1); else by its cadence —
@@ -657,7 +746,11 @@ class RuleTaker:
                 return False
             every = PROBE_FAST_S if now <= expected + PROBE_LATE_MS or near else PROBE_SLOW_S
             return now - w["probe_ms"] >= every * 1000
-        if str(w["market"]["id"]) in self.stream.changed and now >= w["look_ms"]:
+        mid = str(w["market"]["id"])
+        if now < w["look_ms"]:  # paused (a refusal): a change meanwhile is not one to act on (1.153.3: it kept the loop going round)
+            self.stream.changed.discard(mid)
+            return False
+        if mid in self.stream.changed:
             return True
         every = FAST_S if near else OFFER_STATUS_S if (w["offer"] and not w["open_ms"]) else SLOW_S if w["open_ms"] else CLOSED_SLOW_S
         return now - w["look_ms"] >= every * 1000
@@ -674,6 +767,8 @@ class RuleTaker:
             return
         if not self.due(w, now):
             return
+        if w["market"] is not None:
+            self.stream.changed.discard(str(w["market"]["id"]))  # taken now, whatever this look decides (1.153.3)
         rec = self.record(slug)
         size = self.settings.shares_of(rule.market)
         if rec is not None and (held(rec) >= size - DUST or in_flight(rec)):
@@ -707,14 +802,18 @@ class RuleTaker:
             self.watch(w)["listed_ms"] = now
         w["look_ms"] = now
         mid = str(w["market"]["id"])
-        self.stream.changed.discard(mid)
         pushed = self.stream.book(mid)
         if pushed is None:
             self.reads += 1
         bids, asks = pushed if pushed is not None else await self.book(mid)
         limit = D(self.settings.price(rule.key)) / 100
-        own = self.own_asks(slug, rule.side)  # the pre-open mode's own bids there: never bought from (the account trading with itself)
-        levels = [(p, q - own.get(p, D(0))) for p, q in offered(bids, asks, rule.side, limit) if q - own.get(p, D(0)) > 0]
+        own = self.own_asks(slug, rule.side)
+        if own and min(own) <= limit:
+            # 1.153.3: the pre-open mode's own bids there are offers of this side in the book; a buy at the rule's price would take
+            # them first (the best price first) — the account trading with itself, the fee paid for nothing. Priced a cent under
+            # the cheapest of them instead, sized from the others' offers below it
+            limit = min(own) - D("0.01")
+        levels = offered(bids, asks, rule.side, limit) if limit > 0 else []
         w["offer"] = bool(levels)
         best = offered(bids, asks, rule.side, D("0.99"))[:1]
         self.note_offers(w, levels, best, now)
@@ -755,8 +854,8 @@ class RuleTaker:
 
     def own_asks(self, slug: str, side: str) -> dict[D, D]:
         """The pre-open mode's resting bids on this window's other side, as offers of ``side`` (price -> shares): its Up bid at
-        49¢ is a Down offer at 51¢ in the book. Only gold's 05:15 window can be one it quotes (the shut and the reopen's first
-        are never quoted, 1.150.1 / 1.151.1)."""
+        49¢ is a Down offer at 51¢ in the book. The shut and the reopen's first are never quoted (1.150.1 / 1.151.1); the slots
+        05:15, 05:00, 16:45 and oil's 00:45 can be."""
         ctl = getattr(self.owner, "preopen", None)
         rows = getattr(getattr(ctl, "ledger", None), "rows", None)
         if not rows:
@@ -825,7 +924,7 @@ class RuleTaker:
         rec = rec or self.new_record(slug, w, rule, int((outcome or {}).get("index_set") or 0))
         avg = walk(levels, take)
         rec["orders"].append({"paper": True, "state": "final", "shares": float(take), "filled": float(take), "limit": float(limit),
-                              "avg": float(avg), "fee": core.taker_fee(float(avg), info.fee_bps), "at": self.now(),
+                              "avg": float(avg), "fee_bps": info.fee_bps, "at": self.now(),
                               "book": [[float(p), float(q)] for p, q in levels[:5]]})
         self.save(rec)
         w["word"] = f"只记录：{rule.word} {float(avg) * 100:.1f}¢ × {take:g} 份"
@@ -856,7 +955,7 @@ class RuleTaker:
         rec = self.record(slug) or rec or self.new_record(slug, w, rule, int(outcome.get("index_set") or 0))
         if in_flight(rec):
             return
-        expires = max(w["start"] // 1000 - EXPIRY_BEFORE_S, now // 1000 + MIN_LIFE_S)
+        expires = w["start"] // 1000 - EXPIRY_BEFORE_S  # before the start, always: nothing of it matchable once the window runs
         amounts = live.limit_amounts(True, live.to_wei(limit), live.to_wei(take))
         wallet = self.owner.live.wallet
         identity = f"rule-v1|{self.owner.config.live_chain}|{wallet.maker.lower()}|{info.market_id}|{outcome['token']}|{w['start']}|{len(rec['orders'])}"
@@ -864,7 +963,7 @@ class RuleTaker:
         signed = live.build_order(wallet, outcome["token"], amounts["maker"], amounts["taker"], info.fee_bps, expires, salt=salt)
         digest, signature = wallet.sign_order(signed, info.neg_risk, info.yield_bearing)
         order = {"hash": digest.lower(), "id": "", "state": "placing", "shares": float(take), "limit": float(limit), "filled": 0.0,
-                 "avg": None, "fee": core.taker_fee(float(limit), info.fee_bps), "fee_bps": info.fee_bps, "at": now, "expires": expires,
+                 "avg": None, "fee_bps": info.fee_bps, "at": now, "expires": expires,
                  "book": [[float(p), float(q)] for p, q in levels[:5]]}
         rec["orders"].append(order)
         self.save(rec)
@@ -885,7 +984,7 @@ class RuleTaker:
             status = live.http_status(error)
             definite = isinstance(error, live.OrderRejected) or 400 <= status < 500
             if status == 429 or "限流冷却中" in text:
-                order.update(state="rejected" if status == 429 else "not_sent", error=text)
+                order.update(state="not_sent", error=text)  # the rate limiter, not the order: not one of MAX_REJECTS (1.153.3)
             elif definite and not any(word in text.lower() for word in preopen.DUPLICATE_WORDS):
                 order.update(state="rejected", error=text)
             else:  # a timeout, a lost answer: it may exist — looked for by its hash, never sent again
@@ -909,7 +1008,7 @@ class RuleTaker:
             if rec.get("mode") != "on" or not in_flight(rec):
                 continue
             for order in rec["orders"]:
-                if order.get("state") in FINAL_STATES or now < int(order.get("next_ms") or 0) or self.cooling() > 0:
+                if order.get("paper") or order.get("state") in FINAL_STATES or now < int(order.get("next_ms") or 0) or self.cooling() > 0:
                     continue
                 try:
                     await self.follow_order(rec, order, now)
@@ -919,31 +1018,45 @@ class RuleTaker:
                 self.save(rec)
 
     async def follow_order(self, rec: dict, order: dict, now: int) -> None:
+        """One read of a real order: its fills taken; filled in full, final; off the book (withdrawn, cancelled, expired) it is
+        final only by a read LATE_FILL_MS after it left (a fill matched just before may show late), still on it its rest is
+        withdrawn. Past its signed expiry by GIVE_UP_MS it is final whatever its state, on the fills known (1.153.3)."""
         import live
         state = order["state"]
         if state == "placing":  # a request that left with the process gone before its answer (a restart): looked for by its hash
             order.update(state="unknown", next_ms=now)
             state = "unknown"
+        late = now >= int(order.get("expires") or 0) * 1000 + GIVE_UP_MS
         self.reads += 1
         row = await self.api.order(order.get("id") or "", order["hash"])
         if row is None:
-            if state == "unknown" and now >= int(order.get("expires") or 0) * 1000 + GIVE_UP_MS:
-                order.update(state="not_found", error="按哈希一直查不到：视为没下成")
+            if late:
+                if state == "unknown" and not order.get("id"):
+                    order.update(state="not_found", error="按哈希一直查不到：视为没下成")
+                else:
+                    order.update(state="final", error=f"到期后 {GIVE_UP_MS // 60_000} 分钟仍查不到这张单：按已知成交 {float(order.get('filled') or 0):g} 份记")
             else:
                 order["next_ms"] = now + (UNKNOWN_EVERY_MS if state == "unknown" else FOLLOW_EVERY_MS)
             return
         order["id"] = str(row.get("id") or order.get("id") or "")
         self.take_fills(rec, order, row)
-        if live.order_final(row, float(order["shares"])):
+        if float(order.get("filled") or 0) >= float(order["shares"]) - DUST:
             order["state"] = "final"
             return
-        if order.get("removed"):
-            order["next_ms"] = now + FOLLOW_EVERY_MS
+        if live.order_final(row, float(order["shares"])) or order.get("removed"):  # off the book
+            order["left_ms"] = int(order.get("left_ms") or now)
+            if now - order["left_ms"] >= LATE_FILL_MS or late:
+                order["state"] = "final"
+            else:
+                order.update(state="closing", next_ms=order["left_ms"] + LATE_FILL_MS)
+            return
+        if late:
+            order.update(state="final", error="到期后仍显示挂着：按已知成交记")
             return
         if order.get("id"):  # still open: the rest withdrawn (a taker never waits on the book)
             result = await self.api.remove_orders([order["id"]])
             if order["id"] in (result.get("removed") or []) or order["id"] in (result.get("noop") or []):
-                order["removed"] = now
+                order.update(removed=now, left_ms=now)
             order.update(state="cancelling", next_ms=now + FOLLOW_EVERY_MS)
         else:
             order["next_ms"] = now + UNKNOWN_EVERY_MS
@@ -954,7 +1067,7 @@ class RuleTaker:
         shares, _ = live.order_fill(row, float(order["shares"]))
         price = live.order_price(row)
         if price is not None:
-            order.update(avg=price, fee=core.taker_fee(price, int(order.get("fee_bps") or 0)), avg_stated=True)
+            order.update(avg=price, avg_stated=True)
         before = float(order.get("filled") or 0)
         if shares > before + DUST:
             order["filled"] = shares
@@ -994,7 +1107,7 @@ class RuleTaker:
                 self.save(rec)
                 continue
             pay = up if rec["side"] == "up" else 1 - up
-            pnl = sum(float(o.get("filled") or 0) * (pay - float(o.get("avg") or o.get("limit") or 0) - float(o.get("fee") or 0)) for o in rec["orders"])
+            pnl = net(rec) * pay - cost(rec)  # the shares held (the fee taken in shares) paid out, less the USDT spent (1.153.3)
             rec.update(result="split" if up == 0.5 else "up" if up == 1.0 else "down", pnl=round(pnl, 6), settled_ms=now, settled_day=day_of(now))
             self.save(rec)
             word = "赢" if pnl > DUST else "输" if pnl < -DUST else "平"
