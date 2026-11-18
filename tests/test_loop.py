@@ -477,6 +477,25 @@ async def the_rule_taker_first():
     bot.rules.running = True
     await bot.price_look
     del bot.rules.priced
+    # 1.154.25: what is done once a day and holds the loop for seconds asks for a clear stretch ahead of the rule taker —
+    # by that taker's own plan of when it needs to be fast (busy_in: ms; 0 now, None never)
+    busy, first = [None], [False]
+    bot.rules.first_now, bot.rules.busy_in, bot.rules.now = (lambda: first[0]), (lambda now: busy[0]), (lambda: NOW)
+    quiet[0] = 0
+    assert bot.rules_clear(180) and not bot.rules_first()
+    busy[0] = 180_001
+    assert bot.rules_clear(180)
+    busy[0] = 180_000
+    assert not bot.rules_clear(180), "it goes first within three minutes"
+    busy[0], first[0] = None, True
+    assert not bot.rules_clear(180) and bot.rules_first()
+    first[0], quiet[0] = False, 4_000
+    assert not bot.rules_clear(180) and bot.rules_first()
+    quiet[0] = 7_000
+    bot.rules.busy_in = lambda now: 1 / 0
+    first[0] = False
+    assert not bot.rules_clear(180)  # (its own seconds, said before the plan is asked)
+    del bot.rules.first_now, bot.rules.busy_in, bot.rules.now
     # the step: due, and it waits; the express lane does not ask
     due = lambda ago: time.monotonic() - bot.config.sim_seconds - ago
     bot.sim_ran = at = due(0.5)
@@ -527,12 +546,117 @@ async def the_rule_taker_first():
     assert R.RuleTaker(owner).api.pool is pool, "the rule taker's client: on them"
 
 
+async def the_long_lived_heap_is_set_aside():
+    """1.154.25 — 11-18 18:52, production: a collection of the oldest generation 0.7 s, three in ten minutes, the whole process
+    stopped each time. Nearly all it walks is long-lived and no garbage (the records, the account snapshot): set aside
+    (GcWatch.settle: a collection of what was made since the last time, then gc.freeze), a full collection walks what was
+    made since alone. The bot does it a while after its start and every few minutes; once a day everything is walked again
+    (thaw) — not while the rule taker goes first; and nothing at all in the seconds that taker has the loop to itself."""
+    import gc
+    watch = m.GC_WATCH
+    base = gc.get_freeze_count()  # (the interpreter's own: a few hundred objects that are never looked at)
+    assert not watch.settles and base < 5_000 and watch.thawed is None
+    kept = [{"record": i, "orders": [{"hash": str(i)}]} for i in range(60_000)]  # what a bot keeps: tracked by the collector, never garbage
+    timed = lambda: (lambda began: (gc.collect(), time.perf_counter() - began)[1])(time.perf_counter())
+    whole = min(timed() for _ in range(3))
+    watch.start()
+    try:
+        took = watch.settle()
+        frozen = gc.get_freeze_count()
+        assert frozen >= 120_000 and (watch.settles, watch.settled[2]) == (1, frozen) and watch.thawed is not None and took >= 0, (frozen, watch.settled)
+        after = min(timed() for _ in range(3))
+        assert after < whole / 3, f"a full collection still walks everything: {after * 1000:.1f} ms against {whole * 1000:.1f}"
+        # what is set aside is freed all the same when nothing refers to it (the reference counts): no collector needed
+        del kept[30_000:]
+        assert gc.get_freeze_count() <= frozen - 50_000
+        line = watch.line()
+        import re
+        assert re.search(r"｜长期数据 \d+ 万 个对象已放到一边、回收时不再扫（每 5 分钟整理一次，上次 \d+ 秒前、用了 \d+ ms；每天全部重扫一次）$", line), line
+        assert "整堆回收" in line and not any(gen >= 2 and at >= watch.settled[0] - 5 for at, gen, _ in watch.runs if False), line
+        runs = len(watch.runs)
+        watch.settle()
+        assert len(watch.runs) == runs, "its own collection is told with the settle (上次…用了…), not among the collector's"
+        gc.collect()
+        assert len(watch.runs) == runs + 1 and watch.runs[-1][1] == 2
+        # garbage in a cycle among what was set aside waits for the day's thaw
+        import weakref
+
+        class Node:
+            pass
+        ring = Node()
+        ring.other = Node()
+        ring.other.other = ring
+        alive = weakref.ref(ring)
+        watch.settle()
+        first, settles = watch.thawed, watch.settles
+        del ring
+        gc.collect()
+        assert alive() is not None, "set aside: no collection looks at it"
+        watch.settle(thaw=True)
+        assert alive() is None and watch.thawed >= first and watch.settles == settles + 1
+        # the bot's own loop
+        bot = make_bot()
+        kept_times = (m.GcWatch.SETTLE_FIRST_S, m.GcWatch.SETTLE_EVERY_S)
+        m.GcWatch.SETTLE_FIRST_S, m.GcWatch.SETTLE_EVERY_S = 0.01, 0.02
+        quiet, first_now = [3.0], [True]
+        bot.rules_quiet, bot.rules_clear = (lambda: quiet[0]), (lambda seconds: not first_now[0])
+        task = asyncio.ensure_future(bot.gc_keep())
+        try:
+            before = watch.settles
+            await asyncio.sleep(0.08)
+            assert watch.settles == before, "the rule taker's own seconds: nothing"
+            quiet[0] = 0.0
+            watch.hold()
+            await asyncio.sleep(0.05)
+            assert watch.settles == before, "the collector held off by someone: nothing"
+            watch.release()
+            for _ in range(400):
+                await asyncio.sleep(0.01)
+                if watch.settles >= before + 2:
+                    break
+            assert watch.settles >= before + 2, "every SETTLE_EVERY_S from then on"
+            # a day since everything was walked: again — with a clear stretch ahead of the rule taker (Bot.day_pass_due), not
+            # in the seconds between two of its windows
+            watch.thawed, thawed = time.monotonic() - m.Bot.DAY_PASS_S - 1, []
+            real = watch.settle
+            watch.settle = lambda thaw=False: thawed.append(thaw) or real(thaw)
+            for _ in range(400):
+                await asyncio.sleep(0.01)
+                if len(thawed) >= 2:
+                    break
+            assert len(thawed) >= 2 and not any(thawed), thawed
+            first_now[0] = False
+            for _ in range(400):
+                await asyncio.sleep(0.01)
+                if any(thawed):
+                    break
+            assert any(thawed) and time.monotonic() - watch.thawed < 5
+            # ...but half a day overdue (a taker that goes first round the clock) it is made at any moment that taker does
+            # not have the loop to itself
+            first_now[0] = True
+            assert not bot.day_pass_due(time.monotonic() - m.Bot.DAY_PASS_S - m.Bot.DAY_PASS_LATE_S + 60)
+            assert bot.day_pass_due(time.monotonic() - m.Bot.DAY_PASS_S - m.Bot.DAY_PASS_LATE_S - 1) and bot.day_pass_due(None) is False
+            quiet[0] = 2.0
+            assert not bot.day_pass_due(time.monotonic() - m.Bot.DAY_PASS_S - m.Bot.DAY_PASS_LATE_S - 1), "never in the seconds it has the loop to itself"
+            quiet[0], first_now[0] = 0.0, False
+            assert bot.day_pass_due(None) and not bot.day_pass_due(time.monotonic() - 3600)
+            del watch.settle
+        finally:
+            m.GcWatch.SETTLE_FIRST_S, m.GcWatch.SETTLE_EVERY_S = kept_times
+            bot.stopping.set()
+            await asyncio.wait_for(task, 5)
+    finally:
+        watch.stop()
+    assert gc.get_freeze_count() <= base and not watch.settles and watch.thawed is None and gc.isenabled()  # (as it was found)
+
+
 async def main():
     await loop_watch()
     await snapshot_once()
     await gates()
     await control_page()
     await the_rule_taker_first()
+    await the_long_lived_heap_is_set_aside()
 
 
 asyncio.run(main())

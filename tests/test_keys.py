@@ -405,6 +405,22 @@ class KeyTests(unittest.IsolatedAsyncioTestCase):
             feed.lend = None
             await feed.fetch(url)
             self.assertEqual(sent, ["book-key", "main-key"])
+            # 1.154.25 — /diag's probe of Predict goes ahead of the key's queue. The feed's reads wait last of all (they leave
+            # two tokens behind for the trader's), and on a key at its pace the probe — queued as one of them — timed out after
+            # twelve seconds without ever being sent: "Predict 整组全部失败" while every book was being pushed (11-18 18:52)
+            sent.clear()
+            bucket("main-key", 0.0)  # the key at its pace: nothing in the bucket (a token every ten seconds in this test)
+            waiting = asyncio.ensure_future(feed.fetch(url))
+            await asyncio.sleep(0.05)
+            self.assertEqual((sent, waiting.done()), ([], False), "a read of the feed's waits for its token, and two more left behind")
+            self.assertEqual(await asyncio.wait_for(feed.fetch(url, ahead=True), 1), {})
+            self.assertEqual((sent, waiting.done()), (["main-key"], False), "the probe: sent at once, on the feed's own key — the others still wait")
+            feed.lend = types.SimpleNamespace(key=lambda: "rule-key", why=lambda: "", refused=lambda until, limited=True: None)
+            bucket("rule-key", 8.0)
+            await feed.fetch(url, ahead=True)
+            self.assertEqual(sent, ["main-key", "main-key"], "...never on a borrowed one: it says how the bot's own key answers")
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
         finally:
             m._http_get = real_get
 
