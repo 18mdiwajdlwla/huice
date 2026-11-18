@@ -472,9 +472,11 @@ def races(recs: dict[str, dict], mode: str, since_ms: int) -> list[dict]:
             "offer_at": shown or int(seen.get("offer_ms") or 0), "stamped": bool(shown),
             "lead_min": round((int(r.get("start_ms") or 0) - int(seen["offer_ms"])) / 60_000, 1) if seen.get("offer_ms") else None,
             "peak": float(seen.get("offer_max") or 0), "cut_ms": gap("cut"), "gone_ms": gap("gone"), "open": bool(seen.get("open")),
-            "asked": round(sum(float(o.get("shares") or 0) for o in orders), 4), "bought": round(sum(float(o.get("filled") or 0) for o in orders), 4),
+            "asked": round(sum(float(o.get("shares") or 0) for o in orders if o.get("state") not in NEVER_PLACED), 4),
+            "bought": round(sum(float(o.get("filled") or 0) for o in orders), 4),
             "orders": [{"shares": float(o.get("shares") or 0), "filled": float(o.get("filled") or 0), "paper": bool(o.get("paper")),
                         "seen": o.get("seen"), "fresh": o.get("fresh"), "state": o.get("state"),
+                        "error": str(o.get("error") or "") if o.get("state") in NEVER_PLACED else "",  # (1.154.18: never placed — said so, not "bought nothing")
                         "after": int(o["sent_wall"]) - shown if o.get("sent_wall") and shown else None,
                         "lag": int(o["seen_wall"]) - int(o["book_ts"]) if o.get("book_ts") and o.get("seen_wall") else None,
                         "own": int(o["sent_wall"]) - int(o["seen_wall"]) if o.get("sent_wall") and o.get("seen_wall") else None,
@@ -491,16 +493,23 @@ def race_text(row: dict) -> str:
     if row["offer_at"]:
         text += (f"≤{row['cents']}¢ 的卖单 {clock(row['offer_at'])} 出现" + (f"（开场前 {row['lead_min']:g} 分钟）" if row["lead_min"] is not None else "")
                  + f"，最多 {row['peak']:g} 份；"
-                 + (f"{sec(row['cut_ms'])}后开始被吃" if row["cut_ms"] is not None else "还没有被吃")
-                 + (f"、{sec(row['gone_ms'])}后被吃光" if row["gone_ms"] is not None else "、还没吃光" if row["cut_ms"] is not None else ""))
+                 # (1.154.18: a watch of before 1.154.16 knows when the offers were gone, not when they were first taken from — it read
+                 # "还没有被吃、0.42 秒后被吃光")
+                 + ("、".join(([f"{sec(row['cut_ms'])}后开始被吃"] if row["cut_ms"] is not None else [])
+                             + ([f"{sec(row['gone_ms'])}后被吃光"] if row["gone_ms"] is not None else ["还没吃光" if row["open"] else "到开场前没吃光"] if row["cut_ms"] is not None else []))
+                    or ("还没有被吃" if row["open"] else "到开场前没人吃")))
     else:
         text += "卖单出现的时刻没有记到（重启前的，或没看到规则价以内的卖单）"
     orders = row["orders"]
     if not orders:
         return text + "；没下单" + ("（这一场还在看）" if row["open"] else "")
-    text += "；" + ("只记录 " if all(o["paper"] for o in orders) else "") + (f"买到 {row['bought']:g}/{row['asked']:g} 份" if row["bought"] > DUST else f"下了 {row['asked']:g} 份，没买到")
+    text += "；" + ("只记录 " if all(o["paper"] for o in orders) else "") + (
+        f"买到 {row['bought']:g}/{row['asked']:g} 份" if row["bought"] > DUST else f"下了 {row['asked']:g} 份，没买到" if row["asked"] > DUST else "单没下成")
     for i, o in enumerate(orders, 1):
         if o["paper"]:
+            continue
+        if o.get("state") in NEVER_PLACED:
+            text += f"｜第 {i} 张 要 {o['shares']:g}：没下成" + (f"（{o['error']}）" if o.get("error") else "")
             continue
         parts = ([f"出现后 {o['after']} ms 发出"] if o["after"] is not None else []) + ([f"推送 {o['lag']} ms"] if o["lag"] is not None else [])
         if o["own"] is not None:  # (an order that waited for something else than its book — the one before it — is told apart)
@@ -1478,7 +1487,10 @@ class RuleTaker:
             if fresh < 1:
                 w["word"] = f"盘口 ≤{int(limit * 100)}¢ 的{rule.word} {there:g} 份，在途的单正在吃"
                 return
-            take = room if fresh >= max(D(SWEEP_SHARES), room / SWEEP_PART) else min(fresh, room)
+            # (1.154.18: around the makers' moment an offer of SWEEP_SHARES is a ladder's first step, whatever part of the window it
+            # is — 11-18 01:45, 46 shares in the first book of a ladder of 506: the order for all the window may buy then, not after
+            # the next push)
+            take = room if fresh >= SWEEP_SHARES and (fresh >= room / SWEEP_PART or self.sprinting(w, now)) else min(fresh, room)
             usd_left = self.owner.live.usd() if callable(getattr(self.owner.live, "usd", None)) else None
             if usd_left is not None:  # no more than the USDT at hand buys at the order's price
                 afford = (D(str(max(usd_left, 0.0))) / limit).to_integral_value(rounding="ROUND_FLOOR")
@@ -1954,7 +1966,7 @@ class RuleTaker:
         if reads and statistics.median(reads) >= 150:
             near = connect and statistics.median(connect) < 60
             hint = ("｜入口很近、请求却慢：Predict 的服务器离这个区域远（或它处理慢）" if near else "｜一次请求这么久，多半是离 Predict 的服务器远") \
-                   + "——换一个部署区域试：在那个区域跑 tools/predict_latency.py 对比"
+                   + "——换一个部署区域试：在那个区域新建一个服务、启动命令填 python -u rules.py latency，量出来再比"
         return "网络（不含排队）：" + "｜".join(parts) + hint
 
     def speed_line(self, now: int) -> str:

@@ -1748,7 +1748,7 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         try:
             self.assertEqual(again.net_line(), "网络（不含排队）：机器人在 未知区域｜到 api.predict.fun 新建连接 中位 12 ms（最快 9），是 2～3 个来回｜入口 8a1b2c3d4e5f-AMS"
                                                "｜读一次 中位 310 ms（最快 290）｜下单 / 撤单一次 中位 315 ms（最快 300）"
-                                               "｜入口很近、请求却慢：Predict 的服务器离这个区域远（或它处理慢）——换一个部署区域试：在那个区域跑 tools/predict_latency.py 对比")
+                                               "｜入口很近、请求却慢：Predict 的服务器离这个区域远（或它处理慢）——换一个部署区域试：在那个区域新建一个服务、启动命令填 python -u rules.py latency，量出来再比")
             self.assertIn(again.net_line(), again.status())
             again.api.trips = [("GET", 42.0), ("POST", 61.0)]
             self.assertTrue(again.net_line().endswith("｜读一次 中位 42 ms（最快 42）｜下单 / 撤单一次 中位 61 ms（最快 61）"), "near: no hint")
@@ -1822,6 +1822,46 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
             self.assertRegex("\n".join(lines), r"读盘口被拒绝（HTTP 401: authorization error：没带 Key 或 Key 不对），3 次被拒的应答来回 中位 \d+ ms")
         finally:
             m._http_get, m.ws_connect, asyncio.sleep = plain_get, plain_ws, sleep
+
+
+    async def test_the_race_lines_of_the_first_night(self):
+        """1.154.18 — the first night's /rules (11-18, the watches of 1.154.13). 01:45, the 06:45 window: 46 shares in the first
+        book of a ladder that grew to 506 and stood six seconds — bought as 46, then 166 five seconds on. Around the makers'
+        moment an offer of SWEEP_SHARES is a ladder's first step, whatever part of the window it is: the whole window is asked
+        for at once. And the lines say what is known, no more: a watch of before 1.154.16 knows when the offers were gone, not
+        when they were first taken from; an order that was never placed is not one that bought nothing."""
+        env = dict(RULE_GOLD_SHARES="300", RULE_GOLD_SHUT_CENTS="60", RULE_FAST_HOURS="off", RULE_OIL="off", RULE_GOLD_OPEN_CENTS="0", RULE_GOLD_0515_CENTS="0")
+        slug, moment = f"xau-updown-15m-{GOLD_0600 // 1000}", GOLD_0600 - 300 * 60_000
+        sizes = lambda api: [L.from_wei(int(b["data"]["order"]["takerAmount"])) for b in api.sent]
+        for at, want in ((moment + 2_359, [300.0]), (moment + 3_600_000, [46.0])):  # at the moment — and an hour after it: bought as it shows
+            t, api, clock, x = taker("on", **env)
+            t.verify_tick = lambda: None
+            api.markets["901"] = gold_market(GOLD_0600)
+            api.listed.add(slug)
+            api.books["901"] = {"bids": [], "asks": [[0.50, 46]]}
+            clock.ms = at
+            await t.tick()
+            self.assertEqual((sizes(api), t.sprinting(t.track[slug], clock.ms)), (want, want == [300.0]))
+        shown = bj(2026, 11, 18, 2, 0) + 4_782
+        lost = {"start_ms": bj(2026, 11, 18, 7, 0), "name": "黄金开盘第一档", "cents": 60, "offer_at": shown, "stamped": True, "lead_min": 299.9, "peak": 407.8,
+                "cut_ms": None, "gone_ms": 420, "open": False, "asked": 166.0, "bought": 0.0,
+                "orders": [{"shares": 166.0, "filled": 0.0, "paper": False, "seen": None, "fresh": None, "state": "final", "error": "",
+                            "after": 289, "lag": 178, "own": 111, "trip": 308}]}
+        self.assertEqual(R.race_text(lost), "11-18 07:00 黄金开盘第一档：≤60¢ 的卖单 02:00:04.782 出现（开场前 299.9 分钟），最多 407.8 份；0.42 秒后被吃光；"
+                                            "下了 166 份，没买到｜第 1 张 要 166 成交 0：出现后 289 ms 发出、推送 178 ms、到达→发出 111 ms、往返 308 ms")
+        tail = lambda **change: R.race_text({**lost, "orders": [], **change}).split("份；", 1)[1]
+        self.assertEqual([tail(cut_ms=300, gone_ms=None, open=True), tail(cut_ms=300, gone_ms=None), tail(cut_ms=None, gone_ms=None, open=True),
+                          tail(cut_ms=None, gone_ms=None), tail(cut_ms=300)],
+                         ["0.30 秒后开始被吃、还没吃光；没下单（这一场还在看）", "0.30 秒后开始被吃、到开场前没吃光；没下单", "还没有被吃；没下单（这一场还在看）",
+                          "到开场前没人吃；没下单", "0.30 秒后开始被吃、0.42 秒后被吃光；没下单"])
+        # an order that never left: said so
+        t, api, clock, x = taker("on", **env)
+        t.recs = {slug: {"slug": slug, "mode": "on", "rule": "gold_shut", "name": "黄金 15分涨跌 06:00–06:15", "start_ms": GOLD_0600, "cents": 60, "orders": [
+            {"state": "not_sent", "shares": 166.0, "filled": 0.0, "error": "Predict 接口限流冷却中（12 秒后重试）", "at": NOW}]}}
+        row = R.races(t.recs, "on", 0)[0]
+        self.assertEqual((row["asked"], row["bought"], row["orders"][0]["error"]), (0.0, 0.0, "Predict 接口限流冷却中（12 秒后重试）"))
+        self.assertEqual(R.race_text(row), "11-17 06:00 黄金休市 4 档：卖单出现的时刻没有记到（重启前的，或没看到规则价以内的卖单）；单没下成"
+                                           "｜第 1 张 要 166：没下成（Predict 接口限流冷却中（12 秒后重试））")
 
 
     async def test_off_finishes_what_is_open_and_plans_nothing(self):

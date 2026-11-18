@@ -481,7 +481,9 @@ async def browser_check(bot, data):
           races:[{slug:"xau-updown-15m-2",rule:"gold_shut",name:"黄金休市 4 档",window:"黄金 15分涨跌 06:15–06:30",start_ms:Date.now(),cents:60,offer_at:Date.now()-18000000,lead_min:300,peak:150,cut_ms:350,gone_ms:350,open:true,asked:300,bought:0,
             orders:[{shares:300,filled:0,paper:false,seen:150,fresh:true,after:253,lag:252,own:1,trip:340}]},
            {slug:"xau-updown-15m-1",rule:"gold_shut",name:"黄金休市 4 档",window:"黄金 15分涨跌 06:00–06:15",start_ms:Date.now(),cents:60,offer_at:0,lead_min:null,peak:0,cut_ms:null,gone_ms:null,open:false,asked:212,bought:212,
-            orders:[{shares:166,filled:166,paper:false,seen:null,fresh:null,after:null,lag:240,own:96,trip:350},{shares:46,filled:46,paper:false,seen:null,fresh:false,after:null,lag:252,own:4100,trip:366}]}],rules:[{rule:"gold_shut",name:"黄金休市 4 档",side:"up",cents:58,live_cents:70,course:{windows:3,shares:60,cost:39.6,settled:2,wins:2,losses:0,pnl:19.5},mode:"paper",windows:3,
+            orders:[{shares:166,filled:166,paper:false,seen:null,fresh:null,after:null,lag:240,own:96,trip:350},{shares:46,filled:46,paper:false,seen:null,fresh:false,after:null,lag:252,own:4100,trip:366}]},
+           {slug:"xau-updown-15m-0",rule:"gold_shut",name:"黄金休市 4 档",window:"黄金 15分涨跌 05:45–06:00",start_ms:Date.now(),cents:60,offer_at:0,lead_min:null,peak:0,cut_ms:null,gone_ms:null,open:false,asked:0,bought:0,
+            orders:[{shares:166,filled:0,paper:false,seen:null,fresh:null,state:"not_sent",error:"限流冷却中",after:null,lag:null,own:null,trip:null}]}],rules:[{rule:"gold_shut",name:"黄金休市 4 档",side:"up",cents:58,live_cents:70,course:{windows:3,shares:60,cost:39.6,settled:2,wins:2,losses:0,pnl:19.5},mode:"paper",windows:3,
           shares:150,cost:78.9,settled:2,wins:2,losses:0,pnl:46.1,open:1,watch:{watched:20,offered:12,offer_avg:35.5,best_mid:0.51,open_lead:142,offer_lead:299.9,lost:5,life:180,won:4,won_life:640}}],recent:[{slug:"xau-updown-15m-1",rule:"gold_shut",name:"黄金休市 4 档",
           window:"黄金 15分涨跌 06:00–06:15",start_ms:Date.now(),side:"up",mode:"paper",shares:50,live:20,avg:0.526,cost:26.3,result:"up",pnl:23.2}]})""")
         rtxt = await page.text_content("#a-rules")
@@ -493,7 +495,8 @@ async def browser_check(bot, data):
                      # 1.154.16: each window's race — the offer's coming, how soon it was first taken from and gone, what was bought, each order
                      "抢单记录（北京时间；开始被吃 / 被吃光 = 卖单出现之后多久，按 Predict 盘口的时间戳）", "300 分钟", "0.35 秒", "没买到",
                      "要 300 成交 0，出现后 253 ms 发出，推送 252 ms，到达→发出 1 ms，往返 340 ms", "没记到", "212/212",
-                     "要 166 成交 166，推送 240 ms，到达→发出 96 ms，往返 350 ms；要 46 成交 46，推送 252 ms，到达→发出 4100 ms（不是盘口一到就下的），往返 366 ms"):
+                     "要 166 成交 166，推送 240 ms，到达→发出 96 ms，往返 350 ms；要 46 成交 46，推送 252 ms，到达→发出 4100 ms（不是盘口一到就下的），往返 366 ms",
+                     "要 166：没下成（限流冷却中）"):  # 1.154.18: an order that never left is not one that bought nothing
             assert want in rtxt, (want, rtxt)
         # ...a rule with no price before the window and one for its course; one with neither (and the speed of a version before 1.154.15: no fastest)
         await page.evaluate("""rulesSection({mode:"on",markets:{},speed:{orders:2,filled:2,lag:246,own:2098,trip:358},rules:[{rule:"gold_shut",name:"黄金休市 4 档",side:"up",cents:0,live_cents:60,mode:"on",windows:0,shares:0,cost:0,settled:0,wins:0,losses:0,pnl:0,open:0},
