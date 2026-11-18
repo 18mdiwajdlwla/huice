@@ -275,6 +275,39 @@ def offered(bids: tuple, asks: tuple, side: str, limit: D) -> list[tuple[D, D]]:
     return [(1 - p, q) for p, q in sorted(bids, reverse=True) if 1 - p <= limit]
 
 
+# 1.154.28 — the user: "对手是预挂的" (11-19 01:00: 598 shares at ≤60¢ gone in one piece 0.35 s after they showed, nothing of them to
+# an order that left 2 ms after their book came). Predict takes an order in and shows it, and matches it a moment later — the
+# pre-open mode meets this as the deferred refusal of a post-only order that would cross (preopen.REFUSED_STATUSES) — so a buy
+# resting at the makers' prices before they come is matched with them before any order sent once they show, however soon. The
+# watch keeps the bids of the rule's side (bidding): the first sight of one within RIVAL_BELOW of the rule's price, the book
+# before the offers showed and the one that showed them, and the first after they were gone with none of this taker's orders
+# resting — who rested there, since when, and what of it was left (what it took). Recorded only: nothing is bought on it
+RIVAL_BELOW = D("0.10")  # a bid of the rule's side this far under its price, or dearer, is one that takes the makers' offers
+RIVAL_LEVELS = 5         # ...the dearest bids of the rule's side kept at each of the race's moments
+BIDS_SETTLE_S = 0.5      # ...and the book after the race: one taken this long after none of this taker's orders was seen resting
+#                          (a frame on its way as the last of them left still shows it)
+
+
+def bidding(bids: tuple, asks: tuple, side: str, n: int = RIVAL_LEVELS) -> list[list[float]]:
+    """The book's ``n`` dearest bids for ``side``, the dearest first, as [price, shares]: Up's bids, or — for Down — Up's offers,
+    a bid for Down at p being Up for sale at 1 − p (offered's other half)."""
+    if side == "up":
+        return [[float(p), float(q)] for p, q in sorted(bids, reverse=True)[:n]]
+    return [[float(1 - p), float(q)] for p, q in sorted(asks)[:n]]
+
+
+def minus(bids: list[list[float]], own: dict) -> list[list[float]]:
+    """``bids`` (bidding's) less the pre-open mode's own resting bids among them (RuleTaker.own_bids: price -> shares)."""
+    if not own:
+        return bids
+    out = []
+    for price, shares in bids:
+        left = round(shares - float(own.get(D(str(price)), 0)), 4)
+        if left > DUST:
+            out.append([price, left])
+    return out
+
+
 def without(levels: list[tuple[D, D]], shares: D) -> list[tuple[D, D]]:
     """``levels`` (the cheapest first) less ``shares`` taken from the cheapest."""
     out, left = [], shares
@@ -383,7 +416,12 @@ def held(rec: dict) -> float:
 # coming and going; 1.154.16: when the amount on offer first went down — someone began to take it (the fastest taker's speed: the
 # offers of a ladder are gone only when its last step is)
 WATCH = {"best": None, "offer_max": 0.0, "offer_ms": 0, "listed_ms": 0, "open_ms": 0, "offer_ts": 0, "gone_ms": 0, "gone_ts": 0,
-         "cut_ms": 0, "cut_ts": 0}
+         "cut_ms": 0, "cut_ts": 0,
+         # 1.154.28: the bids of the rule's side (bidding) before the offers showed, in the book that showed them, and in the first
+         # after they were gone with none of this taker's orders resting; the window's first look; the first sight of a bid within
+         # RIVAL_BELOW of the rule's price (when, Predict's stamp of that book, its price and shares; whether at the first look)
+         "bids_before": None, "bids_at": None, "bids_after": None, "looked_ms": 0,
+         "rival_ms": 0, "rival_ts": 0, "rival_px": None, "rival_sz": None, "rival_first": False}
 OPEN_STATES = {"placing", "open", "unknown"}  # an order on its way or on the book: it may still take what the book offers
 
 
@@ -517,6 +555,12 @@ def races(recs: dict[str, dict], mode: str, since_ms: int) -> list[dict]:
             "offer_at": shown or int(seen.get("offer_ms") or 0), "stamped": bool(shown),
             "lead_min": round((int(r.get("start_ms") or 0) - int(seen["offer_ms"])) / 60_000, 1) if seen.get("offer_ms") else None,
             "peak": float(seen.get("offer_max") or 0), "cut_ms": gap("cut"), "gone_ms": gap("gone"), "open": bool(seen.get("open")),
+            # 1.154.28: the bids of the rule's side (clock_bids), and the first sight of one within RIVAL_BELOW of the rule's price
+            "word": rule.word if rule else "", "floor_c": max(0, int(seen.get("cents") or r.get("cents") or 0) - int(RIVAL_BELOW * 100)),
+            "bids_before": seen.get("bids_before"), "bids_at": seen.get("bids_at"), "bids_after": seen.get("bids_after"),
+            "rival": ({"px": float(seen["rival_px"]), "sz": float(seen.get("rival_sz") or 0), "at": int(seen.get("rival_ts") or seen["rival_ms"]),
+                       "first": bool(seen.get("rival_first")), "looked": int(seen.get("looked_ms") or 0)}
+                      if seen.get("rival_ms") and seen.get("rival_px") is not None else None),
             "asked": round(sum(float(o.get("shares") or 0) for o in orders if o.get("state") not in NEVER_PLACED), 4),
             "bought": round(sum(float(o.get("filled") or 0) for o in orders), 4),
             "orders": [{"shares": float(o.get("shares") or 0), "filled": float(o.get("filled") or 0), "paper": bool(o.get("paper")),
@@ -553,6 +597,7 @@ def race_text(row: dict) -> str:
                     or ("还没有被吃" if row["open"] else "到开场前没人吃")))
     else:
         text += "卖单出现的时刻没有记到（重启前的，或没看到规则价以内的卖单）"
+    text += bids_text(row)
     orders = row["orders"]
     if not orders:
         return text + "；没下单" + ("（这一场还在看）" if row["open"] else "")
@@ -577,6 +622,32 @@ def race_text(row: dict) -> str:
     return text
 
 
+def bids_text(row: dict) -> str:
+    """The bids of the rule's side in a window's race (1.154.28, clock_bids): who rested within RIVAL_BELOW of the rule's price before
+    the offers showed (a buy resting there is matched with them before any order sent once they show), what of it was left once they
+    were gone — what it took — and since when the first of them was there. "" for a race watched before 1.154.28."""
+    word, floor = row.get("word") or "", int(row.get("floor_c") or 0)
+    near = lambda xs: [(p, q) for p, q in xs or [] if p * 100 >= floor - 1e-6]
+    shown = lambda xs: "、".join(f"{p * 100:g}¢×{q:g}" for p, q in xs)
+    parts = []
+    if row.get("bids_at") is not None:
+        before = near(row["bids_before"] if row.get("bids_before") is not None else row["bids_at"])
+        parts.append(f"卖单出现前{word}这边 ≥{floor}¢ 的买单 {shown(before)}" if before else f"卖单出现前{word}这边没有 ≥{floor}¢ 的买单")
+        if row.get("bids_after") is not None and before:
+            after = dict(near(row["bids_after"]))
+            took = round(sum(max(0.0, q - after.get(p, 0.0)) for p, q in before), 4)
+            peak = float(row.get("peak") or 0)
+            parts.append(f"卖单没了以后剩 {shown(near(row['bids_after'])) or '0 份'}" + (
+                f"（少了 {took:g} 份，卖单最多 {peak:g} 份：多半是被这些预挂的买单接走的）" if took > DUST and took >= 0.5 * peak else
+                f"（少了 {took:g} 份）" if took > DUST else "（一份没少：卖单不是被它们接走的，是撤掉或被拒了）"))
+    rival = row.get("rival")
+    if rival:
+        when = dt.datetime.fromtimestamp(rival["at"] / 1000, core.BEIJING).strftime("%m-%d %H:%M:%S")
+        parts.append(f"{rival['px'] * 100:g}¢×{rival['sz']:g} 的{word}买单 {when} 第一次看到"
+                     + (f"（{bj(rival['looked'])} 开始看这一场时就已经在了）" if rival["first"] and rival.get("looked") else ""))
+    return "".join("；" + part for part in parts)
+
+
 def race_summary(rows: list[dict]) -> str:
     """The races in a line (1.154.17): how regular the makers' moment is — the offers' showing, by Predict's own stamps, as seconds
     after the quarter hour: its median and its range (regular to a tenth of a second, an order can be timed to it instead of
@@ -592,6 +663,12 @@ def race_summary(rows: list[dict]) -> str:
         parts.append(f"最快的人在出现后 中位 {mid(cuts):.2f} 秒下手（最快 {min(cuts):.2f}）")
     if ours:
         parts.append(f"我们的单在出现后 中位 {mid(ours):.0f} ms 发出（最快 {min(ours):.0f}），再加半个往返才到")
+    # 1.154.28: the races where a buy rested within RIVAL_BELOW of the rule's price before the offers showed (clock_bids)
+    known = [r for r in rows if r.get("bids_at") is not None]
+    if known:
+        ahead = sum(1 for r in known if any(p * 100 >= int(r.get("floor_c") or 0) - 1e-6
+                                            for p, _ in (r["bids_before"] if r.get("bids_before") is not None else r["bids_at"]) or []))
+        parts.append(f"卖单出现前已有人预挂买单（规则价以下 {int(RIVAL_BELOW * 100)}¢ 以内或更高）的 {ahead}/{len(known)} 场")
     return "；".join(parts)
 
 
@@ -1779,7 +1856,7 @@ class RuleTaker:
             # long ago: a look that came seconds after it — a tick was running — is no answer to either)
             w["fresh"] = str(w["market"]["id"]) in self.stream.changed and not indexed
             self.stream.changed.discard(str(w["market"]["id"]))  # taken now, whatever this look decides (1.153.3)
-            if not course and self.observe(w, rule, now):
+            if not course and self.observe(w, rule, now, slug):
                 self.save_watch(slug, w, rule)
         settings = self.settings  # the settings this look decides under: checked again after its reads (below)
         rec = self.record(slug)
@@ -1875,7 +1952,7 @@ class RuleTaker:
         if not levels:
             w.pop("rushed", None)  # (the offer gone: its next showing is asked about afresh)
         best = offered(bids, asks, rule.side, D("0.99"))[:1]
-        if not course and self.note_offers(w, levels, best, now):
+        if not course and self.note_offers(w, levels, best, now, slug, rule, (bids, asks), rec):
             self.save_watch(slug, w, rule)
         if not levels:
             w["word"] = ("盘中：" if course else "") + f"盘口没有 ≤{int(limit * 100)}¢ 的{rule.word}" + (f"（最低 {float(best[0][0]) * 100:g}¢）" if best else "（没人卖）")
@@ -1948,20 +2025,23 @@ class RuleTaker:
         else:
             await self.place(slug, w, rule, levels, take, limit, rec, course)
 
-    def observe(self, w: dict, rule: Rule, now: int) -> bool:
+    def observe(self, w: dict, rule: Rule, now: int, slug: str = "") -> bool:
         """The race's clock kept whatever this look may do (1.154.13): once an offer at the rule's price was seen, the book the
         push connection holds says when it was first taken from and when it was gone — by Predict's own stamp on that book. A
         look held back (the window's shares all ordered, for a minute after a miss; a pause) saw the offer's going only much
         later, and by then the stamp in hand was a later change's. True when something was noted (clock_offers)."""
         seen = w.get("seen")
-        if not seen or not seen.get("offer_ms") or seen.get("gone_ms"):
+        # (1.154.28: on past the offers' going, until the first book after it with none of this taker's orders resting — clock_bids)
+        if not seen or not seen.get("offer_ms") or (seen.get("gone_ms") and (seen.get("bids_at") is None or seen.get("bids_after") is not None)):
             return False
         mid = str(w["market"]["id"])
         got, stamp = self.stream.held(mid), self.stream.stamps.get(mid)
         limit = D(self.settings.price(rule.key)) / 100
         if got is None or stamp is None or limit <= 0:
             return False
-        return self.clock_offers(w, float(sum(q for _, q in offered(got[0], got[1], rule.side, limit))), now, int(stamp[0]))
+        noted = self.clock_offers(w, float(sum(q for _, q in offered(got[0], got[1], rule.side, limit))), now, int(stamp[0]))
+        return self.clock_bids(w, slug, rule.side, bidding(got[0], got[1], rule.side), limit - RIVAL_BELOW, self.record(slug), now,
+                               int(stamp[0]), got[2]) or noted
 
     def own_asks(self, slug: str, side: str) -> dict[D, D]:
         """The pre-open mode's resting bids on this window's other side, as offers of ``side`` (price -> shares): its Up bid at
@@ -1995,12 +2075,18 @@ class RuleTaker:
         when matching was first seen open — what /rules and the review page sum up to show whether a price or a size is off."""
         return w.setdefault("seen", dict(WATCH))
 
-    def note_offers(self, w: dict, levels: list, best: list, now: int) -> bool:
-        """This look's book onto the window's watch; True when the race's clock noted something (the watch is saved then)."""
+    def note_offers(self, w: dict, levels: list, best: list, now: int, slug: str = "", rule: Rule | None = None,
+                    book: tuple | None = None, rec: dict | None = None) -> bool:
+        """This look's book onto the window's watch; True when the race's clock noted something (the watch is saved then). With
+        the rule and the book's two sides, its bids of the rule's side too (clock_bids, 1.154.28)."""
         seen = self.watch(w)
         if best:
             seen["best"] = min(float(best[0][0]), seen["best"] if seen["best"] is not None else 1.0)
-        noted = self.clock_offers(w, float(sum(q for _, q in levels)), now, int((w.get("book_at") or (0, 0))[0]))
+        stamp = int((w.get("book_at") or (0, 0))[0])
+        noted = self.clock_offers(w, float(sum(q for _, q in levels)), now, stamp)
+        if rule is not None and book is not None:
+            floor = D(self.settings.price(rule.key)) / 100 - RIVAL_BELOW
+            noted = self.clock_bids(w, slug, rule.side, bidding(book[0], book[1], rule.side), floor, rec, now, stamp) or noted
         if w["open_ms"] and not seen["open_ms"]:
             seen["open_ms"] = w["open_ms"]
         return noted
@@ -2021,6 +2107,65 @@ class RuleTaker:
             seen["gone_ms"], seen["gone_ts"], noted = now, stamp, True
         w["there"] = total
         return noted
+
+    def clock_bids(self, w: dict, slug: str, side: str, bids: list, floor: D, rec: dict | None, now: int, stamp: int,
+                   at: float | None = None) -> bool:
+        """The bids of the rule's side on the window's watch (1.154.28, bidding): up to the book that showed the offers, the first
+        sight of one at ``floor`` or dearer — the pre-open mode's own left out — with when, Predict's stamp, its price and shares and
+        whether it was there at the window's first look; the book before the offers showed and the one that showed them (no order of
+        this taker's is there yet: it is placed on that very book); once they were gone, the first book the push connection holds
+        (``at``: when it was taken, monotonic) from BIDS_SETTLE_S after none of this taker's orders was seen resting — what the
+        resting buys had left. True when something was noted (the watch is saved then)."""
+        seen, noted, mine = self.watch(w), False, None
+        if not seen.get("looked_ms"):
+            seen["looked_ms"] = now
+
+        def own() -> dict:  # (the pre-open mode's own bids of this side, looked up once a call at most, and only when needed)
+            nonlocal mine
+            mine = self.own_bids(slug, side) if mine is None else mine
+            return mine
+        showing = seen.get("offer_ms") == now and seen.get("bids_at") is None  # (the offers' showing noted by clock_offers this very look)
+        if (not seen.get("offer_ms") or showing) and not seen.get("rival_ms") and bids and D(str(bids[0][0])) >= floor:
+            first = next((level for level in minus(bids, own()) if D(str(level[0])) >= floor), None)
+            if first is not None:
+                seen.update(rival_ms=now, rival_ts=stamp, rival_px=first[0], rival_sz=first[1], rival_first=seen["looked_ms"] == now)
+                noted = True
+        if showing:
+            before = w.get("bids_last")
+            seen["bids_before"] = minus(before, own()) if before is not None else None
+            seen["bids_at"], noted = minus(bids, own()), True
+        elif seen.get("gone_ms") and seen.get("bids_at") is not None and seen.get("bids_after") is None:
+            # (an order is off the book on Predict's word that it removed it, or ended: one whose withdrawal is not confirmed may rest)
+            if any(o.get("state") in OPEN_STATES | {"cancelling"} and not o.get("removed") and not o.get("paper") for o in (rec or {}).get("orders") or []):
+                w.pop("clear_mono", None)
+            elif "clear_mono" not in w:
+                w["clear_mono"] = time.monotonic()
+            elif at is not None and at >= w["clear_mono"] + BIDS_SETTLE_S:
+                seen["bids_after"], noted = minus(bids, own()), True
+        w["bids_last"] = bids
+        return noted
+
+    def own_bids(self, slug: str, side: str) -> dict[D, D]:
+        """The pre-open mode's resting bids on this window's ``side`` (price -> shares): bids of the rule's side in the book like anybody's,
+        but not a buy resting ahead of this taker (clock_bids). The windows the rules take are never quoted (1.150.1 / 1.151.1 / 1.154.19);
+        looked for all the same, as own_asks does for the other side."""
+        ctl = getattr(self.owner, "preopen", None)
+        rows = getattr(getattr(ctl, "ledger", None), "rows", None)
+        if not rows:
+            return {}
+        out: dict[D, D] = {}
+        for key in (slug, *(f"{slug}#{level}" for level in range(1, OWN_LEVELS))):
+            pair = rows.get(key)
+            if pair is None:
+                continue
+            order = (pair.get("orders") or {}).get(side) or {}
+            if order.get("state") not in {"prepared", "placing", "open", "unknown"}:
+                continue
+            with contextlib.suppress(Exception):
+                price, left = D(str(pair["price"])), D(str(pair["shares"])) - D(str(order.get("filled") or 0))
+                if left > 0:
+                    out[price] = out.get(price, D(0)) + left
+        return out
 
     def save_watch(self, slug: str, w: dict, rule: Rule) -> None:
         """The watch onto the window's record as it goes (1.154.16) — an offer shown, taken, gone: /rules shows the race while the

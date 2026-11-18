@@ -2306,6 +2306,80 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         row = next(r for r in page["rules"] if r["rule"] == "gold_shut" and r["mode"] == "on")
         self.assertEqual((row["watch"]["lost"], row["watch"]["life"], row["watch"]["won"], row["watch"]["won_life"]), (1, 180, 1, 600))
 
+    async def test_the_bids_resting_ahead_of_the_offers_are_kept(self):
+        """1.154.28 — the user: "对手是预挂的" (11-19 01:00: 598 shares gone in one piece 0.35 s after they showed, nothing of them to an
+        order that left 2 ms after their book came). The watch keeps the bids of the rule's side: the first sight of one within
+        RIVAL_BELOW of the rule's price (there at the window's first look: placed before it was watched), the book before the offers
+        and the one that showed them, and — once none of this taker's orders rests, and in a book taken after that — the book after:
+        what the resting buy had left. The pre-open mode's own bids are nobody's buy ahead. /rules says it; nothing is bought on it."""
+        up = R.bidding(((D("0.60"), D("900")), (D("0.55"), D("20"))), ((D("0.40"), D("7")),), "up")
+        down = R.bidding(((D("0.70"), D("1")),), ((D("0.45"), D("3")), (D("0.40"), D("7"))), "down")
+        self.assertEqual((up, down), ([[0.6, 900.0], [0.55, 20.0]], [[0.6, 7.0], [0.55, 3.0]]), "a Down bid at p is Up for sale at 1 − p")
+        self.assertEqual(R.minus([[0.6, 900.0], [0.55, 20.0]], {D("0.55"): D("20"), D("0.6"): D("100")}), [[0.6, 800.0]])
+        t, api, clock, x = taker("on", **FAST)
+        t.verify_tick = lambda: None
+        mids = {"901": GOLD_0600, "902": GOLD_0600 + 900_000}
+        for mid, start in mids.items():
+            api.markets[mid] = gold_market(start, mid=int(mid))
+            api.listed.add(api.markets[mid]["categorySlug"])
+        slug, slug2 = (api.markets[mid]["categorySlug"] for mid in mids)
+        book = lambda bids, asks=(): {"bids": [list(b) for b in bids], "asks": [list(a) for a in asks]}
+        resting = [[0.60, 900], [0.55, 20], [0.30, 50]]
+        # 902: only the pre-open mode's own Up bid at 55¢ (20) and a bid far under the price — nobody's buy ahead of this taker
+        x.owner.preopen = types.SimpleNamespace(ledger=types.SimpleNamespace(rows={slug2: {
+            "slug": slug2, "price": "0.55", "shares": "20", "orders": {"up": {"state": "open", "filled": 0.0}}}}))  # (its Up side alone: no Down bid, an offer this taker would trade with itself — own_asks)
+        api.books["901"], api.books["902"] = book(resting), book([[0.55, 20], [0.30, 50]])
+        await t.tick()
+        connected(t, "901", book(resting))
+        connected(t, "902", book([[0.55, 20], [0.30, 50]]))
+        seen, seen2 = t.track[slug]["seen"], t.track[slug2]["seen"]
+        self.assertEqual((seen["rival_px"], seen["rival_sz"], seen["rival_first"], seen["rival_ms"]), (0.6, 900.0, True, seen["looked_ms"]))
+        self.assertEqual(t.record(slug)["seen"]["rival_px"], 0.6, "saved at once: a restart keeps it")
+        self.assertEqual((seen2["rival_ms"], t.record(slug2)), (0, None), "the pre-open mode's own bid: no buy ahead, nothing to save")
+        wall = int(time.time() * 1000)
+        # the makers' offers show with the resting buy still there (the book crossed: Predict matches a moment later); this taker's
+        # order goes out on them — it gets nothing
+        t.stream.take("901", {"version": 2, "updateTimestampMs": wall - 300, **book(resting, [[0.52, 255.8]])})
+        t.stream.take("902", {"version": 2, "updateTimestampMs": wall - 290, **book([[0.55, 20], [0.30, 50]], [[0.53, 30]])})
+        clock.ms += 1_000
+        await t.tick()
+        self.assertEqual(len(api.sent), 2)
+        self.assertEqual((seen["bids_before"], seen["bids_at"]), ([[0.6, 900.0], [0.55, 20.0], [0.3, 50.0]],) * 2)
+        self.assertEqual((seen2["bids_before"], seen2["bids_at"]), ([[0.3, 50.0]],) * 2, "the pre-open mode's own bid left out")
+        # gone: the resting buy took 598; this taker's order (58¢) still rests beside it — not the book after the race
+        t.stream.take("901", {"version": 3, "updateTimestampMs": wall - 130, **book([[0.60, 302], [0.58, 50], [0.55, 20], [0.30, 50]])})
+        t.stream.take("902", {"version": 3, "updateTimestampMs": wall - 120, **book([[0.58, 50], [0.55, 20], [0.30, 50]])})
+        clock.ms += 1_000
+        await t.tick()
+        self.assertTrue(seen["gone_ms"] and seen2["gone_ms"] and seen["bids_after"] is None and seen2["bids_after"] is None)
+        clock.ms += 1_000
+        await t.tick()  # its rest withdrawn (read FILL_READ_MS on): off the book on Predict's word
+        self.assertTrue(all(o.get("removed") for rec in (t.record(slug), t.record(slug2)) for o in rec["orders"]))
+        clock.ms += 1_000
+        await t.tick()  # ...seen so: the book after is one taken from now on — the one in hand may still show the order
+        self.assertEqual((seen["bids_after"], seen2["bids_after"]), (None, None))
+        t.stream.take("901", {"version": 4, "updateTimestampMs": wall + 900, **book([[0.60, 302], [0.55, 20], [0.30, 50]])})
+        t.stream.take("902", {"version": 4, "updateTimestampMs": wall + 910, **book([[0.55, 20], [0.30, 50]])})
+        clock.ms += 1_000
+        await t.tick()
+        self.assertEqual((seen["bids_after"], seen2["bids_after"]), (None, None), f"not {R.BIDS_SETTLE_S} s after yet: a frame on its way may show it")
+        with mock.patch.object(R, "BIDS_SETTLE_S", 0.0):
+            clock.ms += 1_000
+            await t.tick()
+        self.assertEqual((seen["bids_after"], seen2["bids_after"]), ([[0.6, 302.0], [0.55, 20.0], [0.3, 50.0]], [[0.3, 50.0]]))
+        self.assertEqual(t.record(slug)["seen"]["bids_after"], seen["bids_after"], "saved")
+        rows = {r["slug"]: r for r in R.races(t.recs, "on", 0)}
+        line, line2 = R.race_text(rows[slug]), R.race_text(rows[slug2])
+        self.assertIn("；卖单出现前涨这边 ≥48¢ 的买单 60¢×900、55¢×20；卖单没了以后剩 60¢×302、55¢×20"
+                      "（少了 598 份，卖单最多 255.8 份：多半是被这些预挂的买单接走的）；60¢×900 的涨买单 11-17 05:30:00 第一次看到"
+                      "（11-17 05:30 开始看这一场时就已经在了）；下了 50 份，没买到", line)
+        self.assertIn("；卖单出现前涨这边没有 ≥48¢ 的买单；下了 50 份，没买到", line2)
+        self.assertIn("卖单出现前已有人预挂买单（规则价以下 10¢ 以内或更高）的 1/2 场", R.race_summary(list(rows.values())))
+        self.assertIn("卖单出现前涨这边 ≥48¢ 的买单 60¢×900", t.status())
+        # a race watched before 1.154.28: as it was
+        old = {k: v for k, v in rows[slug].items() if k not in ("bids_before", "bids_at", "bids_after", "rival")}
+        self.assertNotIn("买单", R.race_text(old).split("；下了")[0])
+
     async def test_an_order_costs_no_walk_of_the_records(self):
         """1.154.13: between an offer showing and the order leaving — the pre-open mode's own bids found by the window's own keys in
         its ledger (the window's slug, "#<level>": 39,000 records were walked, 17 ms and more), a record renamed "@<attempt>"
@@ -3266,15 +3340,17 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         status = again.status()
         self.assertIn("抢单记录（最近 2 场，北京时间；“开始被吃 / 被吃光”是卖单出现之后多久，按 Predict 盘口自己的时间戳——抢走它的人有多快）：", status)
         self.assertRegex(status, r"  11-17 06:15 黄金休市 4 档：≤60¢ 的卖单 \d\d:\d\d:\d\d\.\d{3} 出现（开场前 300 分钟），最多 150 份；0\.35 秒后开始被吃、0\.35 秒后被吃光；"
+                                 r"卖单出现前涨这边没有 ≥50¢ 的买单；"  # (1.154.28: nobody's buy rested ahead of the offers — clock_bids)
                                  # (1.154.22: the taker's own time in its parts — to the look, to the order signed, to its request leaving)
                                  r"下了 300 份，没买到｜第 1 张 要 300 成交 0（当时盘口上 150 份）：出现后 \d+ ms 发出、推送 \d+ ms、"
                                  r"到达→发出 \d+ ms［到达→开始处理 \d+ ms、处理→签好 \d+ ms、签好→发出 \d+ ms］、往返 \d+ ms")
         self.assertRegex(status, r"  11-17 06:00 黄金休市 4 档：≤60¢ 的卖单 \d\d:\d\d:\d\d\.\d{3} 出现（开场前 300 分钟），最多 195\.4 份；0\.40 秒后开始被吃、1\.20 秒后被吃光；"
-                                 r"买到 212/300 份｜第 1 张 要 300 成交 212（当时盘口上 195\.4 份）：出现后 \d+ ms 发出")
+                                 r"卖单出现前涨这边没有 ≥50¢ 的买单；买到 212/300 份｜第 1 张 要 300 成交 212（当时盘口上 195\.4 份）：出现后 \d+ ms 发出")
         # 1.154.17: the races in a line — how regular the makers' moment is (to time an order to it), how soon the first taker was
         # on the offers, how soon after their showing this taker's orders left
         self.assertRegex(status, r"  近 30 天：卖单出现在整刻钟后 中位 \d+\.\d\d 秒（\d+\.\d\d～\d+\.\d\d，2 场）；最快的人在出现后 中位 0\.38 秒下手（最快 0\.35）；"
-                                 r"我们的单在出现后 中位 \d+ ms 发出（最快 \d+），再加半个往返才到")
+                                 r"我们的单在出现后 中位 \d+ ms 发出（最快 \d+），再加半个往返才到"
+                                 r"；卖单出现前已有人预挂买单（规则价以下 10¢ 以内或更高）的 0/2 场")  # (1.154.28)
         self.assertEqual(R.race_summary([]), "")
         # ...and how far Predict is: the taker's own requests' round trips, the handshake of new connections, the site they enter at
         self.assertEqual(again.net_line(), "", "nothing measured yet (the tests' stand-in client keeps no clock)")
