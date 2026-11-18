@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import bisect
 import collections
 import contextlib
 import contextvars
@@ -50,7 +51,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.21"
+VERSION = "1.154.22"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -5621,6 +5622,8 @@ class LoopWatch:
                 "stalls": sum(r[1] for r in rows), "stall_s": sum(r[2] for r in rows), "by": rows,
                 "seconds": min(span, now - self.started) if self.started else span}
 
+    SHOWN = 10  # the places /diag's line names, the longest held first
+
     def line(self) -> str:
         """/diag's line."""
         s = self.summary()
@@ -5633,7 +5636,10 @@ class LoopWatch:
             return text + f"；没有卡过 {self.STALL_MS:.0f} ms 以上（延迟 = 别的活儿占着主循环、盘口和下单请求在后面排队的时间）"
         share = s["stall_s"] / max(s["seconds"], 1e-9)
         text += f"；卡 {self.STALL_MS:.0f} ms 以上 {s['stalls']} 次、共 {s['stall_s']:.1f} 秒（占 {share:.1%}）"
-        return text + "；卡在：" + "；".join(f"{what} {n} 次共 {secs:.1f} 秒（最长 {longest:.0f} ms）" for what, n, secs, longest in s["by"][:5]) \
+        # 1.154.22: the ten longest, and what the rest come to — on 11-18 the five listed were 39 of the 97 seconds, the other 58 unsaid
+        shown, rest = s["by"][:self.SHOWN], s["by"][self.SHOWN:]
+        return text + "；卡在：" + "；".join(f"{what} {n} 次共 {secs:.1f} 秒（最长 {longest:.0f} ms）" for what, n, secs, longest in shown) \
+            + (f"；另有 {len(rest)} 处共 {sum(r[1] for r in rest)} 次 {sum(r[2] for r in rest):.1f} 秒" if rest else "") \
             + "（延迟 = 别的活儿占着主循环、盘口和下单请求在后面排队的时间；← 后面是调用它的地方）"
 
 
@@ -5710,6 +5716,19 @@ class PredictPacer:
         """A 429 answered on this key (1.154.5): how many requests the key had let through in the 60 seconds before it — /diag
         sets it beside Predict's 240 (11-17: seven 429s on the bot's key in nine minutes at this pace, none on the pre-open key)."""
         self.limits.append((time.monotonic(), self.last_minute()))
+
+
+def predict_rest_kind(url: str) -> str:
+    """What a REST read of Predict's is of, for /diag's count of the feed's reads (PredictFeed.rest_kinds_last)."""
+    path = url.split("?", 1)[0].rstrip("/")
+    if path.endswith("/orderbook"):
+        return "盘口"
+    if "/categories" in path:
+        return "分类"
+    tail = path.rsplit("/", 1)[-1]
+    if "/markets/" in path and tail not in ("markets", ""):
+        return "市场详情" if "/" not in path.split("/markets/", 1)[1] else "其他"
+    return "市场列表" if tail == "markets" else "其他"
 
 
 PREDICT_PACERS: dict[str, PredictPacer] = {}
@@ -6331,6 +6350,16 @@ class PredictFeed:
         cut = time.monotonic() - seconds
         return sum(1 for t in self.lent_at if t >= cut)
 
+    def rest_kinds_last(self, seconds: float = 60.0) -> dict[str, int]:
+        """The REST reads of the last ``seconds`` by what they read (1.154.22, /diag): 盘口 a market's book, 市场详情 its details
+        (the fee, the status, the names), 分类 a category's market list, 市场列表, 其他 — the most first. With every book pushed, a
+        key at its pace on these reads says which of them to spare."""
+        cut, out = time.monotonic() - seconds, {}
+        for at, kind in self.__dict__.get("rest_kinds") or ():
+            if at >= cut:
+                out[kind] = out.get(kind, 0) + 1
+        return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+
     def rate(self) -> float | None:
         """Requests a second over the last minute (the REST reads: books, markets), or None before two samples."""
         now = time.monotonic()
@@ -6389,6 +6418,7 @@ class PredictFeed:
                 raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
             if rest:
                 self.calls += 1
+                self.__dict__.setdefault("rest_kinds", collections.deque(maxlen=4096)).append((time.monotonic(), predict_rest_kind(url)))  # 1.154.22: what the reads are of (/diag)
                 if not self.rate_samples or time.monotonic() - self.rate_samples[-1][0] >= 1:
                     self.rate()  # sampled as the reads go, so /diag has a minute of them
             try:
@@ -12562,11 +12592,289 @@ def driver_may_count(trade: Mapping) -> bool:
     return not (status == "cancelled" and not isinstance(trade.get("live"), dict))
 
 
+TRADE_AUDIT = os.environ.get("SIM_INDEX_AUDIT", "") == "1"  # the tests: every answer the records' index gives is checked against the walk of every record
+TRADE_AUDIT_FAILS: list[str] = []  # ...and what did not match, for the test run to fail on (tests/offline.py)
+
+
+def trade_audit(what: str, same: bool, detail: Any = "") -> bool:
+    """A check of the records' index against the walk it stands for (TRADE_AUDIT): noted when they differ."""
+    if not same:
+        TRADE_AUDIT_FAILS.append(f"{what}: {str(detail)[:600]}")
+        LOG.error("记录索引和全量遍历不一致（%s）：%s", what, str(detail)[:600])
+    return same
+
+
+def trade_open(trade: Mapping) -> bool:
+    """Whether a record may still be acted on by the looks that run at every step, every pushed book and every order — the
+    step's own (fills, withdrawals, markouts, the settlement and its confirmation: sim_decide, sim_due), the real trader's
+    (what is reserved: live_reserved; the orders to send, to cancel, to follow: live_place_pending, live_cancels_unsent,
+    live_sync). 1.154.22: those looks walk these records alone (trades_open), not all of them — 12,800 were kept on 11-18,
+    nearly every one a market long over. It is a superset of each look's own test, which stays where it was: a position or a
+    resting order; a record not settled and confirmed yet (other than an attempt that ended with nothing filled); a
+    withdrawn one holding fills; a real order not at its final word, or whose fills are still to be read."""
+    status = trade.get("status")
+    if status == "filled" or status == "resting":
+        return True
+    if not trade.get("final") and not (status in ("expired", "cancelled") and not float(trade.get("shares") or 0)):
+        return True
+    if status == "cancelled" and trade.get("shares"):
+        return True
+    st = trade.get("live")
+    return isinstance(st, dict) and (st.get("state") != "done" or bool(st.get("fills_pending")))
+
+
+def trade_order_keys(trade: Mapping) -> tuple[str, str] | None:
+    """(order id, order hash in lower case) of a record's real order, "" for one not known; None for a paper record."""
+    st = trade.get("live")
+    if not isinstance(st, dict):
+        return None
+    return (str(st["order_id"]) if st.get("order_id") else "", str(st["hash"]).lower() if st.get("hash") else "")
+
+
+class TradeIndex:
+    """What is kept beside the records Bot.sim_trades hands out (Bot.sim_cache), so that a look at them is not a walk of
+    them all (1.154.22): each market's records and each driver's that may still count, the records still open
+    (trade_open), the real orders by id and by hash, the numbers each slot's attempts have used. Built by one walk when the
+    records are read from the store and kept in step as they are saved, moved and removed (Bot.sim_save, sim_rekey,
+    sim_prune) — every one of them, in the cache's own order.
+
+    Before, each view (TradeMap) built its own indexes by walking every record, and dropped them at its first change. The
+    express lane takes a view at every pushed book, some seventy a second: on 11-18 /diag's ⏱️ 主循环 line named those walks
+    for 153 of the 247 stalls it could place (of_market / ids_of_market under sim_own_order, sim_express_rest and
+    sim_taker_self_cap), with live_exposure's and live_readopt's walks of the same records next — the loop held 16% of the
+    time, a pushed book waiting 8.7 ms at the median and up to 1.9 s.
+
+    ``market`` and ``driver`` are lent to the views as they are (a view's records are the cache as it stood when it was
+    taken, and so are these): never changed in place once lent — the next change copies the dict first (own) and puts a
+    new tuple where a list changes. The rest is read live, by the looks that take the records as they are now."""
+
+    __slots__ = ("records", "market", "driver", "lent", "where", "counting", "seq", "tick", "open", "ordered", "orders", "by_order",
+                 "by_hash", "order_tick", "numbers", "swaps", "dead", "keys_tick", "settled", "settled_tick")
+
+    def __init__(self, records: dict[str, dict]):
+        self.records = records
+        self.lent = False                          # a view holds market / driver as they are
+        self.where: dict[str, str] = {}            # tid -> the market its record is listed under
+        self.counting: dict[str, str] = {}         # tid -> the driver its record is listed under (driver_may_count)
+        self.seq: dict[str, int] = {}              # tid -> its place in the cache's order
+        self.tick = 0
+        self.open: set[str] = set()                # the tids of the records still open (trade_open)
+        self.ordered: list[str] | None = None      # ...in the cache's order (open_order), until the set changes
+        self.orders: dict[str, tuple[str, str]] = {}   # tid -> (order id, hash) as listed below
+        self.by_order: dict[str, list[str]] = {}   # order id -> the tids of the records holding it
+        self.by_hash: dict[str, list[str]] = {}    # order hash (lower case) -> the same
+        self.order_tick = 0                        # counts the changes of those two
+        self.numbers: dict[str, list[int]] = {}    # slot tid -> the numbers n of the tid#n kept
+        self.swaps = 0                             # counts the keys given another record: a view taken before goes by its own walk
+        self.dead = False                          # the cache was read afresh or replaced: this index stands for records no longer kept
+        self.keys_tick = 0                         # counts the keys added and removed: a view taken before no longer holds the cache's keys (TradeMap.kept)
+        self.settled: set[str] = set()             # the tids of the real records settled (the day's P&L comes from them: LiveBot.live_pnl_rows)
+        self.settled_tick = 0                      # counts the saves of such a record (its result, its time, a revision), and those that made one or ended one
+        market: dict[str, list[str]] = {}
+        driver: dict[str, list[str]] = {}
+        for tid, t in records.items():
+            self.seq[tid] = self.tick
+            self.tick += 1
+            self.number(tid, True)
+            name = self.where[tid] = str(t.get("market") or "")
+            market.setdefault(name, []).append(tid)
+            if driver_may_count(t):
+                name = self.counting[tid] = trade_driver(t)[0]
+                driver.setdefault(name, []).append(tid)
+            if trade_open(t):
+                self.open.add(tid)
+            if (keys := trade_order_keys(t)) is not None:
+                self.orders[tid] = keys
+                if keys[0]:
+                    self.by_order.setdefault(keys[0], []).append(tid)
+                if keys[1]:
+                    self.by_hash.setdefault(keys[1], []).append(tid)
+                if t.get("status") == "settled":
+                    self.settled.add(tid)
+        self.market: dict[str, tuple[str, ...]] = {k: tuple(v) for k, v in market.items()}
+        self.driver: dict[str, tuple[str, ...]] = {k: tuple(v) for k, v in driver.items()}
+
+    def number(self, tid: str, add: bool) -> None:
+        head, sep, n = tid.rpartition("#")
+        if not sep or not n.isdigit():
+            return
+        if add:
+            self.numbers.setdefault(head, []).append(int(n))
+        elif (held := self.numbers.get(head)) and int(n) in held:
+            held.remove(int(n))
+            if not held:
+                del self.numbers[head]
+
+    def own(self) -> None:
+        """Before a market's or a driver's list changes: what a view was lent stays as that view took it."""
+        if self.lent:
+            self.market, self.driver, self.lent = dict(self.market), dict(self.driver), False
+
+    def placed(self, ids: tuple[str, ...], tid: str) -> tuple[str, ...]:
+        """``ids`` with ``tid`` where the cache's order has it (the end, for a new key)."""
+        at = self.seq[tid]
+        if not ids or self.seq[ids[-1]] < at:
+            return ids + (tid,)
+        i = bisect.bisect_left(ids, at, key=self.seq.__getitem__)
+        return ids[:i] + (tid,) + ids[i:]
+
+    def listed(self, index: dict[str, tuple[str, ...]], name: str, tid: str, add: bool) -> None:
+        ids = index.get(name, ())
+        if add:
+            index[name] = self.placed(ids, tid)
+        elif tid in ids:
+            left = tuple(k for k in ids if k != tid)
+            if left:
+                index[name] = left
+            else:
+                del index[name]
+
+    def note(self, tid: str, t: dict) -> None:
+        """The record now kept under ``tid`` (new there, another one, or the same one changed), into every list."""
+        if tid not in self.seq:  # a new key: the cache has it at its end
+            self.seq[tid] = self.tick
+            self.tick += 1
+            self.keys_tick += 1
+            self.number(tid, True)
+        settled = t.get("status") == "settled" and isinstance(t.get("live"), dict)
+        if settled or tid in self.settled:
+            self.settled_tick += 1
+            (self.settled.add if settled else self.settled.discard)(tid)
+        market, was = str(t.get("market") or ""), self.where.get(tid)
+        if was != market:
+            self.own()
+            if was is not None:
+                self.listed(self.market, was, tid, False)
+            self.listed(self.market, market, tid, True)
+            self.where[tid] = market
+        driver, was = (trade_driver(t)[0] if driver_may_count(t) else None), self.counting.get(tid)
+        if was != driver:
+            self.own()
+            if was is not None:
+                self.listed(self.driver, was, tid, False)
+                del self.counting[tid]
+            if driver is not None:
+                self.listed(self.driver, driver, tid, True)
+                self.counting[tid] = driver
+        if trade_open(t) != (tid in self.open):
+            self.open.symmetric_difference_update((tid,))
+            self.ordered = None
+        keys, was = trade_order_keys(t), self.orders.get(tid)
+        if was != keys:
+            self.unorder(tid, was)
+            if keys is not None:
+                self.orders[tid] = keys
+                if keys[0]:
+                    self.by_order.setdefault(keys[0], []).append(tid)
+                if keys[1]:
+                    self.by_hash.setdefault(keys[1], []).append(tid)
+            self.order_tick += 1
+
+    def unorder(self, tid: str, keys: tuple[str, str] | None) -> None:
+        if keys is None:
+            return
+        del self.orders[tid]
+        for index, key in ((self.by_order, keys[0]), (self.by_hash, keys[1])):
+            if key and tid in (held := index.get(key, [])):
+                held.remove(tid)
+                if not held:
+                    del index[key]
+
+    def put(self, tid: str, t: dict) -> None:
+        """A record saved under ``tid`` (Bot.sim_save, sim_rekey's new key): into the cache and the lists."""
+        was = self.records.get(tid)
+        self.records[tid] = t
+        if was is not None and was is not t:
+            self.swaps += 1
+        self.note(tid, t)
+
+    def move(self, old: str, new: str, t: dict) -> None:
+        """A record moved from ``old`` to ``new`` (sim_rekey: tid -> tid#n): out of its place, in at the cache's end. A view
+        taken before still has it under ``old`` — it tells by the key itself (TradeMap.open_items)."""
+        self.remove(old)
+        self.put(new, t)
+
+    def drop(self, tid: str) -> None:
+        """A key gone from the cache for good (an old attempt removed: sim_prune). Never an open record's in this code; were it
+        one, the views that still hold it go by their own walks (swaps)."""
+        if tid in self.open:
+            self.swaps += 1
+        self.remove(tid)
+
+    def remove(self, tid: str) -> None:
+        self.records.pop(tid, None)
+        if tid not in self.seq:
+            return
+        del self.seq[tid]
+        self.keys_tick += 1
+        if tid in self.settled:
+            self.settled.discard(tid)
+            self.settled_tick += 1
+        self.number(tid, False)
+        self.own()
+        self.listed(self.market, self.where.pop(tid), tid, False)
+        if (driver := self.counting.pop(tid, None)) is not None:
+            self.listed(self.driver, driver, tid, False)
+        if tid in self.open:
+            self.open.discard(tid)
+            self.ordered = None
+        if tid in self.orders:
+            self.unorder(tid, self.orders[tid])
+            self.order_tick += 1
+
+    def open_order(self) -> list[str]:
+        """The open records' tids, in the cache's order."""
+        if self.ordered is None:
+            self.ordered = sorted(self.open, key=self.seq.__getitem__)
+        return self.ordered
+
+    def in_order(self, tids: Iterable[str]) -> list[str]:
+        """``tids`` (kept ones), in the cache's order."""
+        return sorted(tids, key=self.seq.__getitem__)
+
+    def top_number(self, tid: str) -> int:
+        """The highest n among the tid#n kept (0 with none): the number the next attempt moved out of the slot goes past."""
+        return max(self.numbers.get(tid, ()), default=0)
+
+    def holding(self, by_id: Mapping, by_hash: Mapping) -> list[str]:
+        """The tids of the records whose real order is one of these (order id -> row, hash -> row), in the cache's order."""
+        found: set[str] = set()
+        for rows, index in ((by_id, self.by_order), (by_hash, self.by_hash)):
+            small, large = (rows, index) if len(rows) <= len(index) else (index, rows)
+            for key in small:
+                if key in large:
+                    found.update(index[key])
+        return self.in_order(found)
+
+    def drift(self) -> list[str]:
+        """What the lists say that the records' own fields, as they stand now, do not (the check the bot runs on itself once a
+        minute, Bot.sim_index_check): a record open, counting for its driver or holding an order that its lists do not show
+        — a change made on the record and not saved since. Put right as found; [] when all is in step."""
+        off = []
+        for tid, t in self.records.items():
+            if (tid not in self.seq or self.where.get(tid) != str(t.get("market") or "") or (trade_open(t) and tid not in self.open)
+                    or self.counting.get(tid) != (trade_driver(t)[0] if driver_may_count(t) else None) or self.orders.get(tid) != trade_order_keys(t)
+                    or (tid in self.settled) != (t.get("status") == "settled" and isinstance(t.get("live"), dict))):
+                off.append(tid)
+        for tid in off:
+            self.note(tid, self.records[tid])
+        return off
+
+
+_MISSING: Any = object()
+
+
 class TradeMap(dict):
-    """The paper trades by id (sim_trades), with an index by market and one by driver, built on first use and dropped
-    whenever the map itself changes (a record's status changes; its market, side and driver never do). The decision
-    loop asks for one market's records several times per market (sim_taker_room, sim_own_resting, sim_group_room):
-    scanning every record each time cost the step seconds once thousands of finished trades had piled up."""
+    """The paper trades by id (sim_trades), with an index by market and one by driver. The decision loop asks for one
+    market's records several times per market (sim_taker_room, sim_own_resting, sim_group_room): scanning every record
+    each time cost the step seconds once thousands of finished trades had piled up.
+
+    1.154.22: a view Bot.sim_trades hands out (TradeMap.of) reads the indexes kept beside the records (TradeIndex) and
+    keeps them in step with its own changes — a record put under a new key, one popped — list by list, on its own copies;
+    it also knows which of its records are still open (open_items). A map made by hand has none of that: its indexes are
+    built on first use by a walk of its records and dropped whenever it changes (a record's status changes; its market,
+    side and driver never do), as every view's were before; so are a view's from the moment it is given another record
+    under a key it already has, or anything else its lists cannot follow (alone)."""
 
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
@@ -12574,9 +12882,39 @@ class TradeMap(dict):
         self._by_driver: dict[str, list[dict]] | None = None
         self._ids_by_market: dict[str, list[str]] | None = None
         self.taken: tuple[int, int] | None = None  # sim_trades: which reading of the kept records this map holds, and as of which write; None once it is changed
+        self._index: TradeIndex | None = None      # the kept records' index, while this map is a view of them
+        self._market: dict[str, tuple[str, ...]] | None = None  # ...its lists as lent when the view was taken
+        self._driver: dict[str, tuple[str, ...]] | None = None
+        self._own_market: dict[str, list[str]] = {}  # the lists this view has changed: its own copies
+        self._own_driver: dict[str, list[str]] = {}
+        self._rows: dict[str, list[dict]] = {}       # market -> its records, as last asked
+        self._added: dict[str, None] = {}            # the keys this view was given (at its end, in that order)
+        self._swaps = self._keys_tick = 0
+
+    @classmethod
+    def of(cls, index: TradeIndex) -> "TradeMap":
+        """A view of the kept records as they stand: a copy of the map, the index's lists as they are."""
+        view = cls(index.records)
+        view._index, view._market, view._driver, view._swaps, view._keys_tick = index, index.market, index.driver, index.swaps, index.keys_tick
+        index.lent = True
+        return view
 
     def of_market(self, market: str) -> list[dict]:
         """The records of one market, in the map's order (not to be changed by the caller)."""
+        if self._market is not None:
+            rows = self._rows.get(market)
+            if rows is None:
+                ids = self._own_market.get(market)
+                try:
+                    rows = self._rows[market] = [self[tid] for tid in (self._market.get(market, ()) if ids is None else ids)]
+                except KeyError:  # (never: the lists are this map's keys) — its own walk, rather than a look that fails
+                    trade_audit("of_market", False, f"{market}: a listed key is not in the map")
+                    self.alone()
+                    return self.of_market(market)
+                if TRADE_AUDIT:
+                    walked = [t for t in self.values() if str(t.get("market") or "") == market]
+                    trade_audit("of_market", len(rows) == len(walked) and all(a is b for a, b in zip(rows, walked)), market)
+            return rows
         if self._by_market is None:
             index: dict[str, list[dict]] = {}
             for t in self.values():
@@ -12586,6 +12924,12 @@ class TradeMap(dict):
 
     def ids_of_market(self, market: str) -> list[str]:
         """The ids of one market's records, in the map's order (the express lane's look at its resting orders)."""
+        if self._market is not None:
+            ids = self._own_market.get(market)
+            ids = list(self._market.get(market, ()) if ids is None else ids)
+            if TRADE_AUDIT:
+                trade_audit("ids_of_market", ids == [tid for tid, t in self.items() if str(t.get("market") or "") == market], market)
+            return ids
         if self._ids_by_market is None:
             index: dict[str, list[str]] = {}
             for tid, t in self.items():
@@ -12596,6 +12940,13 @@ class TradeMap(dict):
     def of_driver(self, driver: str) -> list[dict]:
         """The records settling on one driver (trade_driver) that may still count in its group (driver_may_count), in the
         map's order."""
+        if self._driver is not None:
+            ids, get = self._own_driver.get(driver), self.get
+            rows = [t for tid in (self._driver.get(driver, ()) if ids is None else ids) if (t := get(tid)) is not None and driver_may_count(t)]
+            if TRADE_AUDIT:
+                walked = [t for t in self.values() if driver_may_count(t) and trade_driver(t)[0] == driver]
+                trade_audit("of_driver", len(rows) == len(walked) and all(a is b for a, b in zip(rows, walked)), driver)
+            return rows
         if self._by_driver is None:
             index: dict[str, list[dict]] = {}
             for t in self.values():
@@ -12604,40 +12955,143 @@ class TradeMap(dict):
             self._by_driver = index
         return self._by_driver.get(driver, [])
 
+    def open_items(self) -> list[tuple[str, dict]] | None:
+        """This map's (tid, record) pairs that may still be open (trade_open: every open one, and whatever this view was
+        given since it was taken), in the map's order; None when it cannot tell — a map made by hand, a view of records no
+        longer kept (read afresh, a key given another record) or of a record moved by another's hand since: the caller
+        walks every record, as it always did.
+
+        The open set is read as it stands now, not as it stood when the view was taken: a view's records are the kept
+        ones themselves, and one of them changed since — an order taken back from the open list (live_readopt), a late
+        fill — is open in every view that holds it."""
+        index = self._index
+        if index is None or index.dead or index.swaps != self._swaps:
+            return None
+        added, get, records = self._added, self.get, index.records
+        rows = []
+        for tid in index.open_order():
+            if tid in added:
+                continue  # (below, where this view has it)
+            t = records[tid]
+            if get(tid) is t:
+                rows.append((tid, t))
+            elif get(tid.rpartition("#")[0]) is t:
+                return None  # moved to tid#n since this view was taken, and not by it: here it is still under its slot
+        rows.extend((tid, self[tid]) for tid in added)
+        return rows
+
+    def kept(self) -> TradeIndex | None:
+        """The kept records' index, when this view is those records as they stand — nothing put in it or taken out, no key
+        added to the kept ones or removed from them since it was taken: for the looks that go by the records' orders
+        (TradeIndex.by_order / by_hash / holding) or by the settled ones (LiveBot.live_pnl_rows). None for any other map: such a
+        look walks the records it was given."""
+        index = self._index
+        if (index is None or index.dead or index.swaps != self._swaps or index.keys_tick != self._keys_tick or self._added or self._own_market
+                or len(self) != len(index.records)):
+            return None
+        return index
+
+    def alone(self) -> None:
+        """From here on this map's indexes are its own, built by a walk of its records when asked and dropped at every
+        change: its lists could not follow what was just done to it."""
+        self._index = self._market = self._driver = None
+        self._own_market, self._own_driver, self._rows, self._added = {}, {}, {}, {}
+        self._by_market = self._by_driver = self._ids_by_market = None
+
     def _changed(self) -> None:
         self._by_market = self._by_driver = self._ids_by_market = None
         self.taken = None
 
+    def _put(self, key: str, value: Any, was: Any) -> None:
+        self.taken = None
+        if self._market is None:
+            self._by_market = self._by_driver = self._ids_by_market = None
+            return
+        if was is value:
+            return  # the same record under the same key: no list moves
+        if was is not _MISSING or not isinstance(value, dict):
+            return self.alone()  # another record under a key the map has: the key keeps its place, the lists may not hold
+        market = str(value.get("market") or "")
+        ids = self._own_market.get(market)
+        if ids is None:
+            ids = self._own_market[market] = list(self._market.get(market, ()))
+        ids.append(key)
+        self._rows.pop(market, None)
+        if driver_may_count(value):
+            driver = trade_driver(value)[0]
+            ids = self._own_driver.get(driver)
+            if ids is None:
+                ids = self._own_driver[driver] = list(self._driver.get(driver, ()))  # type: ignore[union-attr]
+            ids.append(key)
+        self._added[key] = None
+
+    def _gone(self, key: str, value: Any) -> None:
+        self.taken = None
+        if self._market is None:
+            self._by_market = self._by_driver = self._ids_by_market = None
+            return
+        if not isinstance(value, dict):
+            return self.alone()
+        market = str(value.get("market") or "")
+        ids = self._own_market.get(market)
+        if ids is None:
+            ids = self._own_market[market] = list(self._market.get(market, ()))
+        if key not in ids:
+            return self.alone()  # (never: the lists are this map's keys)
+        ids.remove(key)
+        self._rows.pop(market, None)
+        driver = trade_driver(value)[0]  # (a record's driver never changes: listed there, or nowhere)
+        ids = self._own_driver.get(driver)
+        if ids is None:
+            if key in (held := self._driver.get(driver, ())):  # type: ignore[union-attr]
+                self._own_driver[driver] = [k for k in held if k != key]
+        elif key in ids:
+            ids.remove(key)
+        self._added.pop(key, None)
+
     def __setitem__(self, key: str, value: dict) -> None:
+        was = dict.get(self, key, _MISSING)
         super().__setitem__(key, value)
-        self._changed()
+        self._put(key, value, was)
 
     def __delitem__(self, key: str) -> None:
+        value = dict.get(self, key, _MISSING)
         super().__delitem__(key)
-        self._changed()
+        self._gone(key, value)
 
-    def pop(self, *args: Any) -> Any:
-        value = super().pop(*args)
-        self._changed()
+    def pop(self, key: Any, *default: Any) -> Any:
+        if key not in self:
+            if self._market is None:
+                self._changed()  # (as before: a hand-made map drops its indexes at every call)
+            return super().pop(key, *default)
+        value = super().pop(key)
+        self._gone(key, value)
         return value
 
     def popitem(self) -> Any:
         item = super().popitem()
-        self._changed()
+        self._gone(*item)
         return item
 
     def setdefault(self, key: str, default: Any = None) -> Any:
-        value = super().setdefault(key, default)
-        self._changed()
-        return value
+        if key in self:
+            if self._market is None:
+                self._changed()
+            return self[key]
+        self[key] = default
+        return default
 
     def update(self, *args: Any, **kwargs: Any) -> None:
-        super().update(*args, **kwargs)
-        self._changed()
+        if self._market is None:
+            super().update(*args, **kwargs)
+            return self._changed()
+        for key, value in dict(*args, **kwargs).items():
+            self[key] = value
 
     def clear(self) -> None:
         super().clear()
-        self._changed()
+        self.alone()
+        self.taken = None
 
     def copy(self) -> "TradeMap":
         return TradeMap(self)
@@ -12660,6 +13114,22 @@ def trades_of_driver(trades: Mapping, driver: str) -> list[dict]:
     it has one (TradeMap), else by scanning."""
     of = getattr(trades, "of_driver", None)
     return of(driver) if of is not None else [t for t in trades.values() if driver_may_count(t) and trade_driver(t)[0] == driver]
+
+
+def trades_open(trades: Mapping) -> Iterable[tuple[str, dict]]:
+    """The (tid, record) pairs a look at the open records has to pass, in the map's order: the open ones (trade_open) of a
+    view that knows them (TradeMap.open_items), every record of any other map. The caller's own test of each record stays
+    as it was; this only spares it the records that test would pass over."""
+    of = getattr(trades, "open_items", None)
+    rows = of() if of is not None else None
+    if rows is None:
+        return trades.items()
+    if TRADE_AUDIT:
+        mine, walked = [kv for kv in rows if trade_open(kv[1])], [kv for kv in trades.items() if trade_open(kv[1])]
+        if not trade_audit("trades_open", len(mine) == len(walked) and all(a[0] == b[0] and a[1] is b[1] for a, b in zip(mine, walked)),
+                           f"{[k for k, _ in mine][-6:]} / {[k for k, _ in walked][-6:]}"):
+            return trades.items()
+    return rows
 
 
 def side_held(trades: Mapping, market: str, side: str) -> dict:
@@ -17115,9 +17585,12 @@ class Bot:
         self.faults: dict[tuple[str, str], float] = {}  # (subscription, data item) -> when its current fault began
         self.reply_seq = 0  # command replies get their own delivery keys
         self.last_send_error = ""  # the latest Telegram send failure, for /status
-        self.sim_cache: dict[str, dict] | None = None  # in-memory view of the sim: records (sim_trades)
+        self.sim_cache = None  # in-memory view of the sim: records (sim_trades), with its index (sim_index: over when this is set)
         self.sim_gen = -1
         self.sim_built = 0  # how many times that view was read afresh from the store (TradeMap.taken)
+        self.sim_index_checked = 0.0  # when the index was last checked against the records (sim_index_check)
+        self.sim_index_checks = 0     # ...how many times
+        self.sim_index_drift: dict = {}  # ...and what the last check that found something found: {"at", "n", "tids"}
         self.notice_cache: dict[str, dict] | None = None  # in-memory view of the notice: records
         self.notice_gen = -1
         self.pred_pruned = 0.0  # when old prediction snapshots were last pruned
@@ -19653,27 +20126,75 @@ class Bot:
 
     SIM_SETTLE_MS = 60 * 60_000       # a daily market is settled this long after its close: the official close is in
 
-    def sim_trades(self) -> dict[str, dict]:
-        """Every paper trade, from an in-memory view of the store (the journal page and the sim step would otherwise parse
-        every record's JSON on every look); any write to a sim: record, by whoever, refreshes the view. A TradeMap:
-        the records of one market or driver come from an index, not a scan (trades_of_market, trades_of_driver)."""
+    @property
+    def sim_cache(self) -> dict[str, dict] | None:
+        """The kept records in memory (sim_trades), None until read. Set — to None, to be read afresh, or to another map —
+        the index kept beside it (sim_index) is over: built again at the next look, the views that hold the old one go by
+        their own walks (TradeIndex.dead)."""
+        return self.__dict__.get("_sim_cache")
+
+    @sim_cache.setter
+    def sim_cache(self, records: dict[str, dict] | None) -> None:
+        index = self.__dict__.get("sim_index")
+        if index is not None:
+            index.dead = True
+        self.__dict__["_sim_cache"], self.__dict__["sim_index"] = records, None
+
+    def sim_kept(self) -> TradeIndex:
+        """The kept records as they stand — read from the store when not in memory yet, or when a sim: record was written
+        past sim_save — with the index kept beside them (TradeIndex; the records themselves are its ``records``: the
+        cache, to be read, never changed, by the caller)."""
         generation = self.store.touched.get("sim", 0)
         if self.sim_cache is None or self.sim_gen != generation:
             self.sim_cache = {k.removeprefix("sim:"): sim_upgrade(v) for k, v in self.store.items("sim:")
                               if isinstance(v, dict) and "status" in v}
             self.sim_gen = generation
             self.sim_built = getattr(self, "sim_built", 0) + 1  # (the view read afresh: its records are new objects)
-        view = TradeMap(self.sim_cache)
+        index = self.__dict__.get("sim_index")
+        if index is None:
+            index = self.__dict__["sim_index"] = TradeIndex(self.__dict__["_sim_cache"])
+        return index
+
+    def sim_trades(self) -> dict[str, dict]:
+        """Every paper trade, from an in-memory view of the store (the journal page and the sim step would otherwise parse
+        every record's JSON on every look); any write to a sim: record, by whoever, refreshes the view. A TradeMap:
+        the records of one market or driver come from an index, not a scan (trades_of_market, trades_of_driver) — since
+        1.154.22 the one kept beside the records (sim_kept), not one each view builds for itself."""
+        view = TradeMap.of(self.sim_kept())
         view.taken = (getattr(self, "sim_built", 0), self.sim_gen)  # 1.154.20: the records as kept — this reading of them, at this write — until the map itself is changed (TradeMap._changed)
         return view
 
     def sim_save(self, pairs: Any) -> None:
-        """Persist (trade id, trade) pairs in one transaction and keep the in-memory view current."""
+        """Persist (trade id, trade) pairs in one transaction and keep the in-memory view current (and its index: each
+        record's lists are brought in line with its fields as saved — TradeIndex.put)."""
         pairs = list(pairs)
         self.store.put_many((f"sim:{tid}", trade) for tid, trade in pairs)
         if self.sim_cache is not None:
-            self.sim_cache.update(pairs)
+            index = self.__dict__.get("sim_index")
+            if index is None:
+                self.sim_cache.update(pairs)
+            else:
+                for tid, trade in pairs:
+                    index.put(tid, trade)
         self.sim_gen = self.store.touched.get("sim", 0)
+
+    SIM_INDEX_CHECK_SECONDS = 60.0  # how often the records' index is checked against the records themselves
+
+    def sim_index_check(self, force: bool = False) -> list[str]:
+        """The records' index against the records, once a minute (the step): a record whose own fields say it is open,
+        counts for its driver or holds an order while its lists do not — changed in place and not saved since, which
+        nothing should leave so across a wait. Put right as found and said (the log, /diag): the looks that go by the
+        index (trades_open, the order lists) would have passed such a record over until its next save. The tids found."""
+        index = self.__dict__.get("sim_index")
+        if index is None or (not force and time.monotonic() - getattr(self, "sim_index_checked", 0.0) < self.SIM_INDEX_CHECK_SECONDS):
+            return []
+        self.sim_index_checked = time.monotonic()
+        self.sim_index_checks = getattr(self, "sim_index_checks", 0) + 1
+        off = index.drift()
+        if off:
+            self.sim_index_drift = {"at": self.market.now_ms(), "n": len(off), "tids": off[:5]}
+            self.log_limited("sim_index", f"记录索引自检：{len(off)} 条记录的状态改了但索引没跟上（如 {off[0]}），已按记录现状更正")
+        return off
 
     def note_outcome(self, key: str, day: str, value: Any, source: str) -> None:
         """An official close as it becomes known (scored by /calib, settles the paper trades), with where it came from."""
@@ -21550,7 +22071,8 @@ class Bot:
         the attempt stays in the journal. A record already numbered keeps its key."""
         if "#" in tid.rsplit("|", 1)[-1]:
             return tid
-        current = self.sim_trades()
+        index = self.sim_kept()
+        current = index.records  # (read here and now, not copied: 1.154.22)
         # 1.150.x: already moved. sim_decide takes its copy of the records and then yields once; a placement task resuming in
         # that slice can fail or end the record (live_fail / live_end_unsent -> slot#1), and the step, still seeing it under the
         # slot in its stale copy, asked to move it again: the same attempt was stored a second time at slot#2. The record's
@@ -21560,14 +22082,23 @@ class Bot:
         moved = live.get("rekeyed") if isinstance(live, dict) else None
         if isinstance(moved, str) and moved.startswith(tid + "#") and tid not in current and moved in current:
             return moved
-        numbers = [int(k.rpartition("#")[2]) for k in current if k.startswith(tid + "#") and k.rpartition("#")[2].isdigit()]
-        new_tid = f"{tid}#{max(numbers, default=0) + 1}"  # past the highest ever used: a number sim_prune removed is never reused
+        # 1.154.22: the highest number the slot's attempts hold, from the index (TradeIndex.numbers) — every key was passed for
+        # it, with a copy of the map taken first: a millisecond and a half at each move, and a step that quotes thirty slots
+        # again moves thirty
+        top = index.top_number(tid)
+        if TRADE_AUDIT:
+            trade_audit("top_number", top == max((int(k.rpartition("#")[2]) for k in current if k.startswith(tid + "#") and k.rpartition("#")[2].isdigit()), default=0), tid)
+        new_tid = f"{tid}#{top + 1}"  # past the highest ever used: a number sim_prune removed is never reused
         if isinstance(trade.get("live"), dict):
             trade["live"]["rekeyed"] = new_tid
         self.store.replace([f"sim:{tid}"], [(f"sim:{new_tid}", trade)])  # one transaction: never gone from the database in between
         if self.sim_cache is not None:  # the view follows the move (a rebuild parses every record's JSON: seconds with tens of thousands)
-            self.sim_cache.pop(tid, None)
-            self.sim_cache[new_tid] = trade
+            index = self.__dict__.get("sim_index")
+            if index is None:
+                self.sim_cache.pop(tid, None)
+                self.sim_cache[new_tid] = trade
+            else:
+                index.move(tid, new_tid, trade)
         self.sim_gen = self.store.touched.get("sim", 0)
         return new_tid
 
@@ -21602,8 +22133,12 @@ class Bot:
             # one transaction (Store.replace): an attempt is never deleted uncounted, nor counted and still there to be counted again
             self.store.replace([f"sim:{tid}" for tid in doomed], [(SIM_PRUNED_KEY, counted)])
             if self.sim_cache is not None:
+                index = self.__dict__.get("sim_index")
                 for tid in doomed:
-                    self.sim_cache.pop(tid, None)
+                    if index is None:
+                        self.sim_cache.pop(tid, None)
+                    else:
+                        index.drop(tid)
                 self.sim_gen = self.store.touched.get("sim", 0)
         return len(doomed)
 
@@ -21849,7 +22384,7 @@ class Bot:
         not. Asked at most every SIM_CONFIRM_SECONDS per market; a failed or unreadable answer leaves it pending."""
         wanted: dict[str, list[str]] = {}
         lookups: dict[str, list[str]] = {}  # slug -> old records without the market's id
-        for tid, trade in trades.items():
+        for tid, trade in trades_open(trades):  # 1.154.22: (a record sim_due may name is open: not confirmed, not over unfilled)
             if self.sim_due(trade, now_ms):
                 mid = trade.get("market_id") or trade["market"].partition("#")[2]
                 if not mid:
@@ -21931,6 +22466,7 @@ class Bot:
         except Exception as error:  # a review figure never stops the trading step
             self.log_limited("sim_ev", f"EV 检查失败：{clean_error(error) or type(error).__name__}")
         self.sim_note_closes()
+        self.sim_index_check()  # 1.154.22: the records' index against the records, once a minute
         async with self.sim_lock:  # never beside the express lane (sim_express): one set of decisions at a time
             # 1.150.0 (audit SIM-STALE-CLOCK): the look's clock is read here, where its decisions are made, not where the job began.
             # The real trader's prefetch (a market's details, a sign-in: seconds when Predict is slow) and the wait for this lock lie
@@ -21981,7 +22517,7 @@ class Bot:
         for mk in markets.values():
             if not mk.hold:
                 self.sim_unpriced_since.pop(mk.market, None)  # priced now: the clock of sim_unpriced_reason is cleared
-        for tid, trade in trades.items():
+        for tid, trade in trades_open(trades):  # 1.154.22: the open records alone (every one the two tests below let through is open)
             if trade.get("final") or tid in opened:
                 continue  # settled and confirmed: nothing below applies (and no JSON round trip for it every step)
             if trade["status"] in {"expired", "cancelled"} and float(trade.get("shares") or 0) <= 1e-9:
@@ -22052,7 +22588,7 @@ class Bot:
             self.sim_save(changed)
         self.sim_step_ms = {"盘口": int((t1 - t0) * 1000), "判断": int((t2 - t1) * 1000), "结算": int((t3 - t2) * 1000),
                             "保存": int((time.monotonic() - t3) * 1000)}
-        self.sim_step_info = {"markets": len(markets), "records": len(trades)}
+        self.sim_step_info = {"markets": len(markets), "records": len(trades), "open": len(index.open) if (index := self.__dict__.get("sim_index")) is not None else -1}
         return confirm
 
     def sim_requote_freed(self, markets: dict[str, SimMarket], freed: dict[str, dict], trades: dict[str, dict], now_ms: int,
@@ -22466,8 +23002,10 @@ class Bot:
             # 1.150.0 (audit SIM-STALE-CLOCK): judged on the clock after the wait for the lock, as the step is — a step's decisions
             # hold it meanwhile, and live_requote_freed reads one clock for several keys' looks, each behind the last one's placements
             now_ms = max(now_ms, self.market.now_ms())
-            trades = self.sim_trades()
+            trades: Any = None  # 1.154.22: the records taken only once a market is judged (a copy of the whole map: not for a key with none to judge)
             for mk in self.sim_markets_for(key, now_ms):  # this key's markets alone: the other cards and ladders are not priced for it
+                if trades is None and (mk.decided or not (mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk) or book_crossed(mk.book))):
+                    trades = self.sim_trades()
                 if mk.hold or mk.book.stale(now_ms) or not self.sim_in_scope(mk) or book_crossed(mk.book):
                     self.sim_taker_unseen(mk)
                     if mk.decided and self.sim_in_scope(mk) and not (mk.book.stale(now_ms) or book_crossed(mk.book)):
@@ -25213,7 +25751,8 @@ class Bot:
                 if name == "模拟交易" and self.sim_step_ms:
                     size = self.sim_step_info
                     detail += ("（决策内：" + "、".join(f"{k} {v / 1000:.1f}s" for k, v in self.sim_step_ms.items())
-                               + (f"；{size['markets']} 个市场、{size['records']} 条记录" if size else "") + "）")
+                               + (f"；{size['markets']} 个市场、{size['records']} 条记录" + (f"（其中 {size['open']} 条还没结束，每步只看这些）" if size.get("open", -1) >= 0 else "") if size else "")
+                               + (f"；记录索引自检 {drift['n']} 条没跟上（{stamp(drift['at'], seconds=False)}，如 {drift['tids'][0]}），已更正" if (drift := getattr(self, "sim_index_drift", None)) else "") + "）")
                 sync = getattr(self, "live_sync_detail", None)
                 if name == "模拟交易" and sync:  # 1.137.2: what the sync's seconds went to
                     detail += (f"（同步内：挂单列表" + (f"按市场读 {sync['markets']} 个市场 {sync['list_s']:.1f}s" if sync.get("markets")
@@ -25250,6 +25789,9 @@ class Bot:
                                + (f"、撤单→重挂发出 {span(lat['requote'])}（{lat['requotes']} 笔"
                                   + (f"；中位分段：决定→撤单发出 {p[0]:.1f}s、→Predict 确认 {p[1]:.1f}s、→补挂发出 {p[2]:.1f}s" if (p := lat.get("parts")) else "")
                                   + "）" if lat.get("requote") else ""))
+                signer = getattr(self, "live_signer_note", None)
+                if name == "模拟交易" and callable(signer) and (note := signer()):
+                    detail += "｜" + note  # 1.154.22: which library signs the orders
                 if name == "Predict 盘口" and self.predict.round_info:
                     r = self.predict.round_info
                     detail += (f"｜上轮 {r['keys']} 个市场" + (f"（阶梯 {r['rows']} 档）" if r.get("rows") else "")
@@ -25712,7 +26254,7 @@ class Bot:
         rows: set[str] = set()
         trades = self.sim_trades()
         recent = max(s for s, _ in MARKOUT_HORIZONS) * 1000 + 60_000
-        busy = {t.get("market") for t in trades.values()
+        busy = {t.get("market") for _, t in trades_open(trades)  # (1.154.22: an order in flight and a position are open records)
                 if sim_in_flight(t) or (t.get("status") == "filled" and t.get("filled") and now_ms - int(t["filled"]) <= recent)}
         for mk in self.sim_markets(now_ms):
             if mk.kind not in {"range", "ladder"}:

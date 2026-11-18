@@ -1036,6 +1036,53 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(again.queue.qsize(), 0, "not quoted again: the window is left out")
             await self.finish(again)
 
+    async def test_the_positions_check_is_told_a_fill_before_its_record_is_saved(self):
+        """1.154.22 — the model trader's positions check asks this mode, once a minute, what its orders filled (30 days) and
+        which outcomes hold a fill of its own not read for certain yet; both walked every record's orders (78,000 on 11-18) and
+        now go by the ledger's own two lists (Ledger.filled / unsure). The answers are the walks' at every moment — also between
+        a fill being written onto an order and its record being saved: the reads that follow (the other side's, the final
+        records') are waited for in between, and the check may run then. Told the mode's fills without that one, with the
+        order already read final, it would take those shares for nobody's and could book them onto an order of the model
+        trader's own (the double count of 1.131.5)."""
+        with tempfile.TemporaryDirectory() as folder:
+            ctl, api, clock = controller(STATE_DB=str(Path(folder) / "state.sqlite3"))
+            pairs = await self.book_of(ctl, api, 4)
+            rows = lambda: list(ctl.ledger.rows.values())
+
+            def same(note):
+                self.assertEqual(ctl.filled_by_outcome(30), p.fills_by_outcome(rows(), ctl.now(), 30), note)
+                self.assertEqual(list(ctl.filled_by_outcome(30).items()), list(p.fills_by_outcome(rows(), ctl.now(), 30).items()), note)
+                self.assertEqual(ctl.unverified_outcomes(), p.unverified_outcomes(rows(), ctl.now()), note)
+            same("four resting pairs")
+            self.assertEqual((ctl.filled_by_outcome(30), len(ctl.unverified_outcomes()) > 0, len(ctl.ledger.unsure)), ({}, True, 4))
+            # the cancellation loop's read of one side: filled whole, read final — and the other side's read still to come (monitor_pair)
+            pair, order = pairs[1], pairs[1]["orders"]["up"]
+            ctl.apply_fill(order, {"id": order["id"], "status": "FILLED", "amount": "30000000000000000000", "amountFilled": "30000000000000000000"}, pair)
+            order["state"] = "final"
+            key = (str(pair["market_id"]), int(order["index_set"]))
+            self.assertGreater(order["filled"], 0)
+            self.assertEqual(ctl.filled_by_outcome(30), {key: order["filled"]}, "counted among the mode's fills before the record is saved")
+            same("a fill applied, its record not saved yet")
+            ctl.ledger.save(pair)
+            same("saved")
+            # a second pair's fill, an earlier record: summed in the records' own order; every order final: no outcome unread
+            other, o2 = pairs[0], pairs[0]["orders"]["down"]
+            ctl.apply_fill(o2, {"id": o2["id"], "status": "OPEN", "amount": "30000000000000000000", "amountFilled": "10000000000000000000"}, other)
+            same("a part filled, not saved")
+            for x in pairs:
+                for o in x["orders"].values():
+                    o["state"] = "final"
+            ctl.ledger.save_many(pairs)
+            same("all final")
+            self.assertEqual((ctl.unverified_outcomes(), ctl.ledger.unsure, len(ctl.ledger.filled)), (set(), {}, 2))
+            # a pair that is not the ledger's own record (a copy): its fill is no fill of the ledger's — the walk does not see it either
+            ghost = copy.deepcopy(pairs[2])
+            ctl.apply_fill(ghost["orders"]["up"], {"id": "x", "status": "FILLED", "amount": "5", "amountFilled": "5"}, ghost)
+            same("a copy's fill")
+            ctl.ledger.delete(pairs[1]["slug"])
+            same("a filled record deleted")
+            await self.finish(ctl)
+
     async def test_the_loops_walk_the_working_records_and_the_ledgers_own_counts(self):
         """1.154.20 — 11-17: 39,116 records, 26,956 of them accounted and only history, and every walk of the loops went through
         all of them: the day's P&L a dozen times a second (withdrawing: every placement's gates, the cancellation loop), the

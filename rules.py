@@ -35,6 +35,7 @@ import contextlib
 import dataclasses
 import datetime as dt
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -58,6 +59,12 @@ PROBE_LATE_MS = 5 * 60_000
 NEAR_MS = 15 * 60_000         # the last stretch before the start: the status and the book read every FAST_S (matching opens then)
 FAST_S, SLOW_S, CLOSED_SLOW_S = 2.0, 30.0, 60.0  # the book of an open market (fast near the start), a market not yet open for matching
 OFFER_STATUS_S = 10.0         # 1.153.1: an offer at the rule's price on a market not yet open for matching: its status read this often (it buys the moment it opens)
+# 1.154.22: ...and, from the moment such an offer shows, every STATUS_RUSH_S for STATUS_RUSH_MS beside the looks (rush) — ahead of the
+# key's other reads, a request on the order's way. 11-18 13:15:07, the 18:15 window: 446 shares at ≤58¢ showed on a market listed
+# seconds before, its matching not seen open yet; the status had just been read, so it was not read again for FAST_S, and the order
+# left 2.7 s after the book that showed the offer had arrived (203 of 300 bought: nobody else was there before 3.4 s). The read is
+# some 260 ms from this region: at this pace the reads follow one another, eighty of them at the most; RUSH_READS_MAX a window
+STATUS_RUSH_S, STATUS_RUSH_MS, RUSH_READS_MAX = 0.25, 20_000, 240
 STOP_MS = 15_000              # nothing placed this close to the start: the rule is about the window before it begins
 EXPIRY_BEFORE_S = 5           # an order's signed expiry: this long before the start, always — a cancel that cannot get through leaves
 #                               nothing matchable once the window runs (1.153.3: an order sent in the last 70 s was signed for 65 s,
@@ -480,6 +487,14 @@ def races(recs: dict[str, dict], mode: str, since_ms: int) -> list[dict]:
                         "after": int(o["sent_wall"]) - shown if o.get("sent_wall") and shown else None,
                         "lag": int(o["seen_wall"]) - int(o["book_ts"]) if o.get("book_ts") and o.get("seen_wall") else None,
                         "own": int(o["sent_wall"]) - int(o["seen_wall"]) if o.get("sent_wall") and o.get("seen_wall") else None,
+                        # 1.154.22: the taker's own time in its parts — the book's arrival to the look that placed the order, that
+                        # look's beginning to the order signed (its reads: matching's status, the sign-in, the allowance), the order
+                        # signed to its request leaving; and the wait for matching to open, when the offer was there first
+                        # (a book the look read itself arrived after the look began: no wait for the look, the rest counted from the book)
+                        "wake": int(o["look_wall"]) - int(o["seen_wall"]) if o.get("look_wall") and o.get("seen_wall") and int(o["look_wall"]) >= int(o["seen_wall"]) else None,
+                        "prep": int(o["signed_wall"]) - max(int(o["look_wall"]), int(o.get("seen_wall") or 0)) if o.get("signed_wall") and o.get("look_wall") else None,
+                        "out": int(o["sent_wall"]) - int(o["signed_wall"]) if o.get("sent_wall") and o.get("signed_wall") else None,
+                        "open_wait": o.get("open_wait"), "open_reads": o.get("open_reads"),
                         "trip": int(o["answered_wall"]) - int(o["sent_wall"]) if o.get("answered_wall") and o.get("sent_wall") else None}
                        for o in orders]})
     return sorted(rows, key=lambda x: -x["start_ms"])
@@ -513,7 +528,10 @@ def race_text(row: dict) -> str:
             continue
         parts = ([f"出现后 {o['after']} ms 发出"] if o["after"] is not None else []) + ([f"推送 {o['lag']} ms"] if o["lag"] is not None else [])
         if o["own"] is not None:  # (an order that waited for something else than its book — the one before it — is told apart)
-            parts.append(f"到达→发出 {o['own']} ms" + ("（不是盘口一到就下的）" if o["fresh"] is False else ""))
+            split = [f"{name} {o[key]} ms" for name, key in (("到达→开始处理", "wake"), ("处理→签好", "prep"), ("签好→发出", "out")) if o.get(key) is not None]
+            if o.get("open_wait") is not None:
+                split.append(f"卖单先到、等撮合开启 {o['open_wait']} ms（读了 {o.get('open_reads') or 0} 次状态）")
+            parts.append(f"到达→发出 {o['own']} ms" + (f"［{'、'.join(split)}］" if split else "") + ("（不是盘口一到就下的）" if o["fresh"] is False else ""))
         if o["trip"] is not None:
             parts.append(f"往返 {o['trip']} ms")
         text += (f"｜第 {i} 张 要 {o['shares']:g} 成交 {o['filled']:g}" + (f"（当时盘口上 {o['seen']:g} 份）" if o["seen"] else "")
@@ -682,6 +700,13 @@ class RuleStream:
     def held(self, mid: str) -> tuple | None:
         """(bids, asks, when) as last pushed — or read over REST beside the pushes (merge) — however long ago; None for none."""
         return self.books.get(mid)
+
+    def nudge(self, mid: str) -> None:
+        """The taker looks at this market now though its book has not changed (1.154.22: matching just seen open with an offer
+        in hand): marked as a change that has just come — the loop goes round at once for one, mid-tick too (rest_s: REST_SOON_S)."""
+        self.changed.add(mid)
+        self.arrivals += 1
+        self.pushed.set()
 
     def merge(self, mid: str, bids: tuple, asks: tuple, asked: float) -> bool:
         """A REST read of a window's book beside the pushes (RuleTaker.verify, the per-second hours): dropped when a push came after
@@ -862,6 +887,8 @@ class RuleTaker:
         self.verifying: asyncio.Task | None = None  # the REST read of a window's book under way beside the pushes (verify)
         self.verify_at = 0.0               # monotonic: when the last one began
         self.verifies = self.verify_diffs = self.fast_looks = 0  # REST reads beside the pushes, those that differed, the per-second looks (status)
+        self.status_reads = 0              # ...and the reads of matching's status at the makers' moment (verify_status, 1.154.22)
+        self.rush_tasks: set = set()       # the windows' rushes under way (rush): they share the key's pace, and end with the taker
         self.verify_error = ""
         self.verify_ms: collections.deque = collections.deque(maxlen=120)  # the last REST reads' round trips, ms
         self.collect: list | None = None   # the orders' requests of the tick under way: sent side by side, awaited at its end (send)
@@ -1009,7 +1036,7 @@ class RuleTaker:
                 await self.rest()
         finally:
             self.alive = False
-            side = [t for t in (streaming, lagging, self.warming, self.verifying) if t is not None]
+            side = [t for t in (streaming, lagging, self.warming, self.verifying, *self.rush_tasks) if t is not None]
             for task in side:
                 task.cancel()
             await asyncio.gather(*side, return_exceptions=True)
@@ -1138,6 +1165,62 @@ class RuleTaker:
         lead = int(getattr(self.settings, "lead_minutes", 0) or 0) * 60_000
         return w["start"] - lead if lead > 0 else 0
 
+    def rushing(self, w: dict) -> bool:
+        """The window's offer waits for matching to open and its status is being asked every STATUS_RUSH_S (rush)."""
+        task = w.get("rush_task")
+        return task is not None and not task.done()
+
+    def rush_pace(self) -> float:
+        """Seconds between one window's reads of the status in its rush: STATUS_RUSH_S, and never faster than the key's own
+        pace (a tenth slower than PREDICT_RATE_PER_MIN: 0.3 s at 220 a minute), shared by the windows rushing at once (gold
+        and oil have their quarter hours in common: two windows, 0.6 s each) — these reads go ahead of the others and may
+        borrow as an order does, and what they borrowed the order could not: at this pace the key's budget is not run down
+        under it (two windows each at 0.3 s had it at its floor in 7.5 s, the next order waiting a second for its token)."""
+        per_min = float(core.PREDICT_RATE.get("per_min") or 0)
+        pace = max(STATUS_RUSH_S, 66.0 / per_min) if per_min > 0 and core.PREDICT_PACING else STATUS_RUSH_S
+        return pace * max(1, sum(1 for t in self.rush_tasks if not t.done()))
+
+    def rush(self, slug: str, w: dict) -> None:
+        """1.154.22: an offer at the rule's price in hand on a market whose matching has not been seen open — its status asked now and
+        every rush_pace() seconds for STATUS_RUSH_MS, beside the looks (their own read of it keeps its pace: FAST_S, OFFER_STATUS_S) and
+        ahead of the key's other reads; the moment it says OPEN the window is looked at, and bought. Real orders only; over when
+        the offer is gone, and RUSH_READS_MAX reads a window at the most."""
+        if self.settings.mode != "on" or self.rushing(w) or int(w.get("rush_reads") or 0) >= RUSH_READS_MAX:
+            return
+        w["rush_wall"] = int(time.time() * 1000)
+        task = w["rush_task"] = asyncio.ensure_future(self.rush_run(slug, w))
+        self.rush_tasks.add(task)  # (ended with the taker: run)
+        task.add_done_callback(self.rush_tasks.discard)
+
+    async def rush_run(self, slug: str, w: dict) -> None:
+        began = time.monotonic()
+        prior = "priority" in inspect.signature(self.api.market).parameters  # (a stand-in's market() may not take it)
+        while (not w["open_ms"] and w.get("offer", True) and self.track.get(slug) is w and w["market"] is not None and not self.stop.is_set()
+               and self.settings.mode == "on" and time.monotonic() - began < STATUS_RUSH_MS / 1000 and int(w.get("rush_reads") or 0) < RUSH_READS_MAX):
+            asked = time.monotonic()
+            if self.cooling() <= 0:
+                mid = str(w["market"]["id"])
+                self.reads += 1
+                self.status_reads += 1
+                w["rush_reads"] = int(w.get("rush_reads") or 0) + 1
+                try:
+                    market = await (self.api.market(mid, priority=True) if prior else self.api.market(mid))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    w["rush_error"] = core.clean_error(error) or type(error).__name__
+                else:
+                    if self.track.get(slug) is not w or w["market"] is None:
+                        return
+                    w["market"] = {**market, "categorySlug": slug}
+                    if str(market.get("tradingStatus") or "").upper() == "OPEN":
+                        if not w["open_ms"]:
+                            w["open_ms"], w["open_wall"] = self.now(), int(time.time() * 1000)
+                            self.watch(w)["open_ms"] = self.watch(w)["open_ms"] or w["open_ms"]
+                        self.stream.nudge(mid)  # looked at now: the offer in hand is bought
+                        return
+            await asyncio.sleep(max(0.0, self.rush_pace() - (time.monotonic() - asked)))
+
     def sprinting(self, w: dict, now: int) -> bool:
         """The window is at the makers' moment: from WARM_MS before it (the preparation) to SPRINT_MS after."""
         at = self.moment(w)
@@ -1166,7 +1249,7 @@ class RuleTaker:
                 self.reads += 1
                 w["market"], w["status_ms"] = {**await self.api.market(str(w["market"]["id"])), "categorySlug": slug}, now
                 if str(w["market"].get("tradingStatus") or "").upper() == "OPEN":
-                    w["open_ms"] = now
+                    w["open_ms"], w["open_wall"] = now, int(time.time() * 1000)
                     self.watch(w)["open_ms"] = self.watch(w)["open_ms"] or now
             if self.settings.mode != "on" or self.block(0.0):
                 return
@@ -1239,7 +1322,32 @@ class RuleTaker:
         slug = min(due)[1]
         w = self.track[slug]
         w["rest_at"] = self.verify_at = mono
-        self.verifying = asyncio.create_task(self.verify(str(w["market"]["id"])), name="rules-verify")
+        if hot and not w["open_ms"] and self.stream.alive() and self.stream.held(str(w["market"]["id"])) is not None:
+            # 1.154.22: at the makers' moment a market not yet seen open for matching is asked for its status, not its book — while
+            # its book comes pushed (the connection alive, a book of it in hand): an offer found on it would wait for this very
+            # read. With the push down the read stays the book's, as before: the looks go on on these reads alone then
+            self.verifying = asyncio.create_task(self.verify_status(slug, w), name="rules-verify-status")
+        else:
+            self.verifying = asyncio.create_task(self.verify(str(w["market"]["id"])), name="rules-verify")
+
+    async def verify_status(self, slug: str, w: dict) -> None:
+        try:
+            self.reads += 1
+            self.status_reads += 1
+            now = self.now()
+            market = await self.api.market(str(w["market"]["id"]))
+            if slug not in self.track or self.track[slug] is not w or w["market"] is None:
+                return
+            w["market"], w["status_ms"] = {**market, "categorySlug": slug}, max(now, int(w.get("status_ms") or 0))
+            if str(market.get("tradingStatus") or "").upper() == "OPEN" and not w["open_ms"]:
+                w["open_ms"], w["open_wall"] = self.now(), int(time.time() * 1000)
+                self.watch(w)["open_ms"] = self.watch(w)["open_ms"] or w["open_ms"]
+                if w.get("offer"):  # an offer already in hand: looked at now, bought now
+                    self.stream.nudge(str(w["market"]["id"]))
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self.note(f"撮合状态没读到：{core.clean_error(error) or type(error).__name__}")
 
     async def verify(self, mid: str) -> None:
         asked = time.monotonic()
@@ -1474,6 +1582,8 @@ class RuleTaker:
             # 只记录: what the paper order before the window "bought" is still on the book (nothing was bought) — not there to buy again
             levels = without(levels, D(str(sum(float(o.get("filled") or 0) for o in rec["orders"] if o.get("paper") and not o.get("live")))))
         w["offer"] = bool(levels)
+        if not levels:
+            w.pop("rushed", None)  # (the offer gone: its next showing is asked about afresh)
         best = offered(bids, asks, rule.side, D("0.99"))[:1]
         if not course and self.note_offers(w, levels, best, now):
             self.save_watch(slug, w, rule)
@@ -1482,16 +1592,19 @@ class RuleTaker:
             return
         if not w["open_ms"]:
             near = w["start"] - now <= NEAR_MS
+            if not w.get("rushed"):
+                w["rushed"] = True  # 1.154.22: this showing of the offer: the status asked beside the looks, every STATUS_RUSH_S (rush)
+                self.rush(slug, w)
             if now - w["status_ms"] >= (FAST_S if near or self.fast else OFFER_STATUS_S) * 1000:
                 w["status_ms"] = now
                 self.reads += 1
                 w["market"] = {**await self.api.market(mid), "categorySlug": slug}
-                if str(w["market"].get("tradingStatus") or "").upper() == "OPEN":
-                    w["open_ms"] = now
+                if str(w["market"].get("tradingStatus") or "").upper() == "OPEN" and not w["open_ms"]:
+                    w["open_ms"], w["open_wall"] = now, int(time.time() * 1000)
                     self.watch(w)["open_ms"] = self.watch(w)["open_ms"] or now
             if not w["open_ms"]:
                 w["word"] = (f"盘口已有 ≤{int(limit * 100)}¢ 的{rule.word} {sum(q for _, q in levels):g} 份，等撮合开启就买"
-                             f"（现在 {w['market'].get('tradingStatus') or '?'}）")
+                             f"（现在 {w['market'].get('tradingStatus') or '?'}" + (f"，每 {self.rush_pace():g} 秒读一次状态" if self.rushing(w) else "") + "）")
                 return
         room = D(str(size)) - D(str(held(rec) if rec else 0.0))
         there = sum(q for _, q in levels)
@@ -1709,8 +1822,13 @@ class RuleTaker:
                  # 1.154.15: whether its look answered a book that had just come (else the order waited for something else — a hold
                  # ended, the index — and its time from that book says nothing of speed), when that look began, the order signed
                  "fresh": bool(w.get("fresh")), "look_wall": int(w.get("look_wall") or 0), "signed_wall": int(time.time() * 1000),
+                 # 1.154.22: matching seen open only after the offer was in hand — from when the offer was first seen to that sight, and
+                 # how many reads of the status it took (none of it when matching was known open before the offer showed)
+                 **({"open_wait": int(w["open_wall"]) - int(w["rush_wall"]), "open_reads": int(w.get("rush_reads") or 0)}
+                    if w.get("open_wall") and w.get("rush_wall") and not w.get("open_told") else {}),
                  "seen": float(sum(q for _, q in levels)),  # what the book in hand offered at the price (the order may ask for more)
                  **({"live": True} if course else {})}  # 1.154.14: placed in the window's course
+        w["open_told"] = True  # (the wait for matching to open is the first order's)
         rec["orders"].append(order)
         self.save(rec)
         body = {"data": {"order": {**signed, "signature": signature, "hash": digest}, "strategy": "LIMIT",
@@ -1721,6 +1839,10 @@ class RuleTaker:
         task = asyncio.ensure_future(self.send(slug, w, rule, rec, order, body, take, limit))
         if self.collect is not None:
             self.collect.append(task)
+            # 1.154.22: ...and it starts now — its line in the journal, the request handed to its thread — not when the tick next
+            # waits for something: the looks of the windows after this one (and their reads) stood between an order signed and
+            # its request (signed_wall to sent_wall)
+            await asyncio.sleep(0)
         else:
             await task
 
@@ -1958,6 +2080,7 @@ class RuleTaker:
                      + (f"，推送延迟中位 {lag:.0f} ms" if lag is not None else "")
                      + f"；REST 核对 {self.verifies} 次" + (f"，{self.verify_diffs} 次发现推送没送到的变化" if self.verify_diffs else "")
                      + (f"，一次往返中位 {trip:.0f} ms" if trip is not None else "")
+                     + (f"；等撮合开启时读状态 {self.status_reads} 次" if self.status_reads else "")
                      + (f"；核对读取失败：{self.verify_error}" if self.verify_error else "")
                      + (f"；机器人主循环延迟近 1 分钟中位 {statistics.median(self.loop_lags):.0f} ms、最长 {max(self.loop_lags):.0f} ms" if self.loop_lags else ""))
         elif wait is not None:

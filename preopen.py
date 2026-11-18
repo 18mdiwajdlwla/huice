@@ -184,6 +184,11 @@ class Ledger:
         self.windows: dict[str, int] = {}  # window -> its records here (the status's 已记录 N 场)
         self.seq: dict[str, int] = {}  # a record's place in ``rows`` (its order of entry): what the walks' own order was
         self.seq_next = 0
+        # 1.154.22 — the model trader's positions check asks, once a minute, which outcomes hold a fill of this mode's not read for
+        # certain yet and what this mode's orders filled these thirty days (unverified_outcomes, fills_by_outcome): two walks of
+        # every record's orders, 78,000 of them on 11-18 — more than half of that check's time on the event loop
+        self.unsure: dict[str, dict] = {}  # the records with an order sent whose fills were not known for certain when last saved
+        self.filled: dict[str, dict] = {}  # the records an order of which had filled something when last saved, or has since (note_filled)
         self.unordered = False  # a record put back among the working ones out of its place (never by this code: a test's): sorted again at the next walk
         for slug, row in self.rows.items():
             self.index(slug, row)
@@ -248,6 +253,45 @@ class Ledger:
         if day:
             self.scored.setdefault(day, {})[slug] = row
             self.scored_day[slug] = day
+        unsure = filled = False
+        for o in orders:
+            if not o.get("index_set"):
+                continue
+            unsure = unsure or (o.get("state") != "prepared" and o.get("state") not in NEVER_PLACED and o.get("state") != "final")  # (not order_verified)
+            try:
+                filled = filled or float(o.get("filled") or 0) > 0
+            except (TypeError, ValueError):
+                filled = True  # (no number: filed, and left for the sum to stumble on as the walk did)
+        for held, on in ((self.unsure, unsure), (self.filled, filled)):
+            if on:
+                held[slug] = row
+            else:
+                held.pop(slug, None)
+
+    def note_filled(self, row: dict) -> None:
+        """A fill just written onto an order of ``row``, before the record is saved (Controller.apply_fill): among the filled
+        ones from now. A fill is applied where it is read and the record saved after the reads that follow — the other
+        side's, the final records' (monitor_pair, settle_pair) — and the model trader's positions check may run in between:
+        told the mode's fills without this one, with the order already read final (so no longer "not read yet" either), it
+        took those shares for unexplained and could book them onto an order of its own (the double count of 1.131.5)."""
+        slug = str(row.get("slug") or "")
+        if slug and self.rows.get(slug) is row:
+            self.filled[slug] = row
+
+    def unsure_rows(self) -> list[dict]:
+        """The records with an order sent whose fills were not known for certain when last saved: every record
+        unverified_outcomes would name an outcome of is among them (a record is judged there as it stands)."""
+        if not self.in_step():
+            self.reindex()
+        return list(self.unsure.values())
+
+    def filled_rows(self) -> list[dict]:
+        """The records an order of which had filled something when last saved or has had a fill written onto it since
+        (note_filled), in the order ``rows`` holds them: fills_by_outcome over them sums what it summed over every record,
+        term for term."""
+        if not self.in_step():
+            self.reindex()
+        return [row for _, row in sorted(self.filled.items(), key=lambda kv: self.seq[kv[0]])]
 
     def unindex(self, slug: str, row: dict) -> None:
         """A record leaving ``rows`` (deleted, renamed, archived): its entries in by_hash go with it."""
@@ -256,6 +300,8 @@ class Ledger:
                 del self.by_hash[order["hash"]]
         self.seq.pop(slug, None)
         self.working.pop(slug, None)
+        self.unsure.pop(slug, None)
+        self.filled.pop(slug, None)
         self.struck.pop(slug, None)
         self.untry(slug)
         self.unmark(slug)
@@ -296,6 +342,7 @@ class Ledger:
         self.by_hash, self.working, self.scored, self.scored_day, self.seq, self.seq_next, self.unordered = {}, {}, {}, {}, {}, 0, False
         self.tries, self.tries_key, self.struck = {}, {}, {}
         self.ids, self.hashes, self.marks, self.windows = {}, {}, {}, {}
+        self.unsure, self.filled = {}, {}
         for slug, row in self.rows.items():
             self.index(slug, row)
 
@@ -2131,7 +2178,12 @@ class Controller:
     def filled_by_outcome(self, days: int = 3) -> dict[tuple[str, int], float]:
         """The shares this mode's orders filled, by (market id, index set), for the windows of the last ``days`` days: the
         model trader's positions reconciliation counts them as recorded, not as fills of its own orders to adopt."""
-        return fills_by_outcome(list(self.ledger.rows.values()), self.now(), days)
+        return fills_by_outcome(self.ledger.filled_rows(), self.now(), days)  # 1.154.22: over the records that filled anything, not every record
+
+    def unverified_outcomes(self, days: int = 3) -> set[tuple[str, int]]:
+        """The outcomes where an order of this mode was sent and its fills are not known for certain (unverified_outcomes), over
+        the records that have such an order (1.154.22), not every record."""
+        return unverified_outcomes(self.ledger.unsure_rows(), self.now(), days)
 
     def daily_pnl(self) -> float:
         day = dt.datetime.fromtimestamp(self.now() / 1000, core.BEIJING).date().isoformat()
@@ -2715,6 +2767,8 @@ class Controller:
         order["filled"] = max(before, float(shares * filled / amount))
         if order["filled"] > before:  # 1.151.0: when a fill was first seen (the snapshot's pace: seconds, a minute with thousands of orders) — the review's 成交时距开场
             order.setdefault("fill_ms", self.now())
+        if order["filled"] > 0:
+            self.ledger.note_filled(pair)  # 1.154.22: counted among the mode's fills from this moment, not from the record's next save (Ledger.filled)
 
     def gave_up(self, pair: dict) -> bool:
         """Past the window's start by GIVE_UP_MS: an order Predict cannot show cannot fill any more (it expired before

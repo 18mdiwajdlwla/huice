@@ -805,8 +805,10 @@ class PredictApi:
                     break
         return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
 
-    async def market(self, market_id: str) -> dict:
-        data = await self.call("GET", f"/markets/{core.urllib.parse.quote(str(market_id))}")
+    async def market(self, market_id: str, priority: bool = False) -> dict:
+        """A market's details. ``priority`` (1.154.22): a read on an order's way — the rule taker's look at whether matching has
+        opened, an offer already in hand — goes ahead of the key's other reads, as the order itself does."""
+        data = await self.call("GET", f"/markets/{core.urllib.parse.quote(str(market_id))}", priority=priority)
         if isinstance(data, dict) and data.get("success") is False:
             raise core.RemoteError("Predict 接口返回 success=false：" + (core.http_error_text(data) or core.brief_error(json.dumps(data, ensure_ascii=False), 120)))
         market = data.get("data", data) if isinstance(data, dict) else {}
@@ -2061,7 +2063,7 @@ class LiveBot(core.Bot):
         0.0, and nearly every record is one (12,800 kept on 11-17, a few dozen live). The figure is asked three or four times
         on an order's way out and at every look that may open one; the walk was most of that way's time on the event loop."""
         def held() -> Any:
-            for t in trades.values():
+            for _, t in core.trades_open(trades):  # 1.154.22: the open records alone, where the map knows them (a record that holds anything is one)
                 st = t.get("live")
                 if not isinstance(st, dict):
                     continue
@@ -2138,19 +2140,22 @@ class LiveBot(core.Bot):
         whenever one is settled or re-settled (sim_settle: the only place a record becomes settled, or gets a revision — it
         counts here before the record is even saved) and at midnight; each is still judged as it stands when asked, in the
         records' own order, so the sum is the walk's, term for term."""
-        taken = getattr(trades, "taken", None)
-        if taken is None:
+        # 1.154.22: ...which is when a settled record is saved (TradeIndex.settled_tick) — not at every write of any record: every
+        # order's own record is written on its way out, so each order's gates began with a walk of every record again
+        index = trades.kept() if isinstance(trades, core.TradeMap) else None
+        if index is None:
             return trades.values()  # not the kept records as sim_trades gives them (a dict of the caller's own, a map changed since): every record
-        if (getattr(self, "sim_cache", None) is None or taken != (getattr(self, "sim_built", 0), self.sim_gen)
-                or self.store.touched.get("sim", 0) != self.sim_gen):
-            return trades.values()
-        key = (taken, self.__dict__.get("live_pnl_epoch", 0), since)
+        key = (index.settled_tick, self.__dict__.get("live_pnl_epoch", 0), since)
         held = self.__dict__.get("live_pnl_held")
-        if held is None or held[0] != key:
-            rows = [t for t in trades.values() if isinstance(t.get("live"), dict) and t.get("status") == "settled"
+        if held is None or held[0] is not index or held[1] != key:
+            rows = [t for t in index.records.values() if isinstance(t.get("live"), dict) and t.get("status") == "settled"
                     and (int(t.get("settled") or 0) >= since or t.get("revisions"))]
-            held = self.__dict__["live_pnl_held"] = (key, rows)
-        return held[1]
+            held = self.__dict__["live_pnl_held"] = (index, key, rows)
+        elif core.TRADE_AUDIT:
+            walked = [t for t in trades.values() if isinstance(t.get("live"), dict) and t.get("status") == "settled"
+                      and (int(t.get("settled") or 0) >= since or t.get("revisions"))]
+            core.trade_audit("live_pnl_rows", len(walked) == len(held[2]) and all(a is b for a, b in zip(walked, held[2])), len(walked))
+        return held[2]
 
     def live_check_kill(self, trades: dict[str, dict], now_ms: int) -> None:
         """The daily loss stop: tripped when the day's settled P&L is at −LIVE_MAX_DAILY_LOSS_USD or under — new orders
@@ -2448,7 +2453,7 @@ class LiveBot(core.Bot):
             return  # stopping: nothing new goes out (a request cut off by the exit would leave a record Predict may or may not know)
         trades = self.sim_trades()
         sending = []
-        for tid, trade in trades.items():
+        for tid, trade in core.trades_open(trades):  # 1.154.22: (a pending order's record is open)
             st = trade.get("live")
             if isinstance(st, dict) and st.get("state") == "pending" and trade["status"] == "resting" and tid not in self.live_placing:
                 if hold := self.live_send_hold(now_ms):
@@ -2613,7 +2618,7 @@ class LiveBot(core.Bot):
     def live_cancels_unsent(self, skip: Any = ()) -> dict[str, dict]:
         """The records whose cancel is decided but not sent yet (state cancelling, an order id known), by tid. Not one whose
         removal another path has on its way right now (live_cancels, 1.150.0): its cancel_sent is only set once Predict answers."""
-        return {tid: t for tid, t in self.sim_trades().items() if tid not in skip and isinstance(t.get("live"), dict)
+        return {tid: t for tid, t in core.trades_open(self.sim_trades()) if tid not in skip and isinstance(t.get("live"), dict)  # (1.154.22: the open records alone)
                 and t["live"].get("state") == "cancelling" and not t["live"].get("cancel_sent") and tid not in self.live_placing
                 and str(t["live"].get("order_id") or "") not in self.live_cancels
                 and (t["live"].get("order_id") or not t["live"].get("hash"))}  # 1.138.1: one never sent (no id, no hash) is closed at once too
@@ -2996,7 +3001,7 @@ class LiveBot(core.Bot):
     async def live_sync(self, now_ms: int) -> None:
         trades = self.sim_trades()
         self.live_check_kill(trades, now_ms)  # first, and never behind the open-order read: a list that cannot be read must not keep the switch from tripping
-        active = {tid: t for tid, t in trades.items() if isinstance(t.get("live"), dict) and t["live"].get("state") in PLACING
+        active = {tid: t for tid, t in core.trades_open(trades) if isinstance(t.get("live"), dict) and t["live"].get("state") in PLACING  # (1.154.22: the open records alone)
                   and t["live"].get("state") != "pending"}
         if active and not self.live.ready:
             await self.live_ensure_ready()  # real orders are followed to their end whatever the mode (LIVE=off included)
@@ -3314,11 +3319,27 @@ class LiveBot(core.Bot):
             out.append(f"原策略 {(samples[-1][1] - samples[0][1]) / (samples[-1][0] - samples[0][0]):.1f}")
         feed = getattr(getattr(self, "predict", None), "rate", None)
         if callable(feed) and (rate := feed()) is not None:
-            out.append(f"盘口 {rate:.1f}" + ("（专用 Key）" if self.book_own_key() else ""))
+            kinds = getattr(self.predict, "rest_kinds_last", None)
+            kinds = kinds() if callable(kinds) else {}
+            out.append(f"盘口 {rate:.1f}" + ("（专用 Key）" if self.book_own_key() else "")
+                       # 1.154.22: what the feed's reads are of — a key at its pace on them is the place to look for what can be spared
+                       + (f"（最近一分钟 {sum(kinds.values())} 次：" + "、".join(f"{k} {n}" for k, n in kinds.items()) + "）" if kinds else ""))
         preopen = getattr(self, "preopen", None)
         if preopen is not None and (rate := preopen.request_rate()) is not None:
             out.append(f"预挂 {rate:.1f}" + ("（专用 Key）" if self.preopen_own_key() else ""))
         return out
+
+    def live_signer_note(self) -> str:
+        """Which library signs the orders (/diag, 1.154.22): the native secp256k1 (coincurve, in the image since then) at half a
+        millisecond an order, or eth-keys' own pure-Python curve at three or four — each on the event loop. "" when unknown."""
+        if self.config.live_mode == "off":
+            return ""
+        try:
+            import eth_keys
+            native = eth_keys.KeyAPI().backend.__class__.__name__.lower().startswith("coincurve")
+        except Exception:
+            return ""
+        return "订单签名：原生库（coincurve，每张约 0.5 ms）" if native else "订单签名：纯 Python（每张 3～8 ms，占着主循环；镜像里装上 coincurve 就会自动换成原生库）"
 
     def preopen_own_key(self) -> str:
         """PREOPEN_API_KEY when it is a key other than the bot's own (the pre-open mode's requests then count on it alone), else ""."""
@@ -3710,6 +3731,26 @@ class LiveBot(core.Bot):
             lines.append("没有持仓，也没有在持的记录")
         return "\n".join(lines)
 
+    def live_updated(self, tid: str, t: dict) -> int:
+        """core.trade_updated(t) — when the record last changed — kept for the minute's positions check (1.154.22): that check
+        asks it of every record whose order ended with shares unfilled, to find those of the last two days, and worked it out
+        afresh for each of them every minute (its fills and events passed, one by one: 7,600 records' on 11-18, most of the
+        check's 110 ms on the event loop — once more to sort them). Worked out again when the record's own stamps, the counts
+        of its fills and events or the last of either have changed (they are only ever added to), or another record is under
+        the key."""
+        fills, events = t.get("fills") or (), (t.get("live") or {}).get("events") or ()
+        mark = (t.get("opened"), t.get("filled"), t.get("settled"), len(fills), len(events),
+                fills[-1].get("at") if fills and isinstance(fills[-1], dict) else None, events[-1].get("at") if events and isinstance(events[-1], dict) else None)
+        memo = self.__dict__.setdefault("live_updated_memo", {})
+        held = memo.get(tid)
+        if held is not None and held[0] is t and held[1] == mark:
+            return held[2]
+        if len(memo) > 4 * len(getattr(self, "sim_cache", None) or ()) + 1000:
+            memo.clear()  # (keys of records moved or removed since: not kept for good)
+        value = core.trade_updated(t)
+        memo[tid] = (t, mark, value)
+        return value
+
     async def live_late_fills(self, now_ms: int) -> None:
         """The account's positions against the records, once a minute (1.119.0): one read of the positions, then
         (a) fills that landed as an order was ending and were not read then (a 300-share KOSPI order withdrawn with 0
@@ -3739,7 +3780,7 @@ class LiveBot(core.Bot):
                  # (1.150.0: one that lapsed at the result with nothing filled is settled as the fill lands on it — live_apply: live_settle_late)
                  if t["live"].get("state") == "done" and t["live"].get("order_id") and t.get("status") in {"cancelled", "filled", "settled", "expired"}
                  and float(t.get("order") or 0) - float(t.get("shares") or 0) > 1e-9
-                 and self.LIVE_LATE_FILLS_GRACE_MS <= now_ms - core.trade_updated(t) <= self.LIVE_LATE_FILLS_WINDOW_MS]
+                 and self.LIVE_LATE_FILLS_GRACE_MS <= now_ms - self.live_updated(tid, t) <= self.LIVE_LATE_FILLS_WINDOW_MS]
         open_recs = [(tid, t) for tid, t in live if t.get("status") in {"filled", "resting"} and float(t.get("shares") or 0) > 1e-9]
         if not ended and not open_recs:
             return
@@ -3788,7 +3829,7 @@ class LiveBot(core.Bot):
         # beyond its record (1.120.3: a KOSPI fill at 21¢ and an SK Hynix one at 10¢ had each been put on a 1¢ sweep order placed
         # after them, the newest to end) — else the order the position's price or time names, else, once the records have had
         # LIVE_ADOPT_WAIT_MS to catch up, the newest as a guess, checked against the other orders' records for LIVE_ADOPT_RECHECK_MS
-        ended.sort(key=lambda kv: core.trade_updated(kv[1]), reverse=True)
+        ended.sort(key=lambda kv: self.live_updated(*kv), reverse=True)
         by_out: dict[tuple[str, int], list[tuple[str, dict]]] = {}
         for tid, t in ended:
             k = key_of(t)
@@ -4147,12 +4188,19 @@ class LiveBot(core.Bot):
                 open_rows = held["unmanaged"]
             else:
                 open_rows = self.preopen.unmanaged_rows(open_rows)
+        # 1.154.22: the orders the records hold, from their index (TradeIndex.by_order / by_hash: every record's order id and
+        # hash, kept as the records are saved) — two sets were built at every step by passing every record twice
         trades = self.sim_trades()
-        known_ids = {str(t["live"].get("order_id")) for t in trades.values() if isinstance(t.get("live"), dict) and t["live"].get("order_id")}
-        known_hashes = {str(t["live"].get("hash") or "").lower() for t in trades.values() if isinstance(t.get("live"), dict)}
+        index = trades.kept() if isinstance(trades, core.TradeMap) else None
+        known_ids: Any = {str(t["live"].get("order_id")) for t in trades.values() if isinstance(t.get("live"), dict) and t["live"].get("order_id")} if index is None or core.TRADE_AUDIT else None
+        known_hashes: Any = {str(t["live"].get("hash") or "").lower() for t in trades.values() if isinstance(t.get("live"), dict)} if index is None or core.TRADE_AUDIT else None
+        if index is not None:
+            if core.TRADE_AUDIT:
+                core.trade_audit("live_note_unknown", known_ids == set(index.by_order) and known_hashes - {""} == set(index.by_hash), "")
+            known_ids, known_hashes = index.by_order, index.by_hash
         rule_ids, rule_hashes = self.rules_known()  # 1.153.3: the rule taker's orders are this bot's own
-        known_ids, known_hashes = known_ids | rule_ids, known_hashes | rule_hashes
-        unknown = [r for r in open_rows if str(r.get("id")) not in known_ids and (order_hash_of(r) or "-") not in known_hashes]
+        unknown = [r for r in open_rows if (rid := str(r.get("id"))) not in known_ids and rid not in rule_ids
+                   and (digest := order_hash_of(r) or "-") not in known_hashes and digest not in rule_hashes]
         seen = {u["id"] for u in self.live_unknown_open}
         self.live_unknown_open = [{"id": str(r.get("id")), "hash": order_hash_of(r), "status": str(r.get("status") or ""),
                                    "amount": str(r.get("amount") or "")} for r in unknown]
@@ -4710,7 +4758,29 @@ class LiveBot(core.Bot):
         """An order on the open list whose record here was already finished (judged gone, lapsed, released): it is
         live after all — tracked again with its reservation, never left as "known, so not unknown". A list read before
         the record ended (``at_ms``: the pre-open mode's snapshot) says nothing about that record (1.136.2)."""
-        for tid, t in self.sim_trades().items():
+        # 1.154.22: only the records whose order the list holds are looked at, found by the orders' index (TradeIndex.holding) —
+        # every record was passed twice a step (this step's own read, then the pre-open mode's snapshot) to find, nearly always,
+        # none: 37 of the stalls /diag placed on 11-18, 5.9 s of ten minutes. Which records hold a listed order changes only
+        # when an order's id or hash is written to a record, so for the snapshot the answer is kept until then
+        trades = self.sim_trades()
+        index = trades.kept() if isinstance(trades, core.TradeMap) else None
+        if index is None:
+            pairs: Any = trades.items()  # (records from elsewhere — a stand-in's: every one, as before)
+        else:
+            held = self.__dict__.get("live_snapshot_held")
+            if held is not None and held["by_id"] is by_id and held["by_hash"] is by_hash:
+                mine = held.get("mine")
+                if mine is None or mine[0] is not index or mine[1] != index.order_tick:
+                    mine = held["mine"] = (index, index.order_tick, index.holding(by_id, by_hash))
+                tids = mine[2]
+            else:
+                tids = index.holding(by_id, by_hash)
+            if core.TRADE_AUDIT:
+                walked = [k for k, t in trades.items() if isinstance(t.get("live"), dict)
+                          and (by_id.get(str(t["live"].get("order_id") or "-")) or by_hash.get(str(t["live"].get("hash") or "-").lower())) is not None]
+                core.trade_audit("live_readopt", walked == tids, f"{tids[:5]} / {walked[:5]}")
+            pairs = [(tid, trades[tid]) for tid in tids]
+        for tid, t in pairs:
             st = t.get("live")
             if not isinstance(st, dict) or st.get("state") != "done" or t.get("status") in {"settled", "expired"}:
                 continue
@@ -6870,6 +6940,9 @@ class LiveBot(core.Bot):
         """The outcomes where a pre-open order's fills are not read for certain yet (preopen.unverified_outcomes): a position
         there may be its fill — the positions check leaves them alone until the mode has read them (1.131.5)."""
         from preopen import unverified_outcomes
+        own = getattr(self.preopen, "unverified_outcomes", None)
+        if callable(own):
+            return own()  # 1.154.22: the controller's, from its ledger's index — not a walk of every record's orders, once a minute
         return unverified_outcomes(self.preopen_rows(), self.market.now_ms())
 
     def sim_analysis(self, trades: list[dict], marks: Any, flt: Any = None) -> dict:

@@ -4,6 +4,24 @@ import os
 import urllib.request
 
 os.environ["PREDICT_PACING"] = "off"  # the request pacer (main.PredictPacer, 1.154.0) waits on the clock: the suites run unpaced
+# 1.154.22: every answer the records' index gives (main.TradeIndex: a market's records, a driver's, the open ones, the orders')
+# is checked against the walk of every record it stands for, in every suite, at every call; a suite in which one differed
+# fails whatever its own checks said (below) — the code that asked may have caught the error and gone on
+os.environ.setdefault("SIM_INDEX_AUDIT", "1")
+
+
+def _index_audit() -> None:
+    import sys
+    fails = getattr(sys.modules.get("main"), "TRADE_AUDIT_FAILS", None)
+    if fails:
+        sys.stdout.flush()
+        sys.stderr.write(f"AssertionError: the records' index differed from the walk {len(fails)} time(s): {fails[:3]}\n")
+        sys.stderr.flush()
+        os._exit(1)
+
+
+import atexit  # noqa: E402
+atexit.register(_index_audit)
 
 
 def _no_network(request, *args, **kwargs):

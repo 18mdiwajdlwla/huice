@@ -310,9 +310,17 @@ async def gates():
     assert 0 < len(calls) < 900, f"only the records that may hold something are worked out ({len(calls)} of 1501)"
     # the day's settled P&L: the walk's figure, from the day's own records
     assert bot.live_daily_pnl(trades, NOW) == plain_pnl(bot, trades, NOW) != 0
-    rows = bot.live_pnl_held[1]
+    rows = bot.live_pnl_held[2]
     assert 0 < len(rows) < 600 and all(t["status"] == "settled" for t in rows), len(rows)
-    assert bot.live_daily_pnl(bot.sim_trades(), NOW) == plain_pnl(bot, trades, NOW) and bot.live_pnl_held[1] is rows, "asked again with nothing written: not looked for again"
+    assert bot.live_daily_pnl(bot.sim_trades(), NOW) == plain_pnl(bot, trades, NOW) and bot.live_pnl_held[2] is rows, "asked again with nothing written: not looked for again"
+    # 1.154.22: ...nor after a write of a record that is not a settled one — an order's own record is written on its way out, and
+    # each of its gates began with a walk of every record again; a settled record saved is looked for again
+    resting = next((k, t) for k, t in trades.items() if t.get("status") == "resting" and isinstance(t.get("live"), dict))
+    bot.sim_save([resting])
+    assert bot.live_daily_pnl(bot.sim_trades(), NOW) == plain_pnl(bot, trades, NOW) and bot.live_pnl_held[2] is rows, "another record written: the day's rows stand"
+    bot.sim_save([next((k, t) for k, t in trades.items() if t is rows[0])])
+    assert bot.live_daily_pnl(bot.sim_trades(), NOW) == plain_pnl(bot, trades, NOW) and bot.live_pnl_held[2] is not rows, "a settled record written: looked for again"
+    rows = bot.live_pnl_held[2]
     assert bot.live_daily_pnl(dict(trades), NOW) == plain_pnl(bot, trades, NOW), "a dict of the caller's own is walked whole"
     # a record settled this very moment counts before it is even saved (sim_settle): no order goes out past a loss just settled
     loser = next(t for t in trades.values() if t.get("status") == "filled" and isinstance(t.get("live"), dict))
@@ -338,7 +346,7 @@ async def gates():
     late["live"].update(state="done", order_id="999999", hash="0x" + "9" * 64)
     bot.sim_save([("late|up|吃", late)])
     assert bot.live_daily_pnl(bot.sim_trades(), NOW) == plain_pnl(bot, bot.sim_trades(), NOW)
-    assert late in bot.live_pnl_held[1]
+    assert late in bot.live_pnl_held[2]
     # a map the caller changed is no longer "the records as kept": walked whole
     view = bot.sim_trades()
     extra = copy.deepcopy(late)
@@ -356,7 +364,7 @@ async def gates():
     bot.sim_cache = None
     fresh = bot.sim_trades()
     assert bot.sim_built == built + 1 and fresh.taken == (built + 1, bot.sim_gen)
-    assert bot.live_daily_pnl(fresh, NOW) == plain_pnl(bot, fresh, NOW) and all(any(t is x for x in fresh.values()) for t in bot.live_pnl_held[1])
+    assert bot.live_daily_pnl(fresh, NOW) == plain_pnl(bot, fresh, NOW) and all(any(t is x for x in fresh.values()) for t in bot.live_pnl_held[2])
     # a bot made without its start (a test's) has no kept records: the walk
     bare = L.LiveBot.__new__(L.LiveBot)
     assert bare.live_daily_pnl({"a": late}, NOW) == plain_pnl(bot, {"a": late}, NOW)

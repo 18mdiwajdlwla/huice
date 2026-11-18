@@ -9,6 +9,7 @@ import sys
 import time
 import types
 import unittest
+from unittest import mock
 from decimal import Decimal as D
 from pathlib import Path
 
@@ -572,6 +573,200 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         await t.tick()
         self.assertEqual(len(api.sent), 1)
 
+    async def test_an_offer_waiting_for_matching_has_its_status_asked_at_once_and_fast(self):
+        """1.154.22: an offer at the rule's price on a market whose matching has not been seen open — its status is asked beside
+        the looks, at once and every STATUS_RUSH_S, each read ahead of the key's other reads (priority); the moment it says OPEN
+        the window is looked at and bought, and the order's record says how long the offer waited for that. 11-18 13:15:07: the
+        status had just been read, was not read again for FAST_S, and the order left 2.7 s after the offer's book had arrived."""
+        t, api, clock, x = taker("on")
+        asked: list = []
+
+        async def market(mid, priority=False):
+            asked.append(priority)
+            return copy.deepcopy(api.markets[str(mid)])
+        api.market = market
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        mkt = api.markets["901"] = gold_market(GOLD_0600, status="MATCHING_NOT_ENABLED")
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+        with mock.patch.object(R, "STATUS_RUSH_S", 0.01):
+            await t.tick()  # listed and read: the offer is there, matching is not open
+            w = t.track[slug]
+            self.assertEqual((api.sent, w["offer"], t.rushing(w)), ([], True, True))
+            self.assertIn("等撮合开启就买（现在 MATCHING_NOT_ENABLED，每 0.01 秒读一次状态）", w["word"])
+            listing = len(asked)
+            await asyncio.sleep(0.08)
+            reads = asked[listing:]
+            self.assertGreaterEqual(len(reads), 3, "the status asked again and again, no look needed")
+            self.assertTrue(all(reads), "each ahead of the key's other reads")
+            self.assertEqual((api.sent, w["open_ms"], [c for c in api.calls if c.endswith("/orderbook")]), ([], 0, ["/markets/901/orderbook"]),
+                             "no order yet, and the book not read again for it")
+            mkt["tradingStatus"] = "OPEN"
+            await asyncio.sleep(0.05)
+            self.assertTrue(w["open_ms"] and not t.rushing(w) and "901" in t.stream.changed and t.stream.pushed.is_set(), "open: the loop woken for this window")
+            self.assertEqual((t.stream.arrivals != t.looked, t.rest_s()), (True, R.REST_SOON_S), "as a change that has just come: no tenth of a second's rest before its look")
+            n = len(asked)
+            await t.tick()  # (the clock has not moved: the look is this change's)
+            self.assertEqual(len(api.sent), 1, "bought at that look")
+            order = t.record(slug)["orders"][0]
+            self.assertEqual((order["open_reads"], order["open_wait"] >= 0, len(asked) - n), (w["rush_reads"], True, 0), "no request more before the order")
+            self.assertRegex(R.race_text(R.races(t.recs, "on", 0)[0]), r"卖单先到、等撮合开启 \d+ ms（读了 \d+ 次状态）")
+            await asyncio.sleep(0.03)
+            self.assertEqual(len(asked), n, "open: asked no more")
+        # the offer gone before matching opens: the asking ends; its next showing is asked about afresh — RUSH_READS_MAX reads a window
+        t2, api2, clock2, _ = taker("on")
+        mkt2 = api2.markets["901"] = gold_market(GOLD_0600, status="MATCHING_NOT_ENABLED")
+        api2.listed.add(slug)
+        api2.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+        with mock.patch.object(R, "STATUS_RUSH_S", 0.01):
+            await t2.tick()
+            w2 = t2.track[slug]
+            self.assertTrue(t2.rushing(w2))
+            api2.books["901"] = {"bids": [], "asks": []}
+            clock2.ms += int(R.OFFER_STATUS_S * 1000)
+            await t2.tick()
+            await asyncio.sleep(0.03)
+            self.assertEqual((w2["offer"], t2.rushing(w2), api2.sent), (False, False, []))
+            api2.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+            clock2.ms += int(R.CLOSED_SLOW_S * 1000)
+            await t2.tick()
+            self.assertTrue(t2.rushing(w2), "shown again: asked about again")
+            w2["rush_reads"] = R.RUSH_READS_MAX
+            await asyncio.sleep(0.03)
+            self.assertFalse(t2.rushing(w2))
+        # never faster than the key's own pace (the reads may borrow as an order does: what they borrowed the order could not),
+        # shared by the windows rushing at once — gold and oil have their quarter hours in common
+        with mock.patch.object(m, "PREDICT_PACING", True), mock.patch.dict(m.PREDICT_RATE, {"per_min": 220.0}):
+            self.assertAlmostEqual(t2.rush_pace(), 0.3)
+            with mock.patch.dict(m.PREDICT_RATE, {"per_min": 600.0}):
+                self.assertEqual(t2.rush_pace(), R.STATUS_RUSH_S)
+            waiting = [asyncio.ensure_future(asyncio.sleep(30)) for _ in range(2)]
+            t2.rush_tasks.update(waiting)
+            self.assertAlmostEqual(t2.rush_pace(), 0.6, msg="two windows: half the pace each")
+            for task in waiting:
+                task.cancel()
+            await asyncio.gather(*waiting, return_exceptions=True)
+            t2.rush_tasks.difference_update(waiting)
+        self.assertEqual((t2.rush_pace(), t2.rush_tasks), (R.STATUS_RUSH_S, set()), "the pacing off (these tests): the set pace; no rush left behind")
+        # 只记录 asks nothing fast (no order to be first with)
+        t3, api3, clock3, _ = taker("paper")
+        api3.markets["901"] = gold_market(GOLD_0600, status="MATCHING_NOT_ENABLED")
+        api3.listed.add(slug)
+        api3.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+        await t3.tick()
+        self.assertFalse(t3.rushing(t3.track[slug]))
+        self.assertIn("等撮合开启就买（现在 MATCHING_NOT_ENABLED）", t3.track[slug]["word"])
+
+    async def test_an_orders_request_leaves_within_its_look(self):
+        """1.154.22: an order signed is on its way before the tick goes on to the next window — it used to start only when the
+        tick next waited for something: the looks of the windows after it, and their reads, stood between an order signed and
+        its request."""
+        t, api, clock, x = taker("on")
+        events: list = []
+        call, create = api.call, api.create_order
+
+        async def logged_call(method, path, **kwargs):
+            events.append(path)
+            return await call(method, path, **kwargs)
+
+        async def logged_create(body):
+            events.append("order")
+            return await create(body)
+        api.call, api.create_order = logged_call, logged_create
+        t.journal = lambda rec, order: True  # (as with a store on disk: the order's line written to the taker's journal, no thread to wait for)
+        slugs = [f"xau-updown-15m-{(GOLD_0600 + i * 900_000) // 1000}" for i in range(2)]
+        for i, mid in enumerate(("901", "902")):
+            api.markets[mid] = gold_market(GOLD_0600 + i * 900_000, mid=int(mid))
+            api.listed.add(slugs[i])
+            api.books[mid] = {"bids": [], "asks": [[0.70, 30]]}
+        await t.tick()
+        self.assertEqual(api.sent, [])
+        api.books["901"] = {"bids": [], "asks": [[0.52, 25]]}
+        clock.ms += int(R.SLOW_S * 1000)
+        del events[:]
+        await t.tick()
+        self.assertEqual(len(api.sent), 1)
+        self.assertEqual([e for e in events if e == "order" or e.endswith("/orderbook")], ["/markets/901/orderbook", "order", "/markets/902/orderbook"],
+                         "the first window's order out before the second window is read")
+        order = t.record(slugs[0])["orders"][0]
+        self.assertLess(order["sent_wall"] - order["signed_wall"], 50)
+        row = R.races(t.recs, "on", 0)[0]["orders"][0]
+        self.assertEqual((row["wake"] in (None, 0), row["prep"] >= 0, row["out"] >= 0), (True, True, True), "a book the look read itself: no wait for the look to count")
+
+    async def test_at_the_makers_moment_a_market_not_seen_open_is_asked_for_its_status(self):
+        """1.154.22: at the makers' moment the reads beside the pushes are of the window's status, not its book, until matching is
+        seen open — the book comes pushed, and an offer found on it would wait for that very read."""
+        own, api, clock, _ = taker("on", RULE_FAST_HOURS="off", RULE_OIL="off", RULE_GOLD_OPEN_CENTS="0", RULE_GOLD_0515_CENTS="0",
+                                   RULE_API_KEY="rule-key", PREDICT_API_KEY="main-key")
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        mkt = api.markets["901"] = gold_market(GOLD_0600, status="MATCHING_NOT_ENABLED")
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": []}
+        clock.ms = GOLD_0600 - 300 * 60_000 - 5_000  # five seconds before the 06:00 window's moment
+        hold, own.verify_tick = own.verify_tick, lambda: None
+        await own.tick()
+        own.verify_tick = hold
+        connected(own, "901", {"bids": [], "asks": []}, age=300)
+        w = own.track[slug]
+        self.assertTrue(own.hot(w, clock.ms) and not w["open_ms"])
+        asked: list = []
+        market = api.market
+
+        async def logged(mid):
+            asked.append(str(mid))
+            return await market(mid)
+        api.market = logged
+        books = lambda: sum(1 for c in api.calls if c.endswith("/orderbook"))
+        n = books()
+        for _ in range(2):
+            own.verify_at -= R.VERIFY_EVERY_OWN_S
+            w["rest_at"] = time.monotonic() - 60
+            own.verify_tick()
+            await own.verifying
+        # (the sprint's own preparation may read it once more beside these: warm)
+        self.assertEqual((set(asked), len(asked) >= 2, books() - n, own.status_reads, w["open_ms"]), ({"901"}, True, 0, 2, 0), "its status, not its book")
+        mkt["tradingStatus"] = "OPEN"
+        own.stream.take("901", {"version": 9, "bids": [], "asks": [[0.52, 25]]})  # the makers' offer, pushed
+        await own.tick()
+        self.assertEqual(own.api.sent, [], "matching not seen open yet")
+        own.verify_at -= R.VERIFY_EVERY_OWN_S
+        w["rest_at"] = time.monotonic() - 60
+        own.stream.changed.clear()
+        own.verify_tick()
+        await own.verifying
+        self.assertTrue(w["open_ms"] and "901" in own.stream.changed and own.stream.pushed.is_set(), "seen open with the offer in hand: looked at now")
+        await own.tick()
+        self.assertEqual(len(api.sent), 1)
+        # the push down: the read beside it stays the book's — the looks go on on those reads alone, and without them the window
+        # would wait for a book that never comes (its status asked forty times, its offer never seen)
+        down, api5, clock5, _ = taker("on", RULE_FAST_HOURS="off", RULE_OIL="off", RULE_GOLD_OPEN_CENTS="0", RULE_GOLD_0515_CENTS="0",
+                                      RULE_API_KEY="rule-key", PREDICT_API_KEY="main-key")
+        api5.markets["901"] = gold_market(GOLD_0600, status="MATCHING_NOT_ENABLED")
+        api5.listed.add(slug)
+        api5.books["901"] = {"bids": [], "asks": [[0.70, 25]]}  # (nothing at the rule's price yet: no rush of its own)
+        clock5.ms = GOLD_0600 - 300 * 60_000 - 5_000
+        hold5, down.verify_tick = down.verify_tick, lambda: None
+        await down.tick()
+        down.verify_tick = hold5
+        w5 = down.track[slug]
+        self.assertTrue(down.hot(w5, clock5.ms) and not w5["open_ms"] and not down.stream.alive())
+        n5 = sum(1 for c in api5.calls if c.endswith("/orderbook"))
+        for _ in range(3):
+            down.verify_at -= R.VERIFY_EVERY_OWN_S
+            w5["rest_at"] = time.monotonic() - 60
+            down.verify_tick()
+            await down.verifying
+        self.assertEqual((sum(1 for c in api5.calls if c.endswith("/orderbook")) - n5, down.status_reads), (3, 0), "no push: its book, as before")
+        self.assertEqual(down.rush_tasks, set())
+        own.verify_at -= R.VERIFY_EVERY_OWN_S
+        w["rest_at"] = time.monotonic() - 60
+        w["look_ms"] = 0
+        n, m_asked = books(), len(asked)
+        if not own.finished(slug, R.RULE_OF[w["rule"]]):
+            own.verify_tick()
+            await own.verifying
+            self.assertEqual((books() - n, len(asked) - m_asked), (1, 0), "open: the book again")
+
     async def test_a_pushed_offer_is_bought_at_once(self):
         """The listed windows' books come pushed (RuleStream): a book that changed wakes the loop and its window is looked at
         at once — no waiting for the read cadence, no REST read of the book while the push is fresh."""
@@ -809,11 +1004,13 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         for mid in ("902", "903"):
             t.track.pop(api.markets[mid]["categorySlug"])
         t.planned_ms = clock.ms  # (not planned again in this test: the two stay out)
-        details = sum(1 for c in api.calls if not c.endswith("/orderbook"))
+        details = len(api.calls)
         t.stream.take("901", {"version": 3, "bids": [], "asks": [[0.52, 25]]})  # an offer at the rule's price, pushed
         await t.tick()
         self.assertEqual(L.from_wei(int(api.sent[0]["data"]["order"]["takerAmount"])), 50.0)
-        self.assertEqual((reads(), sum(1 for c in api.calls if not c.endswith("/orderbook"))), (1, details), "no request before the order")
+        # (1.154.22: the order's request starts within its look, the tick letting go of the loop for it — a listing the warm-up asked
+        # to be looked for again may be probed in the same tick, after it; nothing is asked of the order's own market)
+        self.assertEqual((reads(), [c for c in api.calls[details:] if not c.startswith("/categories/")]), (1, []), "no request before the order")
         self.assertIn("每秒检查时段（北京时间）：01:00-07:00｜进行中：每秒看 1 场（已看 17 次）；推送正常；REST 核对 0 次", t.status())
         # the connection gone quiet (no frame for ALIVE_S): the book in hand stands only while young — then the look waits for a REST read
         t.stream.last_frame = time.monotonic() - R.ALIVE_S - 1
@@ -1732,7 +1929,9 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         status = again.status()
         self.assertIn("抢单记录（最近 2 场，北京时间；“开始被吃 / 被吃光”是卖单出现之后多久，按 Predict 盘口自己的时间戳——抢走它的人有多快）：", status)
         self.assertRegex(status, r"  11-17 06:15 黄金休市 4 档：≤60¢ 的卖单 \d\d:\d\d:\d\d\.\d{3} 出现（开场前 300 分钟），最多 150 份；0\.35 秒后开始被吃、0\.35 秒后被吃光；"
-                                 r"下了 300 份，没买到｜第 1 张 要 300 成交 0（当时盘口上 150 份）：出现后 \d+ ms 发出、推送 \d+ ms、到达→发出 \d+ ms、往返 \d+ ms")
+                                 # (1.154.22: the taker's own time in its parts — to the look, to the order signed, to its request leaving)
+                                 r"下了 300 份，没买到｜第 1 张 要 300 成交 0（当时盘口上 150 份）：出现后 \d+ ms 发出、推送 \d+ ms、"
+                                 r"到达→发出 \d+ ms［到达→开始处理 \d+ ms、处理→签好 \d+ ms、签好→发出 \d+ ms］、往返 \d+ ms")
         self.assertRegex(status, r"  11-17 06:00 黄金休市 4 档：≤60¢ 的卖单 \d\d:\d\d:\d\d\.\d{3} 出现（开场前 300 分钟），最多 195\.4 份；0\.40 秒后开始被吃、1\.20 秒后被吃光；"
                                  r"买到 212/300 份｜第 1 张 要 300 成交 212（当时盘口上 195\.4 份）：出现后 \d+ ms 发出")
         # 1.154.17: the races in a line — how regular the makers' moment is (to time an order to it), how soon the first taker was

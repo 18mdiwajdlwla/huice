@@ -2706,6 +2706,8 @@ async def preopen_fills_not_adopted():
     fake.closed["101"]["amountFilled"] = str(10 * WEI)
     rec.update(shares=10.0, status="filled", unfilled=90.0)
     rec["live"]["adopted"] = {"at": NOW + 150_000, "by": "按持仓变动时间", "pos_price": 0.49, "shares": 10.0, "guess": False}
+    # (saved, as every change the bot makes to a record is: the records' index — which of them are still open — follows the saves, 1.154.22)
+    bot.sim_save([(next(tid for tid, t in bot.sim_trades().items() if t["live"].get("order_id") == "101"), rec)])
     await step(bot, NOW + 150_000 + 23 * 60_000, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW + 150_000 + 23 * 60_000))
     rec = next(t for t in bot.sim_trades().values() if t["live"].get("order_id") == "101")
     assert rec["shares"] == 10.0 and rec["live"]["adopted"].get("po_checked") and not rec["live"]["adopted"].get("undone"), rec["live"]["adopted"]
