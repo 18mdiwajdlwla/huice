@@ -788,7 +788,14 @@ async def _nvo_look(bot: m.Bot, card: m.StockTouchMarket, k: int, now: int, stoc
     row = {"k": k, "now": now, "price": card.price, "live": card.index_live, "priced": card.priced_ms, "odds": odds, "truth": truth,
            "close": close, "sigma": card.sigma, "why": card.advice_problem(now), "mk": mk, "pay": bot.touch_payload(card, now),
            "gap": bot.sim_taker_gap(mk, bot.sim_trades(), now)["state"] if mk else None}
-    await (await bot.sim_decide(now))                # the trader's step...
+    # the trader's step, under its lock as Bot.sim_step holds it ("never beside the express lane"). 1.154.17: it was called bare — and
+    # the express task a price push of a second before had scheduled (a tenth of a second of the machine's own clock later) now and
+    # then ran inside the step's first await: it bought the 300 on offer, and the step, on the records as it had read them before,
+    # bought the 200 the paper book had left and wrote its record over the first — one run in ten ended with 200 shares where the
+    # 300 were expected (a failing suite fails the image's build: Dockerfile)
+    async with bot.sim_lock:
+        confirm = await bot.sim_decide(now)
+    await confirm
     await bot.sim_express_look("NVDA-2027", now)     # ...and its express lane
     bot.edge_ran = -1e9
     await bot.edge_alerts(now)                       # the Telegram alerts (they look at every card, whatever SIM_MARKETS trades)

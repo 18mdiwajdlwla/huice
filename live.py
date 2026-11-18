@@ -656,6 +656,9 @@ class PredictApi:
         self.blocked_until = 0.0
         self.calls = 0
         self.limited: collections.deque = collections.deque(maxlen=500)  # monotonic times of the 429s answered to this client (/diag, 1.138.0)
+        # 1.154.17: the last answered requests' round trips, (method, ms) — the request alone: after the key's pace and this client's
+        # gate, in the pool's thread and back (/rules: how far Predict is — the rule taker's race is the network's)
+        self.trips: collections.deque = collections.deque(maxlen=300)
         self.orders_complete = self.positions_complete = True  # the last list read came whole (every page)
         # 1.154.7: path -> (requests, rows of a full page) of its last paged read: what Predict really gives a page (LIVE_ORDERS_PAGE asks
         # for ORDERS_PAGE; a server cap below it would go unseen) and how many pages a read took (the snapshot's pace counts requests)
@@ -687,12 +690,15 @@ class PredictApi:
             self.writes_inflight += 1
             try:
                 async with self.gate:
+                    began = time.perf_counter()
                     raw = await self.send(method, path, payload, timeout)
             finally:
                 self.writes_inflight -= 1
         else:
             async with self.read_gate, self.gate:
+                began = time.perf_counter()
                 raw = await self.send(method, path, payload, timeout)
+        self.__dict__.setdefault("trips", collections.deque(maxlen=300)).append((method, (time.perf_counter() - began) * 1000))
         try:
             return json.loads(raw) if raw else {}
         except (json.JSONDecodeError, UnicodeDecodeError):

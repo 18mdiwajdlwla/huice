@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.16"
+VERSION = "1.154.17"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -1564,6 +1564,14 @@ HTTPS_CONNECTION = http.client.HTTPSConnection  # (the tests put a fake here)
 _POOL: dict[tuple[str, int], list[tuple[Any, float]]] = {}  # (host, port) -> [(connection, last used, monotonic)], oldest first
 _POOL_LOCK = threading.Lock()
 HTTP_STATS = {"new": 0, "reused": 0, "retried": 0}  # connections opened / reused / requests retried on a fresh one (/diag)
+# 1.154.17 — how far a host is (/rules: the rule taker's race is won or lost on the way to Predict). host -> "connect": the last new
+# connections' TCP + TLS handshakes, ms — two or three round trips to whatever answers for the host (a CDN's site near the bot, or the
+# service itself); "edge": the last answer's cf-ray (its suffix names the Cloudflare site the request entered at), else its server header
+HTTP_NET: dict[str, dict] = {}
+
+
+def http_net(host: str) -> dict:
+    return HTTP_NET.setdefault(host, {"connect": collections.deque(maxlen=40), "edge": ""})
 
 
 def _pool_take(host: str, port: int, timeout: float, max_idle: float) -> tuple[Any, bool]:
@@ -1686,6 +1694,10 @@ def _http_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str, st
         while True:
             conn, reused = _pool_take(host, port, timeout, max_idle)
             try:
+                if not reused and callable(getattr(conn, "connect", None)):  # (timed: http_net — request() would have made it itself)
+                    began = time.perf_counter()
+                    conn.connect()
+                    http_net(host)["connect"].append((time.perf_counter() - began) * 1000)
                 conn.request(method, path, body=data, headers=hdrs)
             except (OSError, http.client.HTTPException) as error:
                 conn.close()
@@ -1703,6 +1715,8 @@ def _http_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str, st
                 raise _net_error(error) from None
             break
         status = response.status
+        if edge := (response.getheader("cf-ray") or response.getheader("server")):
+            http_net(host)["edge"] = str(edge)[:40]
         try:
             if status >= 400:
                 raw = b""
