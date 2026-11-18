@@ -1457,6 +1457,99 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         await paper.warming
         self.assertEqual((paper.track[slug]["open_ms"], allowance, auth), (pclock.ms, [], []))
 
+    async def test_ready_after_a_start_and_through_a_windows_last_quarter_hour(self):
+        """1.154.25 — 11-18 18:06: an offer nine minutes before the 18:15 window, outside the per-second hours and no makers'
+        moment; the order was signed 914 ms into its look — the sign-in and the allowance's read came first (the process half
+        an hour old: nothing in hand). The preparation (warm) is made once after a start, as soon as a window's market is
+        known, and kept up through a window's last NEAR_MS before its start, where an offer is bought as it shows too."""
+        t, api, clock, x = taker("on", **IN)  # no per-second hours, no makers' moment, nothing bought in a window's course
+        t.verify_tick = lambda: None
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": []}
+        warms, real_warm, signed_in = [], t.warm, []
+
+        async def warm():
+            warms.append(clock.ms)
+            await real_warm()
+
+        async def ensure_auth():
+            signed_in.append(clock.ms)
+        t.warm, api.ensure_auth = warm, ensure_auth
+
+        async def at(ms):
+            clock.ms = ms
+            await t.tick()
+            if t.warming is not None:
+                await asyncio.wait([t.warming], timeout=2)
+        await at(GOLD_0600 - 40 * 60_000)  # 05:20: the first tick finds the market; the next one, a market known, prepares
+        self.assertEqual((warms, t.warmed, t.fast), ([], False, False))
+        await at(GOLD_0600 - 40 * 60_000 + 1_000)
+        self.assertEqual((warms, t.warmed, signed_in, list(t.allowance)), ([clock.ms], True, [clock.ms], ["CTF_EXCHANGE"]), "once after a start: the sign-in and the allowance in hand")
+        await at(GOLD_0600 - 30 * 60_000)
+        await at(GOLD_0600 - R.NEAR_MS - 1_000)
+        self.assertEqual(len(warms), 1, "not again: half an hour before a window is no time an order is likelier in")
+        await at(GOLD_0600 - R.NEAR_MS)  # the window's last quarter hour: kept up, every WARM_EVERY_MS
+        self.assertEqual((len(warms), warms[-1]), (2, GOLD_0600 - R.NEAR_MS))
+        await at(GOLD_0600 - R.NEAR_MS + R.WARM_EVERY_MS - 1_000)
+        self.assertEqual(len(warms), 2)
+        await at(GOLD_0600 - R.NEAR_MS + R.WARM_EVERY_MS)
+        self.assertEqual(len(warms), 3)
+        # an offer there: its order with no request before it
+        connected(t, "901", {"bids": [], "asks": [[0.55, 30]]})
+        t.stream.changed.add("901")
+        asked, signed = len(api.calls), len(signed_in)
+        chain = []
+
+        async def counted(key):
+            chain.append(key)
+            return 10 ** 30
+        x.owner.live.chain.allowance = counted
+        before, create = [], api.create_order
+
+        async def created(body):
+            before.append((list(api.calls[asked:]), list(chain)))  # what was asked between the offer and its order
+            return await create(body)
+        api.create_order = created
+        clock.ms += 1_000
+        await t.tick()
+        self.assertEqual((len(api.sent), before, len(signed_in) - signed), (1, [([], [])], 1), "(the client asked whether its sign-in is fresh: it is)")
+        # a rule with no price before its window is not prepared for one; nor is 只记录, which sends nothing
+        cold, api2, clock2, _ = taker("on", RULE_GOLD_SHUT_CENTS="0", RULE_GOLD_SHUT_LIVE_CENTS="60", **IN)
+        cold.verify_tick = lambda: None
+        api2.markets["901"] = gold_market(GOLD_0600)
+        api2.listed.add(slug)
+        cold.warmed = True  # (the one after a start made)
+        made = []
+        cold.warm = lambda: made.append(clock2.ms) or real_warm()
+        clock2.ms = GOLD_0600 - 10 * 60_000
+        await cold.tick()
+        clock2.ms += 1_000
+        await cold.tick()
+        self.assertEqual(made, [], "bought in its course alone: prepared from a minute before the start, as before")
+        clock2.ms = GOLD_0600 - R.WARM_MS
+        await cold.tick()
+        self.assertEqual(len(made), 1)
+        if cold.warming is not None:
+            await asyncio.wait([cold.warming], timeout=2)
+        paper, api3, clock3, x3 = taker("paper", **IN)
+        paper.verify_tick = lambda: None
+        api3.markets["901"] = gold_market(GOLD_0600)
+        api3.listed.add(slug)
+        api3.books["901"] = {"bids": [], "asks": []}
+        signs = []
+
+        async def never():
+            signs.append(1)
+        api3.ensure_auth = never
+        for ms in (GOLD_0600 - 10 * 60_000, GOLD_0600 - 10 * 60_000 + 1_000):
+            clock3.ms = ms
+            await paper.tick()
+            if paper.warming is not None:
+                await asyncio.wait([paper.warming], timeout=2)
+        self.assertEqual((paper.warmed, signs, paper.allowance), (True, [], {}))
+
     async def test_orders_for_several_windows_go_out_side_by_side(self):
         """1.154.12: offers showing on several windows at once — each window's order is on its way before another's answer is in
         (they went one after another, a round trip each); the day's cap still counts the first while it is on its way."""

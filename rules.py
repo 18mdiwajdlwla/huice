@@ -934,6 +934,7 @@ class RuleTaker:
         self.api.pool = core.first_pool()  # 1.154.23: its requests on threads of their own — never in the shared pool's queue
         self.fast = False                  # in the per-second hours now (RULE_FAST_HOURS; pace)
         self.warm_ms = 0                   # when their preparation last began (warm)
+        self.warmed = False                # ...whether it was made at all since the start (pace: once, as soon as a market is known)
         self.warming: asyncio.Task | None = None
         self.verifying: asyncio.Task | None = None  # the REST read of a window's book under way beside the pushes (verify)
         self.verify_at = 0.0               # monotonic: when the last one began
@@ -1357,8 +1358,15 @@ class RuleTaker:
             LOG.info("规则吃单：每秒检查%s", "开始" if fast else "结束")
         # ...and prepared from a minute before its start (the sign-in, the allowance: its first order with no request before it)
         near = on and any(now >= w["start"] - WARM_MS and self.live_cents(RULE_OF[w["rule"]]) > 0 for w in self.track.values())
-        if ((wait is not None and wait <= WARM_MS) or sprint or near) and now - self.warm_ms >= WARM_EVERY_MS and (self.warming is None or self.warming.done()):
-            self.warm_ms = now
+        # 1.154.25: ...and through a window's last NEAR_MS before its start, where an offer is bought as it shows too — and once
+        # after a start, as soon as a window's market is known. 11-18 18:06, nine minutes before the 18:15 window and outside
+        # every hour above: 11 shares offered, the order signed 914 ms into its look — the sign-in and the allowance's read came
+        # first (the process half an hour old: nothing in hand), and the offer went to someone else
+        soon = on and any(w["market"] is not None and 0 <= w["start"] - now <= NEAR_MS and self.settings.price(RULE_OF[w["rule"]].key) > 0 for w in self.track.values())
+        first = on and not self.warmed and any(w["market"] is not None for w in self.track.values())
+        if (((wait is not None and wait <= WARM_MS) or sprint or near or soon or first)
+                and now - self.warm_ms >= WARM_EVERY_MS and (self.warming is None or self.warming.done())):
+            self.warm_ms, self.warmed = now, True
             self.warming = asyncio.create_task(self.warm(), name="rules-warm")
 
     def busy_in(self, now: int) -> int | None:
@@ -1462,7 +1470,7 @@ class RuleTaker:
         import live
         try:
             for w in self.track.values():
-                if w["market"] is None:
+                if w["market"] is None and w["probe_ms"] <= self.now():  # (not one put off for a title that does not match: look)
                     w["probe_ms"] = 0
             if self.cooling() > 0:
                 return

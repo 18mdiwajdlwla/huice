@@ -2346,6 +2346,32 @@ class LiveBot(core.Bot):
         except Exception:  # (a figure that cannot be had keeps nobody waiting)
             return 0.0
 
+    def rules_first(self) -> bool:
+        """Whether the rule taker goes first right now (rules.RuleTaker.first_now: its per-second hours and the minute before
+        them, a makers' moment, a window bought in its course) or has the loop to itself (rules_quiet): core.Bot.rules_first."""
+        taker = getattr(self, "rules", None)
+        if taker is None or not getattr(taker, "running", False):
+            return False
+        try:
+            return bool(taker.first_now()) or self.rules_quiet() > 0
+        except Exception:
+            return False
+
+    def rules_clear(self, seconds: float) -> bool:
+        """Whether the rule taker neither goes first now nor will within ``seconds`` (core.Bot.rules_clear, 1.154.25) — by its
+        own plan: its per-second hours, each window's makers' moment, its last quarter hour and its course (RuleTaker.busy_in,
+        what the lending of its key goes by)."""
+        taker = getattr(self, "rules", None)
+        if taker is None or not getattr(taker, "running", False):
+            return True
+        try:
+            if taker.first_now() or self.rules_quiet() > 0:
+                return False
+            wait = taker.busy_in(taker.now())
+            return wait is None or wait > seconds * 1000
+        except Exception:  # (a taker that cannot say keeps nothing waiting)
+            return True
+
     def priced(self, keys: Any) -> None:
         """The cards a price just moved (core.Bot.priced: the express lane looks at them after PRICE_LOOK_DELAY). 1.154.24, the
         rule taker first: a window it buys in its course is judged by the card's index — told now, in the turn that brought

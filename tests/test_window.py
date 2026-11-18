@@ -744,7 +744,7 @@ async def samples():
         store.put(f"wsample:c{i}-updown-15m:120", {**base, "left": 120, "move": 3 * st})  # a later sample of the same market: not the one counted
     store.put("wsample:old-updown-15m:840", {"t": T0 - 20 * 900_000, "start": T0 - 20 * 900_000, "end": T0 - 19 * 900_000, "slug": "old-updown-15m", "key": "UNITREE-15M", "kind": "window", "card": "宇树 15分涨跌",
                                              "left": 840, "up": 0.6, "sigma": 0.5, "sigma_raw": 0.5, "model": 2, "tau": 2.7e-5, "line": 100.0, "move": 3 * st, "result": 1.0, "final": 101.0})
-    bot.sigma_calib_cache.clear()
+    bot.sigma_moves = None  # measured again from the store at the next call (1.154.25: the rows above were put there by hand, not counted in by a market settling)
     real = store.get(f"wsample:{spec.slug}:840")  # the window sampled above has its result too: the eleventh
     z_real = math.log(real["final"] / real["price"]) / (real["sigma_raw"] * math.sqrt(real["tau"]))  # 1.122.0: the end over the price at the sample
     assert abs(m.sample_z(real, raw=True) - z_real) < 1e-12 and m.sample_z({"sigma": 0.5, "tau": 2.7e-5, "move": 0.001}) == 0.001 / (0.5 * math.sqrt(2.7e-5)) \
@@ -781,7 +781,7 @@ async def samples():
     assert abs(pooled.sigma_calib(m.CRYPTO_DAY_CALIB)[0] - math.sqrt((5 * 4 + 10) / 15)) < 1e-9 and pooled.sigma_calib(m.CRYPTO_DAY_CALIB)[1] == 5
     assert pooled.sigma_calib("BTC-DAY") == (1.0, 0) and "σ 校准系数（BTC / ETH / BNB 日涨跌合并）：×1.41（按 5 个市场" in "\n".join(pooled.window_report())
     store.delete_keys([k for k in store.keys("wsample:") if k.startswith(("wsample:c", "wsample:e", "wsample:old", "wsample:d"))])  # the made-up windows go
-    bot.sigma_calib_cache.clear()
+    bot.sigma_moves = None  # measured again from the store at the next call (1.154.25: the rows above were put there by hand, not counted in by a market settling)
     # a window that ended while the bot was down is settled on its kept end when the samples are read; an end within the tie
     # band keeps no result (Predict's call), the move all the same
     for slug, close in (("x-updown-15m-1", "101"), ("y-updown-15m-2", "100.02")):

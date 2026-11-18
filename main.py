@@ -52,7 +52,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.24"
+VERSION = "1.154.25"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -1427,6 +1427,30 @@ class Store:
             else:
                 rows[k] = text
         return [(k, json.loads(rows[k])) for k in sorted(rows)]
+
+    def each(self, prefix: str) -> Any:
+        """The records under ``prefix`` one at a time, in the keys' order — what items() gives, never all of them parsed at
+        once (1.154.25: the samples of sixty days — hundreds of thousands of rows — were a gigabyte held for the length of a
+        pass over them). The queued records as they stood when the pass began, each in its key's place (the queued version
+        of a record, not the table's; a queued delete skipped); the table as the pass's read finds it — a database on disk
+        shows it as it stood at the pass's first row (and so shows every read made on this thread until the pass is over:
+        flush() first where that matters), one in memory as it stands at each row."""
+        overlay = self._overlay(prefix)  # before the table read (keys)
+        queued, i = sorted(overlay), 0
+        for k, text in self.conn.execute("SELECT k, v FROM records WHERE k >= ? AND k < ? ORDER BY k", self._bounds(prefix)):
+            while i < len(queued) and queued[i] < k:  # queued, not in the table (yet): in its place among the keys
+                if overlay[queued[i]] is not None:
+                    yield queued[i], json.loads(overlay[queued[i]])
+                i += 1
+            if i < len(queued) and queued[i] == k:
+                if overlay[k] is not None:
+                    yield k, json.loads(overlay[k])
+                i += 1
+            else:
+                yield k, json.loads(text)
+        for k in queued[i:]:
+            if overlay[k] is not None:
+                yield k, json.loads(overlay[k])
 
     def count(self, prefix: str) -> int:
         return len(self.keys(prefix))
@@ -5559,6 +5583,16 @@ class GcWatch:
     reference counts free nearly everything all the same, only garbage in cycles waits."""
     KEEP_S = 600.0
     NOTE_MS = 5.0  # a collection of a younger generation is kept when it took this long
+    # 1.154.25 — the long-lived heap set aside (settle). 11-18 18:52, production: a collection of the oldest generation 0.7 s
+    # (three in ten minutes, 2.1 s — the whole process stopped, the pushed books and the orders waiting). What it walks is
+    # nearly all long-lived and not garbage: the pre-open mode's 39,000 records, its account snapshot, the model trader's
+    # 13,900. gc.freeze() puts everything alive now into a generation no collection looks at again — an object there is
+    # still freed the moment nothing refers to it (the reference counts), only garbage in cycles among them waits — so a
+    # full collection walks what was made since: measured at that scale, 250 ms over everything, 6 ms with a new account
+    # snapshot and the records since on top, 0.1 ms right after
+    SETTLE_FIRST_S = 90.0     # ...first this long after the start (the records read, the first rounds made)
+    SETTLE_EVERY_S = 300.0    # ...then what has become long-lived since, this often
+    #                           ...and once a day everything is walked again (gc.unfreeze: garbage in cycles among what was set aside — Bot.day_pass_due)
 
     def __init__(self) -> None:
         self.runs: collections.deque = collections.deque(maxlen=4000)  # (monotonic, generation, ms)
@@ -5566,6 +5600,10 @@ class GcWatch:
         self.watching = False
         self.holders = 0   # how many asked for no automatic collection now (hold)
         self.held = 0      # ...and how many times in all
+        self.settled = (0.0, 0.0, 0)  # (monotonic, ms, objects set aside) of the last settle
+        self.settling = False         # ...one under way (note)
+        self.settles = 0   # ...how many there were
+        self.thawed: float | None = None  # monotonic: when everything was last walked (the first settle, then each thaw); None before any
 
     def start(self) -> None:
         if not self.watching:
@@ -5580,6 +5618,28 @@ class GcWatch:
         if self.holders:
             self.holders = 0
             gc.enable()
+        if self.settles:
+            gc.unfreeze()  # (as it was found: the tests)
+            self.settled, self.settles, self.thawed = (0.0, 0.0, 0), 0, None
+
+    def settle(self, thaw: bool = False) -> float:
+        """What is alive now set aside from the collector (gc.freeze), after one collection of what has been made since the
+        last time — so no garbage is set aside with it. ``thaw``: everything walked again first (gc.unfreeze: the whole
+        heap's collection, hundreds of ms — once a day, at a quiet moment). The ms it took."""
+        began = time.perf_counter()
+        self.settling = True  # (its own collection is told with it in /diag, not among the collector's)
+        try:
+            if thaw:
+                gc.unfreeze()
+            gc.collect()
+            gc.freeze()
+        finally:
+            self.settling = False
+        ms, now = (time.perf_counter() - began) * 1000, time.monotonic()
+        self.settled, self.settles = (now, ms, gc.get_freeze_count()), self.settles + 1
+        if thaw or self.thawed is None:
+            self.thawed = now
+        return ms
 
     def note(self, phase: str, info: dict) -> None:
         """The collector's own callback (gc.callbacks): a collection begins, a collection is over."""
@@ -5588,7 +5648,7 @@ class GcWatch:
         elif self.began:
             ms, self.began = (time.perf_counter() - self.began) * 1000, 0.0
             generation = int(info.get("generation", -1))
-            if generation >= 2 or ms >= self.NOTE_MS:
+            if (generation >= 2 or ms >= self.NOTE_MS) and not self.settling:
                 self.runs.append((time.monotonic(), generation, ms))
 
     def hold(self) -> None:
@@ -5615,7 +5675,12 @@ class GcWatch:
             text += f"；另有 {len(young)} 次小回收超过 {self.NOTE_MS:g} ms（最长 {max(young):.0f} ms）"
         text += "（整堆回收时整个进程停着，盘口和下单都在等"
         text += f"；规则吃单抢单的十几秒里不自动回收，本次启动 {self.held} 次" + ("，现在正暂停着" if self.holders else "") if self.held else "；规则吃单抢单的十几秒里不自动回收"
-        return text + "）" + ("" if gc.isenabled() or self.holders else "｜⚠️ 自动回收是关着的")
+        text += "）"
+        if self.settles:  # 1.154.25
+            at, ms, count = self.settled
+            text += (f"｜长期数据 {f'{count / 10_000:.0f} 万' if count >= 10_000 else count} 个对象已放到一边、回收时不再扫（每 {self.SETTLE_EVERY_S / 60:g} 分钟整理一次，"
+                     f"上次 {max(0, int(time.monotonic() - at))} 秒前、用了 {ms:.0f} ms；每天全部重扫一次）")
+        return text + ("" if gc.isenabled() or self.holders else "｜⚠️ 自动回收是关着的")
 
 
 GC_WATCH = GcWatch()
@@ -6465,23 +6530,25 @@ class PredictFeed:
         (t0, n0), (t1, n1) = self.rate_samples[0], self.rate_samples[-1]
         return (n1 - n0) / (t1 - t0) if t1 - t0 >= 5 else None
 
-    async def fetch(self, url: str, payload: dict | None = None) -> Any:
+    async def fetch(self, url: str, payload: dict | None = None, ahead: bool = False) -> Any:
         """One Predict request, at most PREDICT_PARALLEL at a time; a 429 (or any retry_after) pauses them all. 1.154.21: a
         REST read goes out on the rule taker's key while that one is idle and has a token to spare (lent_key); refused there
         before anything was read — that key's limit, a 401 / 403 — it is asked once more on the feed's own key, and nothing
-        more is borrowed for a while (lent_refusal)."""
+        more is borrowed for a while (lent_refusal). ``ahead`` (1.154.25): this one read does not wait behind the key's
+        others — /diag's probe of Predict, one request a look: queued as the feed's reads are, last of all, on a key at its
+        pace it timed out without ever being sent and said Predict could not be reached (11-18 18:52)."""
         left = self.blocked_until - time.monotonic()
         if left > 0:
             raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
         rest = url.startswith(PREDICT_REST)
-        lent = self.lent_key() if rest else ""
+        lent = self.lent_key() if rest and not ahead else ""
         if lent:
             try:
                 return await self.fetch_with(url, payload, lent)
             except RemoteError as error:
                 if not self.lent_refusal(error, lent):
                     raise
-        return await self.fetch_with(url, payload, self.api_key())
+        return await self.fetch_with(url, payload, self.api_key(), ahead)
 
     def lent_refusal(self, error: RemoteError, key: str) -> bool:
         """Whether a read's failure on the borrowed key is that key's refusal of it (fetch): its limit — the rule taker's
@@ -6499,12 +6566,13 @@ class PredictFeed:
                 return True
         return False
 
-    async def fetch_with(self, url: str, payload: dict | None, key: str) -> Any:
+    async def fetch_with(self, url: str, payload: dict | None, key: str, ahead: bool = False) -> Any:
         """fetch, with ``key`` in x-api-key (the feed's own, or the borrowed one): the key's budget, the gate, the request."""
         rest = url.startswith(PREDICT_REST)
         if rest:
-            # the key's budget, shared with the trading clients (1.154.0) unless the feed has its own (1.154.5); behind their reads (1.154.9)
-            await predict_pacer(key).take(low=True)
+            # the key's budget, shared with the trading clients (1.154.0) unless the feed has its own (1.154.5); behind their reads
+            # (1.154.9) — but for a read that goes ahead (fetch: /diag's probe), which takes its token as an order does
+            await predict_pacer(key).take(write=ahead, low=not ahead)
         async with self.gate:
             # 1.150.0: a cooldown that began while this request waited for its slot (another read's 429) is honoured here too,
             # as live.py's send() does since 1.138.0: nothing queued behind the PREDICT_PARALLEL in flight goes out into it.
@@ -17634,6 +17702,10 @@ class Bot:
         self.sim_follow_since: dict[str, tuple[float, int]] = {}  # market|side -> (the place a resting order would move to, since when it has been that: sim_follow_settled)
         self.sim_follow_timers: dict[str, asyncio.TimerHandle] = {}  # book key -> the express look due when a follow's settle runs out (sim_follow_wake)
         self.sigma_calib_cache: dict[str, tuple[float, int]] = {}  # card key -> (σ factor, windows measured): sigma_calib
+        # ...and what those rest on (1.154.25): calibration key -> market slug -> z², the square of the standardised move of the
+        # market's earliest counted sample; None until measured (sigma_measure: one pass over every sample, at the start). A market
+        # settling adds its own (sigma_note) — no pass over the samples of sixty days at every quarter hour and 5-minute mark
+        self.sigma_moves: dict[str, dict[str, float]] | None = None
         self.sim_taker_seen: dict[str, int] = {}  # taker slot -> when (ms) its side was first buyable in the run of looks that still finds it so (SIM_TAKER_HOLD_SECONDS)
         # market -> {"end": its end (ms), "up" / "down": {price level in that side's terms: [shares the paper takers bought there and
         # the earlier resting orders were credited, shares the order resting on that side now was credited]}}: what the paper fills have
@@ -18512,7 +18584,8 @@ class Bot:
                     continue  # another moment than the one meant, or taken before a restart
                 self.store.put(key, self.window_snapshot(mkt, kind, left, now_ms))
                 taken += 1
-        if time.monotonic() - self.wsample_pruned >= 86_400:
+        # (1.154.25: the day's pruning reads every sample — seconds of the event loop: with a clear stretch ahead of the rule taker)
+        if self.day_pass_due(self.wsample_pruned):
             self.wsample_pruned = time.monotonic()
             if pruned := self.window_prune(now_ms):
                 LOG.info("模型样本整理：清掉 %d 条 %d 天前的", pruned, WSAMPLE_KEEP_DAYS)
@@ -18575,11 +18648,13 @@ class Bot:
                 row["line"] = float(start.get("close") or 0) if isinstance(start, dict) else 0.0
             if self.window_settle_row(row, float(final), float(getattr(mkt, "TIE", IndexUpDownMarket.TIE))):
                 self.store.put(key, row)
-        self.sigma_calib_cache.pop(spec.key, None)  # the card's factor is measured again on the next refresh (sigma_calib)
-        if kind == "day":
-            # 1.150.0: the daily cards' pool counts kind == "day" samples alone, so only a daily market settling can move it; every
-            # 15-minute and 5-minute window used to drop it too (one more full pass over the samples at each quarter hour and 5-minute mark)
-            self.sigma_calib_cache.pop(CRYPTO_DAY_CALIB, None)
+        # 1.154.25: the market's samples counted into its card's factor here and now (sigma_note) — the factor used to be dropped
+        # and measured again at the next refresh by a pass over every sample kept (sixty days of every card's: 2.1–2.5 s of the
+        # event loop on 11-18, at every quarter hour and 5-minute mark, three to six seconds past it — the very seconds the rule
+        # taker's offers show; 1.150.0 had made it one pass where it was one a card). The same figure: the same rows, the same rule
+        if self.sigma_moves is not None:
+            rows = [self.store.get(f"wsample:{spec.slug}:{left}") for left in WSAMPLE_HORIZONS.get(kind, ())]
+            self.sigma_note(spec.slug, [r for r in rows if isinstance(r, dict)])
 
     SIGMA_CALIB_PRIOR = 10     # sigma_calib: windows' worth of "σ is right" the measured ones are averaged with (20 before 1.121.0)
     SIGMA_CALIB_RANGE = (0.5, 2.0)  # ...and the factor's bounds (0.7–1.4 before 1.121.0: SK 海力士's windows moved 0.69 of the σ√τ
@@ -18591,47 +18666,92 @@ class Bot:
         (SIGMA_MODEL), the move from the line over the raw σ√τ priced then — pooled with SIGMA_CALIB_PRIOR windows at 1
         and kept within SIGMA_CALIB_RANGE. A 15-minute card's by its key; the daily crypto cards' together under
         CRYPTO_DAY_CALIB (1.106.1: a window a day each, the three moving on the same days). 1 with no such window yet.
-        Cached until a window settles (window_resolve).
 
-        1.150.0: a miss measures every key at once, in one pass over the samples (window_rows: every card's rows parsed and
-        sorted, the ones whose market ended while the bot was down settled). It used to make that pass for the one key asked
-        for, and refresh_updown asks for each card's: at every quarter hour twenty-odd windows settle together, so the
-        refresh right after made twenty-odd full passes back to back on the event loop (seconds with a few days of samples,
-        over half a minute at two weeks, more at WSAMPLE_KEEP_DAYS) while the new windows opened. Each key's factor is the
-        same as one measured on its own: the same rows, the same order, the same arithmetic."""
+        Measured once, at the first call, in one pass over the samples (sigma_measure; 1.150.0: every key at once — it used
+        to be a pass a key); from then on a market that settles is counted in by itself (window_resolve: sigma_note,
+        1.154.25), and so is one whose samples are dropped for their age (window_prune). Each key's factor is the same as
+        one measured on its own over every sample: the same rows, the same rule, the same sum."""
+        if self.sigma_moves is None:
+            self.sigma_measure()
         cached = self.sigma_calib_cache.get(key)
-        if cached is not None:
-            return cached
-        firsts: dict[str, dict[str, dict]] = {}  # calibration key -> slug -> the market's earliest sample counted
-        current: dict[str, int] = {}  # calibration key -> the estimator version its samples must have
-        for r in self.window_rows():
-            kind, card = r.get("kind"), r.get("key")
-            # the daily cards' samples pooled; a 15-minute (or 5-minute) card's by its own key — a row without one, or under the pool's
-            # own name, counts for no key (as when each key picked its rows: the pool took kind == "day", a card its key's windows)
-            calib =CRYPTO_DAY_CALIB if kind == "day" else card if kind == "window" and isinstance(card, str) and card != CRYPTO_DAY_CALIB else None
-            if calib is None:
-                continue
-            if calib not in current:
-                # the current estimator's samples alone: the daily cards' (UpDownMarket), or the card's own (1.121.0: the 15-minute
-                # cards moved to the shape of the day, version 3; the daily cards stayed at 2)
-                current[calib] = UpDownMarket.SIGMA_MODEL if calib == CRYPTO_DAY_CALIB else getattr(self.updowns.get(calib), "SIGMA_MODEL", IndexUpDownMarket.SIGMA_MODEL)
-            if r.get("move") is None or int(r.get("model") or 1) < current[calib] or not r.get("sigma_raw") or not r.get("tau"):
-                continue
-            mine, slug = firsts.setdefault(calib, {}), str(r.get("slug"))
-            if slug not in mine or int(r.get("left") or 0) > int(mine[slug].get("left") or 0):
-                mine[slug] = r
-        low, high = self.SIGMA_CALIB_RANGE
-        for calib in {key, CRYPTO_DAY_CALIB, *self.updowns, *firsts}:  # a key without a counted window: 1
-            zs = [z for z in (sample_z(r, raw=True) for r in firsts.get(calib, {}).values()) if z is not None]
-            n = len(zs)
-            factor = math.sqrt((sum(z * z for z in zs) + self.SIGMA_CALIB_PRIOR) / (n + self.SIGMA_CALIB_PRIOR)) if n else 1.0
-            self.sigma_calib_cache[calib] = (min(max(factor, low), high), n)
-        return self.sigma_calib_cache[key]
+        if cached is None:
+            cached = self.sigma_calib_cache[key] = self.sigma_factor((self.sigma_moves or {}).get(key, {}))  # (no counted window: 1)
+        return cached
 
-    def window_rows(self) -> list[dict]:
-        """Every sample, oldest first; one whose market ended while the bot was down is settled here on the kept end."""
-        rows = []
-        for key, row in self.store.items("wsample:"):
+    def sigma_key(self, row: Mapping) -> str | None:
+        """The calibration key a sample counts for: the daily cards' samples pooled; a 15-minute (or 5-minute) card's by its own
+        key — a row without one, or under the pool's own name, counts for no key."""
+        kind, card = row.get("kind"), row.get("key")
+        return CRYPTO_DAY_CALIB if kind == "day" else card if kind == "window" and isinstance(card, str) and card != CRYPTO_DAY_CALIB else None
+
+    def sigma_counts(self, row: Mapping, calib: str) -> bool:
+        """Whether a sample is one the factor is measured on: settled, with the σ and τ it priced, and made with the current
+        estimator — the daily cards' (UpDownMarket), or the card's own (1.121.0: the 15-minute cards moved to the shape of
+        the day, version 3; the daily cards stayed at 2)."""
+        current = UpDownMarket.SIGMA_MODEL if calib == CRYPTO_DAY_CALIB else getattr(self.updowns.get(calib), "SIGMA_MODEL", IndexUpDownMarket.SIGMA_MODEL)
+        return not (row.get("move") is None or int(row.get("model") or 1) < current or not row.get("sigma_raw") or not row.get("tau"))
+
+    def sigma_factor(self, moves: Mapping) -> tuple[float, int]:
+        """(the factor, the windows it rests on) from the windows' z² (sigma_moves): their mean with SIGMA_CALIB_PRIOR windows
+        at 1, its root, within SIGMA_CALIB_RANGE. The sum is the exactly rounded one (fsum): whatever order the windows came in."""
+        n = len(moves)
+        low, high = self.SIGMA_CALIB_RANGE
+        factor = math.sqrt((math.fsum(moves.values()) + self.SIGMA_CALIB_PRIOR) / (n + self.SIGMA_CALIB_PRIOR)) if n else 1.0
+        return min(max(factor, low), high), n
+
+    def sigma_measure(self) -> None:
+        """Every key's factor measured in one pass over the samples (window_each: every card's rows, the ones whose market
+        ended while the bot was down settled) — at the first call of sigma_calib. Seconds of the event loop with weeks of
+        samples: once a start, where it was once every 5 minutes (1.154.25)."""
+        firsts: dict[str, dict[str, tuple[int, float | None]]] = {}  # calibration key -> slug -> (seconds left, z) of the market's earliest sample counted
+        for r in self.window_each():  # (a sample at a time: not every row of sixty days parsed and held at once)
+            calib = self.sigma_key(r)
+            if calib is None or not self.sigma_counts(r, calib):
+                continue
+            mine, slug, left = firsts.setdefault(calib, {}), str(r.get("slug")), int(r.get("left") or 0)
+            if slug not in mine or left > mine[slug][0]:
+                mine[slug] = (left, sample_z(r, raw=True))
+        moves: dict[str, dict[str, float]] = {calib: {slug: z * z for slug, (_, z) in mine.items() if z is not None} for calib, mine in firsts.items()}
+        self.sigma_moves = moves
+        self.sigma_calib_cache = {calib: self.sigma_factor(moves.get(calib, {})) for calib in {CRYPTO_DAY_CALIB, *self.updowns, *moves}}
+
+    def sigma_note(self, slug: str, rows: list) -> None:
+        """One market's samples as they stand now — ``rows``: all that is kept of it — counted into the factors (1.154.25):
+        the earliest of them that counts (sigma_counts) is the market's, as the pass over every sample would have it; with
+        none, the market counts for nothing (its samples dropped for their age: window_prune). The keys it touches get
+        their factor anew — a sum over that card's windows, a fraction of a millisecond. Nothing before the first measure."""
+        moves = self.sigma_moves
+        if moves is None:
+            return
+        try:
+            best: dict[str, Mapping] = {}
+            for r in rows:
+                calib = self.sigma_key(r)
+                if calib is not None and self.sigma_counts(r, calib) and (calib not in best or int(r.get("left") or 0) > int(best[calib].get("left") or 0)):
+                    best[calib] = r
+            changed = {calib: sample_z(r, raw=True) for calib, r in best.items()}
+        except Exception as error:
+            # a sample that cannot be read as one (never this code's own): nothing half counted — every key measured again
+            # from the samples at the next call, as before any was (the pass says what it stumbles on)
+            self.sigma_moves, self.sigma_calib_cache = None, {}
+            self.log_limited("sigma-note", f"σ 校准：{slug} 的样本读不出来（{clean_error(error) or type(error).__name__}），下一次全部重算")
+            return
+        for calib in set(changed) | {calib for calib, mine in moves.items() if slug in mine}:
+            mine = moves.setdefault(calib, {})
+            z = changed.get(calib)
+            if z is None:
+                mine.pop(slug, None)
+            else:
+                mine[slug] = z * z
+            self.sigma_calib_cache[calib] = self.sigma_factor(mine)
+
+    def window_items(self, late: set | None = None) -> Any:
+        """Every sample with its key, one at a time, in the keys' order (a market's samples follow one another); one whose
+        market ended while the bot was down is settled here on the kept end (its market's slug put in ``late``). What is
+        queued is written first (a second at the most: a pass on a database on disk reads it as it stood at its first row —
+        Store.each — and a market's end queued then and written during the pass would be found by neither)."""
+        self.store.flush(1.0)
+        for key, row in self.store.each("wsample:"):
             if not isinstance(row, dict):
                 continue
             if row.get("final") is None:
@@ -18643,20 +18763,71 @@ class Bot:
                     with contextlib.suppress(ValueError, TypeError, decimal.InvalidOperation):
                         if self.window_settle_row(row, float(end["close"]), self.window_tie(row)):
                             self.store.put(key, row)
+                            if late is not None:
+                                late.add(str(row.get("slug")))
             elif row.get("result") is None and row.get("kind") == "window" and float(row.get("final") or 0) > 0:
                 # judged a tie with the index windows' band before 1.115.1: a spot window's own band is narrower, so its result may be known
                 with contextlib.suppress(ValueError, TypeError):
                     if self.window_settle_row(row, float(row["final"]), self.window_tie(row)) and row.get("result") is not None:
                         self.store.put(key, row)
-            rows.append(row)
+            yield key, row
+
+    def window_each(self, late: set | None = None) -> Any:
+        """Every sample, one at a time (window_items, without the keys)."""
+        for _, row in self.window_items(late):
+            yield row
+
+    def window_rows(self) -> list[dict]:
+        """Every sample, oldest first (the reports: /calib, /samples); one whose market ended while the bot was down is settled
+        here on the kept end — and counted into the factors measured before (1.154.25: sigma_note)."""
+        late: set[str] = set()
+        rows = list(self.window_each(late))
         rows.sort(key=lambda r: (int(r.get("t") or 0), str(r.get("slug") or "")))
+        if late and self.sigma_moves is not None:
+            mine: dict[str, list] = {slug: [] for slug in late}
+            for row in rows:
+                if str(row.get("slug")) in mine:
+                    mine[str(row.get("slug"))].append(row)
+            for slug, kept in mine.items():
+                self.sigma_note(slug, kept)
         return rows
 
     def window_prune(self, now_ms: int) -> int:
-        """Samples older than WSAMPLE_KEEP_DAYS are dropped. The number dropped."""
-        old = [key for key, row in self.store.items("wsample:")
-               if isinstance(row, dict) and int(row.get("t") or 0) < now_ms - WSAMPLE_KEEP_DAYS * DAY_MS]
+        """Samples older than WSAMPLE_KEEP_DAYS are dropped. The number dropped. 1.154.25: a market that lost a sample is
+        counted again on what is kept of it (sigma_note: the factors in hand stay those of a pass over every sample left) —
+        from the rows this pass reads anyway, a market at a time (its samples' keys follow one another), not by another
+        pass; and never with every sample parsed at once (Store.each). A sample settled late on the way (window_items: its
+        market's end kept after the card had moved on) is counted in likewise — the pass every 5 minutes used to find those.
+        The factors are touched once the old samples are dropped: a pass that fails half-way has changed nothing."""
+        cut, old = now_ms - WSAMPLE_KEEP_DAYS * DAY_MS, []
+        late: set[str] = set()
+        again: list[tuple[str, list]] = []  # (market slug, its samples kept): counted again after the pass
+        market, kept, lost = None, [], False  # the market under way (its keys' common part), its samples kept, whether one was dropped
+
+        def done() -> None:
+            slugs = {str(row.get("slug")) for row in kept} or {str(market).removeprefix("wsample:")}
+            if lost or slugs & late:
+                again.extend((slug, [row for row in kept if str(row.get("slug")) == slug]) for slug in slugs)
+        for key, row in self.window_items(late):
+            if key.rpartition(":")[0] != market:
+                if market is not None:
+                    done()
+                market, kept, lost = key.rpartition(":")[0], [], False
+            try:
+                aged = int(row.get("t") or 0) < cut
+            except (TypeError, ValueError):
+                aged = False  # (no time to judge it by: kept)
+            if aged:
+                old.append(key)
+                lost = True
+            else:
+                kept.append(row)
+        if market is not None:
+            done()
         self.store.delete_keys(old)
+        if self.sigma_moves is not None:
+            for slug, rows in again:
+                self.sigma_note(slug, rows)
         return len(old)
 
     @staticmethod
@@ -25775,7 +25946,12 @@ class Bot:
                     bids, asks = book.get("bids") or [], book.get("asks") or []
                     top = lambda rows: f"{float(rows[0][0]) * 100:.1f}¢×{float(rows[0][1]):g}" if rows and isinstance(rows[0], (list, tuple)) and len(rows[0]) >= 2 else "无"
                     return f"{key} 市场 {mid}：买1 {top(bids)}｜卖1 {top(asks)}"
-                probes.append(("Predict", "REST 订单簿", lambda mid=str(known.market_id): self.predict.fetch(f"{PREDICT_REST}/markets/{urllib.parse.quote(mid)}/orderbook"), check_book))
+                # (1.154.25: ahead of the key's queue — the feed's reads wait last of all there, and with the key at its pace the
+                # probe timed out unsent: "Predict 整组全部失败" while every book was being pushed and orders went through)
+                def read_book(mid: str = str(known.market_id)) -> Any:
+                    url, fetch = f"{PREDICT_REST}/markets/{urllib.parse.quote(mid)}/orderbook", self.predict.fetch
+                    return fetch(url, ahead=True) if "ahead" in inspect.signature(fetch).parameters else fetch(url)  # (a stand-in's fetch may not take it)
+                probes.append(("Predict", "REST 订单簿", read_book, check_book))
 
             def check_gql(data: Any) -> str:
                 if not isinstance(data, dict) or "data" not in data:
@@ -26325,6 +26501,61 @@ class Bot:
         if keys:
             self.priced(keys)
 
+    async def gc_keep(self) -> None:
+        """The long-lived heap kept out of the collector's way (GcWatch.settle, 1.154.25): SETTLE_FIRST_S after the start, then
+        every SETTLE_EVERY_S — a few ms each (what was made since the last time); once a day everything is walked again
+        (thaw), which is the whole heap's collection: with a clear stretch ahead of the rule taker (day_pass_due). Nothing
+        in the seconds the rule taker has the loop to itself (no collection there at all: rules.RuleTaker.gc_guard). The
+        first one after a start is the whole heap's too — made all the same, outside those seconds: until it is, the
+        collector's own full collections come when they will."""
+        wait = GcWatch.SETTLE_FIRST_S
+        while not self.stopping.is_set():
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.stopping.wait(), wait)
+            if self.stopping.is_set():
+                return
+            quiet = getattr(self, "rules_quiet", None)
+            if GC_WATCH.holders or (quiet is not None and quiet() > 0):
+                wait = 2.0
+                continue
+            try:
+                due = GC_WATCH.thawed is not None and self.day_pass_due(GC_WATCH.thawed)
+                took = GC_WATCH.settle(thaw=due)
+                if due or GC_WATCH.settles == 1:
+                    LOG.info("垃圾回收：长期数据 %d 个对象放到一边（%s，用了 %.0f ms）", GC_WATCH.settled[2], "全部重扫" if due else "启动后第一次", took)
+            except Exception as error:
+                self.log_limited("gc-keep", f"垃圾回收整理失败：{clean_error(error) or type(error).__name__}")
+            wait = GcWatch.SETTLE_EVERY_S
+
+    DAY_PASS_S = 86_400.0        # what is done once a day and holds the event loop for seconds (the samples' pruning, the collector's thaw)...
+    DAY_PASS_CLEAR_S = 180.0     # ...is begun with this long ahead in which the rule taker does not go first (rules_clear)
+    DAY_PASS_LATE_S = 12 * 3600  # ...or, this long overdue, at any moment that taker does not have the loop to itself
+
+    def rules_first(self) -> bool:
+        """Whether the rule taker goes first right now (LiveBot: its per-second hours, a makers' moment, a window bought in its
+        course). Never, for a bot without one."""
+        return False
+
+    def rules_clear(self, seconds: float) -> bool:
+        """Whether the rule taker neither goes first now nor will within ``seconds`` (LiveBot: by its own plan of the day).
+        Always, for a bot without one."""
+        return True
+
+    def day_pass_due(self, last: float | None) -> bool:
+        """Whether a once-a-day pass that holds the event loop for seconds may begin now (1.154.25: the samples' pruning, the
+        collector's thaw): a day since the last one (``last``, monotonic; None: never made), and a clear stretch ahead of
+        the rule taker — begun in the eighteen seconds between two of its windows it would run into the next one's first
+        seconds — or so long overdue that it is made at any moment that taker does not have the loop to itself (a taker
+        that goes first round the clock must not keep the samples of more than sixty days, nor the collector from ever
+        walking what was set aside)."""
+        over = self.DAY_PASS_S if last is None else time.monotonic() - last
+        if over < self.DAY_PASS_S:
+            return False
+        if self.rules_clear(self.DAY_PASS_CLEAR_S):
+            return True
+        quiet = getattr(self, "rules_quiet", None)
+        return over >= self.DAY_PASS_S + self.DAY_PASS_LATE_S and not (quiet is not None and quiet() > 0)
+
     def priced(self, keys: Any) -> None:
         """Book keys a pushed price moved: looked at together after PRICE_LOOK_DELAY (price_looks) — the express lane for
         their takers, the trader woken for the rest (note_job) — not once per tick of a busy pair."""
@@ -26832,6 +27063,7 @@ class Bot:
         tasks = [*core, *self.reference_tasks]
         tasks.append(asyncio.create_task(self.loop_watch.run(self.stopping), name="loop-watch"))  # 1.154.20: the loop's own delay, and what holds it
         GC_WATCH.start()  # 1.154.23: how long the garbage collector holds the process (/diag)
+        tasks.append(asyncio.create_task(self.gc_keep(), name="gc-keep"))  # 1.154.25: ...and the long-lived heap kept out of its way
         if self.config.predict:  # Predict's WebSocket beside the REST rounds (PREDICT_WS=off: it idles)
             tasks.append(asyncio.create_task(self.predict.stream.run(self.stopping), name="predict-ws"))
         for name, stream in (("binance-ws-futures", self.binance_streams["futures"]), ("binance-ws-spot", self.binance_streams["spot"]),
