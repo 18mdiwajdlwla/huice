@@ -367,6 +367,11 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(t.today_pnl(), -R.cost(rec), 6)
         self.assertIn("❌ 规则吃单结算", x.notes[-1])
         self.assertEqual(x.redeemed, [], "a loss: nothing to redeem")
+        # 1.154.26 (the audit of 11-18, 15): ...and against the loss stop at once — summed again as the window is settled, at the
+        # tick's end (it used to be in the figure only from the tick after the next)
+        self.assertEqual(t.pnl_at[0], clock.ms)
+        self.assertAlmostEqual(t.pnl_at[1], -R.cost(rec), 6)
+        self.assertAlmostEqual(t.day_pnl_now(), -R.cost(rec), 6)
 
     async def test_the_gates_hold_real_orders(self):
         """No real order while real trading is paused, killed, off, at the loss stop, cooling down, short of USDT — nor within
@@ -512,6 +517,612 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
             await t.tick()
         self.assertEqual(len(api.sent), R.MAX_REJECTS)
         self.assertIn(f"拒绝了 {R.MAX_REJECTS} 次", t.track[slug]["word"])
+
+    async def test_a_look_acts_only_under_the_settings_it_decided_by(self):
+        """1.154.26 (the audit of 11-18, 5): a look takes the window's record by the mode in force, waits for its reads (the
+        listing, the book, the status) and then acts by the mode in force *then*. Saved on the control page in between — on →
+        只记录: a paper fill was added to the real record and saved as real (shares nobody bought in the day's spend, the
+        positions check and the window's P&L against the loss stop); 只记录 → on: the real order went onto the paper record,
+        which nothing follows (never read, its rest never withdrawn). Now a look whose settings changed while it waited does
+        nothing — the next one decides afresh — and neither a paper fill nor a real order ever lands on the other's record."""
+        rules_of = lambda **env: m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "RULE_FAST_HOURS": "off", **env}).rules
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+
+        def held_book(api):
+            """The next reads of the book wait for the event."""
+            gate, plain = asyncio.Event(), api.call
+
+            async def call(method, path, **kwargs):
+                if path.endswith("/orderbook"):
+                    await gate.wait()
+                return await plain(method, path, **kwargs)
+            api.call = call
+            return gate
+
+        # on -> paper while the look waits for the book: the real record (an order of five, filled) is left as it is
+        t, api, clock, x = taker("on", RULE_SHARES="40")
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.51, 5]]}
+        api.fill[1], api.price = 5.0, 0.51
+        await t.tick()
+        clock.ms += R.FILL_READ_MS
+        await t.tick()
+        self.assertEqual([(o["state"], o["filled"]) for o in t.record(slug, "on")["orders"]], [("final", 5.0)])
+        api.books["901"] = {"bids": [], "asks": [[0.51, 20]]}
+        gate = held_book(api)
+        clock.ms += int(R.SLOW_S * 1000)
+        looking = asyncio.create_task(t.tick())
+        await asyncio.sleep(0.01)
+        self.assertFalse(looking.done(), "waiting for the book")
+        t.configure(rules_of(RULE_TAKER="paper", RULE_SHARES="40"))
+        gate.set()
+        await looking
+        real = t.record(slug, "on")
+        self.assertEqual(([bool(o.get("paper")) for o in real["orders"]], R.filled(real), len(api.sent)), ([False], 5.0, 1), "no paper fill on the real record")
+        # (the window's watch may have made the paper record meanwhile — save_watch, an offer noted: it holds no order)
+        self.assertEqual((t.track[slug]["word"], (t.record(slug, "paper") or {}).get("orders", [])), ("设置刚改过：这一轮不下单，下一轮按新设置重新看", []))
+        self.assertAlmostEqual(R.filled_by_outcome(t.recs, clock.ms)[("901", 1)], 5 * (1 - R.fee_share(0.51, 200)), 6, "what the account really holds")
+        clock.ms += int(R.SLOW_S * 1000)
+        await t.tick()  # the next look, under 只记录: on its own record
+        self.assertEqual((R.filled(t.record(slug, "paper")), [bool(o.get("paper")) for o in t.record(slug, "on")["orders"]], len(api.sent)), (20.0, [False], 1))
+
+        # paper -> on while the look waits: no real order on the paper record (made by the window's watch, an offer seen before matching opened)
+        t, api, clock, x = taker("paper")
+        mkt = api.markets["901"] = gold_market(GOLD_0600, status="MATCHING_NOT_ENABLED")
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+        await t.tick()
+        self.assertEqual((t.record(slug, "paper")["orders"], t.record(slug, "on")), ([], None))
+        mkt["tradingStatus"] = "OPEN"
+        gate = held_book(api)
+        clock.ms += int(R.OFFER_STATUS_S * 1000)
+        looking = asyncio.create_task(t.tick())
+        await asyncio.sleep(0.01)
+        self.assertFalse(looking.done())
+        t.configure(rules_of(RULE_TAKER="on"))
+        gate.set()
+        await looking
+        self.assertEqual((api.sent, t.record(slug, "paper")["orders"], t.track[slug]["word"]), ([], [], "设置刚改过：这一轮不下单，下一轮按新设置重新看"))
+        clock.ms += int(R.SLOW_S * 1000)
+        await t.tick()  # the next look, under 真实吃单: the order on a real record of its own — followed, counted
+        self.assertEqual((len(api.sent), len(t.record(slug, "on")["orders"]), t.record(slug, "paper")["orders"]), (1, 1, []))
+        self.assertEqual(R.unverified(t.recs), {("901", 1)})
+
+        # ...and whatever record is handed to them: a real order goes onto the real record alone, a paper fill onto the paper one
+        t, api, clock, x = taker("on")
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        await t.tick()
+        w = t.track[slug]
+        rule, levels = R.RULE_OF[w["rule"]], [(D("0.51"), D(10))]
+        paper_rec = t.new_record(slug, w, rule, 1, mode="paper")
+        t.save(paper_rec)
+        await t.place(slug, w, rule, levels, D(10), D("0.52"), paper_rec)
+        self.assertEqual((len(api.sent), [o["state"] for o in t.record(slug, "on")["orders"]], t.record(slug, "paper")["orders"]), (1, ["open"], []))
+        t.configure(rules_of(RULE_TAKER="paper"))
+        t.paper(slug, w, rule, levels, D(10), D("0.52"), t.record(slug, "on"))
+        self.assertEqual(([bool(o.get("paper")) for o in t.record(slug, "on")["orders"]], [bool(o.get("paper")) for o in t.record(slug, "paper")["orders"]]),
+                         ([False], [True]))
+
+    async def test_an_order_is_judged_again_as_its_bytes_leave(self):
+        """1.154.26 (the audit of 11-18, 4): between an order's look and its request there may be waits — the sign-in, the
+        allowance's read, a token of the key's pace, a slot (11-18: 2.5 s once). The check right before the bytes (before_send)
+        knew the bot's gates but nothing of what the look itself went by: now also the rule taker's settings as the look had
+        them (its switch, the price, the size, the day's cap — any of them saved anew: not sent, the next look decides), the
+        index in a window's course (the rule's side no longer ahead of the start: not sent), and the bot or the taker stopping."""
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+
+        async def one(change, **env):
+            t, api, clock, x = taker("on", **env)
+            api.markets["901"] = gold_market(GOLD_0600)
+            api.listed.add(slug)
+            api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+            plain = api.create_order
+
+            async def create(body):  # (the stand-in judges before_send as its first step: what comes before it here is the order's wait)
+                change(t, x, clock)
+                return await plain(body)
+            api.create_order = create
+            return t, api, clock, x
+
+        same = {"TELEGRAM_BOT_TOKEN": "offline", "RULE_TAKER": "on", "RULE_FAST_HOURS": "off"}
+        for change, word in (
+                (lambda t, x, clock: t.configure(m.Config.from_env({**same, "RULE_GOLD_SHUT_CENTS": "45"}).rules), "规则吃单的设置刚改过"),
+                (lambda t, x, clock: t.configure(m.Config.from_env({**same, "RULE_GOLD": "off"}).rules), "规则吃单的设置刚改过"),
+                (lambda t, x, clock: t.configure(m.Config.from_env({**same, "RULE_MAX_DAY_USD": "5"}).rules), "规则吃单的设置刚改过"),
+                (lambda t, x, clock: t.stop.set(), "机器人正在停止"),
+                (lambda t, x, clock: x.owner.stopping.set(), "机器人正在停止")):
+            t, api, clock, x = await one(change)
+            await t.tick()
+            order = t.record(slug, "on")["orders"][0]
+            self.assertEqual((api.sent, order["state"]), ([], "not_sent"), word)
+            self.assertIn(word, order["error"])
+            self.assertEqual(t.decided, {}, "nothing kept of an order that is over")
+            # (held back on its settings: no pause — the next look decides under the new ones; a stop is a refusal like any other)
+            self.assertEqual(t.track[slug]["look_ms"] > clock.ms, word == "机器人正在停止", word)
+        # the same settings saved again (the control page saves them all, whatever was changed): the order goes
+        t, api, clock, x = await one(lambda t, x, clock: t.configure(m.Config.from_env(same).rules))
+        await t.tick()
+        self.assertEqual((len(api.sent), t.record(slug)["orders"][0]["state"], t.decided), (1, "open", {}))
+        # in a window's course: the index back under the start while the order waited — not sent; still ahead — sent
+        for price, sent in (("3999.5", 0), ("4000.3", 1)):
+            t, api, clock, x = taker("on", RULE_GOLD_SHUT_LIVE_CENTS="70", RULE_SHARES="40", **IN)
+            t.verify_tick = lambda: None
+            api.markets["901"] = gold_market(GOLD_0600)
+            api.listed.add(slug)
+            api.books["901"] = {"bids": [], "asks": [[0.65, 30]]}
+            clock.ms = GOLD_0600 + R.LIVE_FULL_MS
+            card = gold_card(x, clock, GOLD_0600, 4000, "4000.4")
+            plain = api.create_order
+
+            async def create(body, card=card, price=price, plain=plain):
+                card.price = D(price)
+                return await plain(body)
+            api.create_order = create
+            await t.tick()
+            order = t.record(slug, "on")["orders"][0]
+            self.assertEqual((len(api.sent), order["state"]), (sent, "open" if sent else "not_sent"), price)
+            if not sent:
+                self.assertTrue(order["error"].startswith("盘中：涨还没领先（指数 3,999.5，起点 4,000"), order["error"])
+                # held back, not refused: no half minute's pause — the index over the start again a second later, it is bought
+                self.assertEqual(t.track[slug]["look_ms"], 0)
+                clock.ms += 1_000
+                gold_card(x, clock, GOLD_0600, 4000, "4000.4")
+                api.create_order = plain
+                await t.tick()
+                self.assertEqual((len(api.sent), [o["state"] for o in t.record(slug, "on")["orders"]]), (1, ["not_sent", "open"]))
+
+    async def test_a_bare_409_is_an_order_that_may_exist(self):
+        """1.154.26 (the audit of 11-18, 3): "HTTP 409: Conflict" on the order's POST with none of the duplicate's wording was a
+        refusal here — the window's shares freed, the next look sending a second order — while the model trader has taken it
+        since 1.150.0 for what it is: Predict (or a gateway before it) holding that hash. Now "result unknown": looked for by
+        its hash FILL_READ_MS on, its fills taken, its rest withdrawn, never sent again."""
+        t, api, clock, x = taker("on", RULE_SHARES="40")
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+        api.fill[1], api.price = 30.0, 0.51
+        plain = api.create_order
+
+        async def conflict(body):
+            await plain(body)  # Predict took the order...
+            raise m.RemoteError("HTTP 409: Conflict")  # ...and this is what came back
+        api.create_order = conflict
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        self.assertEqual((order["state"], order["next_ms"] - clock.ms, order["id"]), ("unknown", R.FILL_READ_MS, ""))
+        self.assertIn("下单结果未知", t.track[slug]["word"])
+        clock.ms += R.FILL_READ_MS
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        self.assertEqual((order["id"], order["filled"], order["state"], api.removed), ("1", 30.0, "cancelling", ["1"]), "found by its hash: the fills taken, the rest withdrawn")
+        for _ in range(8):  # (within LATE_FILL_MS of its leaving the book: the window is held in full — the ten left are bought after it)
+            clock.ms += 5_000
+            await t.tick()
+        self.assertEqual((len(api.sent), t.record(slug)["orders"][0]["state"]), (1, "closing"), "never sent again")
+        # one Predict does not have. It answered — the order is there or it was refused, and its record by the hash tells which:
+        # held as unknown (the window not bought again) while that record may merely lag, CONFLICT_GRACE_MS and CONFLICT_MISSES
+        # reads; then not placed after all — the window free again, and counted among Predict's refusals (MAX_REJECTS). Not held
+        # until its expiry and a quarter hour more, its hash read every ten seconds all that time (an answer gone missing still is)
+        t, api, clock, x = taker("on", RULE_SHARES="40")
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+
+        async def refused(body):
+            raise m.RemoteError("HTTP 409: Conflict")
+        api.create_order = refused
+        began = clock.ms
+        await t.tick()
+        first = t.record(slug)["orders"][0]
+        self.assertEqual((first["state"], first.get("conflict")), ("unknown", True))
+        while clock.ms - began < R.CONFLICT_GRACE_MS - 10_000:
+            clock.ms += 10_000
+            await t.tick()
+        self.assertEqual((first["state"], len(t.record(slug)["orders"]), first["misses"] >= R.CONFLICT_MISSES), ("unknown", 1, True),
+                         "read often enough, but not for long enough yet")
+        clock.ms = began + R.CONFLICT_GRACE_MS + 2_000
+        await t.tick()
+        self.assertEqual(first["state"], "not_found")
+        self.assertIn("答复 409", first["error"])
+        self.assertEqual(R.held(t.record(slug)), 0.0, "the window is free again")
+        for _ in range(R.MAX_REJECTS + 2):  # ...and bought again — each try counted as a refusal, MAX_REJECTS of them the window's last
+            for _ in range(12):
+                clock.ms += 10_000
+                await t.tick()
+        orders = t.record(slug)["orders"]
+        self.assertEqual(([o["state"] for o in orders], [bool(o.get("conflict")) for o in orders]), (["not_found"] * R.MAX_REJECTS, [True] * R.MAX_REJECTS))
+        self.assertIn(f"拒绝了 {R.MAX_REJECTS} 次", t.track[slug]["word"])
+        # an answer gone missing (no word from Predict at all) is still looked for until its expiry: test_a_lost_answer_is_found_by_its_hash
+        # a 400 is a refusal, as it was (test_a_refusal_pauses_the_window)
+
+    async def test_a_journal_line_cut_short_is_no_journal_line(self):
+        """1.154.26 (the audit of 11-18, 11): os.write says how many bytes it wrote and raises nothing when that is fewer (a full
+        disk, a quota) — the line was taken for written and the order sent with nothing a restart could find it by (recover
+        passes over a cut line). Now the cut line is ended, so the next stands on its own, and the order waits for the
+        store's own write instead, as it does with no journal at all."""
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "state.db")
+            _, _, clock, x = taker("on")
+            x.owner.store = m.Store(path)
+            t = R.RuleTaker(x.owner)
+            api = t.api = Api(t)
+            journal = path + R.JOURNAL_SUFFIX
+            slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+            api.markets["901"] = gold_market(GOLD_0600)
+            api.listed.add(slug)
+            api.books["901"] = {"bids": [], "asks": [[0.51, 50]]}
+            api.fill[1] = 50.0
+            flushes, plain_flush, real_write = [], x.owner.store.flush, os.write
+            x.owner.store.flush = lambda *a: flushes.append(1) or plain_flush(*a)
+            cut = [True]
+
+            def write(fd, data):  # the journal's first line: 40 bytes of it and no more
+                if fd == t.journal_fd and len(data) > 40 and cut[0]:
+                    cut[0] = False
+                    return real_write(fd, data[:40])
+                return real_write(fd, data)
+            os.write = write
+            try:
+                await t.tick()
+            finally:
+                os.write = real_write
+            order = t.record(slug)["orders"][0]
+            self.assertEqual((len(api.sent), order["state"], flushes), (1, "open", [1]), "sent once the store had it: the flush stood in for the line")
+            self.assertTrue(any("订单日志只写进 40/" in text for _, text in t.errors), list(t.errors))
+            raw = open(journal, "rb").read()
+            self.assertEqual((len(raw), raw.endswith(b"\n")), (41, True), "the cut line ended")
+            # the next order's line stands on its own after it — a restart reads it, and passes over the cut one
+            self.assertTrue(t.journal(t.record(slug), {"hash": "0xnext", "state": "placing"}))
+            lines = open(journal, encoding="utf-8").read().splitlines()
+            self.assertEqual((len(lines), json.loads(lines[1])["order"]["hash"]), (2, "0xnext"))
+            again = R.RuleTaker(x.owner)
+            self.assertEqual([o["hash"] for o in again.record(slug)["orders"]], [order["hash"], "0xnext"])
+            # the store's write failing too: not sent at all
+            x.owner.store.flush = lambda *a: False
+            api.books["901"] = {"bids": [], "asks": [[0.51, 50]]}
+            cut[0] = True
+            os.write = write
+            try:
+                self.assertFalse(t.journal(t.record(slug), {"hash": "0xthird", "state": "placing"}))
+            finally:
+                os.write = real_write
+            x.owner.store.flush = plain_flush
+            x.owner.store.close()
+
+    async def test_the_stop_withdraws_the_rule_orders_too(self):
+        """1.154.26 (the audit of 11-18, 1): the emergency stop and /live cancel all went by the model trader's records and the
+        pre-open mode's ledger; a rule order on the book was in neither — the stop answered 没有真实挂单可撤 and the order stood
+        until its own next read (and through every read that failed). withdraw_all: each order with an id still on the book
+        asked to be withdrawn at once (on the bot's own key when the taker's fails); one whose request is still out is
+        withdrawn by the tick that gets its answer, with no wait of FILL_READ_MS, once real trading was stopped meanwhile."""
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+
+        async def resting(**more):
+            t, api, clock, x = taker("on", RULE_SHARES="40", **more)
+            api.markets["901"] = gold_market(GOLD_0600)
+            api.listed.add(slug)
+            api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+            api.fill[1], api.price = 30.0, 0.51
+            return t, api, clock, x
+
+        t, api, clock, x = await resting()
+        self.assertEqual(await t.withdraw_all("紧急停止"), "", "nothing out: no line")
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        self.assertEqual((order["state"], order["shares"], api.removed), ("open", 40.0, []), "ten of the forty rest on the book")
+        x.state.paused = "紧急停止"
+        line = await t.withdraw_all("紧急停止")
+        self.assertEqual(line, "规则吃单：1 张挂着的单已请求撤回，Predict 确认 1 张。")
+        self.assertEqual((api.removed, order["state"], order["removed"], order["next_ms"]), (["1"], "cancelling", clock.ms, clock.ms + R.FOLLOW_EVERY_MS))
+        self.assertEqual(await t.withdraw_all("紧急停止"), "", "asked once: its final word is follow's to read")
+        clock.ms += R.FOLLOW_EVERY_MS
+        await t.tick()
+        clock.ms += R.LATE_FILL_MS
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        self.assertEqual((order["state"], order["filled"], api.removed), ("final", 30.0, ["1"]), "its fills read to Predict's final word, as ever")
+
+        # the taker's key failing (a cooldown): the bot's own client asks — and when that fails too, the line says so
+        t, api, clock, x = await resting()
+        await t.tick()
+        asked = []
+
+        async def cooling(ids):
+            raise m.RemoteError("Predict 接口限流冷却中（18 秒后重试）", 18)
+
+        async def own(ids):
+            asked.append(list(ids))
+            return {"removed": list(ids), "noop": []}
+        api.remove_orders, x.owner.live.api.remove_orders = cooling, own
+        self.assertEqual((await t.withdraw_all("紧急停止"), asked), ("规则吃单：1 张挂着的单已请求撤回，Predict 确认 1 张。", [["1"]]))
+        t, api, clock, x = await resting()
+        await t.tick()
+        api.remove_orders = x.owner.live.api.remove_orders = cooling
+        line = await t.withdraw_all("紧急停止")
+        self.assertEqual(line, "规则吃单：1 张挂着的单已请求撤回，Predict 确认 0 张，1 张没撤成（Predict 接口限流冷却中（18 秒后重试）），规则吃单每秒再撤。")
+        order = t.record(slug)["orders"][0]
+        self.assertEqual((order["state"], order["next_ms"], order.get("removed")), ("open", 0, None), "read and asked again at the next tick")
+
+        # the stop comes while the order's request is out: withdrawn the moment its answer brings the id — before any read of it
+        # (which may lag, or fail), not FILL_READ_MS on
+        t, api, clock, x = await resting()
+        plain, said, seq = api.create_order, [], []
+        plain_read, plain_remove = api.order, api.remove_orders
+
+        async def stopped_meanwhile(body):
+            got = await plain(body)  # the bytes left...
+            x.state.paused = "紧急停止"  # ...and the stop came before the answer
+            said.append(await t.withdraw_all("紧急停止"))
+            return got
+
+        async def read(oid, digest=""):
+            seq.append("read")
+            return await plain_read(oid, digest)
+
+        async def remove(ids):
+            seq.append("remove")
+            return await plain_remove(ids)
+        api.create_order, api.order, api.remove_orders = stopped_meanwhile, read, remove
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        self.assertEqual(said, ["规则吃单：1 张还在发送途中，应答一到就撤。"])
+        self.assertEqual((api.removed, order["state"], order["removed"], order["filled"]), (["1"], "cancelling", clock.ms, 0.0))
+        self.assertEqual(seq, ["remove"], "no read of the order stood before its removal")
+        clock.ms += R.FOLLOW_EVERY_MS
+        await t.tick()
+        self.assertEqual((order["state"], order["filled"]), ("closing", 30.0), "its fills read after, to Predict's final word as ever")
+        # ..."nothing to remove" for an order a moment old proves nothing: not taken for off the book — read, and asked again
+        t, api, clock, x = await resting()
+        plain, asked = api.create_order, []
+
+        async def stopped(body):
+            got = await plain(body)
+            x.state.paused = "紧急停止"
+            return got
+
+        async def noop_once(ids, real=api.remove_orders):
+            asked.append(list(ids))
+            return {"removed": [], "noop": list(ids)} if len(asked) == 1 else await real(ids)
+        api.create_order, api.remove_orders = stopped, noop_once
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        self.assertEqual((asked, order["state"], order.get("removed")), ([["1"], ["1"]], "cancelling", clock.ms), "asked again by the same tick's own follow-up")
+        # not stopped: its rest stays FILL_READ_MS for a ladder still being posted, as before
+        t, api, clock, x = await resting()
+        await t.tick()
+        self.assertEqual((api.removed, t.record(slug)["orders"][0]["next_ms"]), ([], clock.ms + R.FILL_READ_MS))
+        # an answer gone missing: looked for by its hash by the stop itself — found, withdrawn there and then
+        t, api, clock, x = await resting()
+        api.timeout = True
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        self.assertEqual((order["state"], order["id"], order["next_ms"]), ("unknown", "", clock.ms + R.UNKNOWN_EVERY_MS))
+        x.state.paused = "紧急停止"
+        self.assertEqual(await t.withdraw_all("紧急停止"), "规则吃单：1 张挂着的单已请求撤回，Predict 确认 1 张。")
+        self.assertEqual((order["id"], order["state"], api.removed), ("1", "cancelling", ["1"]))
+        # ...not to be found (it may never have been placed — or its record lags): said as such, no success for the stop
+        # (LiveBot.live_control reads "结果未知"), and looked for again at the taker's next tick
+        t, api, clock, x = await resting()
+        api.timeout = True
+        await t.tick()
+        api.rows.clear()
+        x.state.paused = "紧急停止"
+        line = await t.withdraw_all("紧急停止")
+        order = t.record(slug)["orders"][0]
+        self.assertEqual(line, "规则吃单：1 张下单结果未知，按哈希现在查不到（可能没下成，也可能还挂着）：规则吃单接着核对，一查到就撤。")
+        self.assertEqual((order["state"], order["next_ms"], api.removed), ("unknown", 0, []))
+        # an order that ended while the pass waited for Predict's answer is left as it ended (not put back to "cancelling")
+        t, api, clock, x = await resting()
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        real_remove = api.remove_orders
+
+        async def ended_meanwhile(ids):
+            order.update(state="final", filled=40.0)  # the taker's own follow-up read it filled in full while this request was out
+            return {"removed": [], "noop": list(ids)}
+        api.remove_orders = ended_meanwhile
+        line = await t.withdraw_all("紧急停止")
+        self.assertEqual((order["state"], order.get("removed"), line), ("final", None, "规则吃单：1 张挂着的单已请求撤回，Predict 确认 1 张。"))
+        api.remove_orders = real_remove
+        # a paper record's fills are nobody's to withdraw
+        t, api, clock, x = taker("paper")
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+        await t.tick()
+        self.assertEqual((R.filled(t.record(slug, "paper")), await t.withdraw_all("紧急停止")), (30.0, ""))
+
+    async def test_the_loss_stop_is_never_judged_on_an_old_sum(self):
+        """1.154.26 (the audit of 11-18, 15): the day's settled P&L the loss stop goes by is summed at a tick's end and used by the
+        orders that follow (a sum over the day's records of all three strategies — never made on an order's way), again once
+        it was a second old. Whatever was settled within that second was not in it. The sum is now of a day and of the model
+        trader's count of settlements (pnl_mark): made again at the next tick's end as soon as either moved — and at once
+        when this taker settles a window itself (test_real_orders_are_taken_and_their_rest_withdrawn)."""
+        t, api, clock, x = taker("on")
+        x.state.day = -10.0
+        self.assertEqual((t.day_pnl_now(), t.block(0.0)), (-10.0, ""))
+        x.state.day = -150.0  # read again within PNL_FRESH_MS: the sum in hand (an order's own checks never sum)
+        clock.ms += 200
+        self.assertEqual(t.day_pnl_now(), -10.0)
+        await t.tick()
+        self.assertEqual(t.day_pnl_now(), -10.0, "less than a second old and nothing settled: not summed again")
+        x.owner.live_pnl_epoch = 1  # the model trader settled a record (LiveBot.sim_settle)
+        clock.ms += 200
+        await t.tick()  # ...and the tick's end sums again, though the sum is 400 ms old
+        self.assertEqual(t.day_pnl_now(), -150.0)
+        self.assertIn("今日已结算亏损", t.block(0.0))
+        # midnight, Beijing: yesterday's sum is not today's, however young
+        t, api, clock, x = taker("on")
+        clock.ms = bj(2026, 11, 18, 0, 0) - 400
+        x.state.day = -150.0
+        self.assertEqual(t.day_pnl_now(), -150.0)
+        x.state.day = 0.0  # (the new day's)
+        clock.ms += 800
+        self.assertEqual((t.day_pnl_now(), t.block(0.0)), (0.0, ""))
+
+    async def test_the_journal_brings_back_no_record_past_its_keep(self):
+        """1.154.26 (the audit of 11-18, 25): the journal is begun anew only at a start; a process running past KEEP_DAYS holds
+        the lines of orders whose finished records plan has removed since. The next start took them for orders the store
+        never got: back as "unknown", read by hash, their fills announced again, their window settled anew with today as
+        its day — in the loss stop's figure. A line whose record is gone and whose window is past KEEP_DAYS is passed over;
+        one of a window still within it is restored as before."""
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "state.db")
+            _, _, clock, x = taker("on")
+            x.owner.store = m.Store(path)
+            t = R.RuleTaker(x.owner)
+            old_start, new_start = clock.ms - (R.KEEP_DAYS + 1) * m.DAY_MS, clock.ms - 3_600_000
+            for start, digest in ((old_start, "0xold"), (new_start, "0xnew")):
+                slug = f"xau-updown-15m-{start // 1000}"
+                rec = {"slug": slug, "rule": "gold_shut", "side": "up", "mode": "on", "market_id": "901", "index_set": 1, "start_ms": start,
+                       "end_ms": start + 900_000, "orders": [], "pnl": None, "name": slug}
+                self.assertTrue(t.journal(rec, {"hash": digest, "state": "placing", "shares": 10.0, "limit": 0.5, "filled": 0.0, "expires": start // 1000 - 5}))
+            x.owner.store.flush()
+            again = R.RuleTaker(x.owner)  # neither record is in the store: the old one was finished and removed, the new one never got there
+            self.assertEqual({k: [o["hash"] for o in r["orders"]] for k, r in again.recs.items()}, {f"xau-updown-15m-{new_start // 1000}": ["0xnew"]})
+            x.owner.store.close()
+
+    async def test_todays_line_keeps_real_and_paper_apart(self):
+        """1.154.26: /rules' 今天 summed the real windows and the paper ones in one line — on a day the mode was switched, shares
+        bought added to shares only noted, a window of both counted twice."""
+        t, api, clock, x = taker("on")
+        start = GOLD_0600
+        base = {"rule": "gold_shut", "side": "up", "market_id": "901", "index_set": 1, "start_ms": start, "end_ms": start + 900_000, "name": "黄金", "pnl": None}
+        slug = f"xau-updown-15m-{start // 1000}"
+        t.recs[slug] = {**base, "slug": slug, "mode": "on", "orders": [{"state": "final", "shares": 30.0, "filled": 30.0, "avg": 0.5, "limit": 0.5, "fee_bps": 200}]}
+        t.recs[f"paper:{slug}"] = {**base, "slug": slug, "mode": "paper", "pnl": 5.0,
+                                   "orders": [{"paper": True, "state": "final", "shares": 50.0, "filled": 50.0, "avg": 0.4, "limit": 0.5, "fee_bps": 200}]}
+        text = t.status()
+        self.assertIn("今天：1 场买到 30 份，成本 $15.00", text)
+        self.assertIn("今天（只记录，没真买）：1 场买到 50 份，成本 $20.00；已结算 1 场 +$5.00", text)
+        self.assertNotIn("2 场买到 80 份", text)
+
+    async def test_a_book_pushed_while_the_read_was_out_is_the_one_looked_at(self):
+        """1.154.26 (the audit of 11-18, 16): in the per-second hours a window with no book in hand is read over REST; a book
+        pushed while that read was out is the newer one (RuleStream.merge drops the read) — but the look went on with the
+        read's levels and marked the push as taken: the offer it brought was seen a look later."""
+        t, api, clock, x = taker("on", **FAST)
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": []}  # what the REST read answers: nothing on offer
+        t.stream.ws, t.stream.last_frame = object(), time.monotonic()  # the push connection up, no book of this market yet
+        t.stream.subscribed.add("901")
+        plain = api.call
+
+        async def call(method, path, **kwargs):
+            got = await plain(method, path, **kwargs)
+            if path.endswith("/orderbook"):
+                t.stream.take("901", {"version": 1, "bids": [], "asks": [[0.51, 30]]})  # pushed while the read was out
+            return got
+        api.call = call
+        await t.tick()
+        self.assertTrue(t.fast)
+        self.assertEqual(len(api.sent), 1, t.track[slug]["word"])
+        self.assertEqual(L.from_wei(int(api.sent[0]["data"]["order"]["takerAmount"])) > 0, True)
+        order = t.record(slug)["orders"][0]
+        self.assertEqual(order["book"], [[0.51, 30.0]], "sized on the pushed book")
+        # no push meanwhile: the read's book, in hand for the next looks, as before
+        t, api, clock, x = taker("on", **FAST)
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+        await t.tick()
+        self.assertEqual((len(api.sent), t.stream.held("901")[1] != ()), (1, True))
+
+    async def test_what_the_review_of_1_154_26_asked_for(self):
+        """The independent review's remarks on this version's order path, each pinned: an order held back by its own last check
+        is no refusal but not without bound either (HELD_BACK_MAX in a row pause the window) and is none of the orders timed;
+        place() judges the settings again after its own waits; halted() knows every stop of real trading; a journal line that
+        could not even be ended makes the next one begin on a new line; a journal line of another shape never ends the
+        taker's start."""
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        same = {"TELEGRAM_BOT_TOKEN": "offline", "RULE_TAKER": "on", "RULE_FAST_HOURS": "off"}
+        # held back HELD_BACK_MAX times in a row: paused like a refusal; never sent — no time of its leaving on it
+        t, api, clock, x = taker("on")
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+        plain, cents = api.create_order, iter(range(40, 57))
+
+        async def saved_each_time(body):  # the settings saved anew while every order waits for its slot
+            t.configure(m.Config.from_env({**same, "RULE_GOLD_SHUT_CENTS": str(next(cents))}).rules)
+            return await plain(body)
+        api.create_order = saved_each_time
+        api.books["901"] = {"bids": [], "asks": [[0.30, 30]]}  # (on offer under every price it is saved to)
+        for n in range(1, R.HELD_BACK_MAX + 1):
+            await t.tick()
+            orders = t.record(slug, "on")["orders"]
+            self.assertEqual(([o["state"] for o in orders], ["sent_wall" in o for o in orders]), (["not_sent"] * n, [False] * n))
+            self.assertEqual(t.track[slug]["look_ms"] > clock.ms, n == R.HELD_BACK_MAX, n)
+            clock.ms += 1_000
+        self.assertIsNone(R.speed_stats(t.recs, 0), "orders that never left are none of those timed")
+        # place(): the settings saved anew during its own waits (the allowance's read) — no order made of the old ones
+        t, api, clock, x = taker("on")
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+
+        async def allowance(key):
+            t.configure(m.Config.from_env({**same, "RULE_GOLD_SHUT_CENTS": "45"}).rules)
+            return 10 ** 30
+        x.owner.live.chain.allowance = allowance
+        await t.tick()
+        self.assertEqual((api.sent, (t.record(slug) or {}).get("orders", []), t.track[slug]["word"]), ([], [], "设置刚改过：这张单不下了，下一轮按新设置重新看"))
+        # halted(): every stop of real trading — not a passing reason (a cooldown, the balance)
+        t, api, clock, x = taker("on")
+        self.assertFalse(t.halted())
+        api.blocked_until, x.state.usd = time.monotonic() + 30, 0.0
+        self.assertFalse(t.halted(), "a cooldown or an empty balance says nothing against an order already out")
+        for change in (lambda: setattr(x.state, "paused", "x"), lambda: setattr(x.state, "killed", "y"),
+                       lambda: t.configure(m.Config.from_env({**same, "RULE_TAKER": "paper"}).rules),
+                       lambda: setattr(x.owner, "config", m.dataclasses.replace(x.owner.config, live_mode="pause")),
+                       lambda: setattr(x.owner, "config", m.dataclasses.replace(x.owner.config, live_allowed=False))):
+            t, api, clock, x = taker("on")
+            change()
+            self.assertTrue(t.halted())
+        # the journal: a cut line whose own end could not be written either — the next line begins on a new one, and is read
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "state.db")
+            _, _, clock, x = taker("on")
+            x.owner.store = m.Store(path)
+            t = R.RuleTaker(x.owner)
+            journal, real_write, wrote = path + R.JOURNAL_SUFFIX, os.write, []
+            rec = {"slug": slug, "rule": "gold_shut", "side": "up", "mode": "on", "market_id": "901", "index_set": 1, "start_ms": GOLD_0600,
+                   "end_ms": GOLD_0600 + 900_000, "orders": [], "pnl": None, "name": slug}
+
+            def full_disk(fd, data):  # 40 bytes of the line, and then not even a newline
+                if fd != t.journal_fd:
+                    return real_write(fd, data)
+                wrote.append(len(data))
+                if len(wrote) == 1:
+                    return real_write(fd, data[:40])
+                raise OSError(28, "No space left on device")
+            os.write = full_disk
+            try:
+                self.assertFalse(t.journal(rec, {"hash": "0xcut", "state": "placing"}))
+            finally:
+                os.write = real_write
+            self.assertTrue(t.journal_cut and not open(journal, "rb").read().endswith(b"\n"))
+            self.assertTrue(t.journal(rec, {"hash": "0xwhole", "state": "placing"}))
+            self.assertFalse(t.journal_cut)
+            lines = open(journal, encoding="utf-8").read().splitlines()
+            self.assertEqual((len(lines), json.loads(lines[1])["order"]["hash"]), (2, "0xwhole"), "on a line of its own")
+            # ...and lines that are no entry at all: passed over — the taker (and the bot with it) starts all the same
+            with open(journal, "a", encoding="utf-8") as f:
+                f.write('[1, 2]\n"text"\n{"key": 5, "order": "x"}\n{"key": "k", "rec": {"slug": "s", "start_ms": "abc"}, "order": {"hash": "0xbad"}}\n')
+            again = R.RuleTaker(x.owner)
+            self.assertEqual([o["hash"] for o in again.record(slug)["orders"]], ["0xwhole"])
+            x.owner.store.close()
 
     async def test_each_market_on_its_own_with_its_own_size(self):
         """RULE_GOLD / RULE_OIL switch a market's rules on or off by themselves; RULE_GOLD_SHARES / RULE_OIL_SHARES size each."""
@@ -886,8 +1497,9 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         answer, create7 = asyncio.Event(), api7.create_order
 
         async def answered_late(body):
+            got = await create7(body)  # (the bytes left — the last check before them passed, 1.154.26 — the answer is what is late)
             await answer.wait()
-            return await create7(body)
+            return got
         api7.create_order = answered_late
         slow.stream.take("901", {"version": 3, "bids": [], "asks": [[0.52, 25]]})
         if R.EAGER:
@@ -898,7 +1510,9 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         answer.set()
         await asyncio.wait_for(runner7, 5)
         order7 = slow.record(slug)["orders"][0]
-        self.assertEqual((order7["state"], order7["id"], slow.first_tasks), ("open", "1", set()))
+        # (1.154.26: answered — and, the taker stopping, its rest asked to be withdrawn as its last act: not left on the book
+        # unread until the next start)
+        self.assertEqual((order7["state"], order7["id"], slow.first_tasks, api7.removed), ("cancelling", "1", set(), ["1"]))
         # the threads gone (the process ending): a request that could not be handed to one was never sent — not "unknown"
         gone, api8, clock8, _ = taker("on", RULE_FAST_HOURS="01:00-07:00", RULE_OIL="off", RULE_GOLD_OPEN_CENTS="0", RULE_GOLD_0515_CENTS="0")
         gone.verify_tick = lambda: None

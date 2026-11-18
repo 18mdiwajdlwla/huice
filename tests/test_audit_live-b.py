@@ -40,6 +40,84 @@ async def live_stop_ok():
 
 asyncio.run(live_stop_ok())
 
+
+async def stop_takes_the_rule_orders():
+    """1.154.26 (the audit of 11-18, 1): the emergency stop and /live cancel all | account ask the rule taker to withdraw its real
+    orders too — first, before the model trader's sync and the pre-open mode's batches (RuleTaker.withdraw_all: tests/test_rules.py)
+    — and say so; what it could not withdraw turns the stop's verdict red. A single order id is nobody's but the model trader's."""
+    import types
+    asked = []
+
+    def taker(line="", fail=None):
+        async def withdraw_all(why):
+            asked.append(why)
+            if fail is not None:
+                raise fail
+            return line
+        return types.SimpleNamespace(withdraw_all=withdraw_all, recs={}, running=False)  # (its records: the sync asks which orders are its own)
+
+    done = "规则吃单：1 张挂着的单已请求撤回，Predict 确认 1 张。"
+    bot = make_bot(SIM_WAYS="maker")
+    await bot.live_prepare()
+    bot.rules = taker(done)
+    r = await bot.live_control("stop", {})
+    assert r["ok"] and asked == ["紧急停止或管理员撤单"] and done in r["message"], r
+    # (the model trader has none of its own: said of its orders alone, beside a rule order withdrawn)
+    assert "原策略没有真实挂单可撤。" in r["message"] and bot.live_paused() == "紧急停止", r
+    # the rule order could not be withdrawn: the stop is not green
+    for kept in (taker("规则吃单：1 张挂着的单已请求撤回，Predict 确认 0 张，1 张没撤成（HTTP 500: boom），规则吃单每秒再撤。"),
+                 taker(fail=m.RemoteError("HTTP 500: boom"))):
+        bot = make_bot(SIM_WAYS="maker")
+        await bot.live_prepare()
+        bot.rules = kept
+        r = await bot.live_control("stop", {})
+        assert not r["ok"] and "规则吃单" in r["message"] and "没撤成" in r["message"], r
+    # one of its orders may exist and could not be found by its hash ("结果未知"): it may rest — no green toast, as an unknown order of
+    # the model trader's makes the stop a ❌ (FR-STOP-OK-UNKNOWN)
+    bot = make_bot(SIM_WAYS="maker")
+    await bot.live_prepare()
+    bot.rules = taker("规则吃单：1 张下单结果未知，按哈希现在查不到（可能没下成，也可能还挂着）：规则吃单接着核对，一查到就撤。")
+    r = await bot.live_control("stop", {})
+    assert not r["ok"] and "结果未知" in r["message"], r
+    # its removals hanging (a client that does not answer): the stop waits RULES_WITHDRAW_S for them at the most, says so, and
+    # the others' cancels are not behind it — the three go side by side
+    import asyncio as _asyncio
+    hung = _asyncio.Event()
+
+    async def never(why):
+        await hung.wait()
+        return ""
+    bot = make_bot(SIM_WAYS="maker")
+    await bot.live_prepare(); await bot.live_prefetch(NOW)
+    await step(bot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    bot.rules, bot.RULES_WITHDRAW_S = types.SimpleNamespace(withdraw_all=never, recs={}, running=False), 0.2
+    began = _asyncio.get_running_loop().time()
+    r = await bot.live_control("stop", {})
+    assert _asyncio.get_running_loop().time() - began < 3.0, "bounded"
+    assert not r["ok"] and "规则吃单：挂着的单没撤成（0.2 秒内没有答复）" in r["message"] and "Predict 确认撤掉 1 笔" in r["message"], r
+    hung.set()
+    # none of its orders out: nothing said, and the stop's reply is what it was
+    bot = make_bot(SIM_WAYS="maker")
+    await bot.live_prepare()
+    bot.rules = taker("")
+    r = await bot.live_control("stop", {})
+    assert r["ok"] and "规则吃单" not in r["message"] and "\n没有真实挂单可撤。" in r["message"], r
+    # with the model trader's own order: both in the reply; /live cancel all and account ask too, a single order id does not
+    bot = make_bot(SIM_WAYS="maker")
+    await bot.live_prepare(); await bot.live_prefetch(NOW)
+    await step(bot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
+    bot.rules = taker(done)
+    del asked[:]
+    text = await bot.live_cancel_command(["all"], NOW)
+    assert "Predict 确认撤掉 1 笔" in text and text.rstrip().endswith(done) and asked == ["紧急停止或管理员撤单"], text
+    text = await bot.live_cancel_command(["account"], NOW)
+    assert len(asked) == 2 and done in text, text
+    text = await bot.live_cancel_command(["12345"], NOW)
+    assert len(asked) == 2 and "规则吃单" not in text, text
+
+
+asyncio.run(stop_takes_the_rule_orders())
+
 async def live_4xx_filled():
     """LIVE-4XX-FILLED: a bare "HTTP 409: Conflict" on the order POST is Predict holding that hash (a duplicate without the
     wording): the record stays "result unknown" with its hash and the sync adopts the order — a taker Predict took and filled

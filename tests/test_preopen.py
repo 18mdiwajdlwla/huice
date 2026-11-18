@@ -255,6 +255,50 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         ctl.stop.clear()
         await self.finish(ctl)
 
+    async def test_a_bare_409_is_a_side_that_may_exist(self):
+        """1.154.26 (the audit of 11-18, 3): "HTTP 409: Conflict" on a side's POST with none of the duplicate's wording was a
+        refusal here ("rejected": nothing reserved, never looked for) while the model trader has taken it since 1.150.0 for
+        Predict holding that hash — an order taken and answered so rested unknown to the mode until its signed expiry. Now
+        "unknown", as an answer gone missing is: its hash and its money kept, the other side withdrawn, never sent again; a
+        400 is a refusal as it was (test_refusal_is_final_and_releases)."""
+        ctl, api, clock = controller()
+        plain = api.create_order
+
+        async def conflict_on_the_second(body):
+            got = await plain(body)
+            if len(api.sent) == 2:
+                raise m.RemoteError("HTTP 409: Conflict")  # (Predict took it, and this is what came back)
+            return got
+        api.create_order = conflict_on_the_second
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        await ctl.place_pair(c)
+        pair = ctl.ledger.rows[c["slug"]]
+        # looked for by its hash in the same pass — there it is, resting: withdrawn with the other side (as "rejected" it was
+        # never looked for: one side of a pair left on the book until its signed expiry, in nobody's records)
+        self.assertEqual((pair["orders"]["down"]["state"], pair["orders"]["up"]["state"], pair["orders"]["down"]["id"]), ("removed", "removed", "2"))
+        self.assertEqual((sorted(api.removed), {row["status"] for row in api.rows.values()}, ctl.risk()), (["1", "2"], {"CANCELLED"}, 49.))
+        await ctl.place_pair(c)
+        self.assertEqual(len(api.sent), 2, "never sent again")
+        await self.finish(ctl)
+        # ...and one Predict does not have (the 409 was a refusal after all): unknown — its hash and its money kept, the other
+        # side withdrawn — until the hash is given up after the window's start, as with an answer gone missing
+        ctl, api, clock = controller()
+        plain = api.create_order
+
+        async def refused_on_the_second(body):
+            if len(api.sent) == 1:
+                api.sent.append(copy.deepcopy(body))
+                raise m.RemoteError("HTTP 409: Conflict")
+            return await plain(body)
+        api.create_order = refused_on_the_second
+        await ctl.place_pair(c)
+        pair = ctl.ledger.rows[c["slug"]]
+        self.assertEqual((pair["orders"]["down"]["state"], pair["orders"]["up"]["state"], api.removed, ctl.risk()), ("unknown", "removed", ["1"], 49.))
+        clock.ms = c["start_ms"] + p.GIVE_UP_MS
+        await ctl.cancel_pair(pair, "again")
+        self.assertEqual((pair["orders"]["down"]["state"], pair["phase"]), ("not_found", "closed"))
+        await self.finish(ctl)
+
     async def test_pause_during_send_queue_blocks_http(self):
         ctl, api, _ = controller()
         async def pause(): ctl.owner.live_paused = lambda: "paused"
@@ -2184,6 +2228,43 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             bot = L.LiveBot.__new__(L.LiveBot)
             bot.preopen, bot.config, bot.market = ctl, ctl.owner.config, ctl.owner.market
             self.assertEqual(bot.preopen_review()["total"]["records"], 4)
+            # 1.154.26: within one build of the review page (review_scope) the review is made once — the daily summary and the
+            # analysis both ask — and each record's figures once (quote_of: four walks of every record a build); the same
+            # figures as made afresh, and nothing kept beyond the build
+            rows_now = list(ctl.ledger.rows.values())
+            fresh_review, fresh_bets, fresh_cards = p.review(rows_now, NOW), p.ev_bets(rows_now), p.cards_between(rows_now, "2026-11-06", "2026-11-07")
+            self.assertIsNot(p.quote_of(rows_now[0]), p.quote_of(rows_now[0]))
+            made, real_made = [], p.quote_made
+            p.quote_made = lambda pair: made.append(pair.get("slug")) or real_made(pair)
+            try:
+                with bot.review_scope():
+                    first = bot.preopen_review()
+                    self.assertIs(bot.preopen_review(), first)
+                    self.assertIs(p.quote_of(rows_now[0]), p.quote_of(rows_now[0]))
+                    self.assertEqual((p.review(rows_now, NOW), p.ev_bets(rows_now), p.cards_between(rows_now, "2026-11-06", "2026-11-07")), (fresh_review, fresh_bets, fresh_cards))
+                    with bot.review_scope():  # (one within another: the outer one's)
+                        self.assertIs(bot.preopen_review(), first)
+                    self.assertIs(bot.preopen_review(), first)
+                    # ...of the controller's own records alone. One read off a file for this build (the archive, the working file
+                    # while the mode is off: new objects at every read) is made and let go, never kept until the build's end —
+                    # tens of thousands of them together were 600 MB and twice the time at every start's first build
+                    off_file, own_makes = [json.loads(json.dumps(r)) for r in rows_now], list(made)
+                    self.assertIsNot(p.quote_of(off_file[0]), p.quote_of(off_file[0]))
+                    self.assertEqual(p.review(off_file, NOW), fresh_review)
+                    self.assertTrue(all(held[0] is ctl.ledger.rows.get(held[0]["slug"]) for held in p.QUOTES_KEPT[1].values()) and len(p.QUOTES_KEPT[1]) <= len(rows_now))
+                    self.assertGreater(len(made), len(own_makes), "made afresh each time it is asked")
+                    made[:] = own_makes  # (the count below is of the controller's own records)
+                self.assertEqual((len(made), len(set(made)), set(made) <= {r["slug"] for r in rows_now}), (4, 4, True),
+                                 "each record's figures once for the whole build (the one whose orders were never sent is in no table)")
+            finally:
+                p.quote_made = real_made
+            self.assertTrue(p.QUOTES_KEPT is None and bot.review_kept is None and bot.preopen_review() is not first and bot.preopen_review() == first)
+            self.assertIsInstance(m.Bot.review_scope(bot), __import__("contextlib").nullcontext)
+            running, bot.preopen = bot.preopen, None  # no controller (the mode off): every record is read off the file — none kept at all
+            with bot.review_scope():
+                self.assertIsNot(p.quote_of(rows_now[0]), p.quote_of(rows_now[0]))
+                self.assertEqual(p.QUOTES_KEPT[1], {})
+            bot.preopen = running
             # the daily summary: the day's line counts the quotes in and has them as a part; 累计 too; not under a filter
             rows = bot.summary_rows([], {})
             self.assertEqual([(x["label"], x["records"], x["pnl"], [q["name"] for q in x["parts"]]) for x in rows],
@@ -2451,6 +2532,29 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctl.risk(), 0.)
         await self.finish(ctl)
 
+    async def test_the_entry_cut_off_is_judged_again_as_the_orders_leave(self):
+        """1.154.26 (the audit of 11-18, 17): PREOPEN_ENTRY_SECONDS was judged when the window was taken as a candidate, not after
+        the waits on its orders' way (the allowance's read, the sign-in, the account lock, a token of the key's pace): a
+        window looked at 181 s before its start went out at 178 — or later still, up to the cancel time's own gate."""
+        start = NOW + 3600_000  # (market()'s window)
+        for lead_s, sent in ((181, 0), (190, 2)):
+            ctl, api, clock = controller()
+            self.assertEqual(ctl.settings.entry_seconds, 180)
+            clock.ms = ctl.account_at = start - lead_s * 1000
+            c = p.candidate(market(), clock.ms, ctl.owner.config, ctl.settings)
+            self.assertIsNotNone(c, p.candidate_problem(market(), clock.ms, ctl.owner.config, ctl.settings))
+
+            async def waits(at=clock.ms):  # what stands between the candidate's judgement and its bytes: three seconds of it
+                clock.ms = at + 3_000
+            api.before = waits
+            await ctl.place_pair(c)
+            self.assertEqual(len(api.sent), sent, lead_s)
+            if sent:
+                self.assertEqual({o["state"] for o in ctl.ledger.rows[c["slug"]]["orders"].values()}, {"open"})
+            else:
+                self.assertEqual((c["slug"] in ctl.ledger.rows, ctl.error), (False, "已过新挂的截止时间（等授权、登录或排队时过了），不再发送"))
+            await self.finish(ctl)
+
     async def test_safe_api_validates_error_envelope_and_checks_after_gate(self):
         api = p.safe_api("https://offline.invalid/v1", "key", None)
         api.jwt = "offline"
@@ -2661,6 +2765,56 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         text = await bot._live_cancel_command(["account"], NOW)
         self.assertEqual(bot.live.api.removed, ["999"])
         self.assertIn("账户上无记录的挂单 1 张：Predict 确认撤掉 1 张", text)
+        # 1.154.26 (the audit of 11-18, 2): the read is cut at ORDERS_PAGES_MAX pages — always, beside this mode's thousands — and
+        # nobody looked at its own word (orders_complete): an order listed past the cut was not withdrawn, the reply silent. The
+        # mode's last whole snapshot of the account fills the list in...
+        bot.live.api.removed, bot.live.api.orders_complete = [], False
+        ctl.account_rows = [{"id": "0u", "order": {"hash": "0x0000up"}}, {"id": "999", "order": {"hash": "0xforeign"}},
+                            {"id": "777", "order": {"hash": "0xpastthecut"}}]
+        ctl.account_at = NOW - 60_000
+        text = await bot._live_cancel_command(["account"], NOW)
+        self.assertEqual((bot.live.api.removed, text.startswith("✅")), (["999", "777"], True), text)
+        self.assertIn("账户上无记录的挂单 2 张（其中 1 张是按预挂 60 秒前的账户快照补上的）：Predict 确认撤掉 2 张", text)
+        # (an id the snapshot alone named, left out of Predict's answer: most likely gone since — said, and no ❌ for it)
+        plain_remove = bot.live.api.remove_orders
+
+        async def without_777(ids):
+            bot.live.api.removed.extend(ids)
+            return {"removed": [i for i in ids if i != "777"], "noop": []}
+        bot.live.api.remove_orders, bot.live.api.removed = without_777, []
+        with patch.object(L, "REMOVE_RETRY_S", 0.0):
+            text = await bot._live_cancel_command(["account"], NOW)
+        self.assertTrue(text.startswith("✅") and "，1 张快照里有、Predict 这次没提（多半已不在）" in text and "没撤成" not in text, text)
+        bot.live.api.remove_orders = plain_remove
+        # ...and with none young enough the reply says the list was cut, and is no success — with or without anything to withdraw
+        bot.live.api.removed, ctl.account_at = [], NOW - bot.LIVE_SNAPSHOT_MAX_AGE_MS - 1
+        text = await bot._live_cancel_command(["account"], NOW)
+        self.assertEqual((bot.live.api.removed, text.startswith("❌")), (["999"], True), text)
+        self.assertIn("账户挂单太多，这次只读到前 3 张：排在后面的挂单（手动单）没有撤到", text)
+        only_own = bot.live.api.orders
+
+        async def own_alone(status="OPEN"):
+            return (await only_own(status))[:2]
+        bot.live.api.orders, bot.live.api.removed = own_alone, []
+        text = await bot._live_cancel_command(["account"], NOW)
+        self.assertEqual((bot.live.api.removed, text.startswith("❌ 读到的挂单里没有要撤的，但账户挂单太多，这次只读到前 2 张")), ([], True), text)
+        # an id Predict leaves out of every answer is not one that "needed no removal": not withdrawn, the reply a ❌
+        bot.live.api.orders, bot.live.api.orders_complete, bot.live.api.removed = only_own, True, []
+
+        async def silent(ids):
+            bot.live.api.removed.extend(ids)
+            return {"removed": [], "noop": []}
+        bot.live.api.remove_orders = silent
+        with patch.object(L, "REMOVE_RETRY_S", 0.0):
+            text = await bot._live_cancel_command(["account"], NOW)
+        self.assertTrue(text.startswith("❌") and "称无需撤" not in text, text)
+        self.assertIn("账户上无记录的挂单 1 张：Predict 确认撤掉 0 张，1 张没撤成（Predict 的应答里没有它们），再发一次 /live cancel account", text)
+
+        async def gone(ids):
+            return {"removed": [], "noop": list(ids)}
+        bot.live.api.remove_orders = gone
+        text = await bot._live_cancel_command(["account"], NOW)
+        self.assertTrue(text.startswith("✅") and "账户上无记录的挂单 1 张：Predict 确认撤掉 0 张，1 张称无需撤" in text, text)
         await self.finish(ctl)
 
     async def test_a_settings_change_withdraws_a_big_book_in_batches(self):
@@ -2707,6 +2861,54 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(pr["accounted"] for pr in pairs) and len(api.removed) == 60 and len(sizes) <= 4, sizes)
         self.assertEqual(ctl.bulk_last["removed"], 60)
         self.assertEqual(await ctl.withdraw_all("x"), "")  # nothing left
+        await self.finish(ctl)
+
+    async def test_switched_off_the_filled_windows_are_still_settled(self):
+        """1.154.26 (the audit of 11-18, 8): a pair with a fill is accounted by settle_pair alone, on Predict's result. Switched
+        off, the mode wound down until nothing could rest and the fills were read — a minute or two after the cancels, the
+        windows not yet run — and stopped; nothing settled the filled ones after that: their loss in no day's P&L, outside
+        LIVE_MAX_DAILY_LOSS_USD, until the mode was switched on again (and then booked on that day). Now the operator is told
+        the orders are off as before, the controller goes on until those windows have their result, and a start with the
+        mode off takes them up too."""
+        ctl, api, clock = controller()
+        pairs = await self.book_of(ctl, api, 3)  # 6 orders resting
+        filled = pairs[0]
+        api.rows[filled["orders"]["up"]["hash"]]["amountFilled"] = "20"  # 20 of its 50 Up taken before the switch
+        notes = []
+        ctl.notify = lambda text, key="": notes.append(text)
+        ctl.wind_down("预挂模式已关闭")
+        task = asyncio.create_task(ctl.cancellation_loop())
+        try:
+            await self.until(lambda: all(pr["phase"] == "closed" for pr in pairs))
+            clock.ms += p.LATE_FILL_MS
+            await self.until(lambda: len(notes) == 1)  # nothing rests, the fills read: said now
+            self.assertEqual(notes[0], "✅ 开盘前预挂已关闭：本模式的挂单已全部撤完；还有 1 场有成交、等结果：出结果后照常结算入账，都结算完本模式才停")
+            await asyncio.sleep(1.2)  # (two passes of the loop)
+            self.assertEqual((ctl.stop.is_set(), filled.get("accounted"), filled["orders"]["up"]["filled"], [bool(pr.get("accounted")) for pr in pairs[1:]]),
+                             (False, None, 20.0, [True, True]), "not stopped: the filled window waits for its result")
+            self.assertEqual((ctl.rest_cleared(clock.ms), ctl.results_awaited(clock.ms), ctl.wound_up(clock.ms), len(notes)), (True, 1, False, 1))
+            self.assertIn("已成交的场次都出结果结算完就自动停止", ctl.status())
+            self.assertEqual(ctl.blocked(), "预挂模式已关闭", "nothing new goes out meanwhile")
+            # the window over, Predict's result in: settled as ever (Up lost: 20 shares at the pair's price), and only then the stop
+            clock.ms = p.settle_from(filled) + 61_000
+            api.markets["123"]["outcomes"][0]["status"] = "WON"  # Down
+            await asyncio.wait_for(ctl.stop.wait(), 5)
+            price = p.pair_quote(filled)[0]
+            self.assertTrue(filled["accounted"] and filled["result"] == "down")
+            self.assertAlmostEqual(filled["pnl"], -price * 20)
+            self.assertEqual((filled["accounted_day"], len(notes)), (dt.datetime.fromtimestamp(clock.ms / 1000, m.BEIJING).date().isoformat(), 1))
+        finally:
+            ctl.stop.set()
+            await asyncio.gather(task, return_exceptions=True)
+        # a market that never gives its result is not waited for beyond three days from its start
+        ctl, api, clock = controller()
+        pairs = await self.book_of(ctl, api, 1)
+        for order in pairs[0]["orders"].values():
+            order.update(state="final", filled=10.0)
+        self.assertTrue(p.awaiting_result(pairs[0], clock.ms) and p.awaiting_result(pairs[0], pairs[0]["start_ms"] + 3 * m.DAY_MS))
+        self.assertFalse(p.awaiting_result(pairs[0], pairs[0]["start_ms"] + 3 * m.DAY_MS + 1))
+        self.assertFalse(p.awaiting_result({**pairs[0], "accounted": True}, clock.ms) or p.awaiting_result(
+            {**pairs[0], "orders": {s: {**o, "filled": 0.0} for s, o in pairs[0]["orders"].items()}}, clock.ms))
         await self.finish(ctl)
 
     async def test_a_rate_limit_mid_withdrawal_is_waited_out_not_left_to_one_order_at_a_time(self):
@@ -2790,6 +2992,30 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             await bot.preopen_apply()
             self.assertTrue(winding.ended and bot.preopen is not winding and not bot.preopen.winding and winding.keep_on_stop)
             await bot.preopen_stop("test")
+            # 1.154.26 (the audit of 11-18, 8): the mode off at a start with nothing that may rest — but a window with fills whose
+            # result nobody booked (the wind-down ended before its result, a restart in the middle): a controller to settle it
+            bot.config = m.Config.from_env({**env, "PREOPEN_15M": "off"})
+            for _ in range(3):  # (the apply the wound-up controller's end asked for may still be on its way: let it pass, then none runs)
+                await asyncio.sleep(0.02)
+                await bot.preopen_stop("test")
+            ledger = p.Ledger(bot.config.preopen.db)
+            for slug in ("w0", "w1"):
+                ledger.delete(slug)
+            ledger.save({"slug": "f1", "key": "BTC-15M", "phase": "closed", "start_ms": NOW - 3600_000, "expires": (NOW - 3610_000) // 1000,
+                         "orders": {"up": {"id": "3", "hash": "0xf", "state": "final", "filled": 20.0}, "down": {"id": "4", "hash": "0xe", "state": "final", "filled": 0.0}}})
+            ledger.save({"slug": "f0", "key": "BTC-15M", "phase": "closed", "start_ms": NOW - 7200_000, "expires": (NOW - 7210_000) // 1000, "accounted": True,
+                         "accounted_day": "2026-11-17", "pnl": -9.8, "orders": {"up": {"id": "5", "hash": "0xd", "state": "final", "filled": 20.0}}})  # settled: nothing to do
+            ledger.close()
+            self.assertEqual((bot.preopen_left(), bot.preopen_leftovers()), ((0, 1), 0))
+            await bot.preopen_apply()
+            self.assertEqual(bot.preopen.winding, "预挂模式关着，但还有已成交的场次没结算")
+            await bot.preopen_stop("test")
+            ledger = p.Ledger(bot.config.preopen.db)
+            ledger.save({**ledger.rows["f1"], "accounted": True, "accounted_day": "2026-11-18", "pnl": -9.8})  # settled by that controller
+            ledger.close()
+            self.assertEqual(bot.preopen_left(), (0, 0))
+            await bot.preopen_apply()
+            self.assertIsNone(bot.preopen, "nothing left: none started")
 
 
 class BulkApi:

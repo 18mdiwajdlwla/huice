@@ -307,6 +307,15 @@ async def run():
     rounds_read.clear(); bare.refreshed = -1e9
     await bare.refresh({"HSI": HSI_SLUG, "NVDA-2027": nvda}, hot={"HSI", "NVDA-2027"})
     assert "NVDA-2027" in rounds_read, ("two minutes on: asked again", rounds_read)
+    # 1.154.26 (the audit of 11-18, 22): the back-off is the market's, not the card's — the card rolled to another market (a new slug
+    # under the same key), its book is asked at once; the same market goes on waiting
+    bare.absent_at["NVDA-2027"] = time.monotonic()
+    rounds_read.clear(); bare.refreshed = -1e9
+    await bare.refresh({"HSI": HSI_SLUG, "NVDA-2027": nvda}, hot={"HSI", "NVDA-2027"})
+    assert "NVDA-2027" not in rounds_read and "NVDA-2027" in bare.absent_at, rounds_read
+    rounds_read.clear(); bare.refreshed = -1e9
+    await bare.refresh({"HSI": HSI_SLUG, "NVDA-2027": nvda + "-next"}, hot={"HSI", "NVDA-2027"})
+    assert "NVDA-2027" in rounds_read and "NVDA-2027" not in bare.absent_at, ("the next market under the key: asked at once", rounds_read)
     # 1.154.5: a ladder's level the stream keeps current is read by REST only as a check, every PREDICT_PUSH_CHECK_SECONDS — not by every
     # hot round (a hot level) nor every PREDICT_COLD_POLL_SECONDS (a cold one); a level not pushed is read as before
     lad = feed_with_books()

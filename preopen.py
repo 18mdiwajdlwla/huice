@@ -1076,6 +1076,19 @@ def resting_orders(pair: dict, now_ms: int) -> int:
     return sum(1 for o in (pair.get("orders") or {}).values() if o.get("state") in MAY_REST)
 
 
+def awaiting_result(pair: dict, now_ms: int, days: int = 3) -> bool:
+    """A window with fills whose result is not booked yet (1.154.26, the audit of 11-18, 8): not accounted, something filled
+    as far as its orders' records say, its start within ``days`` — a market that never gives its result is not waited for
+    longer. A filled pair is accounted by settle_pair alone, on Predict's result; with the mode switched off the wind-down
+    ended once nothing could rest and the fills were read — minutes after the cancels, the windows not yet run — and then
+    nothing settled it: its loss was in no day's P&L, outside LIVE_MAX_DAILY_LOSS_USD, until the mode was next switched on
+    (and then booked on that day). The wind-down goes on for these (Controller.wound_up), and a start with the mode off
+    takes them up (LiveBot.preopen_left)."""
+    if pair.get("accounted") or int(pair.get("start_ms") or 0) < now_ms - days * core.DAY_MS:
+        return False
+    return any(float(o.get("filled") or 0) > 0 for o in (pair.get("orders") or {}).values())
+
+
 def awaiting_finals(pair: dict, now_ms: int, days: int = 3) -> int:
     """The pair's withdrawn orders whose final fills are still unread ("removed"), its window within unverified_outcomes'
     ``days``; none for an accounted pair.
@@ -1214,9 +1227,45 @@ def level_name(price: float, shares: float) -> str:
     return f"{price * 100:g}¢×{shares:g}"
 
 
+# (the records a running controller's ledger holds: key -> record; id(a record) -> (that record, its quote_of)) while one build of
+# the review page runs (quotes_kept), else None
+QUOTES_KEPT: tuple[dict, dict] | None = None
+
+
+@contextlib.contextmanager
+def quotes_kept(owned: dict | None = None) -> Any:
+    """For the length of one build of the review page's data (1.154.26): each record's quote_of made once. A build asks for
+    every record's four times — the review's tables, 按市场, the EV bets, the daily summary — and with 39,000 records that was
+    a third of the seconds the build held the event loop. A build runs in one piece on that loop, so no record changes
+    under it; nothing is kept beyond it. (Nobody writes into a quote: they are read.)
+
+    Only the records ``owned`` holds — a running controller's ledger, key -> record: they live on anyway. A record read off a
+    file for this build alone (the archive, the working file while no controller runs: new objects at every read) is made
+    and let go as it always was: kept until the build's end, tens of thousands of them stayed in memory together (the
+    review of this version measured 600 MB more, and the build twice as long, at 60,000 archived records — at every
+    start's first build)."""
+    global QUOTES_KEPT
+    outer = QUOTES_KEPT
+    QUOTES_KEPT = outer if outer is not None else (owned if isinstance(owned, dict) else {}, {})
+    try:
+        yield
+    finally:
+        QUOTES_KEPT = outer
+
+
 def quote_of(pair: dict) -> dict:
     """One record as the review counts it: a window, an attempt, two sides at one price; settled = accounted with a fill
     (the official result priced it), pending = a fill the result has not priced yet, withdrawn = accounted with none."""
+    kept = QUOTES_KEPT
+    if kept is None or kept[0].get(pair.get("slug")) is not pair:  # (no build under way, or not one of the ledger's own: quotes_kept)
+        return quote_made(pair)
+    held = kept[1].get(id(pair))
+    if held is None or held[0] is not pair:
+        held = kept[1][id(pair)] = (pair, quote_made(pair))
+    return held[1]
+
+
+def quote_made(pair: dict) -> dict:
     price, shares = pair_quote(pair)
     orders = pair.get("orders") or {}
     filled = {side: float((orders.get(side) or {}).get("filled") or 0) for side in ("up", "down")}
@@ -1761,6 +1810,7 @@ class Controller:
         self.winding = ""  # why the mode winds down (switched off with orders out): every order withdrawn, the final fills read, then it stops itself
         self.winding_since = 0
         self.rest_clear_ms = 0  # winding down: since when nothing of this mode can rest on the book (the final reads have FINALS_WAIT_MS)
+        self.wound_told = False  # ...and the operator told that every order is withdrawn (once: the wind-down may go on for the filled windows' results)
         self._remove_limit: Any = None  # the measured batch when the owner keeps none (the tests' owner)
 
     def now(self) -> int:
@@ -2161,6 +2211,12 @@ class Controller:
         pair = self.ledger.holder(digest)  # (by the hash index: this walked every record, four times a pair — Audit PRE-LEDGER-GROWTH)
         if pair is None or pair["phase"] != "active" or self.now() >= pair["cancel_ms"]:
             return "市场已进入撤单阶段，不再发送"
+        # 1.154.26 (the audit of 11-18, 17): the entry cut-off (PREOPEN_ENTRY_SECONDS; BTC 5-minute's own) was judged when the
+        # window was taken as a candidate — before the waits on an order's way: the allowance's read, the sign-in, the account
+        # lock, a token of the key's pace. A window looked at 181 s before its start went out at 178, or — a slow read, a key
+        # at its limit — up to the cancel time's own gate above. Judged again here, as the bytes are about to leave
+        if int(pair["start_ms"]) - self.now() < self.settings.timing(str(pair.get("key") or "")).entry_seconds * 1000:
+            return "已过新挂的截止时间（等授权、登录或排队时过了），不再发送"
         if (why := self.card_holds.get(str(pair.get("key") or ""))) and pair["start_ms"] - self.now() <= CARD_HOLD_NEAR_MS:
             return why
         if pair["expires"] * 1000 - self.now() < SEND_MIN_LEFT_MS:
@@ -2745,9 +2801,11 @@ class Controller:
                 if status == 429 or "限流冷却中" in text:
                     # the rate limiter refused the request before it was processed (429), or the shared cooldown kept it in: not placed
                     order.update(state="rejected" if status == 429 else "not_sent", error=text, limited=True)
-                elif definite and not any(w in text.lower() for w in DUPLICATE_WORDS):
+                elif definite and status != 409 and not any(w in text.lower() for w in DUPLICATE_WORDS):
                     # Predict refused it (a post-only order that would cross, an invalid field): nothing was placed, nothing
                     # to reserve or reconcile (the first revision kept such an order "unknown", and its money, for good)
+                    # 1.154.26 (the audit of 11-18, 3): ...but not a bare 409 Conflict — Predict, or a gateway before it, holding
+                    # that hash (the model trader's reading since 1.150.0): unknown below, its hash and its money kept
                     order.update(state="rejected", error=text)
                 else:
                     # A timeout, malformed answer or duplicate response does not prove
@@ -3187,10 +3245,9 @@ class Controller:
             self.winding, self.winding_since, self.rest_clear_ms = reason, self.now(), 0
             LOG.info("开盘前预挂：%s，撤单收尾中", reason)
 
-    def wound_up(self, now_ms: int) -> bool:
-        """Winding down: done once no order of this mode can be on the book (withdrawn, ended, or past its signed expiry) and
-        every withdrawn one's final fills are read — or FINALS_WAIT_MS after nothing could rest (the rest read at the next
-        start)."""
+    def rest_cleared(self, now_ms: int) -> bool:
+        """Winding down: no order of this mode can be on the book (withdrawn, ended, or past its signed expiry) and every
+        withdrawn one's final fills are read — or FINALS_WAIT_MS after nothing could rest (the rest read at the next start)."""
         if self.bulk_task is not None and not self.bulk_task.done():
             return False
         rows = [p for p in self.ledger.pending() if not p.get("accounted")]
@@ -3201,6 +3258,16 @@ class Controller:
         unread = any(not order_verified(o) for p in rows for o in p["orders"].values())
         reading = any(key.startswith("cancel:") and not task.done() for key, task in self.settling.items())
         return not (unread or reading) or now_ms - self.rest_clear_ms >= FINALS_WAIT_MS
+
+    def results_awaited(self, now_ms: int) -> int:
+        """The windows with fills whose result is still to be booked (awaiting_result)."""
+        return sum(1 for p in self.ledger.pending() if awaiting_result(p, now_ms))
+
+    def wound_up(self, now_ms: int) -> bool:
+        """Winding down: done once nothing of this mode can rest and the withdrawn orders' fills are read (rest_cleared) —
+        and, 1.154.26, no window with fills still waits for its result: the loop goes on settling those as it always did
+        (settle_pair on Predict's result), and only then does the controller stop itself."""
+        return self.rest_cleared(now_ms) and not self.results_awaited(now_ms)
 
     def bulk_line(self) -> str:
         """The batch withdrawals, for the status: the one under way (how far), else the last one; the measured batch."""
@@ -3407,12 +3474,17 @@ class Controller:
                         continue  # withdrawn this very pass, every order off the book: nothing to do before their final reads, which its bookkeep booked (ended)
                     self.bookkeep(pair)  # the next try is booked now: a read that hangs does not make the loop ask again meanwhile
                     self.launch_reconcile(pair)
-            if self.winding and self.wound_up(now):
-                unread = sum(1 for p in self.ledger.rows.values() if not p.get("accounted") and any(not order_verified(o) for o in p["orders"].values()))
-                self.notify(f"✅ 开盘前预挂已关闭：本模式的挂单已全部撤完" + (f"（{unread} 场的成交还没核对完，下次开启时接着核对）" if unread else ""), key="preopen:wound")
-                LOG.info("开盘前预挂收尾完成：%s", self.winding)
-                self.stop.set()
-                return
+            if self.winding and self.rest_cleared(now):
+                waiting = self.results_awaited(now)
+                if not self.wound_told:  # (said when the orders are off the book, as before — not hours later, when the last result is in)
+                    self.wound_told = True
+                    unread = sum(1 for p in self.ledger.rows.values() if not p.get("accounted") and any(not order_verified(o) for o in p["orders"].values()))
+                    self.notify(f"✅ 开盘前预挂已关闭：本模式的挂单已全部撤完" + (f"（{unread} 场的成交还没核对完，下次开启时接着核对）" if unread else "")
+                                + (f"；还有 {waiting} 场有成交、等结果：出结果后照常结算入账，都结算完本模式才停" if waiting else ""), key="preopen:wound")
+                if not waiting:
+                    LOG.info("开盘前预挂收尾完成：%s", self.winding)
+                    self.stop.set()
+                    return
             # 1.154.20: the records not accounted (Ledger.pending), and a look's task only for a pair it would read an order of.
             # 11-17: 12,143 resting pairs, every one covered by the account snapshot — and every five seconds a task was made for
             # each (a coroutine, the gate, monitor_pair finding nothing to read), 12,000 at once: the event loop held some 200 ms
@@ -3594,7 +3666,7 @@ class Controller:
         cme_next = next(iter(core.cme_shuts(self.now(), self.now() + 5 * core.DAY_MS)), None) if shut_cards["cme"] else None  # CME's shut now in force, or the next
         named = lambda ps: "、".join(str(p.get("name") or window_of(p)) + (f" 第 {int(p['level']) + 1} 档" if p.get("level") else "") for p in ps[:3]) + ("…" if len(ps) > 3 else "")
         why = (self.hold() or self.budget_problem()) if self.alive else ""
-        state = ("已停止" if not self.alive else f"收尾中（{self.winding}）：不再新挂，挂着的单分批撤完、成交核对完就自动停止" if self.winding
+        state = ("已停止" if not self.alive else f"收尾中（{self.winding}）：不再新挂，挂着的单分批撤完、成交核对完、已成交的场次都出结果结算完就自动停止" if self.winding
                  else f"暂停，{why}" if self.blocked() else "运行")
         bulk = self.bulk_line()
         busy = bool(self.winding or self.bulk_progress.get("total"))  # under way: right under the state line, else at the end

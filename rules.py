@@ -151,6 +151,11 @@ HOT_BEFORE_MS, HOT_AFTER_MS = 10_000, 120_000  # ...and around the moment itself
 VERIFY_HOT_S = 1.0
 ALLOWANCE_MS = 60_000         # the exchange allowance read again this often
 ALLOWANCE_UNLIMITED, ALLOWANCE_LONG_MS = 10 ** 40, 3_600_000  # ...one this large (an unlimited approval: 2^256 − 1) only this often
+RECHECKED = ("规则吃单的设置刚改过", "盘中：")  # before_send's words for an order held back on what its look had judged (send: no pause for these)
+HELD_BACK_MAX = 3             # ...up to this many in a row a window: then it pauses like a refusal (a record of them, one a look, helps nobody)
+CONFLICT_GRACE_MS = 90_000    # an order Predict answered 409 for and then cannot show by its hash is given up as never placed after this long...
+CONFLICT_MISSES = 6           # ...and this many reads that found nothing (an answer gone missing waits for its expiry, as before: GIVE_UP_MS)
+LAST_WITHDRAW_S = 4.0         # the taker's last act as it stops: its orders still on the book asked to be withdrawn, within this (1.154.26)
 DUST = 1e-6
 FINAL_STATES = {"final", "rejected", "not_sent", "not_found"}
 NEVER_PLACED = {"rejected", "not_sent", "not_found"}
@@ -958,12 +963,15 @@ class RuleTaker:
         self.ticks, self.in_tick = 0, False  # the loop's ticks so far, one under way...
         self.gated: tuple[int, str] = (-1, "")  # ...and block(0.0) as the tick under way found it (gate)
         self.pnl_at: tuple[int, float] = (0, 0.0)  # the day's P&L of the loss stop and when it was summed (day_pnl_now: after a tick's looks)
+        self.pnl_of: tuple = ()            # ...and what that sum is of (pnl_mark): summed afresh when it is no longer
         self.looked = 0                    # the stream's count of changes as the last tick's looks began (rest)
         self.journal_fd: int | None = None  # the orders' journal, open for appending (journal); None: none (a store in memory)
+        self.journal_cut = False           # ...its last line was cut short and may not be ended: the next one begins on a new line
         self.loop_lags: collections.deque = collections.deque(maxlen=int(60 / LAG_EVERY_S))  # the loop's delay over the last minute, ms (lag_loop)
         self.track: dict[str, dict] = {}   # window slug -> what is known of it (its rule, start, market, when last looked at, the last word)
         self.planned_ms = 0
         self.sending: dict[str, str] = {}  # hash -> slug while its request is out (before_send's lookup)
+        self.decided: dict[str, Any] = {}  # ...and the settings its look decided it under (before_send: not sent once they changed, 1.154.26)
         self.allowance: dict[str, tuple[int, int]] = {}
         self.errors: collections.deque = collections.deque(maxlen=20)
         self.error = ""
@@ -1057,13 +1065,32 @@ class RuleTaker:
         slug = self.sending.get(digest)
         if slug is None:
             return "不是规则吃单这一刻要发的订单"
-        rec = self.record(slug) or {}
+        # 1.154.26 (audit 4): between an order's look and its bytes there may be waits — the sign-in, the allowance's read, a token
+        # of the key's pace, a slot (11-18: 2.5 s once) — and the gates below knew nothing of what the look itself went by: the
+        # rule's own settings (its switch, its price, the window's size, the day's cap) and, in a window's course, the index.
+        # Judged again here: the settings the look decided under still the ones in force, the index still on the rule's side,
+        # the bot not stopping. Refused, nothing went out (NotSent); the next look decides afresh
+        if self.stop.is_set() or getattr(getattr(self.owner, "stopping", None), "is_set", bool)():
+            return "机器人正在停止，不再发单"
+        decided = self.decided.get(digest)
+        if decided is not None and decided != self.settings:
+            return "规则吃单的设置刚改过，这张单不发了（下一轮按新设置重新判断）"
+        rec = self.record(slug, "on") or {}  # (a real order is on the real record, whatever the mode is by now)
         order = next((o for o in rec.get("orders") or [] if o.get("hash") == digest), None)
         if order is None:
             return "订单记录不见了"
         if int(order.get("expires") or 0) * 1000 - self.now() < SEND_MIN_LEFT_MS:
             return "距订单到期不足 5 秒（开场前 5 秒到期；盘中的单在这一场结束前 5 秒到期），不再发送"
-        return self.block(float(order.get("shares") or 0) * float(order.get("limit") or 0))
+        if why := self.block(float(order.get("shares") or 0) * float(order.get("limit") or 0)):
+            return why
+        if order.get("live") and (rule := RULE_OF.get(rec.get("rule"))) is not None:
+            try:
+                why = self.live_guard(slug, rule, self.now())
+            except Exception as error:  # (said as a refusal: raised from here it would read as a request whose answer went missing)
+                why = f"发单前复核指数出错（{type(error).__name__}）"
+            if why:
+                return f"盘中：{why}"
+        return ""
 
     def today_pnl(self) -> float:
         return day_pnl(self.recs, day_of(self.now()))
@@ -1074,14 +1101,22 @@ class RuleTaker:
         after the tick's looks (turn), so an order's own checks — the tick's gate, the order's, the one right before its bytes go
         out — find it summed: up to PNL_FRESH_MS old, summed here only when older."""
         now = self.now()
-        if self.pnl_at[0] and 0 <= now - self.pnl_at[0] <= PNL_FRESH_MS:
-            return self.pnl_at[1]
+        if self.pnl_at[0] and 0 <= now - self.pnl_at[0] <= PNL_FRESH_MS and self.pnl_of[:1] == (day_of(now),):
+            return self.pnl_at[1]  # (of today: yesterday's sum is not the new day's figure, however young — 1.154.26)
         return self.sum_pnl(now)
+
+    def pnl_mark(self, now: int) -> tuple:
+        """What the summed figure is of (1.154.26, the audit of 11-18, 15): the Beijing day, and the model trader's count of
+        settlements (LiveBot.sim_settle bumps it). The sum was made again a second after the last one, whatever had been
+        settled in between — and a window this taker settled itself (settle runs after the tick's sum) was not in the figure
+        the next tick's orders were judged by. Summed again as soon as either moved, and right after a settlement of its own
+        — at a tick's end both, never on an order's way (turn, settle: the sum walks the day's records of all three)."""
+        return day_of(now), getattr(self.owner, "__dict__", {}).get("live_pnl_epoch", 0)
 
     def sum_pnl(self, now: int) -> float:
         owner = self.owner
         pnl = owner.live_daily_pnl(owner.sim_trades(), now) + float(getattr(owner, "preopen_pnl", lambda: 0.0)()) + self.today_pnl()
-        self.pnl_at = (now, pnl)
+        self.pnl_at, self.pnl_of = (now, pnl), self.pnl_mark(now)
         return pnl
 
     # -- the loop --
@@ -1104,6 +1139,11 @@ class RuleTaker:
             # tick would have (the bot allows the taker ten seconds: LiveBot.rules_stop); cancelled only with the taker itself
             async with self.tick_lock:
                 pass
+            # 1.154.26: an order answered in the loop's last moments would rest unread until the next start (a deploy: a minute
+            # or two; its signed expiry at the worst) — its rest is asked to be withdrawn before the process goes. A few
+            # seconds at the most, and never in the way of the stop
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self.withdraw_all("机器人停止"), LAST_WITHDRAW_S)
         finally:
             self.alive = self.running = False
             if self.gc_off:  # (never left off)
@@ -1338,7 +1378,8 @@ class RuleTaker:
                         self.note(f"下单过程出错：{core.clean_error(failed) or type(failed).__name__}")
             if self.fast:
                 self.verify_tick()
-            if self.settings.mode == "on" and self.owner.config.live_max_daily_loss_usd and self.now() - self.pnl_at[0] >= 1_000:
+            if self.settings.mode == "on" and self.owner.config.live_max_daily_loss_usd and (
+                    self.now() - self.pnl_at[0] >= 1_000 or self.pnl_of != self.pnl_mark(self.now())):
                 self.sum_pnl(self.now())  # for the next ticks' orders: summed here, not on an order's way (day_pnl_now)
         self.stream.want({str(w["market"]["id"]) for w in self.track.values() if w["market"] is not None})
         await self.follow()
@@ -1523,7 +1564,8 @@ class RuleTaker:
             return f"这一场已买满 {size:g} 份" if not in_flight(rec) else f"这一场的 {size:g} 份已全部下单，等结果（撤回的部分 {LATE_FILL_MS // 1000} 秒后确认没有晚到的成交才算空出来）"
         if self.settings.mode == "paper" and any(o.get("paper") and bool(o.get("live")) == course for o in rec["orders"]):
             return "只记录：这一场" + ("盘中" if course else "") + "已记过（只记一次：没真买，盘口上的单还在，再记就重复了）"
-        if sum(1 for o in rec["orders"] if o.get("state") == "rejected") >= MAX_REJECTS:
+        # (1.154.26: an order answered 409 and then not to be found by its hash was not placed either — follow_order: counted too)
+        if sum(1 for o in rec["orders"] if o.get("state") == "rejected" or (o.get("state") == "not_found" and o.get("conflict"))) >= MAX_REJECTS:
             return f"Predict 拒绝了 {MAX_REJECTS} 次，这一场不再下单"
         return ""
 
@@ -1739,6 +1781,7 @@ class RuleTaker:
             self.stream.changed.discard(str(w["market"]["id"]))  # taken now, whatever this look decides (1.153.3)
             if not course and self.observe(w, rule, now):
                 self.save_watch(slug, w, rule)
+        settings = self.settings  # the settings this look decides under: checked again after its reads (below)
         rec = self.record(slug)
         size = self.settings.shares_of(rule.market)
         cents = self.live_cents(rule) if course else self.settings.price(rule.key)
@@ -1802,7 +1845,15 @@ class RuleTaker:
             self.reads += 1
         bids, asks = pushed if pushed is not None else await self.book(mid)
         if pushed is None and self.fast:
-            self.stream.merge(mid, bids, asks, asked)  # in hand for the next looks
+            got = self.stream.held(mid)
+            if got is not None and got[2] > asked:
+                # 1.154.26 (the audit of 11-18, 16): a book was pushed while this read was out. merge drops the read then (the push
+                # is the newer) — but the look went on with the read's levels all the same, and marked the push as taken: an
+                # offer the push brought was seen a look later, an order sized on offers the push had already taken away
+                bids, asks = got[0], got[1]
+                pushed = (bids, asks)  # (its stamps are the push's: book_at below)
+            else:
+                self.stream.merge(mid, bids, asks, asked)  # in hand for the next looks
             self.stream.changed.discard(mid)           # ...and taken by this one
         # 1.154.13, the race's clock: Predict's own stamp on this book (a pushed one's) and when it reached the bot — kept on the watch
         # (when an offer first showed, when it was gone) and on an order sized on it (how long the bot took)
@@ -1882,6 +1933,15 @@ class RuleTaker:
         take = take.to_integral_value(rounding="ROUND_FLOOR")
         if take < 1 or float(take * limit) < 1.0:  # Predict's minimum order ($1, live.MIN_ORDER_USD)
             w["word"] = f"盘口 ≤{int(limit * 100)}¢ 的{rule.word}只有 {there:g} 份，不够一张最小订单（或额度、余额剩得不够）"
+            return
+        if self.settings != settings:
+            # 1.154.26 (audit 5): the settings were saved anew while this look waited for a read (the listing, the book, the
+            # status). The record in hand is the old mode's — on → paper: paper() added a paper fill to the real record, saved
+            # as real (shares nobody bought in the day's spend, the positions check and the window's P&L against the loss stop);
+            # paper → on: place() put a real order on the paper record, which nothing follows (never read, its rest never
+            # withdrawn) — and the size, the price and the day's cap worked out above are the old ones. Nothing done on them
+            w["word"] = "设置刚改过：这一轮不下单，下一轮按新设置重新看"
+            w["look_ms"] = 0  # (at the next tick, not a cadence on: the book's change this look took is not marked any more)
             return
         if self.settings.mode == "paper":
             self.paper(slug, w, rule, levels, take, limit, rec, course)
@@ -1991,9 +2051,9 @@ class RuleTaker:
             raise core.RemoteError("订单簿格式异常")
         return core.predict_levels(data.get("bids"), True), core.predict_levels(data.get("asks"), False)
 
-    def new_record(self, slug: str, w: dict, rule: Rule, index_set: int) -> dict:
+    def new_record(self, slug: str, w: dict, rule: Rule, index_set: int, mode: str | None = None) -> dict:
         card, start = card_of(rule), w["start"]
-        return {"slug": slug, "rule": rule.key, "card": rule.card, "side": rule.side, "mode": self.settings.mode,
+        return {"slug": slug, "rule": rule.key, "card": rule.card, "side": rule.side, "mode": mode or self.settings.mode,
                 "name": card.window_spec(start).name if hasattr(card.window_spec(start), "name") else slug,
                 "start_ms": start, "end_ms": card.end_of(start), "market_id": str(w["market"]["id"]), "index_set": index_set,
                 "cents": self.settings.price(rule.key), "orders": [], "created_ms": self.now(), "result": "", "pnl": None}
@@ -2003,7 +2063,9 @@ class RuleTaker:
         import live
         info = live.parse_market(w["market"], self.owner.config.predict_fee_bps)
         outcome, _ = live.outcome_for_side("updown", rule.side, info.outcomes)
-        rec = rec or self.new_record(slug, w, rule, int((outcome or {}).get("index_set") or 0))
+        if rec is not None and rec.get("mode") != "paper":
+            rec = self.record(slug, "paper")  # 1.154.26 (audit 5): a paper fill goes onto the paper record alone, whatever was handed in
+        rec = rec or self.new_record(slug, w, rule, int((outcome or {}).get("index_set") or 0), mode="paper")
         rec["index_set"] = int(rec.get("index_set") or 0) or int((outcome or {}).get("index_set") or 0)
         avg = walk(levels, take)
         rec["orders"].append({"paper": True, "state": "final", "shares": float(take), "filled": float(take), "limit": float(limit),
@@ -2021,6 +2083,7 @@ class RuleTaker:
         if why := self.block(usd):
             w["word"] = why
             return
+        settings = self.settings  # (the look's: nothing waited for between its own check and here)
         info = live.parse_market(w["market"], self.owner.config.predict_fee_bps)
         outcome, assumed = live.outcome_for_side("updown", rule.side, info.outcomes)
         if outcome is None or assumed:
@@ -2037,8 +2100,13 @@ class RuleTaker:
             w["word"] = "交易所授权额度不足"
             return
         await self.api.ensure_auth()
+        if self.settings != settings:  # 1.154.26 (audit 5): saved anew during the two waits above — as in look
+            w["word"] = "设置刚改过：这张单不下了，下一轮按新设置重新看"
+            return
         now = self.now()
-        rec = self.record(slug) or rec or self.new_record(slug, w, rule, int(outcome.get("index_set") or 0))
+        # (the real record alone — never the one handed in when that is the paper one: an order there would be followed by nothing)
+        rec = (self.record(slug, "on") or (rec if rec is not None and rec.get("mode") == "on" else None)
+               or self.new_record(slug, w, rule, int(outcome.get("index_set") or 0), mode="on"))
         # (a record its watch made — save_watch, keep_watch — knows no outcome yet: without it the positions check would not take the
         # fills for this taker's, 1.154.16: filled_by_outcome goes by the record's index set)
         rec["index_set"] = int(rec.get("index_set") or 0) or int(outcome.get("index_set") or 0)
@@ -2071,6 +2139,7 @@ class RuleTaker:
         w["open_told"] = True  # (the wait for matching to open is the first order's)
         rec["orders"].append(order)
         self.save(rec)
+        self.decided[order["hash"]] = settings
         body = {"data": {"order": {**signed, "signature": signature, "hash": digest}, "strategy": "LIMIT",
                          "pricePerShare": str(amounts["price_per_share"])}}
         # 1.154.12: the request itself — the hash onto the disk, the POST, its answer — goes beside the other windows' (send). The
@@ -2100,6 +2169,7 @@ class RuleTaker:
         # request is made in this very turn there too)
         if not self.journal(rec, order) and not (getattr(self.store, "writer", True) is None or await asyncio.to_thread(self.store.flush)):
             order.update(state="not_sent", error="数据库写入未完成，没有发单")
+            self.decided.pop(order["hash"], None)
             self.save(rec)
             return
         self.sending[order["hash"]] = slug
@@ -2109,6 +2179,7 @@ class RuleTaker:
             order.update(id=str(result.get("order_id") or ""), state="open", next_ms=self.now() + FILL_READ_MS)
         except preopen.NotSent as error:
             order.update(state="not_sent", error=core.clean_error(error))
+            order.pop("sent_wall", None)  # (it never left: not one of the orders timed — speed_stats)
         except Exception as error:
             text = core.clean_error(error) or type(error).__name__
             status = live.http_status(error)
@@ -2119,20 +2190,44 @@ class RuleTaker:
                 order.update(state="not_sent", error="进程正在停止，请求没有发出")
             elif status == 429 or "限流冷却中" in text:
                 order.update(state="not_sent", error=text)  # the rate limiter, not the order: not one of MAX_REJECTS (1.153.3)
-            elif definite and not any(word in text.lower() for word in preopen.DUPLICATE_WORDS):
+            elif definite and status != 409 and not any(word in text.lower() for word in preopen.DUPLICATE_WORDS):
                 order.update(state="rejected", error=text)
             else:  # a timeout, a lost answer: it may exist — looked for by its hash, never sent again
-                order.update(state="unknown", error=text, next_ms=self.now() + UNKNOWN_EVERY_MS)
+                # 1.154.26 (audit 3): a bare 409 Conflict too — Predict, or a gateway before it, holding that hash, the answer the
+                # model trader has taken so since 1.150.0 (a taker taken and filled at once, then "failed": its shares outside
+                # every count). Here it was a refusal: the window's shares freed, the next look sending a second order beside
+                # one that may exist. Looked for by its hash at once (FILL_READ_MS), not in ten seconds
+                # (``conflict``: Predict did answer — an order it then cannot show by its hash for CONFLICT_GRACE_MS was a
+                # refusal after all, follow_order; one whose answer went missing waits for its expiry, as before)
+                order.update(state="unknown", error=text, next_ms=self.now() + (FILL_READ_MS if status == 409 else UNKNOWN_EVERY_MS),
+                             **({"conflict": True} if status == 409 else {}))
         finally:
             self.sending.pop(order["hash"], None)
+            self.decided.pop(order["hash"], None)
             order["answered_wall"] = int(time.time() * 1000)
+        if order["state"] == "open" and order.get("id") and self.halted():
+            # 1.154.26: real trading was stopped while the request was out (the emergency stop, a pause, the mode): its rest is
+            # asked to be withdrawn now, by the id this answer brought — before its first read (which may lag or fail), not
+            # FILL_READ_MS on
+            await self.withdraw_one(order)
         self.save(rec)
         w["word"] = ("盘中 " if order.get("live") else "") + {
             "open": f"已下单：{rule.word} ≤{int(limit * 100)}¢ × {take:g} 份", "unknown": f"下单结果未知（{order.get('error')}），按哈希核对"}.get(
             order["state"], f"没下成：{order.get('error') or order['state']}")
         if order["state"] in NEVER_PLACED:
             self.note(f"{rec['name']} 没下成：{order.get('error') or order['state']}")
-            w["look_ms"] = self.now() + REJECT_PAUSE_MS  # not again for half a minute (a refusal repeated every two seconds helps nobody)
+            # (1.154.26: no half minute's pause for an order its own last check held back because what it was decided on had
+            # moved — the settings saved anew, the index back across the start in a window's course: nothing was refused, and
+            # the next look judges the same things first — it sends nothing while they stand, and buys the moment they do not)
+            held_back = order["state"] == "not_sent" and str(order.get("error") or "").startswith(RECHECKED)
+            w["held_back"] = int(w.get("held_back") or 0) + 1 if held_back else 0
+            if not held_back or w["held_back"] >= HELD_BACK_MAX:  # (HELD_BACK_MAX of them in a row: paused all the same)
+                w["held_back"] = 0
+                w["look_ms"] = self.now() + REJECT_PAUSE_MS  # not again for half a minute (a refusal repeated every two seconds helps nobody)
+            else:
+                w["look_ms"] = 0  # ...looked at again at the next tick: under the settings as they are now, on the index as it stands then
+        else:
+            w.pop("held_back", None)
 
     def journal_path(self) -> str:
         path = str(getattr(self.store, "path", "") or "")
@@ -2144,14 +2239,29 @@ class RuleTaker:
         for the store's writer, no thread. False without such a file (the caller flushes the store, as before)."""
         if self.journal_fd is None:
             return False
-        line = json.dumps({"key": rid(rec["slug"], rec["mode"]), "rec": {k: v for k, v in rec.items() if k != "orders"}, "order": order},
-                          ensure_ascii=False) + "\n"
+        # (after a line that was cut short this one begins on a new line: the cut one's own end may not have been written either)
+        line = (b"\n" if self.journal_cut else b"") + (json.dumps(
+            {"key": rid(rec["slug"], rec["mode"]), "rec": {k: v for k, v in rec.items() if k != "orders"}, "order": order},
+            ensure_ascii=False) + "\n").encode("utf-8")
         try:
-            os.write(self.journal_fd, line.encode("utf-8"))
-            return True
+            wrote = os.write(self.journal_fd, line)
         except OSError as error:
             self.note(f"订单日志写入失败（{type(error).__name__}），改为等数据库写完再发单")
             return False
+        if wrote != len(line):
+            # 1.154.26 (audit 11): a line cut short (a full disk, a quota — os.write says how much it wrote and raises nothing)
+            # was taken for written: the order went out with nothing a restart could find it by (recover skips a cut line), the
+            # store's own write maybe failing for the same reason. The cut line ended, so the next one stands on its own (and,
+            # should that newline not get in either, the next line begins with one: journal_cut), and the order waits for
+            # the store instead (send)
+            self.journal_cut = True
+            with contextlib.suppress(OSError):
+                if os.write(self.journal_fd, b"\n") == 1:
+                    self.journal_cut = False
+            self.note(f"订单日志只写进 {wrote}/{len(line)} 字节（磁盘满了？），改为等数据库写完再发单")
+            return False
+        self.journal_cut = False
+        return True
 
     def recover(self) -> None:
         """At the start: the journal's orders the records do not hold — a request that left as the process ended, its record not
@@ -2166,11 +2276,22 @@ class RuleTaker:
                     for line in lines:
                         try:
                             entry = json.loads(line)
-                        except ValueError:
-                            continue  # a line cut short: its request never left (the line is written whole before it)
-                        key, order = entry.get("key"), entry.get("order") or {}
-                        rec = self.recs.get(key) or {**(entry.get("rec") or {}), "orders": []}
-                        if not key or not order.get("hash") or not rec.get("slug") or any(o.get("hash") == order["hash"] for o in rec["orders"]):
+                            key, order = entry.get("key"), entry.get("order") or {}
+                            kept = self.recs.get(key)
+                            rec = kept or {**(entry.get("rec") or {}), "orders": []}
+                            old = kept is None and int(rec.get("start_ms") or 0) < self.now() - KEEP_DAYS * core.DAY_MS
+                            if not key or not order.get("hash") or not rec.get("slug") or any(o.get("hash") == order["hash"] for o in rec["orders"]):
+                                continue
+                        except (ValueError, TypeError, AttributeError, KeyError):
+                            # a line cut short: its request never left (the line is written whole before it) — or, 1.154.26, one
+                            # that is no entry at all (another shape): passed over, never the taker's start (and the bot's) ended by it
+                            continue
+                        if old:
+                            # 1.154.26 (the audit of 11-18, 25): the journal is begun anew only at a start, so one process running
+                            # past KEEP_DAYS holds the lines of orders whose finished records plan has since removed — taken here
+                            # for orders the store never got: back as "unknown", read by their hashes, their fills announced
+                            # again and their window settled once more with today as its day (the loss stop's figure). A
+                            # record that old and gone was finished, not lost
                             continue
                         rec["orders"].append({**order, "state": "unknown", "error": "重启前发出的单，记录里还没有：按哈希核对", "next_ms": 0})
                         self.recs[key] = rec
@@ -2218,6 +2339,18 @@ class RuleTaker:
                     order.update(state="not_found", error="按哈希一直查不到：视为没下成")
                 else:
                     order.update(state="final", error=f"到期后 {GIVE_UP_MS // 60_000} 分钟仍查不到这张单：按已知成交 {float(order.get('filled') or 0):g} 份记")
+            elif state == "unknown" and not order.get("id") and order.get("conflict"):
+                # 1.154.26: Predict answered 409 for it — it processed the request, so the order is there or it was refused, and
+                # its record by the hash tells which. Not to be found CONFLICT_MISSES times over CONFLICT_GRACE_MS (a record
+                # may lag its order by moments, not by a minute and a half): refused. Held as unknown until its expiry and a
+                # quarter hour more, a 409 that was a refusal kept the whole window — bought in neither phase — and read its
+                # hash every ten seconds all that time (five hours of it for an order of the makers' moment)
+                order["misses"] = int(order.get("misses") or 0) + 1
+                if order["misses"] >= CONFLICT_MISSES and now - int(order.get("at") or now) >= CONFLICT_GRACE_MS:
+                    order.update(state="not_found", error=f"Predict 答复 409，之后按哈希查了 {order['misses']} 次都没有这张单：视为被拒、没下成")
+                    self.note(f"{rec.get('name') or rec.get('slug')} 那张答复 409 的单按哈希查不到，视为没下成（这一场可以再买）")
+                else:
+                    order["next_ms"] = now + UNKNOWN_EVERY_MS
             else:
                 order["next_ms"] = now + (UNKNOWN_EVERY_MS if state == "unknown" else FOLLOW_EVERY_MS)
             return
@@ -2243,6 +2376,102 @@ class RuleTaker:
             order.update(state="cancelling", next_ms=now + FOLLOW_EVERY_MS)
         else:
             order["next_ms"] = now + UNKNOWN_EVERY_MS
+
+    def halted(self) -> bool:
+        """No real order may be opened now by the operator's word or the bot's own stop: the mode not 真实吃单, LIVE not on, a
+        pause (/live pause, the emergency stop), the day's stop. (Not the passing reasons block also knows — a cooldown, the
+        balance: those say nothing against an order already out.)"""
+        owner, c = self.owner, self.owner.config
+        return bool(self.settings.mode != "on" or c.live_mode != "on" or not getattr(c, "live_allowed", True)
+                    or owner.live_paused() or owner.live_killed())
+
+    async def withdraw_one(self, order: dict) -> None:
+        """An order answered while real trading is stopped (send: halted): its rest asked to be withdrawn at once, by its id.
+        Off the book only on Predict's word that it removed it — "nothing to remove" for an order a moment old proves
+        nothing; else it is read at the next tick, and asked again (follow_order)."""
+        now = self.now()
+        try:
+            result = await self.api.remove_orders([order["id"]])
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            order.update(error=core.clean_error(error) or type(error).__name__, next_ms=0)
+            return
+        if str(order["id"]) in {str(i) for i in (result.get("removed") or [])}:
+            order.update(removed=now, left_ms=now, state="cancelling", next_ms=now + FOLLOW_EVERY_MS)
+        else:
+            order["next_ms"] = 0
+
+    async def withdraw_all(self, why: str) -> str:
+        """The emergency stop's and /live cancel all's pass over this taker's real orders (1.154.26, audit 1). They were in nobody's
+        list but follow's: the stop paused real trading, withdrew the model trader's and the pre-open mode's orders and answered
+        没有真实挂单可撤 — a rule order on the book stood until its own next read (FILL_READ_MS after its answer, then every
+        second; ten while a read failed or the key cooled; at the worst until its signed expiry). Now: an order whose answer
+        went missing is looked for by its hash here and now; every one with an order id still on the book is asked to be
+        withdrawn, on the taker's key or, that failing, on the bot's own; one whose request is still out has no id to
+        withdraw by — withdrawn the moment its answer brings one (send: halted). The line for the reply — "没撤成" in it for
+        what could not be withdrawn, "结果未知" for an order that may exist and could not be found (neither is a stop that
+        worked: LiveBot.live_control) — and "" when the taker has no real order out."""
+        out = [(rec, o) for rec in self.recs.values() if rec.get("mode") == "on"
+               for o in rec.get("orders") or [] if not o.get("paper") and o.get("state") not in FINAL_STATES]
+        if not out:
+            return ""
+        lost = [(rec, o) for rec, o in out if not o.get("id") and o.get("state") == "unknown" and o.get("hash")]
+        if lost:
+            self.reads += len(lost)
+            rows = await asyncio.gather(*(self.api.order("", o["hash"]) for _, o in lost), return_exceptions=True)
+            for (rec, o), row in zip(lost, rows):
+                if isinstance(row, asyncio.CancelledError):
+                    raise row
+                if isinstance(row, dict) and row.get("id") not in (None, "") and not o.get("id"):
+                    o["id"] = str(row["id"])  # found: withdrawn below (its fills are follow's to read, as ever)
+        resting = [(rec, o) for rec, o in out if o.get("id") and not o.get("removed") and o.get("state") in {"open", "cancelling", "unknown"}]
+        done: set[str] = set()
+        error = ""
+        if resting:
+            ids = [str(o["id"]) for _, o in resting]
+            for api in (self.api, getattr(getattr(self.owner, "live", None), "api", None)):
+                if api is None or not callable(getattr(api, "remove_orders", None)):
+                    continue
+                try:
+                    result = await api.remove_orders(ids)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as failed:
+                    error = core.clean_error(failed) or type(failed).__name__
+                    continue
+                done = {str(i) for i in (result.get("removed") or [])} | {str(i) for i in (result.get("noop") or [])}
+                error = ""
+                break
+        now, off = self.now(), 0
+        for rec, o in resting:
+            if o.get("state") in FINAL_STATES or o.get("removed") or o.get("state") == "closing":
+                off += 1  # ended, or taken off by the taker's own follow-up, while this pass waited for its answer: left as it is
+                continue
+            if str(o["id"]) in done:  # (as follow_order has it: off the book, final by a read LATE_FILL_MS on — its fills are still to be read)
+                o.update(removed=now, left_ms=int(o.get("left_ms") or now), state="cancelling", next_ms=now + FOLLOW_EVERY_MS)
+                off += 1
+            else:
+                o["next_ms"] = 0  # read, and asked again, at the taker's next tick
+            self.save(rec)
+        unknown = [(rec, o) for rec, o in out if not o.get("id") and o.get("state") == "unknown"]
+        flying = [(rec, o) for rec, o in out if not o.get("id") and o.get("state") == "placing"]
+        for rec, o in unknown:
+            o["next_ms"] = 0
+            self.save(rec)
+        parts = []
+        if resting:
+            missed = len(resting) - off
+            parts.append(f"{len(resting)} 张挂着的单已请求撤回，Predict 确认 {off} 张"
+                         + (f"，{missed} 张没撤成（{error or 'Predict 的应答里没有它'}），规则吃单每秒再撤" if missed else ""))
+        if unknown:
+            parts.append(f"{len(unknown)} 张下单结果未知，按哈希现在查不到（可能没下成，也可能还挂着）：规则吃单接着核对，一查到就撤")
+        if flying:
+            parts.append(f"{len(flying)} 张还在发送途中，应答一到就撤")
+        if not parts:
+            return ""
+        LOG.warning("规则吃单：%s——%s", why, "；".join(parts))
+        return "规则吃单：" + "；".join(parts) + "。"
 
     def take_fills(self, rec: dict, order: dict, row: dict) -> None:
         """An order record's fills onto ours: the shares, the average price it states (its limit while none is stated)."""
@@ -2293,6 +2522,10 @@ class RuleTaker:
             pnl = net(rec) * pay - cost(rec)  # the shares held (the fee taken in shares) paid out, less the USDT spent (1.153.3)
             rec.update(result="split" if up == 0.5 else "up" if up == 1.0 else "down", pnl=round(pnl, 6), settled_ms=now, settled_day=day_of(now))
             self.save(rec)
+            # (1.154.26: the day's P&L of the loss stop with this result in it, for the next tick's orders — summed here, at the
+            # tick's end; with no loss stop set there is nothing to keep)
+            if rec.get("mode") == "on" and self.owner.config.live_max_daily_loss_usd:
+                self.sum_pnl(now)
             word = "赢" if pnl > DUST else "输" if pnl < -DUST else "平"
             rule = RULE_OF.get(rec.get("rule"))
             self.notify(f"{'✅' if pnl > DUST else '❌' if pnl < -DUST else '➖'} 规则吃单结算{'（只记录）' if rec.get('mode') == 'paper' else ''}："
@@ -2493,11 +2726,14 @@ class RuleTaker:
                 lines.append(f"  近 30 天：{summary}")
             lines.extend("  " + race_text(row) for row in rows)
         today = day_of(now)
-        mine = [r for r in recs.values() if day_of(int(r.get("start_ms") or 0)) == today and filled(r) > DUST]
-        if mine:
-            done = [r for r in mine if r.get("pnl") is not None]
-            lines.append(f"今天：{len(mine)} 场买到 {sum(filled(r) for r in mine):g} 份，成本 ${sum(cost(r) for r in mine):,.2f}"
-                         + (f"；已结算 {len(done)} 场 {money(sum(float(r['pnl']) for r in done))}" if done else ""))
+        # (1.154.26: the real windows and the paper ones apart — on a day the mode was switched the one line added shares bought
+        # to shares only noted, and counted a window of both twice. By the windows' start, as before)
+        for mode, word in (("on", "今天"), ("paper", "今天（只记录，没真买）")):
+            mine = [r for r in recs.values() if r.get("mode") == mode and day_of(int(r.get("start_ms") or 0)) == today and filled(r) > DUST]
+            if mine:
+                done = [r for r in mine if r.get("pnl") is not None]
+                lines.append(f"{word}：{len(mine)} 场买到 {sum(filled(r) for r in mine):g} 份，成本 ${sum(cost(r) for r in mine):,.2f}"
+                             + (f"；已结算 {len(done)} 场 {money(sum(float(r['pnl']) for r in done))}" if done else ""))
         last = sorted((r for r in recs.values() if filled(r) > DUST), key=lambda r: -int(r.get("start_ms") or 0))[:5]
         for r in last:
             lines.append(f"  {bj(int(r['start_ms']))} {(RULE_OF.get(r['rule']) or RULES[0]).name} 买{'涨' if r['side'] == 'up' else '跌'} "

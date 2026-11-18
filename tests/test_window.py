@@ -643,6 +643,60 @@ async def run():
                                  "Predict 起点价（startPrice）：100,000.5000",
                                  "卡片：起点 K 线 100,000.0000；定价用的起点 100,000.5000（Predict 起点价）；两者差 +0.001%"], said
     assert (await bbot.cmd_market(m.Request("/market", [], 1, 0, 42))).startswith("用法：/market ") and "没有名字含" in await bbot.cmd_market(m.Request("/market", ["没有这个"], 1, 0, 42))
+    # 1.154.26: a missing start price is asked for every 5 s after the window's start only where the figure may come (GraphQL
+    # answering for the kind, REST gave one within a day — or the kind has not been asked a minute's worth yet); a kind found to
+    # give none, every STRIKE_UNSEEN_SECONDS — 11-18: GraphQL refused and the REST records carrying none, twenty-odd cards'
+    # details were read every 5 s for three minutes after each quarter hour
+    asked = []
+    async def no_strike(slug, mid, eager=False):
+        asked.append(eager)
+        return None
+    kept_strike, kept_markets, kept_unlikely = bbot.predict.strike, dict(bbot.predict.markets), bbot.predict.strike_unlikely
+    bbot.predict.strike, bbot.predict.markets[bspec.slug] = no_strike, ({"id": "55"}, 0.0)
+    bbot.predict.strikes.pop(bspec.slug, None)
+    in_window, real_mono, clock = bspec.start_ms + 60_000 + 1_000, time.monotonic, [0.0]
+    time.monotonic = lambda: real_mono() + clock[0]
+    try:
+        for unlikely, every in ((False, m.PREDICT_STRIKE_EAGER_SECONDS), (True, m.Bot.STRIKE_UNSEEN_SECONDS)):
+            bbot.predict.strike_unlikely = lambda slug, unlikely=unlikely: unlikely
+            btc.times["strike"], before = -1e9, len(asked)
+            for step in range(0, 180, 5):  # the three minutes after the start, the card refreshed every 5 s
+                clock[0] += 5
+                await bbot.updown_strike(btc, in_window)
+            assert len(asked) - before == -(-180 // every) and all(asked), (unlikely, len(asked) - before)
+        assert (m.PREDICT_STRIKE_EAGER_SECONDS, m.Bot.STRIKE_UNSEEN_SECONDS) == (5, 75)  # 36 reads a window where it may come, 3 where it does not
+    finally:
+        time.monotonic = real_mono
+        bbot.predict.strike, bbot.predict.strike_unlikely = kept_strike, kept_unlikely
+        bbot.predict.markets.clear(); bbot.predict.markets.update(kept_markets)
+    # ...and which kinds those are (PredictFeed.strike_unlikely): by this process's own tries, not merely "none seen yet" — after a
+    # restart nothing has been seen for any kind, and the first window's figure is asked for as eagerly as ever
+    import types
+    feed = m.PredictFeed.__new__(m.PredictFeed)
+    feed.config, feed.types, feed.no_strike, feed.graphql_until = types.SimpleNamespace(predict_graphql=False), {}, set(), 0.0
+    feed.strike_seen, feed.strike_tried, feed.strikes, feed.category_raw, feed.market_meta = {}, {}, {}, {}, {}
+    answers = {"price": None}
+    async def details(market_id):
+        return {"start_price": answers["price"]} if answers["price"] else {}
+    async def no_fetch(url, *a, **k):
+        raise m.RemoteError("HTTP 404")
+    feed.market_details, feed.fetch = details, no_fetch
+    slug = "xau-updown-15m-1794867300"
+    assert not feed.strike_possible(slug) and not feed.strike_unlikely(slug), "a fresh start: asked eagerly"
+    real_mono2, tick = time.monotonic, [0.0]
+    time.monotonic = lambda: real_mono2() + tick[0]
+    try:
+        for n in range(1, m.PredictFeed.STRIKE_TRIES + 1):
+            tick[0] += m.PREDICT_STRIKE_EAGER_SECONDS + 1
+            assert await feed.strike(slug, "901", eager=True) is None
+            assert feed.strike_unlikely(slug) == (n >= m.PredictFeed.STRIKE_TRIES), n
+        assert feed.strike_unlikely("xau-updown-15m-1794868200") and not feed.strike_unlikely("btc-updown-15m-1794868200"), "by the kind, each its own"
+        answers["price"] = m.D("4012.5")  # one found: the kind's figure does come — eager again, and for a day whatever the tries
+        tick[0] += m.PREDICT_STRIKE_EAGER_SECONDS + 1
+        assert await feed.strike(slug, "901", eager=True) == m.D("4012.5")
+        assert feed.strike_possible(slug) and not feed.strike_unlikely(slug) and feed.strike_tried == {}
+    finally:
+        time.monotonic = real_mono2
     btc.strike = None
     # settled on the pair's 1-minute closes: the end 0.011% over the start is 涨; one within 0.01% is left to Predict
     closes[bspec.end_ms] = "100011.00"
