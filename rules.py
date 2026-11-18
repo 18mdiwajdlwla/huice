@@ -77,6 +77,17 @@ STATUS_RUSH_S, STATUS_RUSH_MS, RUSH_READS_MAX = 0.25, 20_000, 240
 # and sends the pairs of the windows listed at that quarter hour; one race was lost by some 25 ms.
 QUIET_BEFORE_MS, QUIET_AFTER_MS = 1_000, 15_000
 GC_BEFORE_MS = 5_000  # ...and from this long before the moment to the end of those seconds no automatic garbage collection (gc_guard)
+# 1.154.24 — the same in a window's course (the user: "这五个开盘后，盘中的优先级也是最高的" — gold's four shut quarter hours and the
+# reopen's first, bought on while the index stands on the rule's side of the start). What a look in the course waits for is the
+# index, not the book: Binance pushes it each second and the looks came each second too, of their own — half a second, on
+# average, between the index that put the side ahead and the look that saw it. Now the index's arrival is the look (priced). And
+# the rest of the bot keeps out of the way in the course's first seconds as it does at the makers' moment — the course begins
+# LIVE_START_MS after a quarter hour, where the pre-open mode signs the windows just listed, and at the reopen the index has
+# gapped by then — and for as long as an offer in hand waits for matching to open (rush), however late after the moment it showed
+COURSE_QUIET_MS = 12_000  # the course's first seconds: from QUIET_BEFORE_MS before it begins to this long after
+RUSH_QUIET_MS = 3_000     # an offer in hand, matching not open yet: the others asked to wait this long at a time, and asked again
+INDEX_FRESH_MS = 1_500    # an index older than this as it comes (a socket catching up after a stall: frames of seconds ago, one after
+#                           another) brings no look of its own — the next second's look judges on the newest, as before
 EAGER = sys.version_info >= (3, 12)  # asyncio.Task(eager_start=True): a coroutine run at once, up to its first real wait
 
 
@@ -638,6 +649,15 @@ def speed_stats(recs: dict[str, dict], since_ms: int) -> dict | None:
             "best": {"lag": min(lag, default=None), "own": min(own, default=None), "trip": min(trip, default=None)}}
 
 
+def course_speed(recs: dict[str, dict], since_ms: int) -> dict | None:
+    """The real orders of the windows' course that the index brought, against the clock since ``since_ms`` (1.154.24), None for
+    none: how many, and in ms the median and the least of the index's arrival to the request leaving (RuleTaker.priced: the
+    index's arrival is the look; it used to wait for the taker's own next second)."""
+    took = [int(o["sent_wall"]) - int(o["index_wall"]) for r in recs.values() if r.get("mode") == "on" and int(r.get("start_ms") or 0) >= since_ms
+            for o in r.get("orders") or [] if o.get("live") and o.get("index_wall") and o.get("sent_wall")]
+    return {"orders": len(took), "own": statistics.median(took), "best": min(took)} if took else None
+
+
 def review(recs: dict[str, dict], settings: Any, now_ms: int) -> dict | None:
     """The review page's 规则吃单: each rule's totals (windows bought, shares, cost, settled P&L, wins and losses, open), the
     paper and the real apart, and the last records; None when nothing is recorded and the mode is off."""
@@ -724,10 +744,11 @@ class RuleStream:
         """(bids, asks, when) as last pushed — or read over REST beside the pushes (merge) — however long ago; None for none."""
         return self.books.get(mid)
 
-    def nudge(self, mid: str) -> None:
-        """The taker looks at this market now though its book has not changed (1.154.22: matching just seen open with an offer
-        in hand): marked as a change that has just come — the loop goes round at once for one, mid-tick too (rest_s: REST_SOON_S)."""
-        self.changed.add(mid)
+    def nudge(self, *mids: str) -> None:
+        """The taker looks at these markets now though their books have not changed (1.154.22: matching just seen open with an
+        offer in hand; 1.154.24: the index a window's course is judged by just moved): marked as a change that has just come —
+        the loop goes round at once for one, mid-tick too (rest_s: REST_SOON_S)."""
+        self.changed.update(mids)
         self.arrivals += 1
         self.told()
 
@@ -924,6 +945,10 @@ class RuleTaker:
         self.running = False               # the loop runs (run): only then is a pushed book looked at on the spot
         self.first_ticks = 0               # ticks begun by a pushed book in the turn that brought it (status)
         self.first_tasks: set = set()      # ...those still waiting for something (an order's answer): ended with the taker
+        self.index_looks = 0               # looks at a window in its course that the index's arrival brought (priced, 1.154.24)
+        self.index_late = 0                # ...and the indexes that came too old for one (INDEX_FRESH_MS: a clock apart from Binance's, a stalled socket)
+        self.first_tick = False            # the tick under way was begun by a pushed book or an index (tick_first): what can wait is left to the loop's own
+        self.course_cards: frozenset = frozenset()  # ...the cards whose index such a window hangs on (plan): every other price the bot tells of is none of the taker's
         self.quiet_held = (0.0, 0)         # (monotonic, ms) of quiet_ms as last worked out (asked by every placement of the pre-open mode)
         self.gc_off = False                # the garbage collector held off by this taker now (gc_guard)
         self.verify_error = ""
@@ -1157,9 +1182,58 @@ class RuleTaker:
             return False
         return not self.stream.changed
 
+    def priced(self, keys: Any) -> None:
+        """The index of these cards just moved (the bot's priced(): Binance's index pushed each second, or a read that moved
+        it), 1.154.24. A window in its course is bought while the index stands on the rule's side of its start (live_guard),
+        and the looks that ask came once a second, of their own: half a second, on average, between the index that put the
+        side ahead and the look that saw it — the offers a slower taker finds gone. Now the card's window in its course is
+        looked at as the index comes — in the very turn of the loop that brought it while the taker goes first (nudge:
+        pushed_now), at the loop's next turn otherwise — and its order leaves then, if the book in hand has an offer at the
+        price. Not a window bought in full, nor twice for one index (the bot tells of a move more than once: the push, then
+        the fair values it changed); the look is marked as the index's (w["indexed"]): an order of it carries the index's
+        arrival, not that of a book that came long before (speed_stats, course_speed)."""
+        if not self.running or self.course_cards.isdisjoint(keys):  # (told of every price that moves in the bot: most are no card of a rule's)
+            return
+        now, cards, hit = self.now(), getattr(self.owner, "updowns", None) or {}, []
+        for slug, w in self.track.items():
+            rule = RULE_OF[w["rule"]]
+            # (not a window paused after a refusal: its look would be put off — due — and a tick begun for nothing each second)
+            if w["market"] is None or rule.card not in keys or self.phase(w, now) != "live" or now < w["look_ms"] or self.finished(slug, rule, True):
+                continue
+            card = cards.get(rule.card)
+            # told again for the same index (the push, then the fair values it changed): not looked at twice — but looked at for
+            # the same index once the card has moved on to this window, or got its start (what the first look of a course waits for)
+            seen = (getattr(card, "price", None), getattr(getattr(card, "spec", None), "slug", ""), self.card_line(card))
+            if card is not None and seen == w.get("index_seen"):
+                continue
+            w["index_seen"] = seen
+            if card is not None and now - int(getattr(card, "index_ms", now) or 0) > INDEX_FRESH_MS:
+                self.index_late += 1  # an old index (a socket catching up frame by frame): left to the look of the next second
+                continue
+            hit.append(w)
+        # (nor while no order could go out — the pause, the loss stop, the API's cooldown: the look would stop at the gate)
+        if not hit or (self.settings.mode == "on" and self.block(0.0)) or self.cooling() > 0:
+            return
+        if not self.fast:
+            self.pace(now)  # (a course that has just begun: the taker goes first from this index on, not from its next tick)
+        wall = int(time.time() * 1000)
+        for w in hit:
+            w["indexed"] = wall
+        self.index_looks += 1
+        self.stream.nudge(*(str(w["market"]["id"]) for w in hit))
+
+    @staticmethod
+    def card_line(card: Any) -> Any:
+        """The start a card judges its window by, as it stands (its candle, Predict's own price when it agrees); None for none."""
+        try:
+            return card.line_used() if card is not None else None
+        except Exception:
+            return None
+
     def gc_guard(self, now: int) -> None:
         """No automatic garbage collection from GC_BEFORE_MS before a makers' moment to the end of the seconds around it
-        (quiet_ms: a window this taker can still buy), 1.154.23. A collection of the oldest generation walks every object the
+        (quiet_ms: a window this taker can still buy), 1.154.23 — and so around the beginning of a window's course and while
+        an offer waits for matching to open (1.154.24: quiet_ms's other seconds). A collection of the oldest generation walks every object the
         bot keeps — 220–370 ms measured with the records of 11-18, the whole process stopped — and comes when enough new
         long-lived objects have piled up (an account snapshot of the pre-open mode's is enough): in one of twenty of those
         quarter minutes, by the snapshot's pace. Looked at each tick; let go as the seconds end and when the taker stops."""
@@ -1172,19 +1246,24 @@ class RuleTaker:
             core.GC_WATCH.release()
 
     async def tick_first(self) -> None:
+        self.first_tick = True  # (begun with no tick running or waiting: the lock is its own at once — the mark is this tick's alone)
         try:
             await self.tick()
         except asyncio.CancelledError:
             raise
         except Exception as error:  # (as run notes a tick's failure)
             self.note(core.clean_error(error) or type(error).__name__)
+        finally:
+            self.first_tick = False
 
     def quiet_ms(self, now: int | None = None) -> int:
         """The ms left of the seconds in which the rest of the bot keeps out of the loop's way (1.154.23): around the makers'
         moment — QUIET_BEFORE_MS before it to QUIET_AFTER_MS after — of a window this taker can still buy before its start (real
-        orders, a price set, not bought in full or done with, and nothing that keeps every order back: block). 0 outside them.
-        Asked by the pre-open mode before each pair and by the model trader before each step (LiveBot.rules_quiet): worked out
-        at most every 50 ms."""
+        orders, a price set, not bought in full or done with, and nothing that keeps every order back: block). 1.154.24: and
+        the first seconds of a window's course, for a rule that buys there — QUIET_BEFORE_MS before the course begins
+        (LIVE_START_MS after the start) to COURSE_QUIET_MS after; and while an offer in hand waits for matching to open (rush),
+        RUSH_QUIET_MS at a time. 0 outside them. Asked by the pre-open mode before each pair and by the model trader before
+        each step (LiveBot.rules_quiet): worked out at most every 50 ms."""
         mono = time.monotonic()
         if now is None and mono - self.quiet_held[0] < 0.05:
             return self.quiet_held[1]
@@ -1192,15 +1271,25 @@ class RuleTaker:
         left = 0
         if self.settings.mode == "on":
             for slug, w in self.track.items():
-                at = self.moment(w)
-                if not at or not (at - QUIET_BEFORE_MS <= at_ms < at + QUIET_AFTER_MS) or at_ms >= w["start"] - STOP_MS:
-                    continue
                 rule = RULE_OF[w["rule"]]
-                if self.settings.price(rule.key) <= 0 or self.finished(slug, rule):
+                at, begins = self.moment(w), w["start"] + LIVE_START_MS
+                if at and at - QUIET_BEFORE_MS <= at_ms < at + QUIET_AFTER_MS and at_ms < w["start"] - STOP_MS and self.settings.price(rule.key) > 0:
+                    until, course = at + QUIET_AFTER_MS, False        # the makers' moment
+                elif (begins - QUIET_BEFORE_MS <= at_ms < begins + COURSE_QUIET_MS and self.live_cents(rule) > 0
+                      # (those seconds are of the course's first minute, bought no dearer than before the window: with no price
+                      # there nothing is — nor without the bot's card of the market, which says who is ahead)
+                      and self.settings.price(rule.key) > 0 and (getattr(self.owner, "updowns", None) or {}).get(rule.card) is not None):
+                    until, course = begins + COURSE_QUIET_MS, True    # its course begins
+                elif self.rushing(w):
+                    until, course = at_ms + RUSH_QUIET_MS, False      # an offer in hand, matching not open yet
+                else:
                     continue
-                left = max(left, at + QUIET_AFTER_MS - at_ms)
+                if not self.finished(slug, rule, course):
+                    left = max(left, until - at_ms)
             if left and self.block(0.0):
                 left = 0  # (no order could go out now: nobody waits for it)
+            elif left and self.settings.max_day_usd and self.settings.max_day_usd - spent_on(self.recs, day_of(at_ms), "on") < 1.0:
+                left = 0  # (...nor with the day's cap spent, 1.154.24)
         if now is None:
             self.quiet_held = (mono, left)
         return left
@@ -1208,7 +1297,10 @@ class RuleTaker:
     async def turn(self) -> None:
         """One tick's work: the plan, the pace, every window's look, the orders' sends, a REST read beside the pushes, the follow-ups."""
         now = self.now()
-        if now - self.planned_ms >= PLAN_EVERY_MS:
+        # (1.154.24: the minute's plan — every rule's windows of the day ahead worked out, a millisecond — is the loop's own
+        # tick's, a second on at the most: not on the way of an order a pushed book or an index brought; at once all the same
+        # when there is none yet, or the settings changed)
+        if now - self.planned_ms >= PLAN_EVERY_MS and not (self.first_tick and self.planned_ms):
             self.plan(now)
             self.planned_ms = now
         self.pace(now)
@@ -1217,6 +1309,8 @@ class RuleTaker:
         self.stream.changed &= watched  # a change of a window no longer watched is nobody's to take (1.153.3)
         if self.settings.mode == "off" or self.cooling() > 0:
             self.stream.changed.clear()  # nothing looked at now: the next look reads the book as it stands then
+            for w in self.track.values():
+                w.pop("indexed", None)   # (...nor is it the index's, when it comes)
         if self.settings.mode != "off":
             self.collect = []
             try:
@@ -1500,6 +1594,7 @@ class RuleTaker:
         is one this close to its start (STOP_MS) — or, for a rule that buys in its windows' course too (1.154.14), to its end
         (over). The records past KEEP_DAYS and finished are removed."""
         want: dict[str, tuple[str, int]] = {}
+        self.course_cards = frozenset(r.card for r in RULES if self.live_cents(r) > 0) if self.settings.mode != "off" else frozenset()  # (priced, 1.154.24)
         if self.settings.mode != "off":
             for rule in RULES:
                 course = self.live_cents(rule) > 0  # 1.154.14: bought in the window's course too — followed to LIVE_STOP_MS before its end
@@ -1593,6 +1688,7 @@ class RuleTaker:
         mid = str(w["market"]["id"])
         if now < w["look_ms"]:  # paused (a refusal): a change meanwhile is not one to act on (1.153.3: it kept the loop going round)
             self.stream.changed.discard(mid)
+            w.pop("indexed", None)  # (nor an index that came meanwhile: the look after the pause is not its own, 1.154.24)
             return False
         if mid in self.stream.changed:
             return True
@@ -1625,8 +1721,13 @@ class RuleTaker:
         if not self.due(w, now):
             return
         w["look_wall"], w["fresh"] = int(time.time() * 1000), False
+        # 1.154.24: the index brought this look (priced) — its arrival kept for the order (place), when it is of this moment
+        indexed = int(w.pop("indexed", 0) or 0)
+        w["index_wall"] = indexed if course and 0 <= w["look_wall"] - indexed < 2_000 else 0
         if w["market"] is not None:
-            w["fresh"] = str(w["market"]["id"]) in self.stream.changed  # this look answers a book that just came (speed_stats)
+            # this look answers a book that just came (speed_stats) — not when an index marked its market as changed (however
+            # long ago: a look that came seconds after it — a tick was running — is no answer to either)
+            w["fresh"] = str(w["market"]["id"]) in self.stream.changed and not indexed
             self.stream.changed.discard(str(w["market"]["id"]))  # taken now, whatever this look decides (1.153.3)
             if not course and self.observe(w, rule, now):
                 self.save_watch(slug, w, rule)
@@ -1957,7 +2058,8 @@ class RuleTaker:
                  **({"open_wait": int(w["open_wall"]) - int(w["rush_wall"]), "open_reads": int(w.get("rush_reads") or 0)}
                     if w.get("open_wall") and w.get("rush_wall") and not w.get("open_told") else {}),
                  "seen": float(sum(q for _, q in levels)),  # what the book in hand offered at the price (the order may ask for more)
-                 **({"live": True} if course else {})}  # 1.154.14: placed in the window's course
+                 # 1.154.14: placed in the window's course. 1.154.24: ...by a look the index's arrival brought — when it arrived
+                 **({"live": True, **({"index_wall": int(w["index_wall"])} if w.get("index_wall") else {})} if course else {})}
         w["open_told"] = True  # (the wait for matching to open is the first order's)
         rec["orders"].append(order)
         self.save(rec)
@@ -2236,18 +2338,58 @@ class RuleTaker:
         clock = lambda minutes: f"{minutes % 1440 // 60:02d}:{minutes % 60:02d}"
         hours = "、".join(f"{clock(a - WARM_MS // 60_000)}–{clock(b)}" for a, b in s.fast) if s.fast else ""
         lead = int(getattr(s, "lead_minutes", 0) or 0)
+        in_course = any(self.live_cents(r) > 0 for r in RULES)
         when = "、".join(x for x in (f"每天 {hours}（每秒检查时段和它前 {WARM_MS // 60_000} 分钟）" if hours else "", "对手挂单时刻前后和盘中吃单时" if lead or not hours else "盘中吃单时") if x)
         what = ("盘口一推到就在同一回合里看、签单、把请求交出去（不等主循环轮到）" if EAGER else f"当场处理需要 Python 3.12（现在 {sys.version_info[0]}.{sys.version_info[1]}）：盘口到了仍等主循环轮到"
-                ) + "；请求走规则吃单自己的线程" + ("；这把 Key 不外借" if self.own_key else "")
-        if lead:
-            what += f"；对手挂单时刻前 {QUIET_BEFORE_MS // 1000} 秒到后 {QUIET_AFTER_MS // 1000} 秒（这一场还能买时），预挂不发新单、不处理账户快照，原策略的整步和每分钟的核对顺延（快车道照常）"
+                ) + ("；盘中的场次，指数一到也当场看（不等下一秒的检查）" if in_course else "") + "；请求走规则吃单自己的线程" + ("；这把 Key 不外借" if self.own_key else "")
+        # (1.154.24: the seconds in which the rest of the bot keeps out of the way — quiet_ms)
+        ways = (([f"对手挂单时刻前 {QUIET_BEFORE_MS // 1000} 秒到后 {QUIET_AFTER_MS // 1000} 秒"] if lead else [])
+                + ([f"盘中开头（开场后 {(LIVE_START_MS - QUIET_BEFORE_MS) // 1000}～{(LIVE_START_MS + COURSE_QUIET_MS) // 1000} 秒）"] if in_course else [])
+                + ["卖单已到而撮合还没开启时"])
+        what += f"；{'、'.join(ways)}（都要这一场还能买），预挂不发新单、不处理账户快照，原策略的整步和每分钟的核对顺延（快车道照常）"
         if self.first_now(now):
             quiet = self.quiet_ms(now)
             state = "现在：优先中" + (f"，其他活儿正在让路（还有 {quiet / 1000:.0f} 秒）" if quiet else "") + (f"；本次启动当场处理 {self.first_ticks} 次" if self.first_ticks else "")
         else:
             wait = s.fast_in(now)
             state = "现在不在优先时段" + (f"，下一次 {bj(now + max(0, wait - WARM_MS), False)} 开始" if wait else "")
-        return f"优先：{when}，规则吃单排最前——{what}｜{state}"
+        if self.index_looks or self.index_late:
+            state += f"；盘中由指数带来的检查 {self.index_looks} 次" + (
+                f"（另有 {self.index_late} 次指数到达时已超过 {INDEX_FRESH_MS / 1000:g} 秒，留给每秒的检查——常见于行情连接卡顿后补发；一直很多就是本机时钟和币安差得远）" if self.index_late else "")
+        ahead = self.first_plan(now)
+        return f"优先：{when}，规则吃单排最前——{what}" + (f"｜{ahead}" if ahead else "") + f"｜{state}"
+
+    def first_plan(self, now: int) -> str:
+        """What the taker goes first for in the day ahead, in a few words (/rules, 1.154.24): the makers' moments still to
+        come — of the windows it buys before their start — and the courses still to run, for the rules that buy there
+        (quarter hours on end told as one stretch)."""
+        s, moments, spans = self.settings, set(), []
+        for w in sorted(self.track.values(), key=lambda w: w["start"]):
+            rule = RULE_OF[w["rule"]]
+            at, end = self.moment(w), self.end_of(w)
+            if at and now < at + QUIET_AFTER_MS and s.price(rule.key) > 0:
+                moments.add(at)
+            if self.live_cents(rule) > 0 and now < end - LIVE_STOP_MS:
+                if spans and spans[-1][1] >= w["start"]:
+                    spans[-1][1] = max(spans[-1][1], end)
+                else:
+                    spans.append([w["start"], end])
+        def told(items: list) -> str:  # (the day named where it changes: a time alone reads as today's)
+            out, day = [], day_of(now)
+            for at, text in items:
+                out.append((bj(at)[:6] if day_of(at) != day else "") + text)
+                day = day_of(at)
+            return "、".join(out)
+        parts = []
+        if moments:
+            shown = sorted(moments)[:8]
+            parts.append("盘前抢单时刻 " + told([(at, bj(at, False)) for at in shown]) + (f" 等 {len(moments)} 个" if len(moments) > len(shown) else ""))
+        if spans:
+            # (a stretch that reaches the end of what is planned may go on beyond it: told by its beginning)
+            whole = (self.planned_ms or now) + HORIZON_MS  # (a window starting before this is in the plan)
+            parts.append("盘中 " + told([(a, f"{bj(a, False)}–{bj(b, False)}" if b < whole else f"{bj(a, False)} 起") for a, b in spans[:4]])
+                         + (f" 等 {len(spans)} 段" if len(spans) > 4 else ""))
+        return "接下来一天：" + "；".join(parts) if parts else ""
 
     def net_line(self) -> str:
         """How far Predict is, in a line (/rules, 1.154.17) — 11-18 02:00: an order that left a tenth of a second after its book came
@@ -2286,9 +2428,11 @@ class RuleTaker:
             return ""
         best = sp.get("best") or {}
         ms = lambda key: "—" if sp.get(key) is None else f"{sp[key]:.0f} ms" + (f"（最快 {best[key]:.0f}）" if best.get(key) is not None else "")
+        cs = course_speed(self.recs, now - 30 * core.DAY_MS)  # 1.154.24: the course's orders the index brought
         return (f"下单速度（近 30 天真实订单 {sp['orders']} 张，{sp['filled']} 张有成交）：盘口变化→推送到达 中位 {ms('lag')}、"
                 f"到达→发出 {ms('own')}" + (f"［其中到达→开始处理 {sp['wake']:.0f} ms］" if sp.get("wake") is not None else "")
-                + f"、发出→应答 {ms('trip')}")
+                + f"、发出→应答 {ms('trip')}"
+                + (f"｜盘中由指数带来的 {cs['orders']} 张：指数到达→发出 中位 {cs['own']:.0f} ms（最快 {cs['best']:.0f}）" if cs else ""))
 
     def status(self) -> str:
         now, s = self.now(), self.settings

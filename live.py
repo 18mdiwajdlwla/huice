@@ -2346,6 +2346,21 @@ class LiveBot(core.Bot):
         except Exception:  # (a figure that cannot be had keeps nobody waiting)
             return 0.0
 
+    def priced(self, keys: Any) -> None:
+        """The cards a price just moved (core.Bot.priced: the express lane looks at them after PRICE_LOOK_DELAY). 1.154.24, the
+        rule taker first: a window it buys in its course is judged by the card's index — told now, in the turn that brought
+        the index, where it used to find out at its own next second (rules.RuleTaker.priced). Its failure is its own: the
+        express lane is told all the same."""
+        if not isinstance(keys, (list, tuple, set, frozenset)):
+            keys = list(keys)  # (told twice: not a generator the first would use up)
+        taker = getattr(self, "rules", None)
+        if taker is not None and getattr(taker, "running", False):
+            try:
+                taker.priced(keys)
+            except Exception as error:
+                self.log_limited("rules-priced", f"规则吃单按指数检查出错：{core.clean_error(error) or type(error).__name__}")
+        super().priced(keys)
+
     async def sim_step(self, now_ms: int) -> Any:
         if not self.sim_step_due():
             return False

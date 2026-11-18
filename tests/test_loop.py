@@ -461,6 +461,22 @@ async def the_rule_taker_first():
     assert bot.rules_quiet() == 0.0, "one that is not running: nobody waits"
     bot.rules.running = True
     assert bot.rules_quiet() == 7.0
+    # 1.154.24: a price that moved is told to the rule taker first (its windows in their course hang on the index: looked at
+    # in the turn that brought it), then to the express lane as ever — the taker's failure its own
+    told = []
+    bot.rules.priced = lambda keys: told.append((list(keys), set(bot.price_dirty)))
+    bot.priced(["XAU-15M"])
+    assert told == [(["XAU-15M"], set())] and bot.price_dirty == {"XAU-15M"} and bot.price_look is not None, told
+    bot.rules.priced = lambda keys: 1 / 0
+    bot.priced({"K101"})
+    assert bot.price_dirty == {"XAU-15M", "K101"}
+    bot.rules.running = False
+    bot.rules.priced = lambda keys: told.append("not running")
+    bot.priced(["K101"])
+    assert len(told) == 1
+    bot.rules.running = True
+    await bot.price_look
+    del bot.rules.priced
     # the step: due, and it waits; the express lane does not ask
     due = lambda ago: time.monotonic() - bot.config.sim_seconds - ago
     bot.sim_ran = at = due(0.5)
