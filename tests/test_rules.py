@@ -1731,10 +1731,29 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
                          "how long after the offer showed the order left: the push's lag and the taker's own time")
         status = again.status()
         self.assertIn("抢单记录（最近 2 场，北京时间；“开始被吃 / 被吃光”是卖单出现之后多久，按 Predict 盘口自己的时间戳——抢走它的人有多快）：", status)
-        self.assertRegex(status, r"  11-17 06:15 黄金休市 4 档：≤60¢ 的卖单 \d\d:\d\d:\d\d 出现（开场前 300 分钟），最多 150 份；0\.35 秒后开始被吃、0\.35 秒后被吃光；"
+        self.assertRegex(status, r"  11-17 06:15 黄金休市 4 档：≤60¢ 的卖单 \d\d:\d\d:\d\d\.\d{3} 出现（开场前 300 分钟），最多 150 份；0\.35 秒后开始被吃、0\.35 秒后被吃光；"
                                  r"下了 300 份，没买到｜第 1 张 要 300 成交 0（当时盘口上 150 份）：出现后 \d+ ms 发出、推送 \d+ ms、到达→发出 \d+ ms、往返 \d+ ms")
-        self.assertRegex(status, r"  11-17 06:00 黄金休市 4 档：≤60¢ 的卖单 \d\d:\d\d:\d\d 出现（开场前 300 分钟），最多 195\.4 份；0\.40 秒后开始被吃、1\.20 秒后被吃光；"
+        self.assertRegex(status, r"  11-17 06:00 黄金休市 4 档：≤60¢ 的卖单 \d\d:\d\d:\d\d\.\d{3} 出现（开场前 300 分钟），最多 195\.4 份；0\.40 秒后开始被吃、1\.20 秒后被吃光；"
                                  r"买到 212/300 份｜第 1 张 要 300 成交 212（当时盘口上 195\.4 份）：出现后 \d+ ms 发出")
+        # 1.154.17: the races in a line — how regular the makers' moment is (to time an order to it), how soon the first taker was
+        # on the offers, how soon after their showing this taker's orders left
+        self.assertRegex(status, r"  近 30 天：卖单出现在整刻钟后 中位 \d+\.\d\d 秒（\d+\.\d\d～\d+\.\d\d，2 场）；最快的人在出现后 中位 0\.38 秒下手（最快 0\.35）；"
+                                 r"我们的单在出现后 中位 \d+ ms 发出（最快 \d+），再加半个往返才到")
+        self.assertEqual(R.race_summary([]), "")
+        # ...and how far Predict is: the taker's own requests' round trips, the handshake of new connections, the site they enter at
+        self.assertEqual(again.net_line(), "", "nothing measured yet (the tests' stand-in client keeps no clock)")
+        again.api.base, again.api.trips = "https://api.predict.fun/v1", [("GET", 310.0), ("GET", 290.0), ("GET", 350.0), ("POST", 330.0), ("POST", 300.0)]
+        m.http_net("api.predict.fun")["connect"].extend([12.0, 9.0, 15.0])
+        m.http_net("api.predict.fun")["edge"] = "8a1b2c3d4e5f-AMS"
+        try:
+            self.assertEqual(again.net_line(), "网络（不含排队）：机器人在 未知区域｜到 api.predict.fun 新建连接 中位 12 ms（最快 9），是 2～3 个来回｜入口 8a1b2c3d4e5f-AMS"
+                                               "｜读一次 中位 310 ms（最快 290）｜下单 / 撤单一次 中位 315 ms（最快 300）"
+                                               "｜入口很近、请求却慢：Predict 的服务器离这个区域远（或它处理慢）——换一个部署区域试：在那个区域跑 tools/predict_latency.py 对比")
+            self.assertIn(again.net_line(), again.status())
+            again.api.trips = [("GET", 42.0), ("POST", 61.0)]
+            self.assertTrue(again.net_line().endswith("｜读一次 中位 42 ms（最快 42）｜下单 / 撤单一次 中位 61 ms（最快 61）"), "near: no hint")
+        finally:
+            m.HTTP_NET.pop("api.predict.fun", None)
         # the month's medians count the windows whose watch is over: none yet — then both
         self.assertEqual(R.watch_stats(again.recs, "gold_shut", "on", 0)["watched"], 0)
         clock.ms = GOLD_0600 + 900_000 - R.STOP_MS
@@ -1751,6 +1770,58 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
                                 {"shares": 46.0, "filled": 46.0, "paper": False, "seen": None, "fresh": None, "after": None, "lag": 252, "own": 4_100, "trip": 366}]})
         self.assertEqual(text, "11-17 06:00 黄金休市 4 档：卖单出现的时刻没有记到（重启前的，或没看到规则价以内的卖单）；买到 212/212 份"
                                "｜第 1 张 要 166 成交 166：推送 240 ms、到达→发出 96 ms、往返 350 ms｜第 2 张 要 46 成交 46：推送 252 ms、到达→发出 4100 ms、往返 366 ms")
+
+
+    async def test_the_latency_probe_reads_and_never_orders(self):
+        """1.154.17 — ``python -u rules.py latency``: how far Predict is from the machine it runs on (to compare deploy regions) — on
+        the bot's own request path, reads alone: a market found, its book read ten times, the push connection's ping and first
+        book. A refusal (no key) is still a way there and back, and said so."""
+        asked, lines, plain_get, plain_ws = [], [], m._http_get, m.ws_connect
+
+        def get(url, payload=None, timeout=15, headers=None):
+            asked.append((url, payload, dict(headers or {})))
+            if "/categories/" in url:
+                return json.dumps({"success": True, "data": {"slug": url.rsplit("/", 1)[1], "markets": [{"id": 4242}]}}).encode()
+            return json.dumps({"success": True, "data": {"bids": [], "asks": []}}).encode()
+
+        class Socket:
+            sent: list = []
+
+            async def ping(self):
+                done = asyncio.get_running_loop().create_future()
+                done.set_result(0.01)
+                return done
+
+            async def send(self, text): self.sent.append(json.loads(text))
+            async def recv(self): return json.dumps({"type": "M", "topic": "predictOrderbook/4242", "data": {"version": 1, "bids": [], "asks": []}})
+            async def close(self): self.sent.append("closed")
+
+        async def connect(url, headers):
+            self.assertEqual((url, headers), (m.PREDICT_WS_URL, {"x-api-key": "probe-key"}))
+            return Socket()
+        m._http_get, m.ws_connect = get, connect
+        sleep, asyncio.sleep = asyncio.sleep, lambda s, *a: sleep(0, *a)  # (the probe's pauses between its reads)
+        try:
+            found = await R.latency_probe("probe-key", lines.append, rounds=4)
+            self.assertEqual((len(found["reads"]), len(found["pings"]), found["ws_book"] is not None, found["refused"]), (4, 5, True, []))
+            self.assertTrue(all(payload is None and headers == {"x-api-key": "probe-key"} for _, payload, headers in asked), "reads alone: no request carries a body")
+            self.assertRegex(asked[0][0], r"^https://api\.predict\.fun/v1/categories/btc-updown-15m-\d+$")
+            self.assertEqual({url for url, _, _ in asked[1:]}, {"https://api.predict.fun/v1/markets/4242/orderbook"})
+            self.assertEqual(Socket.sent, [{"method": "subscribe", "requestId": 1, "params": ["predictOrderbook/4242"]}, "closed"])
+            text = "\n".join(lines)
+            self.assertIn("Predict 网络延迟探测（只读，不下单）｜区域 未知", lines[0])
+            self.assertRegex(text, r"读盘口 4 次（同一条连接）：中位 \d+ ms（最快 \d+，最慢 \d+）")
+            self.assertRegex(text, r"推送连接：握手 \d+ ms｜ping 来回 中位 \d+ ms（最快 \d+，最慢 \d+）｜订阅到第一份盘口 \d+ ms")
+
+            def refuse(url, payload=None, timeout=15, headers=None):
+                raise m.RemoteError("HTTP 401: authorization error")
+            m._http_get, lines[:] = refuse, []
+            found = await R.latency_probe("", lines.append, rounds=3)
+            self.assertEqual((found["reads"], len(found["refused"])), ([], 3))
+            self.assertIn("｜没有设置 API Key：可能被拒绝", lines[0])
+            self.assertRegex("\n".join(lines), r"读盘口被拒绝（HTTP 401: authorization error：没带 Key 或 Key 不对），3 次被拒的应答来回 中位 \d+ ms")
+        finally:
+            m._http_get, m.ws_connect, asyncio.sleep = plain_get, plain_ws, sleep
 
 
     async def test_off_finishes_what_is_open_and_plans_nothing(self):

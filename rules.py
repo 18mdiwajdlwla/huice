@@ -469,7 +469,7 @@ def races(recs: dict[str, dict], mode: str, since_ms: int) -> list[dict]:
         rows.append({
             "slug": r.get("slug"), "rule": r.get("rule"), "name": rule.name if rule else str(r.get("rule")), "window": r.get("name"),
             "start_ms": int(r.get("start_ms") or 0), "cents": int(seen.get("cents") or r.get("cents") or 0),
-            "offer_at": shown or int(seen.get("offer_ms") or 0),
+            "offer_at": shown or int(seen.get("offer_ms") or 0), "stamped": bool(shown),
             "lead_min": round((int(r.get("start_ms") or 0) - int(seen["offer_ms"])) / 60_000, 1) if seen.get("offer_ms") else None,
             "peak": float(seen.get("offer_max") or 0), "cut_ms": gap("cut"), "gone_ms": gap("gone"), "open": bool(seen.get("open")),
             "asked": round(sum(float(o.get("shares") or 0) for o in orders), 4), "bought": round(sum(float(o.get("filled") or 0) for o in orders), 4),
@@ -486,7 +486,7 @@ def races(recs: dict[str, dict], mode: str, since_ms: int) -> list[dict]:
 def race_text(row: dict) -> str:
     """A window's race in a line (/rules)."""
     sec = lambda ms: f"{ms / 1000:.2f} 秒"
-    clock = lambda ms: dt.datetime.fromtimestamp(ms / 1000, core.BEIJING).strftime("%H:%M:%S")
+    clock = lambda ms: dt.datetime.fromtimestamp(ms / 1000, core.BEIJING).strftime("%H:%M:%S") + f".{ms % 1000:03d}"  # (1.154.17: to the ms — how regular the makers are)
     text = f"{bj(row['start_ms'])} {row['name']}："
     if row["offer_at"]:
         text += (f"≤{row['cents']}¢ 的卖单 {clock(row['offer_at'])} 出现" + (f"（开场前 {row['lead_min']:g} 分钟）" if row["lead_min"] is not None else "")
@@ -510,6 +510,24 @@ def race_text(row: dict) -> str:
         text += (f"｜第 {i} 张 要 {o['shares']:g} 成交 {o['filled']:g}" + (f"（当时盘口上 {o['seen']:g} 份）" if o["seen"] else "")
                  + ("：" + "、".join(parts) if parts else ""))
     return text
+
+
+def race_summary(rows: list[dict]) -> str:
+    """The races in a line (1.154.17): how regular the makers' moment is — the offers' showing, by Predict's own stamps, as seconds
+    after the quarter hour: its median and its range (regular to a tenth of a second, an order can be timed to it instead of
+    waiting for the push) — how soon the first taker was on them, and how soon after their showing this taker's orders left."""
+    mid = lambda xs: statistics.median(xs)
+    marks = [(r["offer_at"] % 900_000) / 1000 for r in rows if r.get("stamped")]
+    cuts = [r["cut_ms"] / 1000 for r in rows if r.get("cut_ms") is not None and r.get("stamped")]
+    ours = [o["after"] for r in rows for o in r["orders"] if o.get("after") is not None and o.get("fresh") is not False]
+    parts = []
+    if marks:
+        parts.append(f"卖单出现在整刻钟后 中位 {mid(marks):.2f} 秒（{min(marks):.2f}～{max(marks):.2f}，{len(marks)} 场）")
+    if cuts:
+        parts.append(f"最快的人在出现后 中位 {mid(cuts):.2f} 秒下手（最快 {min(cuts):.2f}）")
+    if ours:
+        parts.append(f"我们的单在出现后 中位 {mid(ours):.0f} ms 发出（最快 {min(ours):.0f}），再加半个往返才到")
+    return "；".join(parts)
 
 
 def course_part(rec: dict) -> tuple[float, float, float | None]:
@@ -1909,6 +1927,36 @@ class RuleTaker:
             text += "：推送一有变化就看，另外每 30 秒读一次、开场前 15 分钟每 2 秒"
         return text + moment + key
 
+    def net_line(self) -> str:
+        """How far Predict is, in a line (/rules, 1.154.17) — 11-18 02:00: an order that left a tenth of a second after its book came
+        found the offers gone; what was left of the half second was the way there and back. The region the bot runs in (Railway's
+        variable), the handshake of its new connections to Predict's host (TCP + TLS: two or three round trips to whatever
+        answers there), the site an answer came through (cf-ray), and this taker's own requests' round trips — the request alone,
+        not its wait for the key's pace. "" before any."""
+        host = core.urllib.parse.urlsplit(str(getattr(self.api, "base", "") or "")).hostname or ""
+        net = core.HTTP_NET.get(host) or {}
+        trips = list(getattr(self.api, "trips", ()) or ())
+        reads, writes = [ms for method, ms in trips if method == "GET"], [ms for method, ms in trips if method != "GET"]
+        if not reads and not writes and not net.get("connect"):
+            return ""
+        spread = lambda xs: f"中位 {statistics.median(xs):.0f} ms（最快 {min(xs):.0f}）"
+        connect = list(net.get("connect") or ())
+        parts = [f"机器人在 {os.environ.get('RAILWAY_REPLICA_REGION') or '未知区域'}"]
+        if connect:
+            parts.append(f"到 {host} 新建连接 {spread(connect)}，是 2～3 个来回")
+        if net.get("edge"):
+            parts.append(f"入口 {net['edge']}")
+        if reads:
+            parts.append(f"读一次 {spread(reads)}")
+        if writes:
+            parts.append(f"下单 / 撤单一次 {spread(writes)}")
+        hint = ""
+        if reads and statistics.median(reads) >= 150:
+            near = connect and statistics.median(connect) < 60
+            hint = ("｜入口很近、请求却慢：Predict 的服务器离这个区域远（或它处理慢）" if near else "｜一次请求这么久，多半是离 Predict 的服务器远") \
+                   + "——换一个部署区域试：在那个区域跑 tools/predict_latency.py 对比"
+        return "网络（不含排队）：" + "｜".join(parts) + hint
+
     def speed_line(self, now: int) -> str:
         """The real orders against the clock, in a line (/rules, 1.154.13; the fastest of each, 1.154.15); "" before any."""
         sp = speed_stats(self.recs, now - 30 * core.DAY_MS)
@@ -1935,6 +1983,8 @@ class RuleTaker:
             lines.append(self.fast_line(now))
             if speed := self.speed_line(now):
                 lines.append(speed)
+            if net := self.net_line():
+                lines.append(net)
         for market, name in MARKET_NAMES.items():
             lines.append(f"{name}：{'开' if s.on(market) else '关'}" + (f"｜每场最多 {s.shares_of(market):g} 份" if s.on(market) else "（这个市场的规则都不做）"))
             if not s.on(market):
@@ -1963,6 +2013,8 @@ class RuleTaker:
             # 1.154.16: each window's race, where the medians above are a month's — and there from the moment an offer shows, hours
             # before the window whose end the medians wait for
             lines.append(f"抢单记录（最近 {len(rows)} 场，北京时间；“开始被吃 / 被吃光”是卖单出现之后多久，按 Predict 盘口自己的时间戳——抢走它的人有多快）：")
+            if summary := race_summary(races(recs, s.mode, now - 30 * core.DAY_MS)):
+                lines.append(f"  近 30 天：{summary}")
             lines.extend("  " + race_text(row) for row in rows)
         today = day_of(now)
         mine = [r for r in recs.values() if day_of(int(r.get("start_ms") or 0)) == today and filled(r) > DUST]
@@ -1979,3 +2031,88 @@ class RuleTaker:
         if self.error:
             lines.append(f"最近问题：{self.error}")
         return "\n".join(lines)
+
+
+# --- how far Predict is from wherever this runs (1.154.17) ------------------------------------------------------------------------
+async def latency_probe(key: str, out: Callable[[str], None] = print, rounds: int = 10) -> dict:
+    """``python -u rules.py latency`` — read-only, no order: the way to Predict from the machine this runs on, to be compared
+    between deploy regions (11-18: an order that left a tenth of a second after its book came lost the race; the other four
+    tenths were the network). On the bot's own request path: a first request (a new connection: its handshake), then
+    ``rounds`` reads of an order book on that connection; the push connection's handshake, the library's ping there and back,
+    and a subscription's first book. Run it as a service of its own in the region to try (start command
+    ``python -u rules.py latency``, PREDICT_API_KEY or RULE_API_KEY set) and compare its "读盘口" with the 网络 line of the
+    running bot's /rules. What it measured, for the tests."""
+    host = core.urllib.parse.urlsplit(core.PREDICT_REST).hostname or ""
+    headers = {"x-api-key": key} if key else {}
+    spread = lambda xs: f"中位 {statistics.median(xs):.0f} ms（最快 {min(xs):.0f}，最慢 {max(xs):.0f}）" if xs else "没量到"
+    found: dict = {"region": os.environ.get("RAILWAY_REPLICA_REGION") or "", "reads": [], "pings": [], "first": None, "ws_open": None, "ws_book": None}
+    out(f"Predict 网络延迟探测（只读，不下单）｜区域 {found['region'] or '未知'}｜版本 {core.VERSION}" + ("" if key else "｜没有设置 API Key：可能被拒绝"))
+    card = next((c for c in core.WINDOW_UPDOWN_MARKETS if c.stem == "btc" and c.minutes == 15), core.WINDOW_UPDOWN_MARKETS[0])
+    now = int(time.time() * 1000)
+    slug, market_id = card.slug_of(now - now % card.window_ms), ""  # the BTC quarter hour running now: a market that is there
+    try:
+        began = time.perf_counter()
+        answer = json.loads(await core.predict_blocking(core._http_get, f"{core.PREDICT_REST}/categories/{slug}", None, 10, headers))
+        found["first"] = (time.perf_counter() - began) * 1000
+        markets = (answer.get("data", answer) if isinstance(answer, dict) else {}).get("markets") or []
+        market_id = str(markets[0].get("id") or "") if markets else ""
+        out(f"第一次请求（含新建连接）{found['first']:.0f} ms｜市场 {slug} → {market_id or '没找到'}")
+    except Exception as error:
+        out(f"读市场失败：{core.clean_error(error) or type(error).__name__}")
+    path = f"/markets/{market_id}/orderbook" if market_id else f"/categories/{slug}"
+    refused: list[float] = []  # requests Predict answered with a refusal: there and back all the same
+    why = ""
+    for _ in range(rounds):
+        began = time.perf_counter()
+        try:
+            await core.predict_blocking(core._http_get, core.PREDICT_REST + path, None, 10, headers)
+            found["reads"].append((time.perf_counter() - began) * 1000)
+        except Exception as error:
+            why = core.clean_error(error) or type(error).__name__
+            if why.startswith("HTTP "):
+                refused.append((time.perf_counter() - began) * 1000)
+        await asyncio.sleep(0.4)  # (well inside a key's pace)
+    found["refused"] = refused
+    net = core.HTTP_NET.get(host) or {}
+    connect = list(net.get("connect") or ())
+    out((f"读盘口 {len(found['reads'])} 次（同一条连接）：{spread(found['reads'])}" if found["reads"] or not refused else
+         f"读盘口被拒绝（{why}：没带 Key 或 Key 不对），{len(refused)} 次被拒的应答来回 {spread(refused)}——也是一次往返，可以拿来比")
+        + (f"｜新建连接（TCP+TLS，2～3 个来回）{spread(connect)}" if connect else "") + (f"｜入口 {net['edge']}" if net.get("edge") else "")
+        + (f"｜另有读取失败：{why}" if why and found["reads"] else ""))
+    try:
+        began = time.perf_counter()
+        ws = await core.ws_connect(core.PREDICT_WS_URL, headers)
+        found["ws_open"] = (time.perf_counter() - began) * 1000
+        try:
+            for _ in range(5):
+                began = time.perf_counter()
+                await asyncio.wait_for(await ws.ping(), 5)
+                found["pings"].append((time.perf_counter() - began) * 1000)
+                await asyncio.sleep(0.2)
+            if market_id:
+                began = time.perf_counter()
+                await ws.send(json.dumps({"method": "subscribe", "requestId": 1, "params": [f"predictOrderbook/{market_id}"]}))
+                while time.perf_counter() - began < 5:
+                    frame = json.loads(await asyncio.wait_for(ws.recv(), 5))
+                    if isinstance(frame, dict) and frame.get("type") == "M" and str(frame.get("topic") or "").startswith("predictOrderbook/"):
+                        found["ws_book"] = (time.perf_counter() - began) * 1000
+                        break
+        finally:
+            await ws.close()
+        out(f"推送连接：握手 {found['ws_open']:.0f} ms｜ping 来回 {spread(found['pings'])}"
+            + (f"｜订阅到第一份盘口 {found['ws_book']:.0f} ms" if found["ws_book"] is not None else ""))
+    except Exception as error:
+        out(f"推送连接失败：{core.clean_error(error) or type(error).__name__}")
+    out("怎么看：把这里的“读盘口”中位数和线上机器人 /rules 里“网络”一行的“读一次”比——哪个区域小，哪个区域离 Predict 近；"
+        "下单的往返和它差不多。测完可以把这个服务删掉。")
+    return found
+
+
+if __name__ == "__main__":
+    import sys
+    if sys.argv[1:2] == ["latency"]:
+        asyncio.run(latency_probe(os.environ.get("RULE_API_KEY", "").strip() or os.environ.get("PREDICT_API_KEY", "").strip()))
+        while os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_SERVICE_ID"):
+            time.sleep(3600)  # (a service on Railway is restarted when its process ends: once measured, it waits to be deleted)
+    else:
+        print("用法：python -u rules.py latency   —— 量一下这台机器到 Predict 的网络延迟（只读，不下单；需要 PREDICT_API_KEY 或 RULE_API_KEY）")
