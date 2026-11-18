@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.20"
+VERSION = "1.154.21"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -1057,6 +1057,9 @@ class Config:
     live_orders_page: int = 50         # LIVE_ORDERS_PAGE: orders per page when the account's open list is read (a page is a round trip; 1.112.1)
     predict_rate_per_min: float = 220.0  # PREDICT_RATE_PER_MIN: every API key's requests paced to this many a minute (PredictPacer, 1.154.0); 0 = no pacing
     preopen_api_key: str = ""          # PREOPEN_API_KEY: a second Predict API key for the pre-open mode alone — its own request budget (1.154.0)
+    rule_key_lend: bool = True         # RULE_KEY_LEND: on = while the rule taker is idle its own key (RULE_API_KEY) also carries the orderbook feed's
+    #                                    reads and the pre-open mode's overflow — never from five minutes before the rule taker needs it
+    #                                    (preopen.KeyLending, 1.154.21); off = that key is the rule taker's alone
     rule_api_key: str = ""             # RULE_API_KEY: a Predict API key for the rule taker alone (its reads, orders and push) — its own budget and its own
     #                                    429 cooldown: the bot's key's cooldowns no longer blind it (1.154.12); unset: PREDICT_API_KEY
     predict_book_api_key: str = ""     # PREDICT_BOOK_API_KEY: a Predict API key for the orderbook feed alone (its REST reads and push) — its own budget,
@@ -1282,6 +1285,7 @@ class Config:
             live_orders_page=bounded_int(e, "LIVE_ORDERS_PAGE", 50, 10, 500),
             predict_rate_per_min=float(bounded_int(e, "PREDICT_RATE_PER_MIN", 220, 0, 100_000)),
             preopen_api_key=str(e.get("PREOPEN_API_KEY", "")).strip(),
+            rule_key_lend=not off(e.get("RULE_KEY_LEND", "on")),
             predict_book_api_key=str(e.get("PREDICT_BOOK_API_KEY", "")).strip(),
             rule_api_key=str(e.get("RULE_API_KEY", "")).strip(),
             live_max_open_usd=parse_bounded(e, "LIVE_MAX_OPEN_USD", "500", 1, 100_000_000),
@@ -5650,6 +5654,7 @@ class PredictPacer:
         self.tokens = 0.0
         self.at = time.monotonic()
         self.waited = 0.0  # seconds the reads have waited for a token, in all (/diag)
+        self.waits: collections.deque = collections.deque(maxlen=4096)  # (monotonic, seconds) of each request that waited for its token (waited_last, 1.154.21)
         self.sent: collections.deque = collections.deque(maxlen=4096)  # monotonic times of the requests let through (/diag: the key's minute)
         self.limits: collections.deque = collections.deque(maxlen=200)  # (monotonic, the minute's count then) at each 429 on the key (note_429)
 
@@ -5658,13 +5663,15 @@ class PredictPacer:
         self.tokens = min(self.BURST, self.tokens + (now - self.at) * self.per_min / 60.0)
         self.at = now
 
-    async def take(self, write: bool = False, low: bool = False) -> None:
+    async def take(self, write: bool = False, low: bool = False, leave: float = 0.0) -> None:
         """A token for one request: a read waits for a whole one; an order or a cancel (``write``) may borrow up to a burst ahead;
         a ``low`` read (1.154.9: the orderbook feed's — its rounds ask for dozens at once) leaves LOW_RESERVE behind, so the
         trader's reads on the same key go first: 11-17 14:41, 主 Key 220 次 a minute, the trader's sync (its order reads, the
-        minute's positions pages) queued 22 s behind the book rounds."""
+        minute's positions pages) queued 22 s behind the book rounds. ``leave`` (1.154.21): that many more left behind — the
+        account snapshot's pages on a borrowed key, behind the placements borrowed there (PredictApi.leave)."""
         if self.per_min > 0 and PREDICT_PACING:
-            need = 1.0 - self.BURST if write else 1.0 + (self.LOW_RESERVE if low else 0.0)  # what must be in the bucket for this one to go
+            need = 1.0 - self.BURST if write else 1.0 + (self.LOW_RESERVE if low else 0.0) + max(0.0, leave)  # what must be in the bucket for this one to go
+            began = 0.0
             while True:
                 self.refill()
                 if self.tokens >= need - 1e-9:
@@ -5672,8 +5679,27 @@ class PredictPacer:
                     break
                 wait = (need - self.tokens) * 60.0 / self.per_min
                 self.waited += wait
+                began = began or time.monotonic()
                 await asyncio.sleep(wait)
+            if began:
+                self.waits.append((time.monotonic(), time.monotonic() - began))
         self.sent.append(time.monotonic())
+
+    def spare(self, low: bool = False, leave: float = 0.0) -> bool:
+        """Whether a read (a ``low`` one, leaving ``leave`` more behind) would get its token this instant: what a request that
+        may go out on another key asks before it queues on this one (preopen.Controller.lane, 1.154.21). Always, with the
+        pacing off."""
+        if not (self.per_min > 0 and PREDICT_PACING):
+            return True
+        self.refill()
+        return self.tokens >= 1.0 + (self.LOW_RESERVE if low else 0.0) + max(0.0, leave) - 1e-9
+
+    def waited_last(self, seconds: float = 60.0) -> tuple[int, float]:
+        """(requests that waited for a token, the seconds they waited together) in the last ``seconds``: a key at its pace
+        shows them, an idle one none (/diag: 等节拍)."""
+        cut = time.monotonic() - seconds
+        waits = [w for t, w in self.waits if t >= cut]
+        return len(waits), sum(waits)
 
     def last_minute(self) -> int:
         """The requests let through on the key in the last 60 seconds, every client's (what Predict's per-minute limit counts)."""
@@ -6266,6 +6292,8 @@ class PredictFeed:
         self.absent_at: dict[str, float] = {}                    # item key -> monotonic time its book was answered 404 (1.154.9: PREDICT_ABSENT_SECONDS)
         self.row_asked: dict[str, dict[str, float]] = {}         # item key -> market id -> the same, for a ladder's levels
         self.blocked_until = 0.0                                 # monotonic: after a 429, no request before this
+        self.lend: Any = None                                    # the rule taker's key, lent while that taker is idle (preopen.KeyLending; LiveBot sets it, 1.154.21)
+        self.lent_at: collections.deque = collections.deque(maxlen=4096)  # monotonic times of the reads that went out on it (lent_last)
         self.calls = 0                                           # requests sent (/diag: the request rate on the API key, 1.137.2)
         self.limited: collections.deque = collections.deque(maxlen=500)  # monotonic times of the 429s answered (/diag, 1.138.0)
         self.rate_samples: collections.deque = collections.deque(maxlen=130)  # (monotonic, calls), sampled as the rounds run
@@ -6281,6 +6309,28 @@ class PredictFeed:
         else the bot's PREDICT_API_KEY (the trading clients' too)."""
         return str(getattr(self.config, "predict_book_api_key", "") or "") or self.config.predict_api_key
 
+    def lent_key(self) -> str:
+        """The rule taker's own key, for this read (1.154.21): while that taker is idle (preopen.KeyLending) and its key has a
+        token to spare this instant — the feed's reads go out there, and the bot's key is left to the model trader (its order
+        reads and its sync never queue behind a round of books; and a key shared with anyone else stays further from its
+        limit: 11-17, ninety 429s on it in 2.3 hours, the trader silent twenty seconds each). "" otherwise: the feed's own."""
+        lending = self.lend
+        if lending is None or self.api_key() != self.config.predict_api_key:
+            return ""  # nothing to borrow; or the feed has a key of its own (PREDICT_BOOK_API_KEY): the bot's key carries none of its reads anyway
+        try:
+            lent = lending.key()
+            if not lent or lent == self.api_key() or lending.why() or not predict_pacer(lent).spare(low=True):
+                return ""
+        except Exception:  # (a lender that cannot answer lends nothing)
+            return ""
+        self.lent_at.append(time.monotonic())
+        return lent
+
+    def lent_last(self, seconds: float = 60.0) -> int:
+        """The reads that went out on the borrowed key in the last ``seconds`` (/diag)."""
+        cut = time.monotonic() - seconds
+        return sum(1 for t in self.lent_at if t >= cut)
+
     def rate(self) -> float | None:
         """Requests a second over the last minute (the REST reads: books, markets), or None before two samples."""
         now = time.monotonic()
@@ -6291,13 +6341,45 @@ class PredictFeed:
         return (n1 - n0) / (t1 - t0) if t1 - t0 >= 5 else None
 
     async def fetch(self, url: str, payload: dict | None = None) -> Any:
-        """One Predict request, at most PREDICT_PARALLEL at a time; a 429 (or any retry_after) pauses them all."""
+        """One Predict request, at most PREDICT_PARALLEL at a time; a 429 (or any retry_after) pauses them all. 1.154.21: a
+        REST read goes out on the rule taker's key while that one is idle and has a token to spare (lent_key); refused there
+        before anything was read — that key's limit, a 401 / 403 — it is asked once more on the feed's own key, and nothing
+        more is borrowed for a while (lent_refusal)."""
         left = self.blocked_until - time.monotonic()
         if left > 0:
             raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
-        if url.startswith(PREDICT_REST):
+        rest = url.startswith(PREDICT_REST)
+        lent = self.lent_key() if rest else ""
+        if lent:
+            try:
+                return await self.fetch_with(url, payload, lent)
+            except RemoteError as error:
+                if not self.lent_refusal(error, lent):
+                    raise
+        return await self.fetch_with(url, payload, self.api_key())
+
+    def lent_refusal(self, error: RemoteError, key: str) -> bool:
+        """Whether a read's failure on the borrowed key is that key's refusal of it (fetch): its limit — the rule taker's
+        client pauses with it, as on a 429 of its own — or a 401 / 403; either way the borrowing pauses."""
+        text = str(error)
+        limited = "429" in text
+        with contextlib.suppress(Exception):
+            if error.retry_after or limited:
+                if limited:
+                    predict_pacer(key).note_429()
+                self.lend.refused(time.monotonic() + max(error.retry_after, PREDICT_BACKOFF_SECONDS), limited)
+                return True
+            if "HTTP 401" in text or "HTTP 403" in text:
+                self.lend.off(f"那把 Key 拒绝了请求（{'HTTP 401' if 'HTTP 401' in text else 'HTTP 403'}）")
+                return True
+        return False
+
+    async def fetch_with(self, url: str, payload: dict | None, key: str) -> Any:
+        """fetch, with ``key`` in x-api-key (the feed's own, or the borrowed one): the key's budget, the gate, the request."""
+        rest = url.startswith(PREDICT_REST)
+        if rest:
             # the key's budget, shared with the trading clients (1.154.0) unless the feed has its own (1.154.5); behind their reads (1.154.9)
-            await predict_pacer(self.api_key()).take(low=True)
+            await predict_pacer(key).take(low=True)
         async with self.gate:
             # 1.150.0: a cooldown that began while this request waited for its slot (another read's 429) is honoured here too,
             # as live.py's send() does since 1.138.0: nothing queued behind the PREDICT_PARALLEL in flight goes out into it.
@@ -6305,14 +6387,14 @@ class PredictFeed:
             # once it really goes out, so /diag's rate is the requests sent, not the ones refused
             if (left := self.blocked_until - time.monotonic()) > 0:
                 raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
-            if url.startswith(PREDICT_REST):
+            if rest:
                 self.calls += 1
                 if not self.rate_samples or time.monotonic() - self.rate_samples[-1][0] >= 1:
                     self.rate()  # sampled as the reads go, so /diag has a minute of them
             try:
-                raw = await predict_blocking(_http_get, url, payload, SOURCE_TIMEOUT, self.headers() if url.startswith(PREDICT_REST) else {})
+                raw = await predict_blocking(_http_get, url, payload, SOURCE_TIMEOUT, ({"x-api-key": key} if key else {}) if rest else {})
             except RemoteError as error:
-                if error.retry_after or "429" in str(error):
+                if (error.retry_after or "429" in str(error)) and key == self.api_key():  # (the borrowed key's limit is not this feed's: lent_refusal)
                     self.blocked_until = max(self.blocked_until, time.monotonic() + max(error.retry_after, PREDICT_BACKOFF_SECONDS))
                     if "429" in str(error):
                         self.limited.append(time.monotonic())  # /diag (1.138.0)

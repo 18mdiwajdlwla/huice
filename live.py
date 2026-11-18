@@ -644,6 +644,7 @@ class PredictApi:
     #                        placements, made hours ahead: they leave the burst to the orders that cannot wait (a taker, a cancel)
     low = False            # 1.154.11: this client's reads (and patient orders) leave the key's reserve to the others (PredictPacer.LOW_RESERVE) —
     #                        the pre-open mode's placements and re-reads, behind its account snapshot's pages
+    leave = 0.0            # 1.154.21: ...and this many tokens more: the pre-open mode's snapshot on a borrowed key, behind what else is borrowed there
 
     def __init__(self, base: str, api_key: str, wallet: Wallet | None):
         self.base, self.api_key, self.wallet = base.rstrip("/"), api_key, wallet
@@ -684,7 +685,7 @@ class PredictApi:
         # 1.154.0: the key's request budget first (core.PredictPacer): a read waits for its token; an order or a cancel may borrow a
         # burst ahead of the reads — and Predict's 429, with its twenty seconds of silence for every client on the key, is not met
         write = priority and not self.patient
-        await core.predict_pacer(self.api_key).take(write, low=self.low and not write)
+        await core.predict_pacer(self.api_key).take(write, low=self.low and not write, leave=0.0 if write else self.leave)
         self.calls += 1
         if priority:
             self.writes_inflight += 1
@@ -1858,6 +1859,12 @@ class LiveBot(core.Bot):
         self.handlers["/preopen"] = self.cmd_preopen  # the status, on / off, pause / resume, and the read-only probe of the listing
         self.rules: Any = None  # 规则吃单 (rules.RuleTaker, 1.153.0): started with the process (rules_start), whatever RULE_TAKER says — off it only finishes its records
         self.rules_task: asyncio.Task | None = None
+        # 1.154.21: the rule taker's own key lent while that taker is idle — to the orderbook feed (the bot's key left to the model
+        # trader) and to the pre-open mode (its overflow): one policy for both (preopen.KeyLending, RULE_KEY_LEND)
+        import preopen
+        self.key_lending = preopen.KeyLending(self)
+        if getattr(self, "predict", None) is not None:
+            self.predict.lend = self.key_lending
         self.handlers["/rules"] = self.cmd_rules
 
     # --- readiness -------------------------------------------------------------------------------------------------------
@@ -3351,12 +3358,26 @@ class LiveBot(core.Bot):
             # 1.154.11: judged by the median, not the highest — 17:24, 90 of them at 135～211 (one at 211 kept the note away)
             mid = core.median(sorted(hits)) if hits else 0
             shared = bool(hits) and mid < self.KEY_SHARED_BELOW
-            parts.append(f"{name} {pacer.last_minute()} 次"
-                         + (f"（24 小时内 429 {len(hits)} 次，当时前 60 秒 {min(hits)}～{max(hits)} 次、中位 {mid:g} 次"
-                            + ("，远低于 240：这个 Key 可能还有别的程序或别人在用" if shared else "") + "）" if hits else ""))
+            # 1.154.21: how hard the key is pressed — the requests that waited for its pace in the last minute, and for how long
+            # together (a key at its limit shows them; none and a low count: it is idle) — and what the pre-open mode sent on
+            # the rule taker's key while that one was idle (preopen.Controller.lender)
+            waited, seconds = pacer.waited_last() if hasattr(pacer, "waited_last") else (0, 0.0)
+            notes = [f"等节拍 {waited} 次共 {seconds:.0f} 秒"] if waited else []
+            if key == rule:
+                lent = self.preopen.lent_last() if getattr(self, "preopen", None) is not None and callable(getattr(self.preopen, "lent_last", None)) else 0
+                book = self.predict.lent_last() if callable(getattr(getattr(self, "predict", None), "lent_last", None)) else 0
+                why = self.key_lending.why() if getattr(self, "key_lending", None) is not None and self.key_lending.key() else ""
+                if lent or book:
+                    notes.append("其中" + "、".join(text for n, text in ((book, f"盘口借用 {book} 次"), (lent, f"预挂借用 {lent} 次")) if n))
+                if getattr(self, "key_lending", None) is not None and self.key_lending.key():
+                    notes.append(f"现在不借——{why}" if why else "空闲，借给盘口和预挂用")
+            if hits:
+                notes.append(f"24 小时内 429 {len(hits)} 次，当时前 60 秒 {min(hits)}～{max(hits)} 次、中位 {mid:g} 次"
+                             + ("，远低于 240：这个 Key 可能还有别的程序或别人在用" if shared else ""))
+            parts.append(f"{name} {pacer.last_minute()} 次" + (f"（{'；'.join(notes)}）" if notes else ""))
         if not parts:
             return ""
-        return "、".join(parts) + f"（节流每分钟 {core.PREDICT_RATE['per_min']:g} 次，Predict 默认上限 240）"
+        return "、".join(parts) + f"（节流每分钟 {core.PREDICT_RATE['per_min']:g} 次，Predict 默认上限 240；“等节拍”= 这把 Key 已经用满、请求在排队）"
 
     def live_limited_counts(self) -> str:
         """The 429s answered in the last 24 hours, by client — /diag (1.138.0): whether a key is over Predict's limit. In-memory: a

@@ -1110,6 +1110,29 @@ class RuleTaker:
             self.warm_ms = now
             self.warming = asyncio.create_task(self.warm(), name="rules-warm")
 
+    def busy_in(self, now: int) -> int | None:
+        """How long until the taker needs its key at speed, ms (1.154.21): 0 — it does now; None — not for any window it follows
+        (or it is switched off). At speed: the per-second hours (RULE_FAST_HOURS); a window at the makers' moment, from WARM_MS
+        before it to SPRINT_MS after; a window's last NEAR_MS before its start (its book and status read every FAST_S) and, for
+        a rule that buys there, its course. The pre-open mode asks this before it borrows the key (preopen.Controller.lender):
+        the key is the taker's alone from LEND_BEFORE_MS before any of these."""
+        if self.settings.mode == "off":
+            return None
+        soonest = self.settings.fast_in(now)  # 0 inside the hours, None when there are none
+        if soonest == 0 or self.fast:
+            return 0
+        for w in self.track.values():
+            spans = [(w["start"] - NEAR_MS, self.end_of(w) - LIVE_STOP_MS if self.live_cents(RULE_OF[w["rule"]]) > 0 else w["start"] - STOP_MS)]
+            if at := self.moment(w):
+                spans.append((at - WARM_MS, at + SPRINT_MS))
+            for begin, end in spans:
+                if now >= end:
+                    continue
+                if now >= begin:
+                    return 0
+                soonest = begin - now if soonest is None else min(soonest, begin - now)
+        return soonest
+
     def moment(self, w: dict) -> int:
         """When the makers post on this window (1.154.13): RULE_LEAD_MINUTES before its start; 0 with no such moment set."""
         lead = int(getattr(self.settings, "lead_minutes", 0) or 0) * 60_000
@@ -1915,6 +1938,10 @@ class RuleTaker:
         pushes fared; which key the taker's requests use."""
         s = self.settings
         key = "｜请求用规则吃单自己的 Key（RULE_API_KEY）" if self.own_key else ""
+        lending = getattr(self.owner, "key_lending", None)  # 1.154.21: the key lent while this taker is idle (preopen.KeyLending)
+        if self.own_key and lending is not None and lending.key():
+            why = lending.why()
+            key += "，空闲时借给盘口和预挂（RULE_KEY_LEND）：" + ("现在借出中，要用之前 5 分钟收回" if not why else f"现在不借——{why}")
         lead = int(getattr(s, "lead_minutes", 0) or 0)
         ahead = sorted((self.moment(w), w["start"]) for w in self.track.values() if self.moment(w) and now - self.moment(w) < SPRINT_MS)
         moment = (f"｜对手提前 {lead} 分钟挂单的时刻前后也每秒检查（RULE_LEAD_MINUTES）"
