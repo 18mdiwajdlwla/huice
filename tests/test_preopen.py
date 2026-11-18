@@ -983,7 +983,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(set(by(key)) & shut, key)
             self.assertNotIn(et(18, 0), by(key), "the reopen's first window: quiet 15")
             self.assertTrue({et(16, 45), et(18, 15)} <= set(by(key)), "the last window before the shut ends at 17:00: quoted")
-            self.assertEqual(len(by(key)), len(by("BTC-15M")) - 5)
+            self.assertEqual(len(by(key)), len(by("BTC-15M")) - 5 - (key == "XAU-15M"), "(gold's 05:15 New York window too: 1.154.19)")
         self.assertTrue(shut | {et(18, 0)} <= set(by("BTC-15M")), "round the clock: untouched")
         xau = next(r for r in m.WINDOW_UPDOWN_MARKETS if r.key == "XAU-15M")
         why = "黄金休市（纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00，CME 节假日从 12:00 起）"
@@ -1020,6 +1020,57 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             at = et(17, 15, 6)  # Friday 11-06 17:15 ET: 21 hours after the suite's NOW
             ctl, api, clock = controller([market("xau", at=at, mid=51)], PREOPEN_MARKETS="xau", PREOPEN_AHEAD_MINUTES="1440", **db)
             with patch.object(p, "market_shut", lambda rolling, start: ""):
+                c = p.candidate(market("xau", at=at, mid=51), NOW, ctl.owner.config, ctl.settings)
+                await ctl.place_pair(c)
+            self.assertEqual(ctl.ledger.rows[c["slug"]]["phase"], "active")
+            ctl.keep_on_stop = True
+            await ctl.on_stop()
+            ctl.ledger.close()
+            again, _, _ = controller([market("xau", at=at, mid=51)], PREOPEN_MARKETS="xau", PREOPEN_AHEAD_MINUTES="1440", **db)
+            again.api = again.cancel_api = api; api.ctl = again
+            again.adopt()
+            pair = again.ledger.rows[c["slug"]]
+            self.assertEqual((pair["phase"], pair.get("free"), again.resumed), ("closing", True, 0))
+            await again.cancel_pair(pair, pair["reason"])
+            await again.discover()
+            self.assertEqual(again.queue.qsize(), 0, "not quoted again: the window is left out")
+            await self.finish(again)
+
+    async def test_golds_0515_new_york_window_is_not_quoted(self):
+        """1.154.19 — a window whose outcome is known to lean is not one to bid on both sides of. Gold's 05:15 New York quarter hour
+        (the rule taker's 黄金纽约 05:15: Down 65% over a year): 11-18 the mode's Up bids there were sold into down the whole
+        ladder — 190 shares at 42.4¢ on average, hours before the window — the Down bids left alone. Not quoted, not looked for;
+        one resting from before is withdrawn at the next start (free). In New York time, as the rule is; oil and the crypto
+        cards, and gold's other windows, as before."""
+        et = lambda h, mi, day=6, month=11, offset=-5: m.et_ms(2026, month, day, h, mi, offset)
+        ctl, api, clock = controller(PREOPEN_MARKETS="xau,cl,btc", PREOPEN_AHEAD_MINUTES="1440")
+        starts = p.window_starts(NOW, ctl.owner.config, ctl.settings)  # Thursday 20:00 New York: Friday's 05:15 is nine hours on
+        by = lambda key: [s for r, s in starts if r.key == key]
+        self.assertNotIn(et(5, 15), by("XAU-15M"))
+        self.assertTrue({et(5, 0), et(5, 30)} <= set(by("XAU-15M")), "the quarter hours either side: quoted")
+        self.assertTrue(et(5, 15) in by("CL-15M") and et(5, 15) in by("BTC-15M"), "oil and BTC: as before")
+        why = "黄金纽约 05:15 这一场不挂：结果有偏向（回测跌占多数），两边都挂只会被吃掉输的那边"
+        self.assertEqual(p.candidate_problem(market("xau", at=et(5, 15), mid=41), NOW, ctl.owner.config, ctl.settings), why)
+        self.assertIsNone(p.candidate(market("xau", at=et(5, 15), mid=41), NOW, ctl.owner.config, ctl.settings))
+        self.assertEqual(p.candidate_problem(market("xau", at=et(5, 30), mid=42), NOW, ctl.owner.config, ctl.settings), "")
+        self.assertEqual(p.candidate_problem(market("cl", at=et(5, 15), mid=43), NOW, ctl.owner.config, ctl.settings), "")
+        xau, cl = (next(r for r in m.WINDOW_UPDOWN_MARKETS if r.key == key) for key in ("XAU-15M", "CL-15M"))
+        self.assertEqual((bool(p.leaning_window(xau, et(5, 15))), p.leaning_window(cl, et(5, 15)), p.leaning_window(xau, et(5, 0))), (True, "", ""))
+        # New York's clock: 17:15 Beijing in summer (18:15 Beijing is an ordinary window then); Monday to Friday
+        summer = m.et_ms(2026, 7, 15, 5, 15, -4)
+        self.assertEqual(dt.datetime.fromtimestamp(summer / 1000, m.BEIJING).strftime("%H:%M"), "17:15")
+        self.assertEqual((bool(p.leaning_window(xau, summer)), p.leaning_window(xau, summer + 3_600_000)), (True, ""))
+        self.assertEqual(p.leaning_window(xau, et(5, 15, 7)), "", "Saturday: none (and CME is shut)")
+        self.assertIn("；黄金纽约 05:15 那一场不挂（结果偏跌，1.154.19）", ctl.status())
+        await self.finish(ctl)
+        btc, _, _ = controller(PREOPEN_MARKETS="btc")
+        self.assertNotIn("05:15", btc.status())
+        await self.finish(btc)
+        with tempfile.TemporaryDirectory() as folder:  # quoted by an older version: the next start withdraws it, a free withdrawal, not quoted again
+            db = {"STATE_DB": str(Path(folder) / "state.sqlite3")}
+            at = et(5, 15)
+            ctl, api, clock = controller([market("xau", at=at, mid=51)], PREOPEN_MARKETS="xau", PREOPEN_AHEAD_MINUTES="1440", **db)
+            with patch.object(p, "leaning_window", lambda rolling, start: ""):
                 c = p.candidate(market("xau", at=at, mid=51), NOW, ctl.owner.config, ctl.settings)
                 await ctl.place_pair(c)
             self.assertEqual(ctl.ledger.rows[c["slug"]]["phase"], "active")

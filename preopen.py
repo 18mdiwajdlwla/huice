@@ -374,6 +374,8 @@ def candidate_problem(market: dict, now_ms: int, config: Any, settings: Settings
             return "不在交易时段内"
         if shut := market_shut(rolling, start):
             return shut
+        if lean := leaning_window(rolling, start):
+            return lean
         if str(market.get("status") or "").upper() != "REGISTERED" or market.get("isVisible") is False:
             return f"状态 {market.get('status') or '?'}" + ("、不可见" if market.get("isVisible") is False else "")
         if str(market.get("tradingStatus") or "").upper() not in {"OPEN", "MATCHING_NOT_ENABLED"}:
@@ -444,6 +446,33 @@ def market_shut(rolling: Any, start_ms: int) -> str:
     return ""
 
 
+# 1.154.19 — a window whose outcome is known to lean is not one to bid on both sides of. The rule taker's windows this mode leaves
+# out, by card (rules.RULES): gold's 05:15 New York quarter hour, Monday to Friday — Down 65% over a year (London's morning fix
+# ahead); 11-18 the mode's Up bids there were sold into down the whole ladder, 190 shares at 42.4¢ on average, hours before the
+# window, the Down bids left alone. (The shut quarter hours and the reopen's first, the taker's other windows on by default, are
+# left out already: market_shut, session_opening.)
+LEANING_RULES = {"XAU-15M": ("gold_0515",)}
+
+
+def rules_of(key: str) -> Any:
+    import rules
+    return rules.RULE_OF[key]
+
+
+def leaning_window(rolling: Any, start_ms: int) -> str:
+    """Why a window is not quoted ("" when it may be): it is one of the rule taker's windows on this card that this mode leaves out
+    (LEANING_RULES) — in New York time, as the rule is: 18:15 Beijing in winter, 17:15 in summer."""
+    keys = LEANING_RULES.get(getattr(rolling, "key", ""), ())
+    if not keys:
+        return ""
+    import rules
+    for key in keys:
+        rule = rules.RULE_OF[key]
+        if rule.matches(start_ms):
+            return f"{rule.name} 这一场不挂：结果有偏向（回测{rule.word}占多数），两边都挂只会被吃掉输的那边"
+    return ""
+
+
 WEEKEND_END_HOUR = 8  # the weekend runs to Monday this o'clock Beijing (1.139.2: Sunday evening in the US to the Asian open is crypto's thinnest stretch)
 
 
@@ -470,7 +499,7 @@ def window_starts(now_ms: int, config: Any, settings: Settings) -> list[tuple[An
         start = rolling.first_start(now_ms + timed.entry_seconds * 1000)
         while start <= now_ms + timed.ahead_minutes * 60_000:
             if (rolling.exists(start, holidays) and not market_shut(rolling, start) and not session_opening(rolling, start, holidays, quiet_ms)
-                    and (weekend or not on_weekend(start))):
+                    and not leaning_window(rolling, start) and (weekend or not on_weekend(start))):
                 out.append((rolling, start))
             start = rolling.next_start(start)  # a quarter hour, five minutes, an hour, a day (noon ET to noon ET: 23 or 25 hours over a switch)
     return sorted(out, key=lambda rs: (rs[1], rs[0].key))
@@ -1814,6 +1843,8 @@ class Controller:
             return False  # 1.135.1: a first window after an open, quoted before the rule (or with it off; 1.151.1: it is never off): withdrawn
         if market_shut(rolling, int(pair["start_ms"])):
             return False  # 1.150.1: gold's and oil's windows in CME's shut, quoted before the rule: withdrawn
+        if leaning_window(rolling, int(pair["start_ms"])):
+            return False  # 1.154.19: a window with a known lean (gold's 05:15 New York), quoted before the rule: withdrawn
         if not self.settings.weekend and on_weekend(int(pair["start_ms"])):
             return False  # 1.136.0: the weekend switched off since it was quoted: withdrawn
         if int(pair.get("expires") or 0) != pair["start_ms"] // 1000 - self.settings.timing(str(pair.get("key") or "")).expiry_seconds:
@@ -3054,6 +3085,8 @@ class Controller:
                 + f"；股票卡开盘、午后头 {quiet} 分钟内开始的场次不挂"
                 + (f"；{shut_cards['cme']}休市（{SHUT_TEXT['cme']}）期间的场次不挂" + f"、重开后头 {quiet} 分钟内开始的也不挂"
                    + (f"（北京时间 {when(cme_next[0], self.now())}–{when(cme_next[1], cme_next[0])}）" if cme_next else "") if shut_cards["cme"] else "")
+                + "".join(f"；{rules_of(key).name} 那一场不挂（结果偏{rules_of(key).word}，1.154.19）" for card, keys in LEANING_RULES.items()
+                          if card in self.settings.markets for key in keys)
                 + (f"；{shut_cards['us']}只挂美股常规交易时段内的场次（纽约时间 09:30–16:00，美国假日、半日市按日历）"
                    + f"，开盘后头 {quiet} 分钟的不挂" if shut_cards["us"] else "")  # the end's date only when not the start's
                 + (f"；周末不挂（北京时间周六 00:00 到周一 {WEEKEND_END_HOUR:02d}:00 开始的场次）" if not self.settings.weekend else "") + "\n"
