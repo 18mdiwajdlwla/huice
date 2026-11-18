@@ -2675,7 +2675,8 @@ class Controller:
         away): when matching comes on (note_open), and a market no longer registered or open for orders has its pair
         withdrawn."""
         every = lambda p: REFRESH_MS if p["start_ms"] - self.now() <= 3_600_000 else REFRESH_FAR_MS
-        due = sorted((p for p in self.ledger.rows.values() if p["phase"] == "active" and self.now() - int(p.get("meta_ms") or 0) >= every(p)),
+        # (1.154.27: over the records not accounted — Ledger.pending: an active one is always among them — not every record)
+        due = sorted((p for p in self.ledger.pending() if p["phase"] == "active" and self.now() - int(p.get("meta_ms") or 0) >= every(p)),
                      key=lambda p: int(p.get("meta_ms") or 0))  # the longest unread first; a burst of due windows is spread over iterations
         batch: dict[str, list[dict]] = {}  # market id -> its due records: one read a window, whatever its levels (1.136.1: four levels were four reads)
         for pair in due:
@@ -2694,8 +2695,11 @@ class Controller:
                 if status != "REGISTERED" or trading not in {"OPEN", "MATCHING_NOT_ENABLED"}:
                     await self.cancel_many(pairs, f"市场状态 {status or '?'} / {trading or '?'}")
                 else:
-                    for pair in pairs:
-                        self.ledger.save(pair)
+                    # 1.154.27: one transaction a market, not one a level. The ledger writes on the event loop and waits for the
+                    # disk each time (synchronous=FULL: a record of real orders); seven levels a window were seven such waits back
+                    # to back — 11-18 23:34: six times in ten minutes they held the loop for more than a tenth of a second, once
+                    # for 1,054 ms (a disk that answers in 150 ms now and then, times seven)
+                    self.ledger.save_many(pairs)
         for error in await asyncio.gather(*(one(ps) for ps in batch.values()), return_exceptions=True):
             if isinstance(error, BaseException):
                 raise error
@@ -2911,10 +2915,12 @@ class Controller:
         slug = str(market.get("categorySlug") or market.get("slug") or "")
         if str(market.get("tradingStatus") or "").upper() != "OPEN":
             return
-        for pair in self.ledger.rows.values():  # every level's record of the window
-            if pair["phase"] == "active" and window_of(pair) == slug and not pair.get("open_seen_ms"):
-                pair["open_seen_ms"] = self.now()
-                self.ledger.save(pair)
+        # every level's record of the window (1.154.27: looked for among the records not accounted — an active one always is —
+        # not all of them, at every market read; and saved in one transaction, not one a level: refresh_active)
+        seen = [pair for pair in self.ledger.pending() if pair["phase"] == "active" and not pair.get("open_seen_ms") and window_of(pair) == slug]
+        for pair in seen:
+            pair["open_seen_ms"] = self.now()
+        self.ledger.save_many(seen)
 
     def in_sprint(self, pair: dict) -> bool:
         """The last stretch: past the cancel time, before the signed expiry, with an order that may still be on the book —
@@ -3302,6 +3308,22 @@ class Controller:
                     self.error = core.clean_error(error)
         self.settling[key] = asyncio.create_task(reconcile(), name=key)
 
+    def book_due(self, pairs: list[dict]) -> None:
+        """The closing or unverified pairs whose try has come: each one's next try booked now (bookkeep: a read that hangs
+        does not make the loop ask again meanwhile) and its reconcile started. 1.154.27: the bookings written in one
+        transaction, not one a pair — a quarter-hour's windows come due together, seven levels each, and every write waits
+        for the disk on the event loop (11-18 23:34: twice in ten minutes for more than a tenth of a second, 188 ms once)."""
+        booked = []
+        try:
+            for pair in pairs:
+                if self.now() < self.finals_wait(pair):
+                    continue  # withdrawn this very pass, every order off the book: nothing to do before their final reads, which its bookkeep booked (ended)
+                self.bookkeep(pair, save=False)
+                booked.append(pair)
+                self.launch_reconcile(pair)  # (a task: it runs after this pass's write)
+        finally:
+            self.ledger.save_many(booked)
+
     def due(self, now_ms: int) -> list[dict]:
         """The pairs the cancellation loop acts on now: active ones at their cancel time (or the mode blocked), and
         closing or unverified ones whose next try has come (bookkeep: RETRY_MS doubling to RETRY_MAX_MS)."""
@@ -3469,11 +3491,7 @@ class Controller:
                         self.bulk_task = asyncio.create_task(self.remove_pairs(heavy, patient=True), name="preopen-bulk")
                     held = {p["slug"] for p in heavy}  # the running batch's turn ends first: these wait for the next
                     stale = [p for p in stale if p["slug"] not in held]
-                for pair in stale:
-                    if self.now() < self.finals_wait(pair):
-                        continue  # withdrawn this very pass, every order off the book: nothing to do before their final reads, which its bookkeep booked (ended)
-                    self.bookkeep(pair)  # the next try is booked now: a read that hangs does not make the loop ask again meanwhile
-                    self.launch_reconcile(pair)
+                self.book_due(stale)
             if self.winding and self.rest_cleared(now):
                 waiting = self.results_awaited(now)
                 if not self.wound_told:  # (said when the orders are off the book, as before — not hours later, when the last result is in)

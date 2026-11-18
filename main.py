@@ -52,7 +52,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.26"
+VERSION = "1.154.27"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -16279,7 +16279,7 @@ async function load(){  // the list: light rows, the open trades and the last fe
     if(!r.ok)throw await oops(r);const j=await r.json();  // (1.154.26: a 503 says why — the rule taker goes first, nothing is built now: oops)
     if(openId&&!wantAll&&j.more>0&&!j.trades.some(t=>t.id===openId)){allLoaded=true;again=true}  // a link to an older trade: the whole list
     else{if(load.more){allLoaded=true;load.more=false}data=j;okAt=Date.now();if(filterKey())loadAna();  // the filter's tables refreshed with the list
-      document.getElementById("meta").replaceChildren($("span","","数据 "+data.generated_at+(Date.now()-(data.server_ms||Date.now())>600000?"（旧数据：规则吃单优先时段里不重算，过后自动更新）":"")),$("span","","v"+data.version),$("span","",data.trades.length+" 笔"+(data.more>0?"（更早的 "+data.more+" 笔可载入）":"")));
+      document.getElementById("meta").replaceChildren($("span","","数据 "+data.generated_at+(Date.now()-(data.server_ms||Date.now())>120000?"（"+Math.round((Date.now()-data.server_ms)/60000)+" 分钟前算的：重算一次要占住机器人几秒，所以隔几分钟才重算，规则吃单的优先时段里不重算）":"")),$("span","","v"+data.version),$("span","",data.trades.length+" 笔"+(data.more>0?"（更早的 "+data.more+" 笔可载入）":"")));
       render();if(openId&&details[openId])loadDetail(openId);
       const o=openId&&document.querySelector(".tr.open");if(o&&!load.done)o.scrollIntoView({block:"start"});load.done=true}}
   catch(e){const hms=okAt?clock(okAt):"";
@@ -16836,6 +16836,13 @@ class WebServer:
     # request is told to come back. Kept 30 s otherwise (5 before: every reload of every tab was a build)
     HEAVY = ("journal.json", "journal.csv", "summary.csv", "samples.csv")
     HEAVY_CLEAR_S = 120.0
+    # 1.154.27: ...and, built, it is kept for HEAVY_KEEP_FACTOR times the seconds its build held the event loop (HEAVY_KEEP_MAX_S
+    # at the most): however a page asks, the builds are a hundredth of the loop's time at the most. 11-18 23:34, an hour after
+    # 1.154.26 went live: the review page was still rebuilt every minute — a tab opened before the deploy runs the page's old
+    # script (a reload every 60 s; the new one, every 5 minutes and not while hidden, is in no tab until that tab is
+    # reloaded), and a body kept 30 s answers none of its requests — ten builds in ten minutes, 3.2–4 s of the loop each
+    HEAVY_KEEP_FACTOR = 100.0
+    HEAVY_KEEP_MAX_S = 600.0
     BUSY_TEXT = "规则吃单正在优先时段（抢单时刻前后、开场前 15 分钟和盘中），复盘数据这段时间不重算——算一次要占住机器人几秒；过后自动恢复"
     CONTROL_BODY_MAX = 16384   # bytes a control request may carry
     CONTROL_TRIES = 5          # wrong keys within CONTROL_LOCK_SECONDS that lock the control route for as long
@@ -16876,9 +16883,16 @@ class WebServer:
             if len(self.cache) >= 64:  # the filtered analyses are cached by their filter (1.107.0): the expired ones go
                 # (...but for the review page's own list: what is served while the rule taker goes first)
                 self.cache = {k: v for k, v in self.cache.items() if v[0] > now or k in ("journal.json", "journal.json?all")}
+                if len(self.cache) >= 64:  # 1.154.27: bodies are kept for minutes now (HEAVY_KEEP_FACTOR) — never more than 64 of them, whatever is asked: the soonest to end go
+                    for k in sorted((k for k in self.cache if k not in ("journal.json", "journal.json?all")), key=lambda k: self.cache[k][0])[:len(self.cache) - 48]:
+                        del self.cache[k]
+            began = time.perf_counter()
             with self.bot.review_scope():  # (a build in one piece: what it works out of each record, once — LiveBot)
                 body = build()
-            entry = self.cache[name] = (now + self.CACHE_SECONDS.get(name.partition("?")[0], 0.0), body)
+            keep = self.CACHE_SECONDS.get(name.partition("?")[0], 0.0)
+            if keep > 0 and name.partition("?")[0] in self.HEAVY:  # (by what it cost: HEAVY_KEEP_FACTOR; a body that is not kept at all stays so)
+                keep = max(keep, min(self.HEAVY_KEEP_MAX_S, self.HEAVY_KEEP_FACTOR * (time.perf_counter() - began)))
+            entry = self.cache[name] = (time.monotonic() + keep, body)
         return entry[1]
 
     def compressed(self, body: bytes) -> bytes:

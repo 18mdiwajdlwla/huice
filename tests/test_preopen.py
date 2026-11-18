@@ -255,6 +255,59 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         ctl.stop.clear()
         await self.finish(ctl)
 
+    async def test_a_markets_reread_is_one_write_of_the_ledger(self):
+        """1.154.27: an active window's market is read again every REFRESH_MS / REFRESH_FAR_MS and each of its levels' records
+        saved — one transaction a record, each waiting for the disk on the event loop (synchronous=FULL), seven levels seven
+        waits back to back: 11-18 23:34, six stalls of more than a tenth of a second in ten minutes, one of 1,054 ms. One
+        transaction a market now (and the first sight of matching open likewise), found among the records not accounted."""
+        ctl, api, clock = controller()
+        pairs = await self.book_of(ctl, api, 7)  # seven levels of one window: one market
+        for pair in pairs:
+            pair["meta_ms"] = 0
+            pair.pop("open_seen_ms", None)
+        writes, plain_save, plain_many = [], ctl.ledger.save, ctl.ledger.save_many
+        ctl.ledger.save = lambda row: writes.append(1) or plain_save(row)
+        ctl.ledger.save_many = lambda rows: writes.append(len(rows)) or plain_many(rows)
+        reads = []
+        plain_market = api.market
+
+        async def market_read(mid):
+            reads.append(mid)
+            return await plain_market(mid)
+        api.market = market_read
+        await ctl.refresh_active()
+        self.assertEqual((len(reads), writes), (1, [7]), "one read of the market, one write for its seven records")
+        self.assertTrue(all(pair["meta_ms"] == clock.ms for pair in pairs))
+        stored = {slug: json.loads(body) for slug, body in ctl.ledger.conn.execute("SELECT slug, body FROM pairs")}
+        self.assertEqual({stored[pair["slug"]]["meta_ms"] for pair in pairs}, {clock.ms})
+        # matching seen open: noted on every level's record — one write again, then the reread's
+        api.markets["123"]["tradingStatus"] = "OPEN"
+        del writes[:]
+        clock.ms += p.REFRESH_MS
+        await ctl.refresh_active()
+        self.assertEqual((writes, {pair.get("open_seen_ms") for pair in pairs}), ([7, 7], {clock.ms}))
+        del writes[:]
+        clock.ms += p.REFRESH_MS
+        await ctl.refresh_active()
+        self.assertEqual(writes, [0, 7], "seen open already: nothing to note (an empty write is none)")
+        # ...and the cancellation loop's pass over the closing pairs whose try has come: their next tries booked in one write
+        ctl2, api2, clock2 = controller()
+        closing = await self.book_of(ctl2, api2, 7, phase="closing")
+        writes2, save2, many2 = [], ctl2.ledger.save, ctl2.ledger.save_many
+        ctl2.ledger.save = lambda row: writes2.append(1) or save2(row)
+        ctl2.ledger.save_many = lambda rows: writes2.append(len(rows)) or many2(rows)
+        self.assertEqual([pair["slug"] for pair in ctl2.due(clock2.ms)], [pair["slug"] for pair in closing])
+        ctl2.book_due(closing)
+        self.assertEqual((writes2, len(ctl2.settling)), ([7], 7), "one write for the seven bookings; a reconcile started for each")
+        self.assertTrue(all(pair["retry_ms"] == clock2.ms + p.RETRY_MS and pair["tries"] == 1 for pair in closing))
+        stored = {slug: json.loads(body) for slug, body in ctl2.ledger.conn.execute("SELECT slug, body FROM pairs")}
+        self.assertEqual({stored[pair["slug"]]["retry_ms"] for pair in closing}, {clock2.ms + p.RETRY_MS})
+        self.assertEqual(ctl2.due(clock2.ms), [], "booked: not due again before the next try")
+        ctl2.ledger.save, ctl2.ledger.save_many = save2, many2
+        await self.finish(ctl2)
+        ctl.ledger.save, ctl.ledger.save_many = plain_save, plain_many
+        await self.finish(ctl)
+
     async def test_a_bare_409_is_a_side_that_may_exist(self):
         """1.154.26 (the audit of 11-18, 3): "HTTP 409: Conflict" on a side's POST with none of the duplicate's wording was a
         refusal here ("rejected": nothing reserved, never looked for) while the model trader has taken it since 1.150.0 for

@@ -3,7 +3,7 @@ risks, filters with counts, the list by day (light rows: the open trades and the
 the rest on request), one trade's whole record fetched when it is opened (why the model priced it, the prices behind
 it, proxy and anchor, how it filled, how it was settled, version), deep links, and the CSV / JSON exports. The browser
 part needs Playwright + Chromium and is skipped without them."""
-import asyncio, csv, io, json, os, sys, urllib.parse, urllib.request, datetime as dt
+import asyncio, csv, io, json, os, sys, time, urllib.parse, urllib.request, datetime as dt
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import offline  # noqa: F401  (blocks real HTTP, except to 127.0.0.1)
 import main as m
@@ -279,6 +279,39 @@ async def run():
     web.cached("journal.json?analysis&card=y", lambda: b"{}")
     assert (web.cache["journal.json"][1], web.cache["journal.json?all"][1], len(web.cache)) == (b"LAST", b"ALL", 3), sorted(web.cache)
     web.cache.clear()
+    # 1.154.27 — ...and a heavy body is kept a hundred times as long as its build held the event loop (ten minutes at the most):
+    # however a page asks — a tab opened before a deploy runs the old script, a reload a minute; several tabs — the builds are
+    # a hundredth of the loop's time at the most. 11-18 23:34: ten builds in ten minutes, 3.2–4 s each, the body kept 30 s
+    web.CACHE_SECONDS = {"journal.json": 30.0, "data.json": 1.0}
+    slow = lambda: time.sleep(0.4) or b"{}"
+    before = time.monotonic()
+    web.cached("journal.json", slow)
+    kept = web.cache["journal.json"][0] - before
+    assert 40.0 <= kept < 60.0, kept  # 100 × 0.4 s (and the build's own 0.4 s), not the 30 s of a quick one
+    web.cache.clear()
+    web.cached("journal.json", lambda: b"{}")
+    assert 29.0 < web.cache["journal.json"][0] - time.monotonic() <= 30.0, "a quick build: the plain half minute"
+    web.HEAVY_KEEP_MAX_S = 35.0
+    web.cache.clear(); before = time.monotonic(); web.cached("journal.json?analysis&card=z", slow)
+    assert 35.0 <= web.cache["journal.json?analysis&card=z"][0] - before < 36.0, "ten minutes at the most (35 s here)"
+    del web.HEAVY_KEEP_MAX_S
+    web.cache.clear(); before = time.monotonic(); web.cached("data.json", slow)
+    assert web.cache["data.json"][0] - before < 2.0, "the cards' own data is no heavy body: a second, whatever it took"
+    web.CACHE_SECONDS = {}
+    web.cache.clear(); before = time.monotonic(); web.cached("journal.json", slow)
+    assert web.cache["journal.json"][0] - before < 1.0, "a body that is not kept at all stays so"
+    web.cache.clear()
+    assert (m.WebServer.HEAVY_KEEP_FACTOR, m.WebServer.HEAVY_KEEP_MAX_S) == (100.0, 600.0)
+    # ...and never more than 64 bodies kept, whatever is asked (they stay for minutes now): the soonest to end go, the page's own
+    # list — what is served while the rule taker goes first — never
+    web.CACHE_SECONDS = {"journal.json": 30.0}
+    web.cached("journal.json", lambda: b"list")
+    for i in range(80):
+        web.cached(f"journal.json?analysis&card={i}", lambda: b"{}")
+        assert len(web.cache) <= 64, (i, len(web.cache))
+    assert web.cache["journal.json"][1] == b"list" and "journal.json?analysis&card=79" in web.cache and "journal.json?analysis&card=0" not in web.cache
+    web.CACHE_SECONDS = {}
+    web.cache.clear()
     # a body is built within the bot's review_scope (LiveBot: each of the controller's own records worked out once a build)
     import contextlib
     steps = []
@@ -297,7 +330,7 @@ async def run():
     # instead of every one, and not at all while it is not looked at
     assert 'async function oops(r){if(r.status===503){let j={};try{j=await r.json()}catch(e){}return new Error(j.message||"HTTP 503")}return new Error("HTTP "+r.status)}' in m.JOURNAL_PAGE
     assert m.JOURNAL_PAGE.count("if(!r.ok)throw await oops(r)") == 6 and 'throw new Error("HTTP "+r.status)' not in m.JOURNAL_PAGE
-    assert '(Date.now()-(data.server_ms||Date.now())>600000?"（旧数据：规则吃单优先时段里不重算，过后自动更新）":"")' in m.JOURNAL_PAGE
+    assert '(Date.now()-(data.server_ms||Date.now())>120000?"（"+Math.round((Date.now()-data.server_ms)/60000)+" 分钟前算的：' in m.JOURNAL_PAGE
     assert 'load();setInterval(()=>{if(document.visibilityState!=="hidden")load()},300000);' in m.JOURNAL_PAGE and "setInterval(load,60000)" not in m.JOURNAL_PAGE
     assert 'document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible"&&Date.now()-okAt>60000)load()});' in m.JOURNAL_PAGE
     # --- 1.107.0: 按设置版本 — a table per setting that changed, a row per value with the stretch it ran ---------------------------
