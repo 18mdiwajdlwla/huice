@@ -822,9 +822,17 @@ class PredictApi:
         """POST /v1/orders -> {"order_id", "hash", "code"}; success=false is an error with the API's own reason."""
         answer = await self.authed("POST", "/orders", body, timeout=20, priority=True)
         data = answer.get("data") if isinstance(answer, dict) else None
-        if not isinstance(answer, dict) or answer.get("success") is False or not isinstance(data, dict):
-            raise OrderRejected("下单被拒绝：" + (core.http_error_text(answer) if isinstance(answer, dict) else "")
-                                   or core.brief_error(json.dumps(answer, ensure_ascii=False), 120))
+        if isinstance(answer, dict) and answer.get("success") is False:
+            # (Predict's own words alone, as ever: the callers look in this text for the wording of a duplicate — never its raw answer)
+            raise OrderRejected("下单被拒绝：" + (core.http_error_text(answer) or "Predict 没有说明原因"))
+        if not isinstance(data, dict):
+            # 1.154.26 (the audit of 11-18, 3): a 2xx answer with no body (call reads it as {}), with no "data" or one of another
+            # shape was a refusal too (OrderRejected) — to all three strategies a definite one: the model trader failed the
+            # order and freed its slot, the rule taker freed the window's shares and sent another, the pre-open mode dropped the
+            # side's reservation. But nothing in such an answer says the order was not taken — the status said it was. Not a
+            # refusal: an answer that tells nothing, as one without an order id (below) — the record keeps its hash and its
+            # money, and is looked for by that hash
+            raise core.RemoteError("下单应答没有可读的内容（订单可能已被接受，按哈希核对）：" + core.brief_error(json.dumps(answer, ensure_ascii=False), 120))
         order_id = str(data.get("orderId") or data.get("id") or data.get("order_id") or "")
         if not order_id:
             raise core.RemoteError("下单应答没有订单号：" + core.brief_error(json.dumps(answer, ensure_ascii=False), 120))
@@ -837,8 +845,9 @@ class PredictApi:
         answer = await self.authed("POST", "/orders/remove", {"data": {"ids": [str(i) for i in ids]}}, timeout=timeout, priority=True)
         data = answer.get("data") if isinstance(answer, dict) and isinstance(answer.get("data"), dict) else answer
         if not isinstance(answer, dict) or answer.get("success") is False:
-            raise core.RemoteError("撤单被拒绝：" + (core.http_error_text(answer) if isinstance(answer, dict) else "")
-                                   or core.brief_error(json.dumps(answer, ensure_ascii=False), 120))
+            # (1.154.26: the reason was never there when Predict's answer carried none of its own — "+" binds before "or")
+            raise core.RemoteError("撤单被拒绝：" + ((core.http_error_text(answer) if isinstance(answer, dict) else "")
+                                                   or core.brief_error(json.dumps(answer, ensure_ascii=False), 120)))
         return {"removed": [str(i) for i in (data.get("removed") or [])], "noop": [str(i) for i in (data.get("noop") or [])]}
 
     ORDERS_PAGE = 50      # orders per page (the API pages with first / after and answers a cursor)
@@ -851,6 +860,8 @@ class PredictApi:
         when the read stopped on purpose (1.137.1): ``stop_ids`` all seen, or ``max_pages`` read. ``cap`` (1.150.0) is
         this one read's own page cap in place of ORDERS_PAGES_MAX (the redeem's read of the positions: positions_read)."""
         rows, after, seen = [], "", set()
+        listed: dict = {}  # the rows taken so far, each by what it is (row_mark, position_mark) -> its place: one listed again on a later page is the same row
+        mark_of = position_mark if path.split("?")[0].rstrip("/").endswith("/positions") else row_mark
         limit = self.ORDERS_PAGES_MAX if not cap else max(1, int(cap))
         pages = limit if not max_pages else max(1, min(limit, int(max_pages)))
         asked = full = 0  # requests made; rows of a page that had a next one (a full page: Predict's real page size)
@@ -863,7 +874,19 @@ class PredictApi:
             asked += 1
             self.__dict__.setdefault("paging", {})[path] = asked  # the read under way, page by page (1.154.8: the pre-open hold's progress)
             page = self.rows(data)
-            rows.extend(page)
+            # 1.154.26 (the audit of 11-18, 13): a list that shifts while it is paged (a fill, an order placed or gone between two
+            # pages) shows the row at the boundary on both. Kept twice, a position's shares counted double — the minute's check
+            # of the positions against the records (live_late_fills) sums the rows of an outcome, and what the account then
+            # "held" beyond its records was booked as a late fill onto an ended order of that outcome: shares nobody has, in
+            # the exposure, the P&L and the day's loss stop (the redeem had met the same doubling and guards against it itself).
+            # Each row once, here, for every reader — as the later page shows it (the later read: an amount that moved in between)
+            for row in page:
+                mark = mark_of(row)
+                if mark in listed:
+                    rows[listed[mark]] = row
+                else:
+                    listed[mark] = len(rows)
+                    rows.append(row)
             cursor = data.get("cursor") if isinstance(data, dict) else None
             if isinstance(cursor, dict):
                 cursor = cursor.get("after") or cursor.get("next") or cursor.get("endCursor")
@@ -923,6 +946,25 @@ class PredictApi:
         for the open-order reads and the once-a-minute positions readers (twenty pages already cost seconds), and
         positions_complete stays theirs: this read neither raises their cap nor writes their flag."""
         return await self.paged("/positions", {}, cap=pages)
+
+
+def row_mark(row: dict) -> Any:
+    """What makes a list's row itself (PredictApi.paged): its id when it has one — an order's — else all it says."""
+    if row.get("id") not in (None, ""):
+        return ("id", str(row["id"]))
+    return json.dumps(row, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def position_mark(row: dict) -> Any:
+    """...and a position's row (GET /positions): the market and the outcome it is of — whatever id the row carries (nothing says
+    Predict's is one a position: were it one a market, the second outcome of a market held on both sides would go for a
+    repeat of the first) and whatever its amount is by now (a fill between two pages: the same position, moved). A row
+    that names neither is itself by row_mark."""
+    market = row.get("market") if isinstance(row.get("market"), dict) else {}
+    outcome = row.get("outcome") if isinstance(row.get("outcome"), dict) else {}
+    mid = market.get("id") if market.get("id") not in (None, "") else row.get("marketId")
+    which = next((outcome[k] for k in ("indexSet", "onChainId", "tokenId") if outcome.get(k) not in (None, "")), None)
+    return ("position", str(mid), str(which)) if mid not in (None, "") and which is not None else row_mark(row)
 
 
 def order_hash_of(row: dict) -> str:
@@ -2356,6 +2398,24 @@ class LiveBot(core.Bot):
             return bool(taker.first_now()) or self.rules_quiet() > 0
         except Exception:
             return False
+
+    @contextlib.contextmanager
+    def review_scope(self) -> Any:
+        """One build of the review page's data (core.Bot.review_scope, 1.154.26): each pre-open record's figures made once for
+        all its tables (preopen.quotes_kept), and the pre-open review itself once (preopen_review: the daily summary and the
+        analysis both ask). A build runs in one piece on the event loop — nothing changes under it — and nothing is kept
+        beyond it."""
+        import preopen
+        outer = getattr(self, "review_kept", None)
+        self.review_kept = {} if outer is None else outer
+        # (the running controller's own records alone: what a build reads off a file — the archive, the working file while the
+        # mode is off — is never kept, preopen.quotes_kept)
+        rows = getattr(getattr(getattr(self, "preopen", None), "ledger", None), "rows", None)
+        try:
+            with preopen.quotes_kept(rows if isinstance(rows, dict) else None):
+                yield
+        finally:
+            self.review_kept = outer
 
     def rules_clear(self, seconds: float) -> bool:
         """Whether the rule taker neither goes first now nor will within ``seconds`` (core.Bot.rules_clear, 1.154.25) — by its
@@ -6001,13 +6061,23 @@ class LiveBot(core.Bot):
             return {"check": "自检中，结果随后发来", "redeem": "领取中，结果随后发来", "fills": "持仓核对中，结果随后发来"}[action]
         return await self.live_action(action, req.args[1:], self.market.now_ms())
 
+    PAUSE_BACK = "没有暂停的状态（会接着下单）"  # what a restart returns to while a pause is not in the database (control_unkept)
+
+    def live_pause_write(self, why: str, now_ms: int) -> int | None:
+        """The pause onto the store's record — in force from here (live_paused reads it) — and the store's mark of that write:
+        what control_durable waits for, whenever the caller gets to ask (the emergency stop: after its cancels)."""
+        self.store.put("live:paused", {"at": now_ms, "why": why})
+        return self.store.mark() if callable(getattr(self.store, "mark", None)) else None
+
     async def live_action(self, action: str, args: list[str], now_ms: int) -> Any:
         """/live and the control page share these: "" = the status card (a Reply), else the action's answer text."""
         words = [a.lower() for a in args]
         if action == "pause":
             why = " ".join(a for a in args if a).strip() or "手动暂停"
-            self.store.put("live:paused", {"at": now_ms, "why": why})
-            return f"⏸ 真实交易已暂停（{why}）：不再开新仓；已有挂单保留，/live cancel all 可撤。/live resume 恢复。"
+            # (1.154.26: the pause is the store's record alone — queued, not yet written, a restart forgets it: control_durable)
+            unkept = await self.control_durable(self.live_pause_write(why, now_ms))
+            return (f"⏸ 真实交易已暂停（{why}）：不再开新仓；已有挂单保留，/live cancel all 可撤。/live resume 恢复。"
+                    + ("\n" + self.control_unkept(unkept, self.PAUSE_BACK) if unkept else ""))
         if action == "resume":
             self.store.delete_keys(["live:paused"])
             if getattr(self, "preopen", None) is not None:
@@ -6141,7 +6211,9 @@ class LiveBot(core.Bot):
         result = self.control_set({"LIVE": value})
         if not result["ok"]:
             return "❌ " + result["message"]
-        lines = [f"真实交易模式：{before} → {value}（已保存，重启后仍有效；环境变量 LIVE 只是初始值）"]
+        unkept = await self.control_durable()  # 1.154.26: "已保存，重启后仍有效" only once the database has it
+        lines = [f"真实交易模式：{before} → {value}（已保存，重启后仍有效；环境变量 LIVE 只是初始值）" if not unkept
+                 else f"❌ 真实交易模式：{before} → {value}。" + self.control_unkept(unkept, f" {before}")]
         if value != "off":
             lines += await self.live_prepare()
             if not self.live.ready:
@@ -6385,17 +6457,25 @@ class LiveBot(core.Bot):
             # cancels all failed (❌ HTTP 500, unsent requests, pre-open orders left behind) still came back ok=True and the page
             # showed a green toast — during an emergency, the one moment it matters. The pause is still recorded the same way;
             # its text ("已有挂单保留", which the stop contradicts) is replaced by the stop's own head line.
-            await self.live_action("pause", ["紧急停止"], now_ms)
+            # (1.154.26: the pause is in force as it is written here; whether the database has it — control_durable, a wait of
+            # up to seconds when the disk fails — is asked after the cancels, never ahead of them)
+            mark = self.live_pause_write("紧急停止", now_ms)
             first = "⛔ 紧急停止：已暂停开新仓，正在撤掉本策略的全部挂单（以 Predict 的确认为准）。/live resume 恢复。"
             second = await self.live_cancel_command(["all"], now_ms)
             line = ""
             if getattr(self, "preopen", None) is not None:
                 line = await self.preopen.withdraw_all("紧急停止")
                 second += (f"\n{line}" if line else "") + "\n" + self.preopen.status()
+            unkept = await self.control_durable(mark)  # not in the database yet: said, and no green toast
+            if unkept:
+                first += "\n" + self.control_unkept(unkept, self.PAUSE_BACK)
             text = f"{first}\n{second}"
             # "⏳" (sent, awaiting Predict's confirmation) and "没有真实挂单可撤。" are not failures; "❌"/"未就绪" and pre-open
-            # orders the stop could not withdraw ("没撤成") are
-            stop_failed = second.startswith(("❌", "未就绪")) or "没撤成" in line
+            # orders the stop could not withdraw ("没撤成") are — and, 1.154.26, the rule taker's (rules_withdraw's line)
+            # (...nor one of its orders whose placement is unknown and whose hash Predict cannot show — "结果未知": it may rest,
+            # as an unknown order of the model trader's makes the stop a ❌ below, FR-STOP-OK-UNKNOWN)
+            stop_failed = (second.startswith(("❌", "未就绪")) or "没撤成" in line or bool(unkept)
+                           or any(part.startswith("规则吃单") and ("没撤成" in part or "结果未知" in part) for part in second.split("\n")))
             return {"ok": not stop_failed, "message": text}
         elif action in {"resume", "redeem", "check", "orders", "positions"}:
             text = await self.live_action(action, [], now_ms)
@@ -6405,9 +6485,41 @@ class LiveBot(core.Bot):
         # "nothing to do" is not a failure — but 这次没有领取 is: something claimable was not claimed (no BNB for gas, a redeem that
         # failed, 缺字段 …). 1.150.0 (audit RDM-PAGE-REDEEM): the page's 领取已结算 showed that as a success (the green toast)
         failed = message.startswith(("❌", "未就绪", "用法", "这次没有领取")) or "失败" in message.split("\n")[0]
+        # (1.154.26: nor a pause that is in force but not written to the database yet — control_durable: no green toast for it)
+        failed = failed or "还没写进数据库" in message
         return {"ok": not failed, "message": message}
 
+    async def rules_withdraw(self, why: str) -> str:
+        """The rule taker's real orders asked to be withdrawn now (RuleTaker.withdraw_all, 1.154.26): the line for the reply, ""
+        with no taker or none of its orders out."""
+        taker = getattr(self, "rules", None)
+        if taker is None:
+            return ""
+        try:  # (bounded: a client that hangs keeps no stop waiting — its own follow-up goes on asking)
+            return await asyncio.wait_for(taker.withdraw_all(why), self.RULES_WITHDRAW_S)
+        except asyncio.TimeoutError:
+            return f"规则吃单：挂着的单没撤成（{self.RULES_WITHDRAW_S:g} 秒内没有答复），它自己每秒再撤。"
+        except Exception as error:
+            return f"规则吃单：挂着的单没撤成（{core.clean_error(error) or type(error).__name__}），它自己每秒再撤。"
+
+    RULES_WITHDRAW_S = 8.0  # the stop's wait for the rule taker's removals at the most (rules_withdraw)
+
     async def live_cancel_command(self, words: list[str], now_ms: int) -> str:
+        """/live cancel …: the model trader's orders, the pre-open mode's and — "all" / "account", 1.154.26 (audit 1) — the rule
+        taker's, side by side with the others': none of the three waits for another's requests (a taker's bid stands at the
+        top of the book; the other two's passes take seconds — a sync of the open list, thousands of quotes in batches)."""
+        everything = bool(words) and words[0] in {"all", "account"}
+        if everything:
+            rules_line, text = await asyncio.gather(self.rules_withdraw("紧急停止或管理员撤单"), self.live_cancel_others(words, now_ms))
+        else:
+            rules_line, text = "", await self.live_cancel_others(words, now_ms)
+        if rules_line:  # ("没有真实挂单可撤。" is the model trader's own word: said beside a rule order withdrawn, it is of its orders alone)
+            text = ("原策略" + text) if text.startswith("没有真实挂单可撤。") else text
+            head, mark, tail = text.partition("\n已请求撤销预挂单")  # (before the pre-open mode's part and its long status, not under them)
+            text = head + "\n" + rules_line + mark + tail
+        return text
+
+    async def live_cancel_others(self, words: list[str], now_ms: int) -> str:
         preopen = getattr(self, "preopen", None)
         if preopen is not None and words:
             matches = [p for p in preopen.ledger.rows.values() if any(str(o.get("id") or "") == words[0] for o in p["orders"].values())]
@@ -6429,13 +6541,34 @@ class LiveBot(core.Bot):
         if not words:
             return "用法：/live cancel all（撤掉本策略的全部真实挂单）、/live cancel account（撤掉账户上的全部挂单，含手动单）或 /live cancel <订单号>；/live release <订单号> 把状态未知的订单按不存在处理"
         extra: list[str] = []  # the account's orders this bot has no record of
+        cut = ""  # 1.154.26: why the account's list is not known whole ("" when it is)
+        older: set[str] = set()  # ...the ids the pre-open mode's snapshot alone names (not this command's own read: they may be gone by now)
+        snapshot_age = 0         # ...and how old that snapshot is, seconds
         if words[0] == "account":
             if not self.live.ready:
                 return f"❌ 未就绪：{self.live.not_ready_why}"
             known = {str(t["live"].get("order_id")) for t in trades.values() if isinstance(t.get("live"), dict)}
             preopen = getattr(self, "preopen", None)  # 1.141.1: the pre-open mode's own orders are its loop's to withdraw (in batches), not sent twice
             pre_ids, pre_hashes = preopen.known() if preopen is not None else (set(), set())
-            extra = [str(r.get("id")) for r in await self.live.api.orders("OPEN")
+            rows = await self.live.api.orders("OPEN")
+            # 1.154.26 (the audit of 11-18, 2): this read stops at ORDERS_PAGES_MAX pages (1,000 orders at 50 a page) and says so
+            # (orders_complete — read here with nothing run since the read returned: this read's own word) — and with the pre-open
+            # mode's thousands on the book it always stops there. Nobody looked: an order beyond the cut (a manual one, one whose
+            # record was lost) was not withdrawn and the reply said nothing of it — "没有真实挂单可撤。" even. Now the pre-open
+            # mode's last whole snapshot of the account fills the list in (live_snapshot_fresh: every page, read every minute
+            # or two and taken while under LIVE_SNAPSHOT_MAX_AGE_MS old — an order placed since and listed past the cut is
+            # the one thing it cannot know; the reply says how old it is); with none young enough the reply says the list
+            # was cut and where, and is not a success
+            if not getattr(self.live.api, "orders_complete", True):
+                if self.live_snapshot_fresh(now_ms):
+                    seen = {str(r.get("id")) for r in rows}
+                    added = [r for r in self.preopen.account_rows if str(r.get("id")) not in seen]
+                    older, snapshot_age = {str(r.get("id")) for r in added}, max(0, now_ms - int(self.preopen.account_at)) // 1000
+                    rows = rows + added
+                else:
+                    cut = (f"账户挂单太多，这次只读到前 {len(rows)} 张：排在后面的挂单（手动单）没有撤到——"
+                           "过一两分钟再发一次 /live cancel account（预挂的账户快照读完整后会补上）")
+            extra = [str(r.get("id")) for r in rows
                      if str(r.get("id")) not in known and str(r.get("id")) not in pre_ids and (order_hash_of(r) or "-") not in pre_hashes]
             # 1.150.0 (audit FR-CANCEL-ACCOUNT-STALE-KEY): that read is the whole account's — every page, many of them beside the
             # pre-open mode's thousands — and nothing holds the express lane meanwhile: this command takes no sim_lock, and the lane
@@ -6461,18 +6594,28 @@ class LiveBot(core.Bot):
             self.sim_withdraw(t, "管理员撤单", now_ms)
             self.sim_save([(tid, t)])
         if not targets and not extra:
-            return "没有真实挂单可撤。"
-        problems = []
+            return "没有真实挂单可撤。" if not cut else f"❌ 读到的挂单里没有要撤的，但{cut}"
+        problems = [cut] if cut else []
         if extra:
             limit = self.live_remove_limit()
             result = await remove_in_batches(self.live.api, extra, limit, workers=3, patient=True, deadline=time.monotonic() + 60,
                                              stop=self.stopping.is_set)  # 1.141.0: was one request for them all
             self.live_remove_saved(limit)
             self.live_unknown_open = [u for u in self.live_unknown_open if u["id"] not in set(result["removed"])]
-            quiet = len(result["noop"]) + len(result["unanswered"])
-            missed = len(result["failed"]) + len(result["left"])
-            extra_text = (f"账户上无记录的挂单 {len(extra)} 张：Predict 确认撤掉 {len(result['removed'])} 张" + (f"，{quiet} 张称无需撤" if quiet else "")
-                          + (f"，{missed} 张没撤成（{result['errors'][-1] if result['errors'] else '一分钟内没撤完'}），再发一次 /live cancel account" if missed else ""))
+            # 1.154.26 (the audit of 11-18, 2): an id Predict left out of every answer — neither removed nor "nothing to remove",
+            # three tries — was counted with those it said needed no removal ("称无需撤") under a ✅: it may well still rest.
+            # Counted with what was not withdrawn, the reply a ❌ asking for the command again
+            # (an id the snapshot alone named, left out of the answers: most likely gone since that snapshot — said so, not a miss)
+            silent = len([i for i in result["unanswered"] if i not in older])
+            gone = len(result["unanswered"]) - silent
+            missed = len(result["failed"]) + len(result["left"]) + silent
+            why = result["errors"][-1] if result["errors"] else ("Predict 的应答里没有它们" if silent else "一分钟内没撤完")
+            from_snapshot = len([i for i in extra if i in older])
+            extra_text = (f"账户上无记录的挂单 {len(extra)} 张" + (f"（其中 {from_snapshot} 张是按预挂 {snapshot_age} 秒前的账户快照补上的）" if from_snapshot else "")
+                          + f"：Predict 确认撤掉 {len(result['removed'])} 张"
+                          + (f"，{len(result['noop'])} 张称无需撤" if result["noop"] else "")
+                          + (f"，{gone} 张快照里有、Predict 这次没提（多半已不在）" if gone else "")
+                          + (f"，{missed} 张没撤成（{why}），再发一次 /live cancel account" if missed else ""))
             if missed:
                 problems.append(extra_text)
         list_error = ""
@@ -6751,6 +6894,17 @@ class LiveBot(core.Bot):
         history. Record by record off the file, as before that, only when the counts cannot stand for the records (one in
         the archive that is no plain withdrawn quote) or could not be had; never kept in memory either way."""
         from preopen import archive_share, read_archive, read_rows, review
+        # 1.154.26: asked twice a build of the review page (the daily summary, then the analysis) — a walk of every record
+        # each, seconds of the event loop with 39,000 of them: within one build (review_scope) the second is the first's
+        kept = getattr(self, "review_kept", None)
+        if kept is not None and "preopen" in kept:
+            return kept["preopen"]
+        out = self.preopen_review_build(archive_share, read_archive, read_rows, review)
+        if kept is not None:
+            kept["preopen"] = out
+        return out
+
+    def preopen_review_build(self, archive_share: Any, read_archive: Any, read_rows: Any, review: Any) -> dict | None:
         try:
             if self.preopen is not None:
                 rows, old = list(self.preopen.ledger.rows.values()), self.preopen.ledger.archived()
@@ -6813,8 +6967,12 @@ class LiveBot(core.Bot):
                     self.preopen_start()
                 else:
                     self.preopen_tidy()  # off: no controller will ever move the old records out of the file the check below and the positions check read whole
-                    if self.preopen_leftovers():  # off, yet its records hold orders that may rest: withdrawn all the same
+                    resting, unsettled = self.preopen_left()
+                    if resting:  # off, yet its records hold orders that may rest: withdrawn all the same
                         self.preopen_start(wind_down="预挂模式关着，但上次还有挂单没撤完")
+                    elif unsettled:  # 1.154.26: ...or windows with fills whose result nobody has booked (preopen.awaiting_result)
+                        self.preopen_start(wind_down="预挂模式关着，但还有已成交的场次没结算")
+                        self.preopen.wound_told = True  # (nothing of it rests: no "挂单已全部撤完" notice again at every start)
 
     def preopen_tidy(self) -> None:
         """The mode off and no controller on its ledger file: the old finished quotes that filled nothing still leave the
@@ -6842,16 +7000,22 @@ class LiveBot(core.Bot):
         XR-PRELATE-CRASHED): also the withdrawn orders whose final fills are still unread (preopen.awaiting_finals) — an
         operator's withdrawal on a crashed controller, which has no loop to read them a minute on: the wind-down controller
         reads them, else their outcomes held the model trader's positions check for 3 days."""
-        from preopen import awaiting_finals, read_rows, resting_orders
+        return self.preopen_left()[0]
+
+    def preopen_left(self) -> tuple[int, int]:
+        """What the pre-open mode's records still hold while the mode is off, in one read of its file: (the orders that may
+        rest or whose final fills are unread — preopen_leftovers; the windows with fills whose result is not booked yet,
+        1.154.26 — preopen.awaiting_result). Either starts a controller that only winds down (preopen_apply)."""
+        from preopen import awaiting_finals, awaiting_result, read_rows, resting_orders
         try:
             rows = read_rows(self.config.preopen.db)
         except Exception as error:
             LOG.warning("预挂记录读取失败：%s", core.clean_error(error) or type(error).__name__)
-            return 0
+            return 0, 0
         if not rows:
-            return 0
+            return 0, 0
         now = self.market.now_ms()
-        return sum(resting_orders(p, now) + awaiting_finals(p, now) for p in rows)
+        return sum(resting_orders(p, now) + awaiting_finals(p, now) for p in rows), sum(1 for p in rows if awaiting_result(p, now))
 
     def preopen_start(self, wind_down: str = "") -> None:
         from preopen import Controller
@@ -7038,15 +7202,15 @@ class LiveBot(core.Bot):
     async def cmd_preopen(self, req: core.Request) -> str:
         action = req.args[0].lower() if req.args else ""
         if action == "weekend" and len(req.args) > 1 and req.args[1].lower() in {"on", "off"}:  # 1.138.2: PREOPEN_WEEKEND from Telegram
-            result = self.control_set({"PREOPEN_WEEKEND": req.args[1].lower()})
-            if not result["ok"]:
+            result = await self.control_kept(self.control_set({"PREOPEN_WEEKEND": req.args[1].lower()}))
+            if not result["ok"] and "已在运行中生效" not in result["message"]:  # (in force, not yet in the database: said in the answer below)
                 return "❌ " + result["message"]
             await self.preopen_apply()
             return (result["message"] + "\n" + ("周末不挂：北京时间周六 00:00 到周一 08:00 开始的场次不挂，已挂的撤掉，周一 08:00 起恢复" if req.args[1].lower() == "off"
                                                  else "周末照挂") + ("\n" + self.preopen.status() if self.preopen is not None else ""))
         if action in {"on", "off"}:  # saved on the control page's record and applied at once, as the page would
-            result = self.control_set({"PREOPEN_15M": action})
-            if not result["ok"]:
+            result = await self.control_kept(self.control_set({"PREOPEN_15M": action}))
+            if not result["ok"] and "已在运行中生效" not in result["message"]:
                 return "❌ " + result["message"]
             await self.preopen_apply()
             return result["message"] + "\n" + (self.preopen.status() if self.preopen is not None else "开盘前预挂模式已关闭")

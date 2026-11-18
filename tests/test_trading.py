@@ -177,6 +177,16 @@ async def api_checks():
     server["answers"]["/orders"] = {"success": True, "data": {"nothing": 1}}
     try: await api.create_order({"data": {}}); assert False
     except m.RemoteError as e: assert "订单号" in str(e)
+    # 1.154.26 (the audit of 11-18, 3): only Predict's own "success: false" is a refusal. A 2xx answer that says nothing — no body,
+    # no "data", one of another shape — was one too (OrderRejected: the order failed and freed by all three strategies), though
+    # nothing in it says the order was not taken: result unknown now (a plain RemoteError — the hash kept, looked for by it)
+    for said_nothing in ({}, {"success": True}, {"success": True, "data": None}, {"success": True, "data": [1]}, {"data": "ok"}):
+        server["answers"]["/orders"] = said_nothing
+        try: await api.create_order({"data": {}}); assert False, said_nothing
+        except m.RemoteError as e: assert not isinstance(e, L.OrderRejected) and "按哈希核对" in str(e) and L.http_status(e) == 0, (said_nothing, e)
+    server["answers"]["/orders"] = {"success": False}  # refused with no reason given: said so — never Predict's raw answer in the text
+    try: await api.create_order({"data": {}}); assert False
+    except m.RemoteError as e: assert isinstance(e, L.OrderRejected) and str(e) == "下单被拒绝：Predict 没有说明原因", e
     server["answers"]["/orders/remove"] = lambda body: {"success": True, "removed": body["data"]["ids"][:1], "noop": body["data"]["ids"][1:]}
     assert await api.remove_orders(["1", "2"]) == {"removed": ["1"], "noop": ["2"]}
     server["answers"]["/orders/remove"] = {"success": True, "data": {"removed": [], "noop": ["9"]}}
@@ -1443,6 +1453,34 @@ async def run():
     assert ([r["id"] for r in await api.orders("OPEN", stop_ids={"a"})], api.orders_complete) == (["a", "b"], False)
     assert ([r["id"] for r in await api.orders("OPEN", stop_ids={"zzz"}, max_pages=2)], api.orders_complete) == (["a", "b", "c"], False)
     assert ([r["id"] for r in await api.orders("OPEN", stop_ids={"d"})], api.orders_complete) == (["a", "b", "c", "d"], True), "the last page ends the list: whole"
+    # 1.154.26 (the audit of 11-18, 13): a list that shifts while it is paged shows the row at the boundary on both pages — kept
+    # twice, a position's shares counted double by the minute's check against the records (booked as a late fill onto an ended
+    # order). Each row once: an order by its id; a position (no id) by all it says — two outcomes of one market stay two rows
+    pos = lambda mid, index, amount: {"market": {"id": mid}, "outcome": {"indexSet": index}, "amount": str(amount)}
+    shifted = {"": {"data": [pos(7, 1, 5 * 10 ** 18), pos(8, 1, 3 * 10 ** 18)], "cursor": {"after": "p2"}},
+               "p2": {"data": [pos(8, 1, 3 * 10 ** 18), pos(8, 2, 3 * 10 ** 18), pos(9, 1, 10 ** 18)], "cursor": None}}
+    async def authed_shifted(method, path, *a, **k):
+        return shifted[path.partition("after=")[2]]
+    api.authed = authed_shifted
+    got = await api.positions()
+    assert [(r["market"]["id"], r["outcome"]["indexSet"]) for r in got] == [(7, 1), (8, 1), (8, 2), (9, 1)] and api.positions_complete, got
+    # ...a position is its market and outcome, whatever id its row carries and whatever its amount is by now: listed again with
+    # another amount (a fill between the two pages) it is the same position, as the later page has it; two outcomes of one
+    # market under one id (nothing says Predict's id is one a position) are two positions
+    moved = {"": {"data": [{**pos(7, 1, 5 * 10 ** 18), "id": "m7"}, {**pos(7, 2, 2 * 10 ** 18), "id": "m7"}], "cursor": {"after": "p2"}},
+             "p2": {"data": [{**pos(7, 2, 6 * 10 ** 18), "id": "m7"}, {**pos(9, 1, 10 ** 18), "id": "m9"}], "cursor": None}}
+    async def authed_moved(method, path, *a, **k):
+        return moved[path.partition("after=")[2]]
+    api.authed = authed_moved
+    got = await api.positions()
+    assert [(r["market"]["id"], r["outcome"]["indexSet"], int(r["amount"]) // 10 ** 18) for r in got] == [(7, 1, 5), (7, 2, 6), (9, 1, 1)], got
+    assert L.position_mark({"id": "x", "amount": "1"}) == L.row_mark({"id": "x", "amount": "1"}) == ("id", "x"), "a row that names no market and outcome: by its id"
+    again = {"": {"data": [{"id": "a"}, {"id": "b"}], "cursor": {"after": "c2"}}, "c2": {"data": [{"id": "b", "status": "OPEN"}, {"id": "c"}], "cursor": None}}
+    async def authed_again(method, path, *a, **k):
+        return again[path.partition("after=")[2]]
+    api.authed = authed_again
+    assert [r["id"] for r in await api.orders("OPEN")] == ["a", "b", "c"] and api.paged_stats["/orders"] == (2, 2)
+    api.authed = authed
     # 1.154.7: each read's requests and the rows of a full page (one that had a next) — what Predict really gives a page, whatever
     # LIVE_ORDERS_PAGE asked for (ORDERS_PAGE 50 here, the pages of two and one: a server's cap shows as such)
     await api.orders("OPEN")

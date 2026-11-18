@@ -1567,4 +1567,92 @@ async def ctrl_sources_off():
 
 
 asyncio.run(ctrl_sources_off())
+
+
+async def ctrl_saved_means_written():
+    """1.154.26 (the audit of 11-18, 10): a save answered 已保存并生效 the moment its record was queued for the store's writer.
+    With the writer failing (a full disk — /diag alone says so) LIVE=off, a pause, the emergency stop or a lower cap were in
+    force in memory only, and a restart brought the old value back: real trading on again, nobody having chosen it. Now the
+    answer waits for the database to have that record (Store.reached: not for everything queued after it — the bot never
+    stops writing) and, when it has not, says so and is no success: in force, not kept."""
+    import os, tempfile
+    with tempfile.TemporaryDirectory() as folder:
+        store = m.Store(os.path.join(folder, "state.db"))
+
+        def broken(conn, rows):
+            raise OSError("database or disk is full")
+        # the store: a mark is reached once its own write is committed, whatever was queued after it
+        store.put("a", 1)
+        first = store.mark()
+        assert store.reached(first, 3.0) and store.flush(3.0)
+        store._apply = broken
+        store.put("b", 2)
+        second = store.mark()
+        assert second > first and store.reached(first, 0.1) and not store.reached(second, 0.3) and not store.flush(0.1)
+        assert store.get("b") == 2, "readable all the same (the overlay)"
+        del store._apply
+        assert store.reached(second, 5.0) and m.Store(":memory:").reached(m.Store(":memory:").mark(), 0.0)
+
+        env = {**base, "LIVE": "pause", "PREDICT_PRIVATE_KEY": "0x" + "a" * 64, "PREDICT_API_KEY": "k"}  # a made-up key, never a real one
+        bot = L.LiveBot(m.Config.from_env(env), store, FM(NOW), None)
+        bot.live.api, bot.live.chain = FakeApi(), FakeChain()
+        bot.CONTROL_KEPT_S = 0.3
+        r = await bot.control_action({"action": "set", "values": {"SIM_EDGE_CENTS": "12"}})
+        assert r["ok"] and r["message"].startswith("已保存并生效：SIM_EDGE_CENTS=12") and "数据库" not in r["message"], r
+        # the writer fails: in force, said not to be kept, and no green toast — the page's save, a preset, the reset
+        store._apply = broken
+        r = await bot.control_action({"action": "set", "values": {"SIM_EDGE_CENTS": "13"}})
+        assert not r["ok"] and r["message"].startswith("已保存并生效：SIM_EDGE_CENTS=13") and bot.control_value("SIM_EDGE_CENTS") == "13", r
+        assert "已在运行中生效，但还没写进数据库（OSError: database or disk is full）：这时重启或重新部署会回到保存前的值" in r["message"], r
+        r = await bot.control_action({"action": "set", "values": {"SIM_EDGE_CENTS": "x"}})
+        assert not r["ok"] and "数据库" not in r["message"], "a save that was refused says why, as before"
+        r = await bot.control_action({"action": "preset", "name": m.CONTROL_PRESETS[0][0]})
+        assert not r["ok"] and r["message"].startswith("已套用") and "还没写进数据库" in r["message"], r
+        r = await bot.control_action({"action": "reset"})
+        assert not r["ok"] and r["message"].startswith("已清除网页上保存的设置") and "还没写进数据库" in r["message"], r
+        # a pause, the emergency stop, the mode: the same
+        text = await bot.live_action("pause", ["x"], NOW)
+        assert text.startswith("⏸ 真实交易已暂停（x）") and "还没写进数据库" in text and "会回到没有暂停的状态（会接着下单）" in text and bot.live_paused() == "x", text
+        r = await bot.live_control("pause", {"why": "页面暂停"})  # the page's 暂停 button: in force, and no green toast for it
+        assert not r["ok"] and bot.live_paused() == "页面暂停" and "还没写进数据库" in r["message"], r
+        r = await bot.live_control("stop", {})
+        assert not r["ok"] and bot.live_paused() == "紧急停止" and "还没写进数据库" in r["message"] and r["message"].startswith("⛔ 紧急停止"), r
+        text = await bot.live_set_mode("off")
+        assert text.startswith("❌ 真实交易模式：pause → off。") and "会回到 pause" in text and bot.config.live_mode == "off", text
+        r = await bot.live_control("mode", {"value": "pause"})
+        assert not r["ok"] and bot.config.live_mode == "pause", r
+        # /preopen weekend off | on (Telegram): saved the same way — in force, and said not to be kept
+        text = await bot.cmd_preopen(m.Request("/preopen", ["weekend", "off"], 1, 0, 42))
+        assert "还没写进数据库" in text and bot.control_value("PREOPEN_WEEKEND") == "off", text
+        # the disk back: written, and said to be
+        del store._apply
+        assert store.flush(5.0)
+        r = await bot.control_action({"action": "set", "values": {"SIM_EDGE_CENTS": "14"}})
+        assert r["ok"] and "数据库" not in r["message"], r
+        text = await bot.live_action("pause", ["y"], NOW)
+        assert "数据库" not in text and (store.get("live:paused") or {}).get("why") == "y", text
+        text = await bot.live_set_mode("off")
+        assert text.startswith("真实交易模式：pause → off（已保存，重启后仍有效"), text
+        text = await bot.cmd_preopen(m.Request("/preopen", ["weekend", "on"], 1, 0, 42))
+        assert "数据库" not in text and bot.control_value("PREOPEN_WEEKEND") == "on", text
+        # the writer merely behind (a large batch ahead of this write), no error of its own: said as a queue, not as a failing disk
+        import threading
+        gate = threading.Event()
+
+        def slow(conn, rows, real=type(store)._apply):
+            gate.wait(5)
+            return real(conn, rows)
+        store._apply = slow
+        r = await bot.control_action({"action": "set", "values": {"SIM_EDGE_CENTS": "15"}})
+        gate.set()
+        assert not r["ok"] and "数据库还在写前面排队的内容，0.3 秒内没轮到" in r["message"] and "只是“排队”则稍等再保存一次确认" in r["message"], r
+        del store._apply
+        assert store.flush(5.0) and (store.get("control:env") or {}).get("SIM_EDGE_CENTS") == "15"
+        store.close()
+    # a store in memory writes as it is put: nothing to wait for
+    bot = L.LiveBot(m.Config.from_env({**base, "LIVE": "pause", "PREDICT_PRIVATE_KEY": "0x" + "a" * 64, "PREDICT_API_KEY": "k"}), m.Store(":memory:"), FM(NOW), None)
+    assert await bot.control_durable() == "" and (await bot.control_action({"action": "set", "values": {"SIM_EDGE_CENTS": "12"}}))["ok"]
+
+
+asyncio.run(ctrl_saved_means_written())
 print("AUDIT_CONTROL_OK")

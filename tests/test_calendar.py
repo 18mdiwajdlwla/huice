@@ -161,6 +161,14 @@ async def run():
         assert len(calls) == 1, calls  # 12-25 is a holiday: the 60-second cadence does not apply
     finally:
         m.fetch_source = saved_fetch
+    # 1.154.26: a span written the wrong way round gave no day at all, and said nothing — the holiday week traded as ordinary days.
+    # Taken for the span it plainly means (not refused: a calendar that read until now must not stop the bot from starting)
+    assert m.parse_dates("2026-10-07..2026-10-01, 2026-12-25", "HOLIDAYS_CN") == m.parse_dates("2026-10-01..2026-10-07,2026-12-25", "HOLIDAYS_CN")
+    assert len(m.parse_dates("2026-10-07..2026-10-01", "HOLIDAYS_CN")) == 7
+    try:
+        m.parse_dates("2026-10-07..oct", "HOLIDAYS_CN"); assert False
+    except ValueError as error:
+        assert "日期格式应为" in str(error)
     print("CALENDAR_OK")
 
 

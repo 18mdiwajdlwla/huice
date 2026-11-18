@@ -555,6 +555,7 @@ async def the_long_lived_heap_is_set_aside():
     import gc
     watch = m.GC_WATCH
     base = gc.get_freeze_count()  # (the interpreter's own: a few hundred objects that are never looked at)
+    before_threshold = gc.get_threshold()
     assert not watch.settles and base < 5_000 and watch.thawed is None
     kept = [{"record": i, "orders": [{"hash": str(i)}]} for i in range(60_000)]  # what a bot keeps: tracked by the collector, never garbage
     timed = lambda: (lambda began: (gc.collect(), time.perf_counter() - began)[1])(time.perf_counter())
@@ -571,7 +572,10 @@ async def the_long_lived_heap_is_set_aside():
         assert gc.get_freeze_count() <= frozen - 50_000
         line = watch.line()
         import re
-        assert re.search(r"｜长期数据 \d+ 万 个对象已放到一边、回收时不再扫（每 5 分钟整理一次，上次 \d+ 秒前、用了 \d+ ms；每天全部重扫一次）$", line), line
+        assert re.search(r"｜长期数据 \d+ 万 个对象已放到一边、回收时不再扫（每 5 分钟整理一次——之后新增的在这时收一遍，上次 \d+ 秒前、用了 \d+ ms；每天全部重扫一次）$", line), line
+        # 1.154.26: ...and the collector's own full collections asked for FULL_EVERY middle ones apart from the first settle on
+        # (10 by default: with nothing counted as long-lived any more one came at every tenth — 45 in ten minutes, 2.6 s)
+        assert gc.get_threshold()[2] == m.GcWatch.FULL_EVERY == 400 and gc.get_threshold()[:2] == before_threshold[:2] and watch.threshold == before_threshold
         assert "整堆回收" in line and not any(gen >= 2 and at >= watch.settled[0] - 5 for at, gen, _ in watch.runs if False), line
         runs = len(watch.runs)
         watch.settle()
@@ -648,6 +652,7 @@ async def the_long_lived_heap_is_set_aside():
     finally:
         watch.stop()
     assert gc.get_freeze_count() <= base and not watch.settles and watch.thawed is None and gc.isenabled()  # (as it was found)
+    assert gc.get_threshold() == before_threshold and watch.threshold is None
 
 
 async def main():

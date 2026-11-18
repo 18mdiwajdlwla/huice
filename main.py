@@ -52,7 +52,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.25"
+VERSION = "1.154.26"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -317,6 +317,11 @@ def parse_dates(spec: str, label: str) -> frozenset:
             first, last = dt.date.fromisoformat(start), dt.date.fromisoformat(end or start)
         except ValueError:
             raise ValueError(f"{label} 日期格式应为 YYYY-MM-DD 或 YYYY-MM-DD..YYYY-MM-DD：{item}") from None
+        if first > last:
+            # (1.154.26: a span written the wrong way round — 2026-10-07..2026-10-01 — gave no day at all and said nothing: the
+            # holiday week traded as ordinary days. Taken for the span it plainly means; not an error — a calendar that read
+            # until now must not stop the bot from starting)
+            first, last = last, first
         while first <= last:
             days.add(first)
             first += dt.timedelta(days=1)
@@ -1513,6 +1518,28 @@ class Store:
                 self.lock.wait(left)
         return True
 
+    def mark(self) -> int:
+        """The latest write queued so far: what reached() waits for (1.154.26). 0 with no writer (written as it is put)."""
+        if self.writer is None:
+            return 0
+        with self.lock:
+            return self.version
+
+    def reached(self, mark: int, timeout: float = FLUSH_SECONDS) -> bool:
+        """Wait until the write marked (mark) is committed; False when it is not within ``timeout`` — the writer failing.
+        Unlike flush, not for what was queued after it: the bot never stops writing, and a setting's confirmation is about
+        that setting (Bot.control_durable)."""
+        if self.writer is None:
+            return True
+        deadline = time.monotonic() + timeout
+        with self.lock:
+            while self.written < mark:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self.lock.wait(left)
+        return True
+
     def line(self) -> str:
         """The writer's state in a line (/diag)."""
         if self.writer is None:
@@ -1698,8 +1725,20 @@ def _http_get(url: str, payload: dict | None = None, timeout: int = 15,
     return _http_keepalive(url, split, data, hdrs, timeout)
 
 
+# 1.154.26 (the audit of 11-18, 12): the headers that are a credential — Predict's API key and the sign-in's token (live.PredictApi
+# .headers, the feed's x-api-key). They went wherever a redirect led: the kept-alive path followed a GET's Location to another
+# host, or down to plain http, with the request's headers as they were; urllib's own handler copies every header to the next
+# request too (and replays a redirected POST as a GET with them). Nothing of the kind was ever seen from Predict — but a
+# maintenance page, a moved domain or an edge's http answer would have been handed the key and the session. Sent to the host
+# the request was made to, over https, and to no other
+SECRET_HEADERS = frozenset({"authorization", "x-api-key", "cookie", "proxy-authorization"})
+
+
 def _http_urllib(url: str, data: bytes | None, hdrs: dict[str, str], timeout: int, host: str) -> bytes:
-    req = urllib.request.Request(url, data=data, headers=hdrs)
+    req = urllib.request.Request(url, data=data, headers={k: v for k, v in hdrs.items() if k.lower() not in SECRET_HEADERS})
+    for name, value in hdrs.items():
+        if name.lower() in SECRET_HEADERS:
+            req.add_unredirected_header(name, value)  # with this request alone: urllib's redirect handler does not carry these on
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT) as response:
             raw = _read_body(response, timeout)
@@ -1769,17 +1808,26 @@ def _http_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str, st
                     _pool_put(host, port, conn)
                 url = urllib.parse.urljoin(url, location)
                 split = urllib.parse.urlsplit(url)
+                if split.scheme != "https" or (split.hostname, split.port or 443) != (host, port):
+                    hdrs = {k: v for k, v in hdrs.items() if k.lower() not in SECRET_HEADERS}  # another host, or not https: no credentials (SECRET_HEADERS)
                 if split.scheme != "https" or not split.hostname:
+                    conn = None  # (handed back above: an error of the request below is not this connection's to be closed for)
                     return _http_urllib(url, data, hdrs, timeout, split.hostname or "")
                 host, port = split.hostname, split.port or 443
                 path = (split.path or "/") + (f"?{split.query}" if split.query else "")
                 continue
+            if 300 <= status < 400:
+                # (1.154.26: a redirect that is not followed — a POST's, never sent again; one with no Location — is no answer:
+                # its body, a page or nothing, used to be returned as the request's result)
+                raise RemoteError(f"HTTP {status}: 重定向没有跟随（{'POST 不会重发' if data is not None else '没有给出去向'}）")
             raw = _read_body(response, timeout)
         except RemoteError:
-            conn.close()
+            if conn is not None:
+                conn.close()
             raise
         except (OSError, http.client.HTTPException) as error:
-            conn.close()
+            if conn is not None:
+                conn.close()
             raise _net_error(error) from None
         if response.will_close:
             conn.close()
@@ -5592,6 +5640,14 @@ class GcWatch:
     # snapshot and the records since on top, 0.1 ms right after
     SETTLE_FIRST_S = 90.0     # ...first this long after the start (the records read, the first rounds made)
     SETTLE_EVERY_S = 300.0    # ...then what has become long-lived since, this often
+    # 1.154.26 — ...and the collector's own full collections made rare. 11-18 20:55, the first hour with the heap set aside: the
+    # longest one 114 ms where it was 724 — but 45 of them in ten minutes where there were 3, 2.6 s in all. With next to nothing
+    # counted as long-lived any more, the collector's rule (a full collection when what became long-lived since the last one is
+    # a quarter of all that is) holds at every turn, so one came every tenth collection of the middle generation — each walking
+    # all that was made since the last settle (an account snapshot's rows, a build of the review page). The settle is a full
+    # collection of exactly that, at a moment of its choosing, every SETTLE_EVERY_S: the collector's own are asked for this
+    # many middle ones apart (10 by default) — some ten minutes at the pace seen, there only if the settles stop coming
+    FULL_EVERY = 400
     #                           ...and once a day everything is walked again (gc.unfreeze: garbage in cycles among what was set aside — Bot.day_pass_due)
 
     def __init__(self) -> None:
@@ -5602,6 +5658,7 @@ class GcWatch:
         self.held = 0      # ...and how many times in all
         self.settled = (0.0, 0.0, 0)  # (monotonic, ms, objects set aside) of the last settle
         self.settling = False         # ...one under way (note)
+        self.threshold: tuple | None = None  # the collector's thresholds as they were found (FULL_EVERY in force since the first settle)
         self.settles = 0   # ...how many there were
         self.thawed: float | None = None  # monotonic: when everything was last walked (the first settle, then each thaw); None before any
 
@@ -5621,6 +5678,9 @@ class GcWatch:
         if self.settles:
             gc.unfreeze()  # (as it was found: the tests)
             self.settled, self.settles, self.thawed = (0.0, 0.0, 0), 0, None
+        if self.threshold is not None:
+            gc.set_threshold(*self.threshold)
+            self.threshold = None
 
     def settle(self, thaw: bool = False) -> float:
         """What is alive now set aside from the collector (gc.freeze), after one collection of what has been made since the
@@ -5635,6 +5695,9 @@ class GcWatch:
             gc.freeze()
         finally:
             self.settling = False
+        if self.threshold is None:
+            self.threshold = gc.get_threshold()
+            gc.set_threshold(self.threshold[0], self.threshold[1], max(self.FULL_EVERY, self.threshold[2]))
         ms, now = (time.perf_counter() - began) * 1000, time.monotonic()
         self.settled, self.settles = (now, ms, gc.get_freeze_count()), self.settles + 1
         if thaw or self.thawed is None:
@@ -5678,8 +5741,8 @@ class GcWatch:
         text += "）"
         if self.settles:  # 1.154.25
             at, ms, count = self.settled
-            text += (f"｜长期数据 {f'{count / 10_000:.0f} 万' if count >= 10_000 else count} 个对象已放到一边、回收时不再扫（每 {self.SETTLE_EVERY_S / 60:g} 分钟整理一次，"
-                     f"上次 {max(0, int(time.monotonic() - at))} 秒前、用了 {ms:.0f} ms；每天全部重扫一次）")
+            text += (f"｜长期数据 {f'{count / 10_000:.0f} 万' if count >= 10_000 else count} 个对象已放到一边、回收时不再扫（每 {self.SETTLE_EVERY_S / 60:g} 分钟整理一次——"
+                     f"之后新增的在这时收一遍，上次 {max(0, int(time.monotonic() - at))} 秒前、用了 {ms:.0f} ms；每天全部重扫一次）")
         return text + ("" if gc.isenabled() or self.holders else "｜⚠️ 自动回收是关着的")
 
 
@@ -5802,6 +5865,32 @@ class LoopWatch:
         return text + "；卡在：" + "；".join(f"{what} {n} 次共 {secs:.1f} 秒（最长 {longest:.0f} ms）" for what, n, secs, longest in shown) \
             + (f"；另有 {len(rest)} 处共 {sum(r[1] for r in rest)} 次 {sum(r[2] for r in rest):.1f} 秒" if rest else "") \
             + "（延迟 = 别的活儿占着主循环、盘口和下单请求在后面排队的时间；← 后面是调用它的地方）"
+
+
+# 1.154.26 (the audit of 11-18, 20): a trade pushed in was stamped with the moment it arrived, whatever its own time — the price
+# "as the 30-second read would set it, that read deferred by as long". A socket that stalls and then catches up delivers its
+# backlog in a burst (common here: rules.py's notes on the same stream): each old trade made its card look priced this very
+# second — past the staleness checks (price_problem), the REST read put off again and again — and the look a tenth of a second
+# later priced, and with SIM_TAKER_HOLD_SECONDS=0 bought, on a price minutes old. The 15-minute index cards have gone by the
+# event's own time since 1.122.0 (IndexUpDownMarket.push_index); now the first-touch, the daily up/down and the range cards do
+# too: a pushed trade is as old as it says (never newer than now), one older than the price in hand is not taken, and only a
+# trade of this moment — within PUSH_FRESH_MS — defers the card's own read. (now_ms is on Binance's clock: MarketData.now_ms.)
+PUSH_FRESH_MS = 5_000
+
+
+def vol_again(fails: int, known: bool, every: float) -> float:
+    """Seconds until σ is read again after a read that failed — or came back with none (1.154.26, the audit of 11-18, 26): with
+    no σ yet, 5 s, then twice as long each time up to a minute; with one in hand, five minutes; never later than the regular
+    cadence. The first-touch and the up/down cards read σ again at every pass while they had none — "or self.sigma is None",
+    the pass a second apart: 722 hourly candles, or 1,500 of the index's minutes, a card a second for as long as the read
+    failed (Binance down without a rate-limit answer, a session with too few minutes yet). A few such cards were the futures
+    weight limit, and its cooldown stops every futures read. The flip and the range cards have backed off since 1.150.0."""
+    return min(every, 300.0 if known else min(60.0, 5.0 * 2 ** max(0, min(fails, 8) - 1)))
+
+
+def pushed_stamp(now_ms: int, at_ms: int | None) -> int:
+    """When a pushed trade's price is of: its own time, never later than now; now when it states none."""
+    return now_ms if at_ms is None else min(now_ms, int(at_ms))
 
 
 class PredictPacer:
@@ -6444,6 +6533,7 @@ class PredictFeed:
         self.no_strike: set[str] = set()                         # category types without marketData.startPrice
         self.category_raw: dict[str, tuple[Any, float]] = {}    # slug -> (the REST category answer, when): the start price may sit in it (1.112.0)
         self.strike_seen: dict[str, float] = {}                 # slug stem -> when REST last gave a start price for a market of the kind (strike_possible)
+        self.strike_tried: dict[str, int] = {}                  # ...and the reads asked eagerly since that found none (strike_unlikely, 1.154.26)
         self.graphql_until = 0.0                                 # monotonic: after a 403 from GraphQL, no GraphQL request before this
         self.graphql_error = ""                                  # the refusal
         self.info: dict[str, dict] = {}                          # slug -> {"outcomes": [...], "created_ms": int}
@@ -6470,6 +6560,7 @@ class PredictFeed:
         self.round_info: dict[str, Any] = {}                     # the last hot round: keys, ladder levels read, the slowest key (for /diag)
         self.book_asked: dict[str, float] = {}                   # item key -> monotonic time the stored book was asked for
         self.absent_at: dict[str, float] = {}                    # item key -> monotonic time its book was answered 404 (1.154.9: PREDICT_ABSENT_SECONDS)
+        self.absent_of: dict[str, str] = {}                      # ...and the slug that answer was for (1.154.26: the next market under the key is asked at once)
         self.row_asked: dict[str, dict[str, float]] = {}         # item key -> market id -> the same, for a ladder's levels
         self.blocked_until = 0.0                                 # monotonic: after a 429, no request before this
         self.lend: Any = None                                    # the rule taker's key, lent while that taker is idle (preopen.KeyLending; LiveBot sets it, 1.154.21)
@@ -6626,6 +6717,14 @@ class PredictFeed:
         via_graphql = self.config.predict_graphql and bool(kind) and kind not in self.no_strike and self.graphql_until - time.monotonic() <= 0
         return via_graphql or time.monotonic() - self.strike_seen.get(slug.rsplit("-", 1)[0], -1e18) < 86_400  # REST gave one lately: it comes
 
+    STRIKE_TRIES = 12  # eager reads of a kind's start price with none found (a minute of them) before the kind is taken for one that has none
+
+    def strike_unlikely(self, slug: str) -> bool:
+        """A kind whose start price is not coming, by this process's own tries (1.154.26): no source says it can (strike_possible)
+        and STRIKE_TRIES eager reads since the start, or since the last one found, found none. Not merely "none seen yet": after
+        a restart nothing has been seen for any kind, and the first window's figure is asked for as eagerly as ever."""
+        return not self.strike_possible(slug) and self.__dict__.get("strike_tried", {}).get(slug.rsplit("-", 1)[0], 0) >= self.STRIKE_TRIES
+
     def graphql_note(self) -> str:
         """The pause (or the switch), for /diag: "" while GraphQL is asked."""
         if not self.config.predict_graphql:
@@ -6779,6 +6878,12 @@ class PredictFeed:
                 value = meta[0]["start_price"]
                 self.strike_seen[slug.rsplit("-", 1)[0]] = time.monotonic()
         self.strikes[slug] = (value, time.monotonic())
+        if eager:  # (strike_unlikely: how often a kind was asked this way and gave nothing)
+            tried, stem = self.__dict__.setdefault("strike_tried", {}), slug.rsplit("-", 1)[0]
+            if value is None:
+                tried[stem] = tried.get(stem, 0) + 1
+            else:
+                tried.pop(stem, None)
         return value
 
     async def market_details(self, market_id: str) -> dict:
@@ -7103,6 +7208,7 @@ class PredictFeed:
                     raise
                 # 1.154.9: no book to read (HTTP 404 "Orderbook not found") — an answer, asked again in PREDICT_ABSENT_SECONDS (refresh)
                 self.absent_at[key] = time.monotonic()
+                self.__dict__.setdefault("absent_of", {})[key] = slug
                 raise RemoteError(f"Predict 上这个市场没有盘口（{clean_error(error)}），{int(PREDICT_ABSENT_SECONDS // 60)} 分钟后再看") from None
             self.absent_at.pop(key, None)
             if asked < self.book_asked.get(key, -1e18):
@@ -7157,6 +7263,13 @@ class PredictFeed:
         for table in (self.ladders, self.ladder_rows, self.row_refreshed, self.key_ms, self.row_asked, self.book_asked, self.absent_at):
             for key in [k for k in table if k not in targets]:
                 table.pop(key)
+        # 1.154.26 (the audit of 11-18, 22): a card's "no book" answer (404) is its market's, and kept under the card's key — a card
+        # that rolled to its next market (a new slug under the same key) kept the old market's back-off: the new one's book
+        # not asked for up to PREDICT_ABSENT_SECONDS. Dropped when the slug under the key is no longer the one it was for
+        absent_of = self.__dict__.setdefault("absent_of", {})  # (a feed built without __init__ — the tests' — has none yet)
+        for key in [k for k in self.absent_at if absent_of.get(k, targets.get(k)) != targets.get(k)]:
+            self.absent_at.pop(key)
+        self.absent_of = {k: v for k, v in absent_of.items() if k in self.absent_at}
         self.slugs = dict(targets)
         keep = set(targets.values())  # yesterday's daily slugs are not kept around for ever
         # FEED-CACHE-GROWTH: category_raw too (strike() reads it only for the current slug and re-reads it when missing;
@@ -8387,12 +8500,17 @@ class TouchMarket:
     async def get(self, path: str, **params: Any) -> Any:
         return await binance_spot(path, **params)
 
-    def push_price(self, price: D, now_ms: int) -> None:
+    def push_price(self, price: D, now_ms: int, at_ms: int | None = None) -> None:
         """A trade pushed in (BinanceStream): the price as the 30-second read would set it, that read deferred by as
-        long; at a line the path is checked at once."""
-        self.price, self.priced_ms, self.times["price"] = price, now_ms, time.monotonic()
+        long; at a line the path is checked at once. ``at_ms``: the trade's own time (pushed_stamp, 1.154.26)."""
         if (price <= self.spec.low or price >= self.spec.high) and self.history.get("kind") in {None, "clear"}:
             self.times["scan"] = -1e9
+        stamp = pushed_stamp(now_ms, at_ms)
+        if stamp < int(self.priced_ms or 0):
+            return  # older than the price in hand (the read's, a later trade's): a socket catching up
+        self.price, self.priced_ms = price, stamp
+        if now_ms - stamp <= PUSH_FRESH_MS:
+            self.times["price"] = time.monotonic()
 
     @property
     def history(self) -> dict:
@@ -8406,18 +8524,27 @@ class TouchMarket:
             if mono - self.times["price"] >= self.PRICE_SECONDS:
                 self.times["price"] = mono
                 data = await self.get("ticker/price", symbol=self.spec.symbol)
-                self.price, self.priced_ms = number(data["price"], self.spec.symbol), now_ms
+                if now_ms >= int(self.priced_ms or 0):  # (1.154.26: not over a trade pushed in while this read was out — that one is the newer)
+                    self.price, self.priced_ms = number(data["price"], self.spec.symbol), now_ms
                 if (self.price <= self.spec.low or self.price >= self.spec.high) and self.history.get("kind") in {None, "clear"}:
                     self.times["scan"] = -1e9  # the price is at a line right now: check the path at once, not in 5 minutes
-            if mono - self.times["vol"] >= self.VOL_SECONDS or self.sigma is None:
-                self.times["vol"] = mono
-                # 722: the newest bar is the hour still running, which realized_vol drops; 721 finished bars remain
-                self.sigma = realized_vol(await self.get("klines", symbol=self.spec.symbol, interval="1h", limit=722), now_ms)
-                self.sigma_ms = now_ms
+            if mono - self.times["vol"] >= self.VOL_SECONDS:  # (1.154.26: no "or self.sigma is None" — the first read is at once all the same: vol_again)
+                was, self.times["vol"] = self.times["vol"], mono
+                try:
+                    # 722: the newest bar is the hour still running, which realized_vol drops; 721 finished bars remain
+                    self.sigma = realized_vol(await self.get("klines", symbol=self.spec.symbol, interval="1h", limit=722), now_ms)
+                    self.sigma_ms, self.vol_fails, self.vol_error = now_ms, 0, ""
+                except Exception as error:  # (its own try: a σ read failing no longer keeps the path's scan below from running)
+                    self.vol_fails = int(getattr(self, "vol_fails", 0)) + 1
+                    self.times["vol"] = mono - self.VOL_SECONDS + vol_again(self.vol_fails, self.sigma is not None, self.VOL_SECONDS)
+                    self.vol_error = clean_error(error) or type(error).__name__  # (said until a σ read answers: not only in the pass that tried)
+                except BaseException:  # cancelled in the middle of the read (the round timed out, a shutdown): nothing learnt — due as it was
+                    self.times["vol"] = was
+                    raise
             if self.start_ms and mono - self.times["scan"] >= self.SCAN_SECONDS:
                 self.times["scan"] = mono
                 await self.scan(now_ms)
-            self.error = ""
+            self.error = str(getattr(self, "vol_error", "") or "")
         except Exception as error:
             self.error = clean_error(error) or type(error).__name__
 
@@ -9496,9 +9623,15 @@ class UpDownMarket:
     async def get(self, path: str, **params: Any) -> Any:
         return await binance_spot(path, **params)
 
-    def push_price(self, price: D, now_ms: int) -> None:
-        """A trade pushed in (BinanceStream): the price as the 30-second read would set it, that read deferred by as long."""
-        self.price, self.priced_ms, self.times["price"] = price, now_ms, time.monotonic()
+    def push_price(self, price: D, now_ms: int, at_ms: int | None = None) -> None:
+        """A trade pushed in (BinanceStream): the price as the 30-second read would set it, that read deferred by as long.
+        ``at_ms``: the trade's own time (pushed_stamp, 1.154.26)."""
+        stamp = pushed_stamp(now_ms, at_ms)
+        if stamp < int(self.priced_ms or 0):
+            return  # older than the price in hand (the read's, a later trade's): a socket catching up
+        self.price, self.priced_ms = price, stamp
+        if now_ms - stamp <= PUSH_FRESH_MS:
+            self.times["price"] = time.monotonic()
 
     def at(self, spec: UpDownSpec) -> "UpDownMarket":
         """A market of the same kind on another period (a past day or window a position settles on: Bot.updown_of)."""
@@ -9534,6 +9667,8 @@ class UpDownMarket:
         if self.close_of("end") is None:  # settled: nothing is left to price
             try:
                 await self.read_quote(now_ms, mono)
+                if kept := str(getattr(self, "vol_error", "") or ""):
+                    errors.append(kept)  # 1.154.26: σ's last failure — tried again with a back-off (vol_again), no longer at every pass
             except Exception as error:
                 errors.append(clean_error(error) or type(error).__name__)
         self.error = "；".join(errors)
@@ -9561,15 +9696,31 @@ class UpDownMarket:
         if mono - self.times["price"] >= price_every:
             self.times["price"] = mono
             jobs.append(self.read_price(now_ms))
-        if mono - self.times["vol"] >= vol_every or self.sigma is None:
+        vol_job, vol_was = None, self.times["vol"]
+        if mono - self.times["vol"] >= vol_every:  # (1.154.26: no "or self.sigma is None" — the first read is at once all the same: vol_again)
             self.times["vol"] = mono
+            vol_job = len(jobs)
             jobs.append(self.read_vol(now_ms))
         if not jobs:
             return
-        results = await asyncio.gather(*jobs, return_exceptions=True)
-        for result in results:
-            if isinstance(result, asyncio.CancelledError):
-                raise result
+        try:
+            results = await asyncio.gather(*jobs, return_exceptions=True)
+            for result in results:
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+        except BaseException:  # cancelled in the middle of the reads (the round timed out, a shutdown): nothing learnt of σ — due as it was
+            if vol_job is not None:
+                self.times["vol"] = vol_was
+            raise
+        if vol_job is not None:
+            failed = results[vol_job] if isinstance(results[vol_job], Exception) else None
+            if failed is not None or self.sigma is None:  # failed, or read and none to be had yet
+                self.vol_fails = int(getattr(self, "vol_fails", 0)) + 1
+                self.times["vol"] = mono - vol_every + vol_again(self.vol_fails, self.sigma is not None, vol_every)
+            else:
+                self.vol_fails = 0
+            # (its failure is said until a read of it answers — refresh — not only in the pass that tried)
+            self.vol_error = "" if failed is None else (clean_error(failed) or type(failed).__name__)
         errors = [r for r in results if isinstance(r, Exception)]
         if errors:
             raise RemoteError("；".join(clean_error(e) or type(e).__name__ for e in errors))
@@ -9577,7 +9728,8 @@ class UpDownMarket:
     async def read_price(self, now_ms: int) -> None:
         """The pair's last trade (ticker/price)."""
         data = await self.get("ticker/price", symbol=self.spec.symbol)
-        self.price, self.priced_ms = number(data["price"], self.spec.symbol), now_ms
+        if now_ms >= int(self.priced_ms or 0):  # (1.154.26: not over a trade pushed in while this read was out — that one is the newer)
+            self.price, self.priced_ms = number(data["price"], self.spec.symbol), now_ms
 
     async def read_vol(self, now_ms: int) -> None:
         """σ: the last 30 days' hourly returns, the last five days weighing about half (a month-old calm does not price a
@@ -9997,7 +10149,7 @@ class IndexUpDownMarket(UpDownMarket):
             return f"，分时形态未取得（{brief_error(self.shape_error, 40)}）" if self.shape_error else ""
         return f"，分时形态 ×{self.shape_factor:.2f}（近 {self.shape.span_days:.0f} 日同一时段）"
 
-    def push_price(self, price: D, now_ms: int) -> None:
+    def push_price(self, price: D, now_ms: int, at_ms: int | None = None) -> None:
         return None  # a trade is not the index: only push_index prices it
 
     def push_index(self, price: D, at_ms: int, now_ms: int) -> bool:
@@ -10208,7 +10360,7 @@ class SpotWindowMarket(IndexUpDownMarket):
     async def candles(self, interval: str, limit: int) -> Any:
         return await self.get("klines", symbol=self.spec.symbol, interval=interval, limit=limit)
 
-    def push_price(self, price: D, now_ms: int) -> None:
+    def push_price(self, price: D, now_ms: int, at_ms: int | None = None) -> None:
         """A trade pushed in without its own time: taken as newer than whatever the card holds (trades come in order)."""
         self.push_index(price, max(now_ms, self.index_ms + 1), now_ms)
 
@@ -11468,20 +11620,28 @@ class RangeMarket:
     async def get(self, path: str, **params: Any) -> Any:
         return await (self.futures if self.spec.venue == "futures" else binance_spot)(path, **params)
 
-    def push_price(self, price: D, now_ms: int) -> None:
-        """A trade pushed in (BinanceStream): the price as the 30-second read would set it, that read deferred by as long."""
-        self.price, self.priced_ms, self.times["price"] = price, now_ms, time.monotonic()
-        self.failures["price"] = ""
+    def push_price(self, price: D, now_ms: int, at_ms: int | None = None) -> None:
+        """A trade pushed in (BinanceStream): the price as the 30-second read would set it, that read deferred by as long.
+        ``at_ms``: the trade's own time (pushed_stamp, 1.154.26) — its hour, and whether it is of the window at all."""
+        stamp = pushed_stamp(now_ms, at_ms)
         # audit MOD-RANGE-WICK: a trade pushed through a level is a touch (Predict's book shows it decided at once), but
         # marks() only took the latest price, so the next push back under the level un-reached it until the next scan's
         # running-hour candle (up to SCAN_SECONDS) — a decided level priced as open, its No side looking cheap. Keep the
         # extremes of the pushed trades per hour until the persisted hours (history "through") cover that hour.
-        if self.start_ms and self.start_ms <= now_ms < self.window_end:  # a window not known yet records nothing
-            hour, p = now_ms - now_ms % 3_600_000, float(price)
+        # (1.154.26: by the trade's own time — one made before the window and delivered after its start is not the window's
+        # touch; one of an earlier hour is that hour's extreme)
+        if self.start_ms and self.start_ms <= stamp < self.window_end:  # a window not known yet records nothing
+            hour, p = stamp - stamp % 3_600_000, float(price)
             seen = self.pushed.get(hour)
             self.pushed[hour] = [max(seen[0], p), min(seen[1], p)] if seen else [p, p]
             through = int(self.history.get("through") or 0)
             self.pushed = {h: x for h, x in self.pushed.items() if h + 3_600_000 > through}
+        if stamp < int(self.priced_ms or 0):
+            return  # older than the price in hand (the read's, a later trade's): a socket catching up
+        self.price, self.priced_ms = price, stamp
+        if now_ms - stamp <= PUSH_FRESH_MS:
+            self.times["price"] = time.monotonic()
+        self.failures["price"] = ""
 
     @property
     def window_end(self) -> int:
@@ -11571,7 +11731,8 @@ class RangeMarket:
             self.times["price"] = mono
             try:
                 data = await self.get("ticker/price", symbol=self.spec.symbol)
-                self.price, self.priced_ms = number(data["price"], self.spec.symbol), now_ms
+                if now_ms >= int(self.priced_ms or 0):  # (1.154.26: not over a trade pushed in while this read was out — that one is the newer)
+                    self.price, self.priced_ms = number(data["price"], self.spec.symbol), now_ms
                 self.failures["price"] = ""
             except Exception as error:
                 self.failures["price"] = f"价格：{why(error)}"
@@ -13884,45 +14045,118 @@ def version_label(key: str) -> tuple[str, str]:
     return CONTROL_LABELS.get(env) or VERSION_LABELS.get(env) or VERSION_LABELS.get(key) or key, env
 
 
+VERSION_PRINTS: dict[int, tuple[dict, str]] = {}  # id(a record's version) -> (that version, its fingerprint): sim_by_version reads each once (1.154.26)
+VERSION_TEXTS: dict[str, str] = {}  # ...a fingerprint -> the one string of it (the records of a version share it: a kilobyte each otherwise)
+VERSION_MOST = [0]  # ...and the most records one build has had: the table above is emptied once it holds twice that (the pruned records' versions)
+
+
+def version_print(version: dict) -> str:
+    """A record's version as one string (its settings, sorted), kept by the version's own identity: the records keep their
+    version for good, and the review page asked for every one's at every build — 12,800 of them, a fifth of a second."""
+    held = VERSION_PRINTS.get(id(version))
+    if held is None or held[0] is not version:
+        if len(VERSION_PRINTS) > 2 * VERSION_MOST[0] + 2_000:  # (records pruned since: their versions are held here for nothing)
+            VERSION_PRINTS.clear()
+        if len(VERSION_TEXTS) > 1_000:
+            VERSION_TEXTS.clear()
+        text = json.dumps(version, sort_keys=True, default=str)
+        held = VERSION_PRINTS[id(version)] = (version, VERSION_TEXTS.setdefault(text, text))
+    return held[1]
+
+
+class SummaryColumns:
+    """What summary_of and settled_extras read of each record, read once (1.154.26: the review page's 按设置版本 sums the same
+    records once a setting that ever changed — forty tables over 12,800 records on 11-18, each record's fields asked for
+    and turned into numbers forty times: most of the 6–7 s a build of that page held the event loop). ``of(idx)`` is
+    summary_of + settled_extras over the records at ``idx``, figure for figure: the same terms summed in the same order."""
+
+    def __init__(self, rows: list[dict], marks: Mapping | None = None):
+        marks = marks or {}
+        n = len(rows)
+        self.market = [str(t.get("market") or "") for t in rows]
+        self.shares = shares = [float(t.get("shares") or 0) for t in rows]
+        self.filled = [x > 0 for x in shares]
+        status = [t.get("status") for t in rows]
+        self.done = done = [x == "settled" for x in status]
+        self.resting = [x == "resting" for x in status]
+        self.held = [self.filled[i] and status[i] in {"filled", "resting"} for i in range(n)]
+        self.volume = [float(rows[i]["price"]) * float(rows[i]["shares"]) if self.filled[i] else 0.0 for i in range(n)]
+        self.win = [done[i] and rows[i]["payout"] == 1 for i in range(n)]
+        self.loss = [done[i] and rows[i]["payout"] == 0 for i in range(n)]
+        self.tie = [done[i] and 0 < rows[i]["payout"] < 1 for i in range(n)]
+        self.pnl = [(float(rows[i]["payout"]) - float(rows[i]["price"])) * float(rows[i]["shares"]) if done[i] else 0.0 for i in range(n)]
+        self.mark = [marks.get((self.market[i], str(rows[i].get("side") or ""))) if self.held[i] else None for i in range(n)]
+        self.unrealized = [(float(self.mark[i]) - float(rows[i]["price"])) * float(rows[i]["shares"]) if self.mark[i] is not None else 0.0 for i in range(n)]
+        self.expected = [float(rows[i].get("edge") or 0) * float(rows[i].get("shares") or 0) if done[i] else 0.0 for i in range(n)]
+        self.fair = [float(rows[i].get("fair") or 0) if done[i] else 0.0 for i in range(n)]
+        self.payout = [float(rows[i].get("payout") or 0) if done[i] else 0.0 for i in range(n)]
+
+    def of(self, idx: list[int]) -> dict:
+        done = [i for i in idx if self.done[i]]
+        filled = [i for i in idx if self.filled[i]]
+        held = [i for i in filled if self.held[i]]
+        marked = [i for i in held if self.mark[i] is not None]
+        return {"records": len(idx), "markets": len({self.market[i] for i in idx}),
+                "filled": sum(self.shares[i] for i in filled), "volume": sum(self.volume[i] for i in filled),
+                "settled": len(done), "wins": sum(self.win[i] for i in done), "losses": sum(self.loss[i] for i in done),
+                "ties": sum(self.tie[i] for i in done), "pnl": sum(self.pnl[i] for i in done),
+                "open": len(held), "open_cost": sum(self.volume[i] for i in held),
+                "resting": sum(self.resting[i] for i in idx),
+                "marked": len(marked), "unrealized": sum(self.unrealized[i] for i in marked),
+                "expected": sum(self.expected[i] for i in done),
+                "avg_fair": sum(self.fair[i] for i in done) / len(done) if done else None,
+                "hit": sum(self.payout[i] for i in done) / len(done) if done else None}
+
+
 def sim_by_version(trades: list[dict], marks: Mapping | None = None) -> list[dict]:
     """The review page's 按设置版本 (1.107.0): for every setting (VERSION_KNOBS) that took more than one value among the
     records that say what it was, one table — a row per value with its records' summary_of and settled_extras, the first
     and the last order made under it and how many separate stretches it ran, in the order the values first appeared (the
     oldest beyond VERSION_ROWS_MAX in one row) — the settings changed most recently first, each with its switches and the
     time of the latest. Records are read in the order they were opened; one without a version is left out. Two settings
-    changed together split the records alike: which of them made the difference, the tables cannot tell."""
+    changed together split the records alike: which of them made the difference, the tables cannot tell.
+    1.154.26: each record's fields are read once for all the tables (SummaryColumns), its version's fingerprint kept
+    (version_print), and two rows over the very same records (settings changed together) are summed once."""
     opened = lambda t: int(t.get("opened") or 0)
     ordered = sorted((t for t in trades if isinstance(t.get("version"), dict)), key=opened)
-    prints = [json.dumps(t["version"], sort_keys=True, default=str) for t in ordered]  # a handful of distinct versions: each read once
+    VERSION_MOST[0] = max(VERSION_MOST[0], len(ordered))
+    prints = [version_print(t["version"]) for t in ordered]  # a handful of distinct versions: each read once
+    at = [opened(t) for t in ordered]
     sample: dict[str, dict] = {}
     for t, fp in zip(ordered, prints):
         sample.setdefault(fp, t["version"])
+    columns: SummaryColumns | None = None
+    summed: dict[tuple, dict] = {}  # the records of a row (their places among ``ordered``) -> their figures
     out = []
     for key in VERSION_KNOBS:
         value_of = {fp: version_value(key, v) for fp, v in sample.items()}
         if len({value for ok, value in value_of.values() if ok}) < 2:
             continue
-        groups: dict[Any, list[dict]] = {}
+        if columns is None:
+            columns = SummaryColumns(ordered, marks)
+        groups: dict[Any, list[int]] = {}
         runs: dict[Any, int] = {}
         switches: list[int] = []
         previous: Any = VERSION_UNRECORDED
-        for t, fp in zip(ordered, prints):
+        for i, fp in enumerate(prints):
             ok, value = value_of[fp]
             if not ok:
                 continue
-            groups.setdefault(value, []).append(t)
+            groups.setdefault(value, []).append(i)
             if previous is VERSION_UNRECORDED or value != previous:
                 if previous is not VERSION_UNRECORDED:
-                    switches.append(opened(t))
+                    switches.append(at[i])
                 runs[value] = runs.get(value, 0) + 1
                 previous = value
 
-        def row(name: str, rows: list[dict], stretches: int) -> dict:
-            return {"name": name, "first": opened(rows[0]), "last": max(opened(t) for t in rows), "runs": stretches,
-                    **summary_of(rows, marks), **settled_extras(rows)}
-        values = sorted(groups, key=lambda v: opened(groups[v][0]))
+        def row(name: str, idx: list[int], stretches: int) -> dict:
+            mine = tuple(idx)
+            if mine not in summed:
+                summed[mine] = columns.of(idx)
+            return {"name": name, "first": at[idx[0]], "last": max(at[i] for i in idx), "runs": stretches, **summed[mine]}
+        values = sorted(groups, key=lambda v: at[groups[v][0]])
         early = values[:-VERSION_ROWS_MAX + 1] if len(values) > VERSION_ROWS_MAX else []
-        rows = ([row(f"更早（{len(early)} 种取值）", sorted((t for v in early for t in groups[v]), key=opened), 1)] if early else []) \
+        rows = ([row(f"更早（{len(early)} 种取值）", sorted((i for v in early for i in groups[v]), key=lambda i: at[i]), 1)] if early else []) \
             + [row(version_text(key, v), groups[v], runs[v]) for v in values[len(early):]]
         label, env = version_label(key)
         out.append({"key": key, "label": label, "env": env, "changed": switches[-1] if switches else 0, "switches": len(switches), "rows": rows})
@@ -15548,6 +15782,8 @@ let sumOpen=true;try{sumOpen=localStorage.getItem("jrnsum")!=="0"}catch(e){}  //
 let anaOpen=false;try{anaOpen=localStorage.getItem("jrnana")==="1"}catch(e){}  // the analysis tables: folded unless opened by hand
 let unrecOpen=false;try{unrecOpen=localStorage.getItem("jrnunrec")==="1"}catch(e){}  // 账户里有、记录里没有的持仓: folded unless opened by hand (1.152.2)
 const base=location.pathname.replace(/\/journal\/?$/,"");
+// 1.154.26: the error of an answer that is not ok — a 503 carries the server's own words (the review data is not rebuilt while the rule taker goes first)
+async function oops(r){if(r.status===503){let j={};try{j=await r.json()}catch(e){}return new Error(j.message||"HTTP 503")}return new Error("HTTP "+r.status)}
 document.getElementById("back").href=base;document.getElementById("ctl").href=base+"/control";
 document.getElementById("csv").href=base+"/journal.csv";document.getElementById("scsv").href=base+"/summary.csv";document.getElementById("json").href=base+"/journal.json?full=1";document.getElementById("mcsv").href=base+"/samples.csv";  // also right under /journal/ (CTRL-MCSV: the 导出模型样本 link too, else /journal/samples.csv 404s)
 function val(k,v){if(v==null||v==="")return"—";if(typeof v==="boolean")return v?"是":"否";
@@ -15661,7 +15897,7 @@ function filterText(){return [cardF!=="all"?cardF:"",kindF!=="all"?(KINDS[kindF]
 async function loadAna(){  // the daily summary and the analysis over the filter: the server's, the records the list holds being only the latest
   const fk=filterKey();if(!fk||loadAna.busy===fk)return;loadAna.busy=fk;
   try{const key=ctlKey();const r=await fetch(base+"/journal.json?analysis=1&"+fk,{cache:"no-store",headers:key?{"X-Control-Key":key}:{}});
-    if(!r.ok)throw new Error("HTTP "+r.status);const j=await r.json();ana=Object.assign(j,{key:fk})}
+    if(!r.ok)throw await oops(r);const j=await r.json();ana=Object.assign(j,{key:fk})}
   catch(e){if(!(ana&&ana.key===fk&&!ana.error))ana={key:fk,error:e.message||"读取失败"}}  // a failed refresh keeps what was shown
   finally{if(loadAna.busy===fk)loadAna.busy=null}
   if(fk===filterKey())render()}
@@ -15709,7 +15945,7 @@ function cardsView(S){  // 按市场: today's rows come with the summary's analy
   const kids=[];if(c.error)kids.push($("p","small bad","刷新失败："+c.error+"，下面是上一次读到的"));
   kids.push((j.rows||[]).length?cardsTable(j.rows):$("p","small mut","这段时间没有记录"));cel.replaceChildren(...kids);cardDetail(j.rows||[],j.label)}
 async function loadCards(q){const at=okAt;if(cardsBusy.has(q))return;cardsBusy.add(q);
-  try{const k=ctlKey();const r=await fetch(base+"/journal.json?"+q,{cache:"no-store",headers:k?{"X-Control-Key":k}:{}});if(!r.ok)throw new Error("HTTP "+r.status);cardsCache[q]={at,data:await r.json()}}
+  try{const k=ctlKey();const r=await fetch(base+"/journal.json?"+q,{cache:"no-store",headers:k?{"X-Control-Key":k}:{}});if(!r.ok)throw await oops(r);cardsCache[q]={at,data:await r.json()}}
   catch(e){cardsCache[q]={at,error:e.message||"读取失败",data:(cardsCache[q]||{}).data}}  // a failed re-read keeps what was shown
   finally{cardsBusy.delete(q)}
   summary()}
@@ -15799,7 +16035,7 @@ function recTable(ts,g){  // one compact table of records (1.114.1): in groups b
       if(open){const d=$("tr","det"),td=$("td","wrap");td.colSpan=10;td.append(detailBox(t));d.append(td);tb.append(d)}})});
   tb.append(sumRow("合计",stat(ts),"all"));w.append(tb);return w}
 async function loadRows(q){const at=okAt;if(rowsBusy.has(q))return;rowsBusy.add(q);  // a panel's records, as the page stood (at): read again once it refreshes
-  try{const k=ctlKey();const r=await fetch(base+"/journal.json?"+q,{cache:"no-store",headers:k?{"X-Control-Key":k}:{}});if(!r.ok)throw new Error("HTTP "+r.status);rowsCache[q]={at,rows:await r.json()}}
+  try{const k=ctlKey();const r=await fetch(base+"/journal.json?"+q,{cache:"no-store",headers:k?{"X-Control-Key":k}:{}});if(!r.ok)throw await oops(r);rowsCache[q]={at,rows:await r.json()}}
   catch(e){rowsCache[q]={at,error:e.message||"读取失败",rows:(rowsCache[q]||{}).rows}}  // a failed re-read keeps what was shown
   finally{rowsBusy.delete(q)}
   summary()}
@@ -16040,10 +16276,10 @@ async function load(){  // the list: light rows, the open trades and the last fe
   try{const key=ctlKey();const r=await fetch(base+"/journal.json"+(wantAll?"?all=1":""),{cache:"no-store",headers:key?{"X-Control-Key":key}:{},signal:ctl.signal});
     if(r.status===403||r.status===429){let j={};try{j=await r.json()}catch(e){}  // 1.150.0: "nokey" (a real account, WEB_CONTROL_KEY unset): nothing to type, the message once
       if(r.status===403&&j.nokey)load.keyBad=true;else if(r.status===403&&askKey(j.message||"需要控制口令"))again=true;throw new Error(j.message||("HTTP "+r.status))}
-    if(!r.ok)throw new Error("HTTP "+r.status);const j=await r.json();
+    if(!r.ok)throw await oops(r);const j=await r.json();  // (1.154.26: a 503 says why — the rule taker goes first, nothing is built now: oops)
     if(openId&&!wantAll&&j.more>0&&!j.trades.some(t=>t.id===openId)){allLoaded=true;again=true}  // a link to an older trade: the whole list
     else{if(load.more){allLoaded=true;load.more=false}data=j;okAt=Date.now();if(filterKey())loadAna();  // the filter's tables refreshed with the list
-      document.getElementById("meta").replaceChildren($("span","","数据 "+data.generated_at),$("span","","v"+data.version),$("span","",data.trades.length+" 笔"+(data.more>0?"（更早的 "+data.more+" 笔可载入）":"")));
+      document.getElementById("meta").replaceChildren($("span","","数据 "+data.generated_at+(Date.now()-(data.server_ms||Date.now())>600000?"（旧数据：规则吃单优先时段里不重算，过后自动更新）":"")),$("span","","v"+data.version),$("span","",data.trades.length+" 笔"+(data.more>0?"（更早的 "+data.more+" 笔可载入）":"")));
       render();if(openId&&details[openId])loadDetail(openId);
       const o=openId&&document.querySelector(".tr.open");if(o&&!load.done)o.scrollIntoView({block:"start"});load.done=true}}
   catch(e){const hms=okAt?clock(okAt):"";
@@ -16054,7 +16290,7 @@ async function load(){  // the list: light rows, the open trades and the last fe
   finally{clearTimeout(timer);load.busy=false}
   if(again||load.again){load.again=false;load()}}
 ["csv","scsv","json"].forEach(id=>{const a=document.getElementById(id);a.addEventListener("click",async e=>{const key=ctlKey();if(!key)return;e.preventDefault();  // with a key: fetched with it, saved as a file
-  try{const r=await fetch(a.href,{cache:"no-store",headers:{"X-Control-Key":key}});if(!r.ok)throw new Error("HTTP "+r.status);const u=URL.createObjectURL(await r.blob());
+  try{const r=await fetch(a.href,{cache:"no-store",headers:{"X-Control-Key":key}});if(!r.ok)throw await oops(r);const u=URL.createObjectURL(await r.blob());
     const t=document.createElement("a");t.href=u;t.download=a.getAttribute("download");document.body.append(t);t.click();t.remove();setTimeout(()=>URL.revokeObjectURL(u),5000)}
   catch(err){alert("导出失败："+err.message)}})});
 document.getElementById("unrechd").addEventListener("click",()=>{unrecOpen=!unrecOpen;try{localStorage.setItem("jrnunrec",unrecOpen?"1":"0")}catch(e){}
@@ -16155,7 +16391,7 @@ function tallyRender(j){const el=document.getElementById("tally"),c=j.counts||{}
 async function tallyLoad(tries){const my=++tallySeq,el=document.getElementById("tally");if(!tries)el.replaceChildren($("p","small mut","读取中…"));
   const q=tallyRng?"&range="+tallyRng:"&from="+tallyFrom+"&to="+tallyTo;
   try{const key=ctlKey();const r=await fetch(base+"/journal.json?tally="+encodeURIComponent(tallyKey)+q,{cache:"no-store",headers:key?{"X-Control-Key":key}:{}});
-    if(!r.ok)throw new Error("HTTP "+r.status);const j=await r.json();if(my!==tallySeq)return;
+    if(!r.ok)throw await oops(r);const j=await r.json();if(my!==tallySeq)return;
     const sel=document.getElementById("tcard");if(!sel.options.length)(j.cards||[]).forEach(c=>{const o=document.createElement("option");o.value=c.key;o.textContent=c.name;sel.append(o)});
     if(j.key!==tallyKey||j.from!==(tallyLast||{}).from||j.to!==(tallyLast||{}).to)tallyDay="";
     sel.value=j.key;tallyKey=j.key;document.getElementById("tfrom").value=j.from;document.getElementById("tto").value=j.to;document.getElementById("tto").max=j.today;document.getElementById("tfrom").max=j.today;
@@ -16174,7 +16410,10 @@ if(tallyOpen)tallyLoad(0);
 document.querySelectorAll("details.fold[data-k]").forEach(d=>{const k="jrnfold:"+d.dataset.k;let open=d.dataset.k==="ev";  // 1.152.1: each part of 复盘分析 folds on its own, remembered
   try{const v=localStorage.getItem(k);if(v!==null)open=v==="1"}catch(e){}d.open=open;d.addEventListener("toggle",()=>{try{localStorage.setItem(k,d.open?"1":"0")}catch(e){}})});
 document.addEventListener("click",e=>{const m=document.getElementById("exports");if(m&&m.open&&!m.contains(e.target))m.open=false});  // the export menu closes on a tap elsewhere
-load();setInterval(load,60000);
+// 1.154.26: a build of this page's data is seconds of the bot's event loop (its orders wait behind it) — every 5 minutes, not
+// every one; never for a tab that is not looked at (it loads as it is looked at again, when what it shows is over a minute old)
+load();setInterval(()=>{if(document.visibilityState!=="hidden")load()},300000);
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible"&&Date.now()-okAt>60000)load()});
 </script></body></html>"""
 
 
@@ -16572,6 +16811,10 @@ def page_payload(payload: dict, private: bool = False) -> dict:
     return {**payload, "items": items}
 
 
+class WebBusy(Exception):
+    """A heavy body is not built now (WebServer.cached: the rule taker goes first): the request is told to come back."""
+
+
 class WebServer:
     """Tiny read-only HTTP server (stdlib asyncio) for the probability page.
 
@@ -16585,7 +16828,15 @@ class WebServer:
     """
     MAX_HEADER_BYTES = 8192
     GZIP_MIN_BYTES = 512  # below this a gzip header costs about as much as it saves
-    CACHE_SECONDS = {"data.json": 1.0, "journal.json": 5.0, "live.json": 1.0, "control.json": 1.0, "why.json": 2.0}  # several tabs (or a scanner) share one build per interval
+    CACHE_SECONDS = {"data.json": 1.0, "journal.json": 30.0, "live.json": 1.0, "control.json": 1.0, "why.json": 2.0}  # several tabs (or a scanner) share one build per interval
+    # 1.154.26 — the review page's data is seconds of the event loop a build (11-18 20:55: 6–7 s each, every minute the page
+    # stood open: 57.9 s in ten minutes, the pushed books and the orders waiting behind it). While the rule taker goes first, or
+    # will within HEAVY_CLEAR_S (Bot.rules_clear: its per-second hours, a makers' moment, a window's last quarter hour and its
+    # course), none is built: the last one is served, however old (it says when it was made), or — with none in hand — the
+    # request is told to come back. Kept 30 s otherwise (5 before: every reload of every tab was a build)
+    HEAVY = ("journal.json", "journal.csv", "summary.csv", "samples.csv")
+    HEAVY_CLEAR_S = 120.0
+    BUSY_TEXT = "规则吃单正在优先时段（抢单时刻前后、开场前 15 分钟和盘中），复盘数据这段时间不重算——算一次要占住机器人几秒；过后自动恢复"
     CONTROL_BODY_MAX = 16384   # bytes a control request may carry
     CONTROL_TRIES = 5          # wrong keys within CONTROL_LOCK_SECONDS that lock the control route for as long
     CONTROL_GLOBAL_TRIES = 50  # wrong keys from every address together that lock the route for everyone (addresses can be forged)
@@ -16607,13 +16858,27 @@ class WebServer:
         self.cache: dict[str, tuple[float, bytes]] = {}  # name -> (expires, body): the JSON is built once per interval
         self.gzipped: dict[bytes, bytes] = {body: gzip.compress(body, compresslevel=9) for body in self.pages.values()}
 
+    def busy(self) -> bool:
+        """Whether a heavy body (HEAVY) is not to be built now: the rule taker goes first, or will within HEAVY_CLEAR_S."""
+        try:
+            return not self.bot.rules_clear(self.HEAVY_CLEAR_S)
+        except Exception:  # (a bot that cannot say keeps no page waiting)
+            return False
+
     def cached(self, name: str, build: Any) -> bytes:
         entry = self.cache.get(name)
         now = time.monotonic()
         if entry is None or now >= entry[0]:
+            if name.partition("?")[0] in self.HEAVY and self.busy():
+                if entry is None:
+                    raise WebBusy(self.BUSY_TEXT)
+                return entry[1]  # (the last one built: it carries its own time)
             if len(self.cache) >= 64:  # the filtered analyses are cached by their filter (1.107.0): the expired ones go
-                self.cache = {k: v for k, v in self.cache.items() if v[0] > now}
-            entry = self.cache[name] = (now + self.CACHE_SECONDS.get(name.partition("?")[0], 0.0), build())
+                # (...but for the review page's own list: what is served while the rule taker goes first)
+                self.cache = {k: v for k, v in self.cache.items() if v[0] > now or k in ("journal.json", "journal.json?all")}
+            with self.bot.review_scope():  # (a build in one piece: what it works out of each record, once — LiveBot)
+                body = build()
+            entry = self.cache[name] = (now + self.CACHE_SECONDS.get(name.partition("?")[0], 0.0), body)
         return entry[1]
 
     def compressed(self, body: bytes) -> bytes:
@@ -16656,22 +16921,32 @@ class WebServer:
                     page_payload(self.bot.odds_payload(), private), ensure_ascii=False, default=str).encode("utf-8"))
             if parts[2] == "journal":
                 return 200, "text/html; charset=utf-8", self.pages["journal"]
-            if parts[2] == "journal.json":
-                return self.journal_json(query)
-            if parts[2] == "journal.csv":  # with the review page's filter, when it has one (1.107.2; summary.csv since 1.107.0)
-                flt = journal_filter_of(urllib.parse.parse_qs(query, keep_blank_values=True))
-                return 200, "text/csv; charset=utf-8", self.bot.journal_csv(flt).encode("utf-8")
-            if parts[2] == "summary.csv":  # with the review page's filter, when it has one (1.107.0)
-                flt = journal_filter_of(urllib.parse.parse_qs(query, keep_blank_values=True))
-                return 200, "text/csv; charset=utf-8", self.bot.journal_summary_csv(flt).encode("utf-8")
-            if parts[2] == "samples.csv":  # the model samples (window_sample): the model's own figures, nothing of an account
-                return 200, "text/csv; charset=utf-8", self.bot.window_csv().encode("utf-8")
+            if parts[2] in self.HEAVY:
+                try:
+                    return self.heavy(parts[2], query)
+                except WebBusy as busy:  # 1.154.26: the rule taker goes first — nothing built now (cached)
+                    return 503, "application/json; charset=utf-8", json.dumps({"ok": False, "busy": True, "message": str(busy)}, ensure_ascii=False).encode("utf-8")
             if parts[2] == "why.json":  # the cards' "为什么挂 / 不挂单": an account's orders, keyed as the review data is (handle)
                 return 200, "application/json; charset=utf-8", self.cached(
                     "why.json", lambda: json.dumps(self.bot.why_payload(), ensure_ascii=False, default=str).encode("utf-8"))
             if parts[2] == "control":
                 return 200, "text/html; charset=utf-8", self.pages["control"]
         return 404, "text/plain; charset=utf-8", b"not found"
+
+    def heavy(self, name: str, query: str) -> tuple[int, str, bytes]:
+        """The review page's data and the exports (HEAVY): seconds of the event loop each — WebBusy while the rule taker goes
+        first and nothing built before can be served instead (cached)."""
+        if name == "journal.json":
+            return self.journal_json(query)
+        if self.busy():  # (an export is built whole each time: none kept to serve instead)
+            raise WebBusy(self.BUSY_TEXT)
+        if name == "journal.csv":  # with the review page's filter, when it has one (1.107.2; summary.csv since 1.107.0)
+            flt = journal_filter_of(urllib.parse.parse_qs(query, keep_blank_values=True))
+            return 200, "text/csv; charset=utf-8", self.bot.journal_csv(flt).encode("utf-8")
+        if name == "summary.csv":  # with the review page's filter, when it has one (1.107.0)
+            flt = journal_filter_of(urllib.parse.parse_qs(query, keep_blank_values=True))
+            return 200, "text/csv; charset=utf-8", self.bot.journal_summary_csv(flt).encode("utf-8")
+        return 200, "text/csv; charset=utf-8", self.bot.window_csv().encode("utf-8")  # samples.csv: the model samples (window_sample) — the model's own figures, nothing of an account
 
     def journal_json(self, query: str) -> tuple[int, str, bytes]:
         """journal.json: the review page's list (light rows: the open trades and the last JOURNAL_HISTORY finished
@@ -16689,6 +16964,8 @@ class WebServer:
                 return 404, ctype, json.dumps({"ok": False, "message": "没有这笔记录"}, ensure_ascii=False).encode("utf-8")
             return 200, ctype, json.dumps({"version": VERSION, "trade": row}, ensure_ascii=False, default=str).encode("utf-8")
         if (params.get("tally") or [""])[0].strip():  # 1.143.0: 市场涨跌统计 — not cached: it turns ready within seconds of the candles' read
+            if self.busy():
+                raise WebBusy(self.BUSY_TEXT)
             arg = lambda key: (params.get(key) or [""])[0].strip()
             payload = self.bot.tally_payload(arg("tally"), arg("from"), arg("to"), arg("range"))
             return 200, ctype, json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
@@ -16882,7 +17159,7 @@ class WebServer:
         if gzip_ok and status == 200 and len(body) >= self.GZIP_MIN_BYTES:
             body, encoding = self.compressed(body), "Content-Encoding: gzip\r\n"
         reason = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed",
-                  429: "Too Many Requests", 500: "Internal Server Error"}[status]
+                  429: "Too Many Requests", 500: "Internal Server Error", 503: "Service Unavailable"}[status]
         headers = (f"HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\n{encoding}"
                    "Vary: Accept-Encoding\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
                    "X-Robots-Tag: noindex\r\nContent-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; "
@@ -25370,11 +25647,12 @@ class Bot:
         """One request from the control page (its key already checked): {"ok", "message"}."""
         action = str(data.get("action") or "")
         if action == "set":
-            return self.control_set(data.get("values") if isinstance(data.get("values"), dict) else {})
+            return await self.control_kept(self.control_set(data.get("values") if isinstance(data.get("values"), dict) else {}))
         if action == "reset":
             self.store.delete_keys(["control:env"])
+            mark = self.store.mark() if callable(getattr(self.store, "mark", None)) else None
             self.apply_config(Config.from_env(self.config.env))
-            return {"ok": True, "message": "已清除网页上保存的设置，全部按环境变量运行。"}
+            return await self.control_kept({"ok": True, "message": "已清除网页上保存的设置，全部按环境变量运行。"}, mark)
         if action == "preset":  # 一键搭配: one of CONTROL_PRESETS, saved like any set
             preset = next((p for p in CONTROL_PRESETS if p[0] == str(data.get("name") or "")), None)
             if preset is None:
@@ -25382,7 +25660,7 @@ class Bot:
             result = self.control_set(dict(preset[3]))
             if result.get("ok"):
                 result["message"] = f"已套用「{preset[1]}」。" + result["message"]
-            return result
+            return await self.control_kept(result)
         # 1.150.0 (audit RDM-PAGE-REDEEM): an action that raised — 领取已结算 or 刷新持仓 with Predict's positions list failing or the
         # key in its 429 cooldown — went to the web server's catch-all: HTTP 500, a body that is not JSON, and the page's toast
         # said only 「HTTP 500」, the reason in the log alone (Telegram's /live redeem says it). The page now gets the reason, as
@@ -25393,6 +25671,42 @@ class Bot:
             text = clean_error(error) or type(error).__name__
             self.log_limited("control", f"control action {action} failed: {text}")
             return {"ok": False, "message": f"操作失败：{text}"}
+
+    CONTROL_KEPT_S = 3.0  # a setting's save waits this long for the database to have it before the page is told it has not
+
+    async def control_durable(self, mark: int | None = None) -> str:
+        """Why what was just saved is not in the database yet, "" when it is (1.154.26, the audit of 11-18, 10). A save answered
+        已保存并生效 the moment the record was queued for the store's writer; with the writer failing (a full disk: /diag alone
+        said so) the setting was in force in memory only — LIVE=off, a pause, a lower cap — and a restart brought the old
+        value back: real trading on again, nobody having chosen it. ``mark``: the store's mark as the record was queued (now,
+        when not given: call this before anything else is awaited). Waits CONTROL_KEPT_S at the most, off the loop."""
+        store = self.store
+        if getattr(store, "writer", None) is None or not callable(getattr(store, "reached", None)):
+            return ""  # (a store in memory writes as it is put; a stand-in has no writer to wait for)
+        try:
+            mark = store.mark() if mark is None else mark
+            # (the wait itself bounded too: the thread it runs in may not be had at once — the pool busy with other blocking calls)
+            if await asyncio.wait_for(asyncio.to_thread(store.reached, mark, self.CONTROL_KEPT_S), self.CONTROL_KEPT_S + 1.0):
+                return ""
+        except asyncio.TimeoutError:
+            pass
+        except Exception as error:
+            return type(error).__name__
+        return str(getattr(store, "write_error", "") or "") or f"数据库还在写前面排队的内容，{self.CONTROL_KEPT_S:g} 秒内没轮到"
+
+    @staticmethod
+    def control_unkept(why: str, back: str = "保存前的值") -> str:
+        # (the writer failing — its error in ``why`` — or merely behind: a large batch ahead of this write. Either way not kept yet)
+        return (f"⚠️ 已在运行中生效，但还没写进数据库（{why}）：这时重启或重新部署会回到{back}。"
+                "看 /diag 的“数据库”一行：有“最近错误”是磁盘的问题，只是“排队”则稍等再保存一次确认；写进去之前不要重启，要保险就直接在 Railway 的环境变量里改")
+
+    async def control_kept(self, result: dict, mark: int | None = None) -> dict:
+        """A save's answer, once the database has it — or saying that it has not (control_durable): not a success then."""
+        if not result.get("ok"):
+            return result
+        if why := await self.control_durable(mark):
+            return {"ok": False, "message": result["message"] + "\n" + self.control_unkept(why)}
+        return result
 
     def control_set(self, values: dict) -> dict:
         """Save the settings given, validated together like the environment. None clears a saved value (the environment's
@@ -26473,11 +26787,14 @@ class Bot:
                 trade = (row.get("time"), row.get("price"))
                 fresh = row.get("time") is None or self.pair_trades.get((venue, symbol)) != trade
                 self.pair_trades[(venue, symbol)] = trade
+                at_ms = None  # the trade's own time (pushed_stamp): the cards that took "now" age by it, 1.154.26
+                with contextlib.suppress(TypeError, ValueError):
+                    at_ms = int(row["time"]) if row.get("time") is not None else None
                 for card in cards:
                     if isinstance(card, SpotWindowMarket) and row.get("time") is not None:
                         card.push_index(price, int(row["time"]), now_ms)  # a 15-minute spot window: the trade's own time, as an index push
                     elif fresh:
-                        card.push_price(price, now_ms)
+                        card.push_price(price, now_ms, at_ms)
                     else:
                         continue  # the same trade again (a mark frame): nothing moved, the card's price ages and its REST read comes due
                     keys.append(card.spec.key)
@@ -26535,6 +26852,11 @@ class Bot:
         """Whether the rule taker goes first right now (LiveBot: its per-second hours, a makers' moment, a window bought in its
         course). Never, for a bot without one."""
         return False
+
+    def review_scope(self) -> Any:
+        """A context for one build of the review page's data (WebServer.cached): nothing here; LiveBot keeps each pre-open
+        record's figures for the length of it (preopen.quotes_kept)."""
+        return contextlib.nullcontext()
 
     def rules_clear(self, seconds: float) -> bool:
         """Whether the rule taker neither goes first now nor will within ``seconds`` (LiveBot: by its own plan of the day).
@@ -26673,6 +26995,7 @@ class Bot:
         return refreshed(failed, len(self.updowns) - len(failed))
 
     STRIKE_EAGER_MS = 180_000  # after a window's start, a missing start price is asked for every PREDICT_STRIKE_EAGER_SECONDS this long
+    STRIKE_UNSEEN_SECONDS = 75  # ...this often for a card of a kind whose start price does not come (PredictFeed.strike_unlikely), 1.154.26
 
     async def updown_strike(self, mkt: IndexUpDownMarket, now_ms: int) -> None:
         """The start price Predict shows for the card's window, on the card (line_used): the feed's cached figure — and, in
@@ -26685,7 +27008,13 @@ class Bot:
         start = mkt.spec.start_ms + 60_000
         if value is None and self.config.predict and start <= now_ms < start + self.STRIKE_EAGER_MS:
             market = (self.predict.markets.get(slug) or (None,))[0]
-            if market is not None and time.monotonic() - mkt.times.get("strike", -1e9) >= PREDICT_STRIKE_EAGER_SECONDS:
+            # 1.154.26: every 5 s only where the figure may come (GraphQL answering for the kind, REST gave one within a day — or
+            # the kind has not been asked a minute's worth yet: strike_unlikely). 11-18 20:55: GraphQL refused (403) and the REST
+            # records carrying none, twenty-odd cards read their market's details — and their category — every 5 s for three
+            # minutes after each quarter hour: 48 of the 118 reads a minute the feed made on a key at its pace (a round of
+            # books took 23 s behind them). Three reads a window keep finding out
+            every = self.STRIKE_UNSEEN_SECONDS if self.predict.strike_unlikely(slug) else PREDICT_STRIKE_EAGER_SECONDS
+            if market is not None and time.monotonic() - mkt.times.get("strike", -1e9) >= every:
                 mkt.times["strike"] = time.monotonic()
                 with contextlib.suppress(Exception):  # best effort: the card prices on the candle meanwhile
                     value = await self.predict.strike(slug, str(market["id"]), eager=True)

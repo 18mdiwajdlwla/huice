@@ -240,6 +240,66 @@ async def run():
     web.cache = {f"x{i}": (0.0, b"") for i in range(70)}  # the cache drops what expired once it holds many (the filtered analyses: one a filter)
     web.cached("journal.json?analysis&card=y", lambda: b"{}")
     assert len(web.cache) == 1
+    # 1.154.26 — the review page's data is seconds of the event loop a build (11-18 20:55: 6–7 s each, once a minute while the
+    # page stood open). While the rule taker goes first — or will within two minutes (Bot.rules_clear) — none is built: the
+    # last one is served, however old, or the request is told to come back; the exports and the tally likewise
+    assert m.WebServer.CACHE_SECONDS["journal.json"] == 30.0 and m.WebServer.HEAVY_CLEAR_S == 120.0 and bot.rules_clear(120.0) is True
+    built, asked = [], []
+    real_payload, real_clear = bot.journal_payload, bot.rules_clear
+    bot.journal_payload = lambda full=False, history=None: built.append(1) or real_payload(full, history)
+    web.cache.clear()
+    web.CACHE_SECONDS = {"journal.json": 30.0}
+    first = web.route("GET", f"/p/{TOKEN}/journal.json")
+    assert first[0] == 200 and built == [1] and web.route("GET", f"/p/{TOKEN}/journal.json")[2] is first[2] and built == [1], "kept half a minute"
+    web.cache["journal.json"] = (0.0, first[2])  # (grown old)
+    bot.rules_clear = lambda seconds: asked.append(seconds) or False
+    stale = web.route("GET", f"/p/{TOKEN}/journal.json")
+    assert stale[0] == 200 and stale[2] is first[2] and built == [1] and asked == [120.0], "the rule taker first: the last one built, nothing made"
+    web.cache.clear()
+    for path in ("journal.json", "journal.json?all=1", "journal.json?analysis=1&card=x", "journal.json?cards=1&range=7d", "journal.json?rows=1&day=today",
+                 "journal.json?tally=HSI", "journal.csv", "summary.csv", "samples.csv"):
+        name, _, query = path.partition("?")
+        status, ctype, body = web.route("GET", f"/p/{TOKEN}/{name}", query)
+        told = json.loads(body)
+        assert status == 503 and ctype.startswith("application/json") and told["busy"] is True and "规则吃单正在优先时段" in told["message"] and built == [1], (path, status)
+    assert web.route("GET", f"/p/{TOKEN}/journal.json", "id=nope")[0] == 404, "one record is no build: answered as ever"
+    assert web.route("GET", f"/p/{TOKEN}/data.json")[0] == 200 and web.route("GET", f"/p/{TOKEN}/journal")[0] == 200, "the pages and the odds are no heavy bodies"
+    bot.rules_clear = real_clear
+    again = web.route("GET", f"/p/{TOKEN}/journal.json")
+    assert again[0] == 200 and built == [1, 1] and web.route("GET", f"/p/{TOKEN}/journal.csv")[0] == 200
+    bot.rules_clear = lambda seconds: 1 / 0
+    web.cache.clear()
+    assert web.route("GET", f"/p/{TOKEN}/journal.json")[0] == 200, "a bot that cannot say keeps no page waiting"
+    bot.rules_clear, bot.journal_payload = real_clear, real_payload
+    web.CACHE_SECONDS = {}
+    web.cache.clear()
+    # the last build is what is served while the rule taker goes first: not dropped with the expired ones when the cache is trimmed
+    web.cache = {f"x{i}": (0.0, b"") for i in range(70)}
+    web.cache["journal.json"], web.cache["journal.json?all"] = (0.0, b"LAST"), (0.0, b"ALL")
+    web.cached("journal.json?analysis&card=y", lambda: b"{}")
+    assert (web.cache["journal.json"][1], web.cache["journal.json?all"][1], len(web.cache)) == (b"LAST", b"ALL", 3), sorted(web.cache)
+    web.cache.clear()
+    # a body is built within the bot's review_scope (LiveBot: each of the controller's own records worked out once a build)
+    import contextlib
+    steps = []
+
+    @contextlib.contextmanager
+    def scope():
+        steps.append("in")
+        yield
+        steps.append("out")
+    bot.review_scope = scope
+    web.cached("anything", lambda: steps.append("build") or b"{}")
+    del bot.review_scope
+    assert steps == ["in", "build", "out"], steps
+    web.cache.clear()
+    # ...the page says why (the 503's own words — in every one of its loaders), marks data that is old, asks every 5 minutes
+    # instead of every one, and not at all while it is not looked at
+    assert 'async function oops(r){if(r.status===503){let j={};try{j=await r.json()}catch(e){}return new Error(j.message||"HTTP 503")}return new Error("HTTP "+r.status)}' in m.JOURNAL_PAGE
+    assert m.JOURNAL_PAGE.count("if(!r.ok)throw await oops(r)") == 6 and 'throw new Error("HTTP "+r.status)' not in m.JOURNAL_PAGE
+    assert '(Date.now()-(data.server_ms||Date.now())>600000?"（旧数据：规则吃单优先时段里不重算，过后自动更新）":"")' in m.JOURNAL_PAGE
+    assert 'load();setInterval(()=>{if(document.visibilityState!=="hidden")load()},300000);' in m.JOURNAL_PAGE and "setInterval(load,60000)" not in m.JOURNAL_PAGE
+    assert 'document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible"&&Date.now()-okAt>60000)load()});' in m.JOURNAL_PAGE
     # --- 1.107.0: 按设置版本 — a table per setting that changed, a row per value with the stretch it ran ---------------------------
     v0 = dict(bot.sim_version())
     assert "sim_maker_follow_settle" in v0 and "sigma_calib" in v0 and "sim_maker_min_bid" not in v0  # (the fixture: SIM_MAKER_MIN_BID=0)
@@ -269,6 +329,68 @@ async def run():
     assert m.version_text("sim_maker_deep_markets", ("HSI", "KOSPI")) == "HSI、KOSPI" and m.version_text("sigma_calib", False) == "关" and m.version_text("sim_maker_exit", 0.0) == "关"
     assert m.version_value("sim_maker_deep_markets", {"sim_maker_deep_markets": ["KOSPI", "HSI"]}) == (True, ("HSI", "KOSPI")) and m.version_value("sim_edge", {}) == (False, None)
     assert m.sim_by_version([rec(0, 1_000), rec(1, 2_000)]) == [] and data["analysis"]["versions"] == []  # nothing changed: no table
+    # 1.154.26: the tables read each record's fields once (SummaryColumns) where every row walked its records' — forty tables
+    # over 12,800 records was most of the 6–7 s a build of the review page held the event loop (11-18 20:55). The same
+    # figures to the last bit: the same terms, summed in the same order — against the rows made as they were before
+    def by_version_before(trades, marks=None):
+        opened = lambda t: int(t.get("opened") or 0)
+        ordered = sorted((t for t in trades if isinstance(t.get("version"), dict)), key=opened)
+        prints = [json.dumps(t["version"], sort_keys=True, default=str) for t in ordered]
+        sample = {}
+        for t, fp in zip(ordered, prints):
+            sample.setdefault(fp, t["version"])
+        out = []
+        for key in m.VERSION_KNOBS:
+            value_of = {fp: m.version_value(key, v) for fp, v in sample.items()}
+            if len({value for ok, value in value_of.values() if ok}) < 2:
+                continue
+            groups, runs, switches, previous = {}, {}, [], m.VERSION_UNRECORDED
+            for t, fp in zip(ordered, prints):
+                ok, value = value_of[fp]
+                if not ok:
+                    continue
+                groups.setdefault(value, []).append(t)
+                if previous is m.VERSION_UNRECORDED or value != previous:
+                    if previous is not m.VERSION_UNRECORDED:
+                        switches.append(opened(t))
+                    runs[value] = runs.get(value, 0) + 1
+                    previous = value
+            row = lambda name, rows, stretches: {"name": name, "first": opened(rows[0]), "last": max(opened(t) for t in rows), "runs": stretches,
+                                                 **m.summary_of(rows, marks), **m.settled_extras(rows)}
+            values = sorted(groups, key=lambda v: opened(groups[v][0]))
+            early = values[:-m.VERSION_ROWS_MAX + 1] if len(values) > m.VERSION_ROWS_MAX else []
+            rows = ([row(f"更早（{len(early)} 种取值）", sorted((t for v in early for t in groups[v]), key=opened), 1)] if early else []) \
+                + [row(m.version_text(key, v), groups[v], runs[v]) for v in values[len(early):]]
+            label, env = m.version_label(key)
+            out.append({"key": key, "label": label, "env": env, "changed": switches[-1] if switches else 0, "switches": len(switches), "rows": rows})
+        return sorted(out, key=lambda k: -k["changed"])
+    assert m.sim_by_version(recs) == by_version_before(recs) and m.sim_by_version(recs, {("m0", "up"): 0.4}) == by_version_before(recs, {("m0", "up"): 0.4})
+    import random
+    rng = random.Random(26)
+    vers, cur = [], dict(v0)
+    knobs = [k for k in m.VERSION_KNOBS if k in v0 and k != "code" and isinstance(v0[k], (int, float)) and not isinstance(v0[k], bool)]
+    for i in range(14):  # fourteen versions: the code's and a setting or two changed at each, one of them back and forth
+        cur = {**cur, "code": f"1.{100 + i}.{i}", **{k: cur[k] + 1 for k in rng.sample(knobs, 2)}, knobs[0]: v0[knobs[0]] + i % 2}
+        vers.append(cur)
+    wild = []
+    for i in range(700):
+        status = rng.choice(["settled"] * 5 + ["filled", "resting", "resting", "cancelled", "expired"])
+        shares = 0.0 if status in ("cancelled", "expired") or (status == "resting" and rng.random() < 0.5) else rng.choice([3.0, 10.0, 12.5, 0.1 + 0.2])
+        t = {"market": f"w{i % 90}", "side": rng.choice(["up", "down"]), "kind": "close", "key": "HSI", "item": "恒生指数", "maker": rng.random() < 0.5, "status": status,
+             "shares": shares, "order": 12.5, "price": rng.choice([0.1, 0.33, 0.47, 0.52, 0.7]), "edge": rng.choice([0.07, 0.1, 0.13, None]), "fair": rng.choice([0.55, 0.6, 0.71]),
+             "opened": 10_000 + rng.randrange(5_000) * 7, "version": dict(vers[min(13, i // 50)]) if i % 97 else None}
+        if status == "settled":
+            t["shares"], t["payout"] = max(shares, 1.0), rng.choice([1.0, 0.0, 0.5, 1, 0])
+        wild.append(t)
+    rng.shuffle(wild)
+    wild_marks = {(f"w{i}", side): rng.choice([0.2, 0.45, 0.61]) for i in range(0, 90, 3) for side in ("up", "down")}
+    got = m.sim_by_version(wild, wild_marks)
+    assert got == by_version_before(wild, wild_marks), "the same tables"
+    assert len(got) >= 3 and any(len(k["rows"]) == m.VERSION_ROWS_MAX and k["rows"][0]["name"].startswith("更早") for k in got), [(k["key"], len(k["rows"])) for k in got]
+    assert json.dumps(got, sort_keys=False) == json.dumps(by_version_before(wild, wild_marks), sort_keys=False), "the rows' fields in the same order too"
+    assert m.sim_by_version(wild) == by_version_before(wild) and m.sim_by_version([]) == []
+    one = wild[0]["version"] or wild[1]["version"]
+    assert m.version_print(one) == json.dumps(one, sort_keys=True, default=str) and m.VERSION_PRINTS[id(one)][0] is one
     # --- 1.107.0: the 15-minute tables — by the window's start hour (the card named when there are two), by the minutes left -----
     def win(item, key, start, opened, payout=1.0):
         return {"market": f"{key}-{start}", "kind": "updown", "key": key, "item": item, "side": "up", "maker": True, "status": "settled", "shares": 10.0,

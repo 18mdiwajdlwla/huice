@@ -75,7 +75,8 @@ async def run():
     feed = Feed(); mk.get = feed.get
 
     async def refresh(at):  # the market's own timers run on the monotonic clock: make each part due
-        mk.times.update(price=-1e9, candle=-1e9)
+        # (1.154.26: σ too while there is none — a read that failed is tried again 5 s on, vol_again, no longer at every pass)
+        mk.times.update(price=-1e9, candle=-1e9, **({"vol": -1e9} if mk.sigma is None else {}))
         await mk.refresh(at)
 
     # --- before the starting minute is over there is no line yet, and nothing is asked for ----------------------

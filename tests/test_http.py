@@ -23,6 +23,7 @@ class Answer:
 
 SCRIPT = {}  # host -> the answers in order: an Answer, "send-fail" (the request could not be written), "recv-fail" (no answer came)
 LOG = []     # (connection id, method, path, body)
+SENT = []    # (host, the headers of the request) — which host was handed what (1.154.26)
 
 
 class FakeConn:
@@ -35,6 +36,7 @@ class FakeConn:
     def request(self, method, path, body=None, headers=None):
         assert not self.closed and headers["Accept-Encoding"] == "gzip" and headers["User-Agent"].startswith("CloseAlert/")
         LOG.append((self.id, method, path, body))
+        SENT.append((self.host, dict(headers)))
         step = SCRIPT[self.host].pop(0)
         if step == "send-fail":
             raise ConnectionResetError("Connection reset by peer")
@@ -109,6 +111,69 @@ def run():
         LOG.clear(); SCRIPT[host] = [Answer(302, b"", {"Location": f"https://{host}/moved"}), ok(gzip.compress(b"zipped"), headers={"Content-Encoding": "gzip"}, will_close=True), ok(b"i")]
         assert m._http_get(f"https://{host}/old") == b"zipped" and [p for _, _, p, _ in LOG] == ["/old", "/moved"]
         assert m._http_get(f"https://{host}/next") == b"i" and LOG[-1][0] != LOG[-2][0], "the closed connection was not reused"
+        # 7b. 1.154.26 (the audit of 11-18, 12): a redirect to another host is followed without the credentials — the API key and
+        # the sign-in's token went wherever a Location led; one within the host keeps them; one down to plain http loses them
+        # too (the urllib way: offline here, the guard answers — and the request it was handed carried none); a redirect that
+        # is not followed (a POST's, one with no Location) is an error, not an answer
+        secret = {"x-api-key": "KEY", "Authorization": "Bearer JWT"}
+        had = lambda headers: sorted(k for k in headers if k.lower() in m.SECRET_HEADERS)
+        del SENT[:]
+        SCRIPT[host] = [Answer(302, b"", {"Location": f"https://{host}/v2/x"}), Answer(302, b"", {"Location": "https://elsewhere.example.test/x"})]
+        SCRIPT["elsewhere.example.test"] = [ok(b"there")]
+        assert m._http_get(f"https://{host}/v1/x", headers=secret) == b"there"
+        assert [(h, had(headers)) for h, headers in SENT] == [(host, ["Authorization", "x-api-key"]), (host, ["Authorization", "x-api-key"]),
+                                                              ("elsewhere.example.test", [])], SENT
+        assert SENT[-1][1]["User-Agent"].startswith("CloseAlert/"), "the other headers go on as they were"
+        del SENT[:]
+        SCRIPT[host] = [Answer(302, b"", {"Location": f"https://{host}:8443/x"}), ok(b"other port")]  # another port is another origin (the fake's script is by host)
+        assert m._http_get(f"https://{host}/v1/p", headers=secret) == b"other port"
+        assert [had(headers) for _, headers in SENT] == [["Authorization", "x-api-key"], []], SENT
+        del SENT[:]
+        SCRIPT[host] = [Answer(302, b"", {"Location": "/v1/q?x=1"}), ok(b"same place")]  # a relative one stays where it is: kept
+        assert m._http_get(f"https://{host}/v1/p", headers=secret) == b"same place"
+        assert [had(headers) for _, headers in SENT] == [["Authorization", "x-api-key"], ["Authorization", "x-api-key"]], SENT
+        handed = []
+        real_urlopen = urllib.request.urlopen
+
+        def urlopen(req, *a, **k):
+            handed.append((req.full_url, dict(req.header_items())))
+            raise OSError("offline")
+        urllib.request.urlopen = urlopen
+        try:
+            SCRIPT[host] = [Answer(301, b"", {"Location": "http://plain.example.test/x"})]
+            try:
+                m._http_get(f"https://{host}/v1/y", headers=secret); raise AssertionError("no error")
+            except m.RemoteError as error:
+                assert str(error) == "网络错误 (OSError)", error
+            assert handed[-1][0] == "http://plain.example.test/x" and had(handed[-1][1]) == [], handed
+            SCRIPT[host] = [Answer(301, b"", {"Location": f"http://{host}/v1/y"})]  # the same host, down to plain http: none either
+            try:
+                m._http_get(f"https://{host}/v1/y", headers=secret); raise AssertionError("no error")
+            except m.RemoteError as error:
+                assert str(error) == "网络错误 (OSError)", error
+            assert handed[-1][0] == f"http://{host}/v1/y" and had(handed[-1][1]) == [], handed
+            # ...and the urllib way itself (a proxy): the credentials go with the request, marked as not to be carried over a redirect
+            urllib.request.getproxies = lambda: {"https": "http://proxy:3128"}
+            seen = []
+
+            def opened(req, *a, **k):
+                seen.append((sorted(k for k in req.unredirected_hdrs), sorted(k for k in req.headers if k.lower() in m.SECRET_HEADERS)))
+                raise OSError("offline")
+            urllib.request.urlopen = opened
+            try:
+                m._http_get(f"https://{host}/v1/z", headers=secret); raise AssertionError("no error")
+            except m.RemoteError:
+                pass
+            assert seen == [(["Authorization", "X-api-key"], [])], seen
+        finally:
+            urllib.request.urlopen = real_urlopen
+            urllib.request.getproxies = lambda: {}
+        for answer, payload, word in ((Answer(302, b"<html>", {"Location": f"https://{host}/login"}), {"a": 1}, "POST 不会重发"), (Answer(303, b""), None, "没有给出去向")):
+            SCRIPT[host] = [answer]
+            try:
+                m._http_get(f"https://{host}/v1/orders", payload); raise AssertionError("no error")
+            except m.RemoteError as error:
+                assert str(error) == f"HTTP {answer.status}: 重定向没有跟随（{word}）", error
         # 8. the pool is bounded per host
         for i in range(m.KEEPALIVE_PER_HOST + 3):
             m._pool_put(host, 443, FakeConn(host, 443))
