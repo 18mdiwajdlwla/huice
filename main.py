@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.19"
+VERSION = "1.154.20"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -5518,6 +5518,119 @@ async def predict_blocking(fn: Any, *args: Any) -> Any:
 
 
 PREDICT_PACING = os.environ.get("PREDICT_PACING", "on").strip().lower() != "off"  # the offline tests switch it off (tests/offline.py)
+
+
+class LoopWatch:
+    """How late the event loop runs, and what held it (1.154.20, /diag: 主循环). Everything the bot does — the pushed books and
+    prices, the trader's looks, every request's answer, the pre-open mode, the pages — takes its turn on one loop: a piece of
+    work that holds it for 300 ms makes everything else 300 ms late, an order's request included. 11-18: the model trader's
+    takers had become slow, and nothing said why — it was the pre-open mode's 39,000 records and 24,000 open orders walked
+    over and over on the loop (the trader's own sync digesting that mode's account snapshot at every step, the day's P&L
+    summed a dozen times a second, a task made every five seconds for each resting pair, the control page's status every
+    five seconds while it was open).
+
+    A beat sleeps BEAT_S and notes by how much it woke late; a thread beside the loop looks, whenever a beat is overdue, at
+    what the loop's thread is running just then (its stack: the innermost functions of this code), so a beat late by
+    STALL_MS or more is filed under the work that held it. The last KEEP_S are kept."""
+    BEAT_S = 0.05
+    STALL_MS = 100.0
+    KEEP_S = 600.0
+    OWN = {"main.py": "main", "live.py": "live", "preopen.py": "preopen", "rules.py": "rules"}
+
+    def __init__(self) -> None:
+        self.lags: collections.deque = collections.deque()  # (monotonic, ms late) of each beat of the last KEEP_S
+        self.stalls: collections.deque = collections.deque(maxlen=2000)  # (monotonic, ms late, what held the loop) of the beats late by STALL_MS or more
+        self.beat_at = 0.0       # when the beat under way began (the thread reads it)
+        self.caught: tuple[float, dict[str, int]] | None = None  # (the beat it belongs to, what the thread saw running -> how often)
+        self.ident = 0           # the loop's thread
+        self.alive = False
+        self.started = 0.0
+
+    async def run(self, stopping: asyncio.Event) -> None:
+        self.ident, self.alive, self.started = threading.get_ident(), True, time.monotonic()
+        threading.Thread(target=self.spy, name="loop-watch", daemon=True).start()
+        try:
+            while not stopping.is_set():
+                began = self.beat_at = time.monotonic()
+                await asyncio.sleep(self.BEAT_S)
+                self.note(began, time.monotonic())
+        finally:
+            self.alive = False
+
+    def note(self, began: float, now: float) -> None:
+        """A beat begun at ``began`` woke at ``now``: how late, and — late by STALL_MS or more — under what."""
+        late = max(0.0, (now - began - self.BEAT_S) * 1000)
+        self.lags.append((now, late))
+        while self.lags and now - self.lags[0][0] > self.KEEP_S:
+            self.lags.popleft()
+        if late >= self.STALL_MS:
+            caught = self.caught
+            seen = caught[1] if caught is not None and caught[0] == began else {}
+            self.stalls.append((now, late, max(seen, key=seen.get) if seen else "没抓到是哪一段"))
+
+    def spy(self) -> None:
+        """The thread: while a beat is overdue by more than half of STALL_MS, the loop's thread's stack is read every 20 ms
+        and what it is running counted for that beat (the commonest is the stall's name)."""
+        while self.alive:
+            time.sleep(0.02)
+            began = self.beat_at
+            if not began or (time.monotonic() - began - self.BEAT_S) * 1000 < self.STALL_MS / 2:
+                continue
+            try:
+                where = self.where(sys._current_frames().get(self.ident))
+            except Exception:  # (a look that failed names nothing; it never ends the thread)
+                continue
+            caught = self.caught
+            if caught is None or caught[0] != began:
+                caught = self.caught = (began, {})
+            caught[1][where] = caught[1].get(where, 0) + 1
+
+    @classmethod
+    def where(cls, frame: Any) -> str:
+        """A stack in a few words: the innermost three functions of this code, the caller after each ←."""
+        names: list[str] = []
+        inner = ""
+        while frame is not None and len(names) < 3:
+            base = os.path.basename(frame.f_code.co_filename)
+            if not inner:
+                inner = f"{base.rsplit('.', 1)[0]}.{frame.f_code.co_name}"
+            if base in cls.OWN:
+                names.append(f"{cls.OWN[base]}.{frame.f_code.co_name}")
+            frame = frame.f_back
+        return " ← ".join(names) or inner or "?"
+
+    def summary(self, span_s: float | None = None) -> dict | None:
+        """The last ``span_s`` (KEEP_S at the most): the beats' delay (median, 99%, longest, ms), the stalls (how many, their
+        seconds, by what held the loop: [what, count, seconds, longest ms], the most seconds first) and the seconds covered."""
+        now = time.monotonic()
+        span = min(span_s or self.KEEP_S, self.KEEP_S)
+        lags = sorted(late for at, late in self.lags if now - at <= span)
+        if not lags:
+            return None
+        by: dict[str, list] = {}
+        for at, late, what in self.stalls:
+            if now - at <= span:
+                row = by.setdefault(what, [what, 0, 0.0, 0.0])
+                row[1], row[2], row[3] = row[1] + 1, row[2] + late / 1000, max(row[3], late)
+        rows = sorted(by.values(), key=lambda r: -r[2])
+        return {"n": len(lags), "median": lags[len(lags) // 2], "p99": lags[min(len(lags) - 1, int(len(lags) * 0.99))], "max": lags[-1],
+                "stalls": sum(r[1] for r in rows), "stall_s": sum(r[2] for r in rows), "by": rows,
+                "seconds": min(span, now - self.started) if self.started else span}
+
+    def line(self) -> str:
+        """/diag's line."""
+        s = self.summary()
+        if s is None:
+            return "还没有数据（启动后几秒开始记）"
+        took = f"{s['seconds'] / 60:.0f} 分钟" if s["seconds"] >= 90 else f"{s['seconds']:.0f} 秒"
+        ms = lambda v: f"{v:.0f}" if v >= 10 else f"{v:.1f}"
+        text = f"最近 {took}延迟中位 {ms(s['median'])} ms、99% 的时候不超过 {ms(s['p99'])} ms、最长 {ms(s['max'])} ms"
+        if not s["stalls"]:
+            return text + f"；没有卡过 {self.STALL_MS:.0f} ms 以上（延迟 = 别的活儿占着主循环、盘口和下单请求在后面排队的时间）"
+        share = s["stall_s"] / max(s["seconds"], 1e-9)
+        text += f"；卡 {self.STALL_MS:.0f} ms 以上 {s['stalls']} 次、共 {s['stall_s']:.1f} 秒（占 {share:.1%}）"
+        return text + "；卡在：" + "；".join(f"{what} {n} 次共 {secs:.1f} 秒（最长 {longest:.0f} ms）" for what, n, secs, longest in s["by"][:5]) \
+            + "（延迟 = 别的活儿占着主循环、盘口和下单请求在后面排队的时间；← 后面是调用它的地方）"
 
 
 class PredictPacer:
@@ -12378,6 +12491,7 @@ class TradeMap(dict):
         self._by_market: dict[str, list[dict]] | None = None
         self._by_driver: dict[str, list[dict]] | None = None
         self._ids_by_market: dict[str, list[str]] | None = None
+        self.taken: tuple[int, int] | None = None  # sim_trades: which reading of the kept records this map holds, and as of which write; None once it is changed
 
     def of_market(self, market: str) -> list[dict]:
         """The records of one market, in the map's order (not to be changed by the caller)."""
@@ -12410,6 +12524,7 @@ class TradeMap(dict):
 
     def _changed(self) -> None:
         self._by_market = self._by_driver = self._ids_by_market = None
+        self.taken = None
 
     def __setitem__(self, key: str, value: dict) -> None:
         super().__setitem__(key, value)
@@ -16861,6 +16976,7 @@ class Bot:
         self.fair_sig: tuple | None = None  # the fair prices as of the last feed refresh (note_job): a change wakes the trader
         self.fair_sig_at = -1e9
         self.sim_lock = asyncio.Lock()      # the step's decisions and the express lane never run side by side
+        self.loop_watch = LoopWatch()       # how late the event loop runs and what held it (run starts it; /diag: 主循环)
         self.sim_follow_readonly = False    # sim_why's look: the follow's settle clocks are read, never started or reset (1.138.0)
         self.sim_cooling_timers: dict[str, asyncio.TimerHandle] = {}  # slot -> the express look armed for its cooldown's end (sim_cooling_wake)
         self.sim_express_count = 0          # decisions made by the express lane (for /diag)
@@ -16919,6 +17035,7 @@ class Bot:
         self.last_send_error = ""  # the latest Telegram send failure, for /status
         self.sim_cache: dict[str, dict] | None = None  # in-memory view of the sim: records (sim_trades)
         self.sim_gen = -1
+        self.sim_built = 0  # how many times that view was read afresh from the store (TradeMap.taken)
         self.notice_cache: dict[str, dict] | None = None  # in-memory view of the notice: records
         self.notice_gen = -1
         self.pred_pruned = 0.0  # when old prediction snapshots were last pruned
@@ -19463,7 +19580,10 @@ class Bot:
             self.sim_cache = {k.removeprefix("sim:"): sim_upgrade(v) for k, v in self.store.items("sim:")
                               if isinstance(v, dict) and "status" in v}
             self.sim_gen = generation
-        return TradeMap(self.sim_cache)
+            self.sim_built = getattr(self, "sim_built", 0) + 1  # (the view read afresh: its records are new objects)
+        view = TradeMap(self.sim_cache)
+        view.taken = (getattr(self, "sim_built", 0), self.sim_gen)  # 1.154.20: the records as kept — this reading of them, at this write — until the map itself is changed (TradeMap._changed)
+        return view
 
     def sim_save(self, pairs: Any) -> None:
         """Persist (trade id, trade) pairs in one transaction and keep the in-memory view current."""
@@ -24308,12 +24428,22 @@ class Bot:
         """The page's record list: every resting order and position, and the last ``history`` finished ones (withdrawn,
         failed, lapsed, settled), newest first — with the group the page files them under (resting / position / history),
         the status and the reason, and the real order's id and state when one was sent."""
-        rows = []
+        # 1.154.20: which records are shown is settled first (the group and the time alone), and only those are written out — the
+        # status, the state and the link of every record ever kept (12,800 on 11-17) were worked out at each of the page's
+        # five-second polls to show two hundred of them: a tenth of a second on the event loop, every poll
+        light = []
         for tid, t in trades.items():
-            st = t.get("live") if isinstance(t.get("live"), dict) else {}
             status = t.get("status")
             group = "resting" if status == "resting" else "position" if status == "filled" else "history"
             when = int((t.get("settled") or (t.get("withdrawn") or {}).get("at") or t.get("opened") or 0) if group == "history" else (t.get("opened") or 0))
+            light.append((when, group, tid, t))
+        light.sort(key=lambda r: r[0], reverse=True)
+        kept = [r for r in light if r[1] != "history"] + [r for r in light if r[1] == "history"][:history]
+        kept.sort(key=lambda r: r[0], reverse=True)
+        rows = []
+        for when, group, tid, t in kept:
+            st = t.get("live") if isinstance(t.get("live"), dict) else {}
+            status = t.get("status")
             failed = st.get("final") == "failed"
             why = str((t.get("withdrawn") or {}).get("why") or st.get("error") or (t.get("note") if status in {"expired", "cancelled"} else "") or "")
             rows.append({"id": tid, "opened": stamp(int(t.get("opened") or 0), seconds=False), "when": when, "item": str(t.get("item") or ""),
@@ -24324,10 +24454,7 @@ class Bot:
                          "order_id": str(st.get("order_id") or ""), "live_state": str(st.get("state") or ""),
                          "cancellable": status == "resting" and st.get("state") in {"open", "placing"} and bool(st.get("order_id")),
                          "url": self.sim_url(t)})
-        rows.sort(key=lambda r: r["when"], reverse=True)
-        kept = [r for r in rows if r["group"] != "history"] + [r for r in rows if r["group"] == "history"][:history]
-        kept.sort(key=lambda r: r["when"], reverse=True)
-        return kept
+        return rows
 
     def control_payload(self) -> dict:
         """What the control page shows: whether it may act, each setting (in force, saved, from the environment), the
@@ -24976,6 +25103,8 @@ class Bot:
         lines.append("📡 行情推送：" + "｜".join(f"{name} {stream.line()}" for name, stream in (
             ("币安合约", self.binance_streams["futures"]), ("币安现货", self.binance_streams["spot"]), ("Hyperliquid", self.hl_stream))))
         lines.append(f"💾 数据库：{self.store.line()}")
+        if (watch := getattr(self, "loop_watch", None)) is not None:
+            lines.append(f"⏱️ 主循环：{watch.line()}")
         if self.reference_state:
             lines.append("🔄 后台刷新")
             for name, _ in self.reference_jobs():
@@ -25977,6 +26106,7 @@ class Bot:
                 asyncio.create_task(self.commands_loop(), name="commands"),
                 asyncio.create_task(self.watchdog(), name="watchdog")]
         tasks = [*core, *self.reference_tasks]
+        tasks.append(asyncio.create_task(self.loop_watch.run(self.stopping), name="loop-watch"))  # 1.154.20: the loop's own delay, and what holds it
         if self.config.predict:  # Predict's WebSocket beside the REST rounds (PREDICT_WS=off: it idles)
             tasks.append(asyncio.create_task(self.predict.stream.run(self.stopping), name="predict-ws"))
         for name, stream in (("binance-ws-futures", self.binance_streams["futures"]), ("binance-ws-spot", self.binance_streams["spot"]),

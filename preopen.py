@@ -157,6 +157,25 @@ class Ledger:
         self.conn.commit()
         self.rows = {slug: json.loads(body) for slug, body in self.conn.execute("SELECT slug,body FROM pairs")}
         self.by_hash: dict[str, str] = {}  # order hash -> its record's key (holder); "" for a hash two records hold
+        # 1.154.20 — what the loops walk instead of every record (11-17: 39,116 of them, 26,956 accounted and only history; the day's
+        # P&L alone was summed over all of them a dozen times a second — withdrawing(), asked by every placement's gates and by the
+        # cancellation loop — and with the other walks it held the event loop a quarter of the time: the model trader's orders and
+        # the pushed books waited behind it). Both are kept by index() as a record is saved, and both hold MORE than what counts
+        # now, never less: a record leaves them only when it is saved accounted / without a day's P&L, and whoever walks them
+        # still judges each record as it stands (a pair accounted a moment ago and not saved yet is skipped by its own flag)
+        self.working: dict[str, dict] = {}  # the records not accounted when last saved, in the records' own order (pending)
+        self.scored: dict[str, dict[str, dict]] = {}  # Beijing day -> the records accounted that day with a P&L (day_pnl)
+        self.scored_day: dict[str, str] = {}  # ...and the day each is filed under
+        self.tries: dict[str, dict[str, int]] = {}  # record key (a window's level) -> its records' attempt + 1 each (attempt_after: the discovery's salt)
+        self.tries_key: dict[str, str] = {}  # ...and the record key each record is filed under
+        self.struck: dict[str, dict] = {}  # the records that counted against their window's MAX_ATTEMPTS when last saved (strikes)
+        self.ids: dict[str, int] = {}  # order id -> how many records' orders carry it (known: Controller.unmanaged_rows)
+        self.hashes: dict[str, int] = {}  # ...and their hashes (hash, api_hash), lower case
+        self.marks: dict[str, tuple[tuple, tuple, str]] = {}  # record -> (the ids, the hashes, the window) it was counted with
+        self.windows: dict[str, int] = {}  # window -> its records here (the status's 已记录 N 场)
+        self.seq: dict[str, int] = {}  # a record's place in ``rows`` (its order of entry): what the walks' own order was
+        self.seq_next = 0
+        self.unordered = False  # a record put back among the working ones out of its place (never by this code: a test's): sorted again at the next walk
         for slug, row in self.rows.items():
             self.index(slug, row)
         self.archived_count = self.archive_count()  # (the status says how many)
@@ -175,12 +194,142 @@ class Ledger:
                 self.by_hash[digest] = ""
             elif kept != "":
                 self.by_hash[digest] = slug
+        if slug not in self.seq:  # (its place in ``rows``: entered now, or loaded — a record saved again keeps its place there, and here)
+            self.seq[slug] = self.seq_next
+            self.seq_next += 1
+        if row.get("accounted"):
+            self.working.pop(slug, None)
+        elif slug not in self.working:
+            if self.working and self.seq[slug] < self.seq[next(reversed(self.working))]:
+                self.unordered = True  # back among the working records, out of its place: sorted at the next walk (pending)
+            self.working[slug] = row
+        else:
+            self.working[slug] = row  # (the same key keeps its place; the row may be a new object: a test's, a reload's)
+        orders = (row.get("orders") or {}).values()
+        mark = (tuple(str(o["id"]) for o in orders if o.get("id")),
+                tuple(str(o[k]).lower() for o in orders for k in ("hash", "api_hash") if o.get(k)), window_of(row))
+        if self.marks.get(slug) != mark:
+            self.unmark(slug)
+            for i in mark[0]:
+                self.ids[i] = self.ids.get(i, 0) + 1
+            for h in mark[1]:
+                self.hashes[h] = self.hashes.get(h, 0) + 1
+            self.windows[mark[2]] = self.windows.get(mark[2], 0) + 1
+            self.marks[slug] = mark
+        key = record_key(row)
+        if self.tries_key.get(slug, key) != key:
+            self.untry(slug)
+        self.tries.setdefault(key, {})[slug] = int(row.get("attempt") or 0) + 1
+        self.tries_key[slug] = key
+        if row.get("accounted") and row.get("phase") != "active" and counts_against(row):
+            self.struck[slug] = row
+        else:
+            self.struck.pop(slug, None)
+        try:
+            scored = bool(float(row.get("pnl") or 0))
+        except (TypeError, ValueError):
+            scored = True  # (a figure that is no number: filed, and left for the sum to stumble on as the walk did — never here, in a save)
+        day = str(row.get("accounted_day") or "") if scored else ""
+        was = self.scored_day.get(slug, "")
+        if was and was != day:
+            self.scored.get(was, {}).pop(slug, None)
+            if not self.scored.get(was):
+                self.scored.pop(was, None)
+            self.scored_day.pop(slug, None)
+        if day:
+            self.scored.setdefault(day, {})[slug] = row
+            self.scored_day[slug] = day
 
     def unindex(self, slug: str, row: dict) -> None:
         """A record leaving ``rows`` (deleted, renamed, archived): its entries in by_hash go with it."""
         for order in (row.get("orders") or {}).values():
             if order.get("hash") and self.by_hash.get(order["hash"]) == slug:
                 del self.by_hash[order["hash"]]
+        self.seq.pop(slug, None)
+        self.working.pop(slug, None)
+        self.struck.pop(slug, None)
+        self.untry(slug)
+        self.unmark(slug)
+        if was := self.scored_day.pop(slug, ""):
+            self.scored.get(was, {}).pop(slug, None)
+            if not self.scored.get(was):
+                self.scored.pop(was, None)
+
+    def unmark(self, slug: str) -> None:
+        mark = self.marks.pop(slug, None)
+        if mark is None:
+            return
+        for held, keys in ((self.ids, mark[0]), (self.hashes, mark[1]), (self.windows, (mark[2],))):
+            for k in keys:
+                if held.get(k, 0) <= 1:
+                    held.pop(k, None)
+                else:
+                    held[k] -= 1
+
+    def known(self) -> tuple[dict[str, int], dict[str, int]]:
+        """The ids and the hashes (lower case) of every record's orders, as they were when each record was last saved: an
+        order's hash is saved before the order is sent and its id with the answer, so an order on the account's list is
+        found by either. (Counted, not sets: for a membership test.)"""
+        if not self.in_step():
+            self.reindex()
+        return self.ids, self.hashes
+
+    def untry(self, slug: str) -> None:
+        key = self.tries_key.pop(slug, None)
+        if key is not None and (held := self.tries.get(key)) is not None:
+            held.pop(slug, None)
+            if not held:
+                del self.tries[key]
+
+    def reindex(self) -> None:
+        """Every index made again from ``rows`` as they stand (a test that put records in by hand; index and unindex keep them
+        in step otherwise)."""
+        self.by_hash, self.working, self.scored, self.scored_day, self.seq, self.seq_next, self.unordered = {}, {}, {}, {}, {}, 0, False
+        self.tries, self.tries_key, self.struck = {}, {}, {}
+        self.ids, self.hashes, self.marks, self.windows = {}, {}, {}, {}
+        for slug, row in self.rows.items():
+            self.index(slug, row)
+
+    def attempt_after(self, key: str, default: int = 0) -> int:
+        """The attempt after a record key's last record, the superseded ones included (the discovery's ``attempts``): an
+        attempt that left no record is not reused — its salt would be the first attempt's."""
+        if not self.in_step():
+            self.reindex()
+        held = self.tries.get(key)
+        return max(held.values()) if held else default
+
+    def strikes(self) -> dict[str, int]:
+        """window_strikes of every record, from the few that counted against their window when last saved (a record is
+        judged as it stands: one marked free since counts no more)."""
+        if not self.in_step():
+            self.reindex()
+        return window_strikes(self.struck.values())
+
+    def in_step(self) -> bool:
+        """Whether the indexes cover ``rows`` as they are: every record that came in or left through this class did (save,
+        save_many, delete, rename, archive_old), so a count that differs means records were put in or taken out by hand."""
+        return len(self.seq) == len(self.rows)
+
+    def pending(self) -> list[dict]:
+        """The records not accounted when last saved — every record that is not accounted now is among them — in the order
+        ``rows`` holds them: what a walk of ``rows`` that skips the accounted ones would have gone through, without the
+        accounted ones' tens of thousands. Whoever walks it still skips a record by its own flag."""
+        if not self.in_step():
+            self.reindex()
+        if self.unordered:
+            self.working = dict(sorted(self.working.items(), key=lambda kv: self.seq[kv[0]]))
+            self.unordered = False
+        return list(self.working.values())
+
+    def day_pnl(self, day: str) -> float:
+        """The P&L of the records accounted on a Beijing day: the sum a walk of every record made (Controller.daily_pnl), term
+        for term and in the same order, over the day's records that have one — a record without a P&L added 0.0 there."""
+        if not self.in_step():
+            self.reindex()
+        held = self.scored.get(day)
+        if not held:
+            return 0.0
+        return sum(float(p.get("pnl") or 0) for _, p in sorted(held.items(), key=lambda kv: self.seq[kv[0]]) if p.get("accounted_day") == day)
 
     def holder(self, digest: str) -> dict | None:
         """The record one of whose orders has this hash (Controller.before_send). By the index: the walk it replaces went
@@ -296,6 +445,19 @@ class Ledger:
                 self.conn.execute("INSERT INTO settings VALUES ('paused',?) ON CONFLICT(key) DO UPDATE SET body=excluded.body", (json.dumps(value),))
         row = self.conn.execute("SELECT body FROM settings WHERE key='paused'").fetchone()
         return bool(json.loads(row[0])) if row else False
+
+
+class Attempts:
+    """The discovery's ``attempts`` (record key -> the attempt after its last record), answered from the ledger's index as it
+    stands when asked (1.154.20) instead of a dict made by walking every record at each pass. A key's figure only changes
+    when a record of that key is saved, and the discovery asks for a key it is about to queue — one with no placement under
+    way — so what it reads is what the walk at the pass's start would have held."""
+
+    def __init__(self, ledger: Ledger):
+        self.ledger = ledger
+
+    def get(self, key: str, default: int = 0) -> int:
+        return self.ledger.attempt_after(key, default)
 
 
 class NotSent(core.RemoteError):
@@ -1499,7 +1661,7 @@ class Controller:
         def late(p: dict) -> bool:  # a pair with a fill waits for the result (FILL_SETTLE_MS past the start); one without should clear in minutes
             filled = any(float(o.get("filled") or 0) > 0 for o in p["orders"].values())
             return now_ms > (settle_from(p) + FILL_SETTLE_MS - 15 * 60_000 if filled else int(p.get("cancel_ms") or 0) + STUCK_MS)
-        return [p for p in self.ledger.rows.values() if not p.get("accounted") and p["phase"] != "active" and late(p)]
+        return [p for p in self.ledger.pending() if not p.get("accounted") and p["phase"] != "active" and late(p)]
 
     def check_stuck(self, now_ms: int) -> None:
         """The stuck pairs announced (once in a while each; at most three a pass, the count of the rest)."""
@@ -1736,17 +1898,15 @@ class Controller:
         return ""
 
     def known(self) -> tuple[set[str], set[str]]:
-        ids, hashes = set(), set()
-        for pair in self.ledger.rows.values():
-            for order in pair["orders"].values():
-                if order.get("id"):
-                    ids.add(str(order["id"]))
-                hashes.update(str(order[k]).lower() for k in ("hash", "api_hash") if order.get(k))
-        return ids, hashes
+        """The ids and the hashes of this mode's orders (1.154.20: from the ledger's index — the walk of every record's orders
+        it replaces took 100 ms with 39,000 records, at every account snapshot and, until the model trader kept the answer by
+        snapshot, at every step of its sync)."""
+        ids, hashes = self.ledger.known()
+        return set(ids), set(hashes)
 
     def unmanaged_rows(self, rows: list[dict]) -> list[dict]:
         import live
-        ids, hashes = self.known()
+        ids, hashes = self.ledger.known()
         return [r for r in rows if str(r.get("id")) not in ids and live.order_hash_of(r) not in hashes]
 
     def risk(self) -> float:
@@ -1754,7 +1914,7 @@ class Controller:
         size, until its pair is accounted — by the final reads after a cancel (nothing filled) or by the official
         result. A refusal or a never-sent order ties up nothing."""
         total = 0.0
-        for p in self.ledger.rows.values():
+        for p in self.ledger.pending():  # (1.154.20: the records not accounted, not every record — Ledger.pending)
             if p.get("accounted"):
                 continue
             price, shares = pair_quote(p)  # the pair's own size and price: a pair from older settings keeps its own figure
@@ -1769,7 +1929,7 @@ class Controller:
 
     def daily_pnl(self) -> float:
         day = dt.datetime.fromtimestamp(self.now() / 1000, core.BEIJING).date().isoformat()
-        return sum(float(p.get("pnl") or 0) for p in self.ledger.rows.values() if p.get("accounted_day") == day)
+        return self.ledger.day_pnl(day)  # 1.154.20: over the day's records with a P&L, not every record (asked a dozen times a second)
 
     async def account(self) -> None:
         """The account snapshot: the open orders (every page) and the USDT balance, read outside the placement lock (1.133.0:
@@ -1793,16 +1953,28 @@ class Controller:
                 raise core.RemoteError(f"账户挂单分页未读取完整（读了 {len(rows)} 条、{pages_read} 页仍没到底，上限 {getattr(client, 'ORDERS_PAGES_MAX', '?')} 页），暂停新增订单")
             self.account_pages = max(1, pages_read)
             other = self.unmanaged_rows(rows)
-            known_core = {str(t.get("live", {}).get("order_id")) for t in self.owner.sim_trades().values() if isinstance(t.get("live"), dict)}
+            known_core = {str(t.get("live", {}).get("order_id")) for t in self.owner.sim_trades().values() if isinstance(t.get("live"), dict)} if other else set()
             rule_ids, rule_hashes = getattr(self.owner, "rules_known", lambda: (set(), set()))()  # the rule taker's orders (1.153.3)
-            strangers = [r for r in other if str(r.get("id")) not in known_core | rule_ids and live.order_hash_of(r) not in rule_hashes]
+            mine = known_core | rule_ids
+            strangers = [r for r in other if str(r.get("id")) not in mine and live.order_hash_of(r) not in rule_hashes]
             unmanaged = len(strangers)
             detail = [order_brief(r) for r in strangers[:5]]  # /preopen check names them (1.132.1)
             reserved = 0.0
+            whole: dict[str, float] = {}  # makerAmount -> the USDT of a buy order of it with nothing filled (1.154.20: worked out once an amount, not once an order)
             for row in rows:
                 order = row.get("order") or {}
                 if int(order.get("side") or 0) == 0:
-                    amount, filled = D(str(row.get("amount") or "0")), D(str(row.get("amountFilled") or "0"))
+                    amount_s, filled_s = str(row.get("amount") or "0"), str(row.get("amountFilled") or "0")
+                    if filled_s == "0" and amount_s.isascii() and amount_s.isdigit() and amount_s.strip("0"):
+                        # nothing filled of a whole positive amount — nearly every row (24,000 resting bids): the same figure the
+                        # arithmetic below gives (1 − 0 / amount is 1), without three decimals and a division an order
+                        maker_s = str(order["makerAmount"])
+                        usd = whole.get(maker_s)
+                        if usd is None:
+                            usd = whole[maker_s] = float(D(maker_s) / live.WEI * (1 - D(filled_s) / D(amount_s)))
+                        reserved += usd
+                        continue
+                    amount, filled = D(amount_s), D(filled_s)
                     if amount <= 0 or not 0 <= filled <= amount:
                         raise core.RemoteError("账户订单缺少有效数量，暂停新增订单")
                     reserved += float(D(str(order["makerAmount"])) / live.WEI * (1 - filled / amount))
@@ -1817,7 +1989,7 @@ class Controller:
             self.unmanaged, self.open_reserved, self.balance, self.unmanaged_detail = unmanaged, reserved, balance, detail
             self.listed_ids = {str(r.get("id")) for r in rows}
             self.account_rows = rows
-            by_hash = {live.order_hash_of(r): r for r in rows if live.order_hash_of(r)}
+            by_hash = {digest: r for r in rows if (digest := live.order_hash_of(r))}
             for pair in self.ledger.rows.values():
                 changed = False
                 for order in pair["orders"].values():
@@ -1872,8 +2044,13 @@ class Controller:
                     pair.update(price=str(price), shares=str(int(shares) if shares == int(shares) else shares))
                     self.ledger.save(pair)
             if pair["phase"] == "active" and self.resumable(pair):
-                pair["cancel_ms"] = pair["start_ms"] - self.settings.timing(str(pair.get("key") or "")).cancel_seconds * 1000
-                self.ledger.save(pair)
+                cancel_ms = pair["start_ms"] - self.settings.timing(str(pair.get("key") or "")).cancel_seconds * 1000
+                if pair.get("cancel_ms") != cancel_ms:
+                    # 1.154.20: saved only when its cancel time changes (the setting did). A restart with the same settings took
+                    # over 12,000 resting pairs with a committed write each (synchronous=FULL: an fsync a pair, on the event loop)
+                    # that changed nothing — the whole bot stood still for that long at every start, a deploy included
+                    pair["cancel_ms"] = cancel_ms
+                    self.ledger.save(pair)
                 self.resumed += 1
                 if pair.get("key"):  # the listing horizon as the records know it: the status's 发布到, and the discovery's "beyond the listing", from the start
                     self.listed_by_card[pair["key"]] = max(self.listed_by_card.get(pair["key"], 0), int(pair["start_ms"]))
@@ -1894,7 +2071,7 @@ class Controller:
         if any(o["state"] == "rejected" and not o.get("limited") or o.get("refused") for o in pair["orders"].values()):
             return False  # Predict's refusal, outright or deferred (monitor_pair): the same order would be refused again
         if strikes is None:
-            strikes = window_strikes(self.ledger.rows.values()).get(record_key(pair), 0)
+            strikes = self.ledger.strikes().get(record_key(pair), 0)
         return strikes < MAX_ATTEMPTS
 
     async def on_stop(self) -> None:
@@ -1967,10 +2144,12 @@ class Controller:
         st = self.scan_state
         st.update(reads=0, asked=0, found=0, deferred=0, pending=0, stopped="", probed=0)
         known_before = dict(self.listed_by_card)  # the latest windows known listed as this pass starts: a window beyond them is a listing seen now
-        attempts: dict[str, int] = {}  # record (a window's level) -> the attempt after its last record, the superseded ones included: an attempt that left no record is not reused (its salt would be the first attempt's)
-        for p in self.ledger.rows.values():
-            attempts[record_key(p)] = max(attempts.get(record_key(p), 0), int(p.get("attempt") or 0) + 1)
-        strikes = window_strikes(self.ledger.rows.values())  # 1.131.6: the cap counts failures, not the salt's attempts
+        # record (a window's level) -> the attempt after its last record, the superseded ones included: an attempt that left no
+        # record is not reused (its salt would be the first attempt's). 1.154.20: asked of the ledger's index as a candidate is
+        # queued (Attempts), and the failures counted from the records that have one (Ledger.strikes) — both were worked out by
+        # walking every record at each pass, twice a second while a listing is expected: 39,000 records, some 40 ms a pass
+        attempts = Attempts(self.ledger)
+        strikes = self.ledger.strikes()  # 1.131.6: the cap counts failures, not the salt's attempts
         sprint = self.sprinting()  # judged as the pass begins: a pass that started for a listing stays with the listings (the next tick re-reads)
         try:
             await self.probe_listings(known_before, full, attempts, strikes, st)
@@ -2507,6 +2686,18 @@ class Controller:
                 # markets unjudged the round spent its reads elsewhere and the win waited for a later one)
                 soon(str(pair.get("market_id") or ""))
 
+    def monitor_reads(self, pair: dict, now_ms: int, covered: bool) -> bool:
+        """Whether a look at this resting pair (monitor_pair) would read one of its orders: an open one the account snapshot
+        does not cover (``covered``: the snapshot is fresh), or one found ended whose final read has come. The cancellation
+        loop asks before it makes the look's task (1.154.20)."""
+        for order in pair["orders"].values():
+            if order["state"] != "open" and not (order["state"] == "removed" and now_ms >= self.final_read_ms(order, pair)):
+                continue
+            if covered and order.get("id") in self.listed_ids:
+                continue
+            return True
+        return False
+
     async def monitor_pair(self, pair: dict) -> None:
         """An order ID is not proof that a deferred post-only order was accepted."""
         if (pair["phase"] != "active" or not self.account_at or self.now() - int(pair.get("created_ms") or 0) < 10_000
@@ -2699,7 +2890,7 @@ class Controller:
         start)."""
         if self.bulk_task is not None and not self.bulk_task.done():
             return False
-        rows = [p for p in self.ledger.rows.values() if not p.get("accounted")]
+        rows = [p for p in self.ledger.pending() if not p.get("accounted")]
         if any(p["phase"] == "active" or resting_orders(p, now_ms) for p in rows):
             self.rest_clear_ms = 0
             return False
@@ -2746,7 +2937,7 @@ class Controller:
         closing or unverified ones whose next try has come (bookkeep: RETRY_MS doubling to RETRY_MAX_MS)."""
         blocked = bool(self.withdrawing())  # an operator's stop withdraws the active pairs; not the stop itself (on_stop decides), not an account not verified yet
         out = []
-        for p in self.ledger.rows.values():
+        for p in self.ledger.pending():  # (1.154.20: the records not accounted — this runs twice a second)
             if p.get("accounted"):
                 continue
             if p["phase"] == "active" and (now_ms >= p["cancel_ms"] or blocked):
@@ -2905,10 +3096,21 @@ class Controller:
                 LOG.info("开盘前预挂收尾完成：%s", self.winding)
                 self.stop.set()
                 return
-            for pair in list(self.ledger.rows.values()):
+            # 1.154.20: the records not accounted (Ledger.pending), and a look's task only for a pair it would read an order of.
+            # 11-17: 12,143 resting pairs, every one covered by the account snapshot — and every five seconds a task was made for
+            # each (a coroutine, the gate, monitor_pair finding nothing to read), 12,000 at once: the event loop held some 200 ms
+            # each time, and at every pass until the first snapshot after a start. What such a task did is done here: the look
+            # is noted (checked_ms), nothing else
+            clock = self.now()
+            covered = bool(self.account_at) and clock - self.account_at <= self.account_stale_ms()
+            for pair in self.ledger.pending():
                 if pair["phase"] == "active" and now - int(pair.get("checked_ms") or 0) >= MONITOR_MS and now - int(pair.get("created_ms") or 0) >= 10_000:
                     key = "monitor:" + pair["slug"]  # (a look due: not a task for every active pair twice a second)
-                    if key not in self.settling or self.settling[key].done():
+                    if not self.account_at:
+                        pass  # no snapshot yet: monitor_pair looks at nothing (the first one covers every resting order at once)
+                    elif not self.monitor_reads(pair, clock, covered):
+                        pair["checked_ms"] = clock  # every order of it covered by the snapshot, or not open: the look, as monitor_pair notes it
+                    elif key not in self.settling or self.settling[key].done():
                         async def monitor(p: dict = pair) -> None:
                             async with self.settle_gate:
                                 try:
@@ -2918,7 +3120,7 @@ class Controller:
                                 except Exception as error:
                                     self.error = core.clean_error(error)
                         self.settling[key] = asyncio.create_task(monitor(), name=key)
-                if pair.get("accounted") or self.now() < settle_from(pair):
+                if pair.get("accounted") or clock < settle_from(pair):
                     continue
                 key = "settle:" + pair["slug"]
                 if key in self.settling and not self.settling[key].done():
@@ -3011,9 +3213,12 @@ class Controller:
         """The coming windows' levels (start beyond the new-order cutoff) this mode will not quote again, the soonest first:
         (their failures at MAX_ATTEMPTS, refused by Predict) — each level's latest record (1.131.6: /preopen says so; a
         window that went missing used to say nothing)."""
-        strikes = window_strikes(self.ledger.rows.values())
+        strikes = self.ledger.strikes()
         latest: dict[str, dict] = {}
+        now = self.now()
         for p in self.ledger.rows.values():
+            if int(p.get("start_ms") or 0) <= now:
+                continue  # 1.154.20: a window that has begun is listed by nothing below (its start is under every cutoff): its level's records — one start a level — need no look
             k = record_key(p)
             if k not in latest or int(p.get("attempt") or 0) > int(latest[k].get("attempt") or 0):
                 latest[k] = p
@@ -3035,7 +3240,7 @@ class Controller:
         windows up to the latest one seen listed count as listed; a level with its failures at the cap does not count."""
         now = self.now()
         active = {record_key(p) for p in self.ledger.rows.values() if p["phase"] == "active"}
-        strikes = window_strikes(self.ledger.rows.values())
+        strikes = self.ledger.strikes()
         windows: set[str] = set()
         pairs, usd = 0, 0.0
         for rolling, start in window_starts(now, self.owner.config, self.settings):
@@ -3054,12 +3259,18 @@ class Controller:
         return len(windows), pairs, usd
 
     def status(self) -> str:
-        rows = list(self.ledger.rows.values())
+        # 1.154.20: the counts in one pass and from the ledger's own (Ledger.pending, windows, strikes) — the status walked every
+        # record a dozen times (39,000: 0.2 s on the event loop), and the control page asked for it every five seconds
+        total, resting = len(self.ledger.rows), 0
+        cleared = total - sum(1 for p in self.ledger.pending() if not p.get("accounted"))
+        reserved = self.risk()
         spent, refused = self.unquotable()
         quoted_to: dict[str, int] = {}  # card -> the latest window with a quote resting (the first level's, the deeper ones wait for the start)
-        for p in rows:
-            if p["phase"] == "active" and p.get("key"):
-                quoted_to[p["key"]] = max(quoted_to.get(p["key"], 0), int(p.get("start_ms") or 0))
+        for p in self.ledger.rows.values():  # (one pass for the resting ones: their count, and each card's latest)
+            if p["phase"] == "active":
+                resting += 1
+                if p.get("key"):
+                    quoted_to[p["key"]] = max(quoted_to.get(p["key"], 0), int(p.get("start_ms") or 0))
         windows_left, pairs_left, usd_left = self.unplaced()
         shut_cards = {h: "、".join(r.coin for r in core.preopen_cards() if getattr(r, "hours", "") == h and r.key in self.settings.markets) for h in SHUT_TEXT}  # 1.150.1: the cards a shut keeps back
         quiet = open_quiet_ms(self.settings) // 60_000  # 1.151.1: the minutes in force (the first window after an open always)
@@ -3093,12 +3304,12 @@ class Controller:
                 + (f"BTC 5 分钟自己的时间：开场前 {b5.cancel_seconds} 秒撤单、{b5.expiry_seconds} 秒签名到期，不足 {b5.entry_seconds} 秒不再新挂，"
                    + ("挂 24 小时内已发布的全部场次" if b5.ahead_minutes >= 1440 else f"只挂 {b5.ahead_minutes} 分钟内开始的场次") + "\n"
                    if "BTC-5M" in self.settings.markets and (b5 := self.settings.timing("BTC-5M")) is not self.settings else "") +  # 1.152.0
-                f"已记录 {len({window_of(p) for p in rows})} 场、{len(rows)} 条（{sum(1 for p in rows if p['phase'] == 'active')} 条挂着，{sum(1 for p in rows if p.get('accounted'))} 条已结清）"
+                f"已记录 {len(self.ledger.windows)} 场、{total} 条（{resting} 条挂着，{cleared} 条已结清）"
                 + (f"，另有 {self.ledger.archived_count} 条已归档（结束超过 {ARCHIVE_AFTER_MS // core.DAY_MS} 天、已撤且没成交的；复盘页照常统计）" if self.ledger.archived_count else "") + "，"
                 f"队列 {self.queue.qsize() + len(self.parked)} 场" + (f"（{len(self.parked)} 场在等，见暂不新挂）" if self.parked else "") + f"；{listed}"
                 + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"
-                f"预留 {self.risk():.2f}U{f' / 限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '，不设上限'}（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉的场次在撤单 {LATE_FILL_MS // 1000} 秒后读到一份没成交才释放）"
-                + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {self.risk() + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，新发布的先挂，其余按开场先后补挂中") if pairs_left else "")
+                f"预留 {reserved:.2f}U{f' / 限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '，不设上限'}（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉的场次在撤单 {LATE_FILL_MS // 1000} 秒后读到一份没成交才释放）"
+                + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {reserved + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，新发布的先挂，其余按开场先后补挂中") if pairs_left else "")
                 + (f"\n请求约 {self.request_rate():.1f} 次/秒（最近一分钟）；" if self.request_rate() is not None else "\n")
                 + self.pace_line()
                 + f"账户快照每 {self.account_interval_s():.0f} 秒（{self.account_pages} 页挂单" + self.page_rows_note()

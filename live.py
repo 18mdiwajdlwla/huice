@@ -2049,8 +2049,22 @@ class LiveBot(core.Bot):
 
     def live_exposure(self, trades: dict[str, dict]) -> float:
         """USDT the real records tie up (live_reserved summed): positions at their price, every order still able to
-        fill at its cap."""
-        return sum(self.live_reserved(t) for t in trades.values())
+        fill at its cap. 1.154.20: a record that ties up nothing by its own fields — over (settled, lapsed, withdrawn with
+        nothing filled), no order of it on the book or in doubt, no fills awaited — is passed without the call: it added
+        0.0, and nearly every record is one (12,800 kept on 11-17, a few dozen live). The figure is asked three or four times
+        on an order's way out and at every look that may open one; the walk was most of that way's time on the event loop."""
+        def held() -> Any:
+            for t in trades.values():
+                st = t.get("live")
+                if not isinstance(st, dict):
+                    continue
+                status = t.get("status")
+                if (status != "filled" and status != "resting" and (status != "cancelled" or not t.get("shares"))
+                        and st.get("state") not in PLACING and not st.get("fills_pending")):
+                    continue  # live_reserved: nothing held (no shares counted, nothing that may still fill)
+                yield self.live_reserved(t)
+        total = sum(held())  # (the built-in sum, as before: it carries the rounding along, and a 0.0 left out changes nothing of it)
+        return total if total or not trades else 0.0
 
     def live_fit_shares(self, trades: dict[str, dict], price: float) -> float:
         """The most shares the real-trading limits take at ``price`` per share (a maker's price, a taker's cap): the
@@ -2093,7 +2107,7 @@ class LiveBot(core.Bot):
         today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).replace(hour=0, minute=0, second=0, microsecond=0)
         since = int(today.timestamp() * 1000)
         total = 0.0
-        for t in trades.values():
+        for t in self.live_pnl_rows(trades, since):
             if not isinstance(t.get("live"), dict) or t.get("status") != "settled":
                 continue
             if int(t.get("settled") or 0) >= since:
@@ -2107,6 +2121,29 @@ class LiveBot(core.Bot):
                             if isinstance(r, dict) and int(r.get("at") or 0) >= since)
                 total += min(0.0, moved) * float(t["shares"])
         return total
+
+    def live_pnl_rows(self, trades: dict[str, dict], since: int) -> Any:
+        """The records live_daily_pnl walks (1.154.20): every record of ``trades`` — or, when ``trades`` is the kept records as
+        they stand (sim_trades, not changed since), the ones the day's figure can come from: settled today, or settled before
+        with a revision. The figure is asked before every order, at every step, by the pre-open mode's gates a dozen times a
+        second and by the rule taker every second; walking every record ever kept for it (12,800) was a large part of what
+        held the event loop. Which records those are is worked out again whenever a record is written (the store's count),
+        whenever one is settled or re-settled (sim_settle: the only place a record becomes settled, or gets a revision — it
+        counts here before the record is even saved) and at midnight; each is still judged as it stands when asked, in the
+        records' own order, so the sum is the walk's, term for term."""
+        taken = getattr(trades, "taken", None)
+        if taken is None:
+            return trades.values()  # not the kept records as sim_trades gives them (a dict of the caller's own, a map changed since): every record
+        if (getattr(self, "sim_cache", None) is None or taken != (getattr(self, "sim_built", 0), self.sim_gen)
+                or self.store.touched.get("sim", 0) != self.sim_gen):
+            return trades.values()
+        key = (taken, self.__dict__.get("live_pnl_epoch", 0), since)
+        held = self.__dict__.get("live_pnl_held")
+        if held is None or held[0] != key:
+            rows = [t for t in trades.values() if isinstance(t.get("live"), dict) and t.get("status") == "settled"
+                    and (int(t.get("settled") or 0) >= since or t.get("revisions"))]
+            held = self.__dict__["live_pnl_held"] = (key, rows)
+        return held[1]
 
     def live_check_kill(self, trades: dict[str, dict], now_ms: int) -> None:
         """The daily loss stop: tripped when the day's settled P&L is at −LIVE_MAX_DAILY_LOSS_USD or under — new orders
@@ -2212,6 +2249,7 @@ class LiveBot(core.Bot):
             st["events"].append({"at": now_ms, "what": f"撤单：{why}"})
 
     def sim_settle(self, trade: dict, up: float, note: str, now_ms: int, by: str) -> None:
+        self.__dict__["live_pnl_epoch"] = self.__dict__.get("live_pnl_epoch", 0) + 1  # live_pnl_rows: the day's settled records are looked for afresh
         super().sim_settle(trade, up, note, now_ms, by)
         st = trade.get("live")
         if (isinstance(st, dict) and by == "Predict 最终结果" and trade.get("status") == "settled" and float(trade.get("shares") or 0) > 1e-9
@@ -3197,10 +3235,18 @@ class LiveBot(core.Bot):
         self.live_readopt(open_rows, by_id, by_hash, now_ms, now_ms)
         full_rows, full_at = self.live_full_list(open_rows, now_ms)  # the whole account (1.136.2): this read when whole, else the pre-open mode's snapshot
         if full_rows is not None:
-            self.live_whole = ({str(r.get("id")) for r in full_rows}, {order_hash_of(r) for r in full_rows if order_hash_of(r)}, full_at)
-            self.live_open_ids, self.live_open_ids_at = {str(r.get("id")) for r in full_rows}, full_at
-            if full_rows is not open_rows:
-                self.live_readopt(full_rows, {str(r.get("id")): r for r in full_rows}, {order_hash_of(r): r for r in full_rows if order_hash_of(r)}, now_ms, full_at)
+            # 1.154.20: the snapshot's ids, hashes and rows by either are worked out once a snapshot (live_snapshot_view), not at
+            # every step — it is the same list until that mode reads the next one, and with its 24,000 open orders the sets and
+            # dicts built here four times over, and the walk of its 39,000 records for the unrecorded ones (live_note_unknown),
+            # held the event loop some 200 ms of every step: the express lane's looks, the pushed books and every order's request
+            # waited behind it
+            view = self.live_snapshot_view(full_rows, full_at) if full_rows is not open_rows else None
+            ids = view["ids"] if view is not None else set(by_id)
+            hashes = view["hashes"] if view is not None else set(by_hash)
+            self.live_whole = (ids, hashes, full_at)
+            self.live_open_ids, self.live_open_ids_at = ids, full_at
+            if view is not None:
+                self.live_readopt(full_rows, view["by_id"], view["by_hash"], now_ms, full_at)
         if full_rows is not None:  # 1.138.1: only a whole view says which orders are unrecorded — a cut list emptied it, and an order
             self.live_note_unknown(full_rows, now_ms)  # of unknown state could be released over the stray order that may be it
         self.live_synced_at = self.live_list_at_ms = now_ms
@@ -3373,8 +3419,25 @@ class LiveBot(core.Bot):
         if getattr(self.live.api, "orders_complete", True):
             return open_rows, now_ms
         if self.live_snapshot_fresh(now_ms):
-            return list(self.preopen.account_rows), int(self.preopen.account_at)
+            return self.preopen.account_rows, int(self.preopen.account_at)  # (the list itself, never changed here: live_snapshot_view knows it by it)
         return None, 0
+
+    def live_snapshot_view(self, rows: list[dict], at: int) -> dict:
+        """The pre-open mode's account snapshot as the step's sync reads it (1.154.20), worked out once a snapshot: its order ids,
+        its hashes, its rows by either, and — filled in by live_note_unknown — the rows that mode's records do not explain. That
+        mode publishes a new list with every snapshot (Controller.account) and never changes one, so the list itself, its time
+        and its length tell a new one; the rows are the snapshot's own (a fill written onto one is read as it stands)."""
+        held = self.__dict__.get("live_snapshot_held")
+        if held is None or held["rows"] is not rows or held["at"] != at or held["n"] != len(rows):
+            by_id: dict[str, dict] = {}
+            by_hash: dict[str, dict] = {}
+            for r in rows:
+                by_id[str(r.get("id"))] = r
+                if digest := order_hash_of(r):
+                    by_hash[digest] = r
+            held = self.__dict__["live_snapshot_held"] = {"rows": rows, "at": at, "n": len(rows), "by_id": by_id, "by_hash": by_hash,
+                                                          "ids": set(by_id), "hashes": set(by_hash), "unmanaged": None}
+        return held
 
     def live_snapshot_fresh(self, now_ms: int) -> bool:
         """Whether the pre-open mode's last complete account snapshot is young enough to stand for the whole account."""
@@ -4052,7 +4115,17 @@ class LiveBot(core.Bot):
         for /live and the page, announced once each. They are not this strategy's to manage; /live cancel account
         withdraws them with everything else."""
         if getattr(self, "preopen", None) is not None:
-            open_rows = self.preopen.unmanaged_rows(open_rows)
+            # 1.154.20: of that mode's own snapshot, once a snapshot (live_snapshot_view) — its records hold an order's hash before
+            # the order is sent and lose it only once the order is long over (archived two days on; deleted when never sent), so
+            # which rows of one snapshot they explain does not change while that snapshot stands. Asked at every step, the walk of
+            # its 39,000 records' orders was the largest part of the sync's time on the loop
+            held = self.__dict__.get("live_snapshot_held")
+            if held is not None and held["rows"] is open_rows and held["n"] == len(open_rows):
+                if held["unmanaged"] is None or held.get("by") is not self.preopen:
+                    held["unmanaged"], held["by"] = self.preopen.unmanaged_rows(open_rows), self.preopen
+                open_rows = held["unmanaged"]
+            else:
+                open_rows = self.preopen.unmanaged_rows(open_rows)
         trades = self.sim_trades()
         known_ids = {str(t["live"].get("order_id")) for t in trades.values() if isinstance(t.get("live"), dict) and t["live"].get("order_id")}
         known_hashes = {str(t["live"].get("hash") or "").lower() for t in trades.values() if isinstance(t.get("live"), dict)}
@@ -5925,8 +5998,28 @@ class LiveBot(core.Bot):
         data = super().control_payload()
         data["mode"], data["live"] = "live", self.live_status(self.market.now_ms())
         if getattr(self, "preopen", None) is not None:
-            data["preopen"] = {"status": self.preopen.status(), "reserved_usd": self.preopen.risk()}
+            data["preopen"] = self.preopen_page()
         return data
+
+    PREOPEN_PAGE_SECONDS = 15.0  # the control page's copy of the pre-open mode's status is this old at the most
+
+    def preopen_page(self) -> dict:
+        """The pre-open mode's block of the control page: its status and its reservation, worked out at most every
+        PREOPEN_PAGE_SECONDS (1.154.20). The page asks every five seconds while it is open, and the status reads that mode's
+        whole ledger — 0.2 s on the event loop with 39,000 records, every poll: with the page open, the model trader's orders
+        and the pushed books waited behind it. /preopen answers afresh, and so does the page right after an action of its own
+        (control_action clears the copy)."""
+        held = self.__dict__.get("preopen_page_held")
+        now = time.monotonic()
+        if held is None or held[0] is not self.preopen or now - held[1] >= self.PREOPEN_PAGE_SECONDS:
+            held = self.__dict__["preopen_page_held"] = (self.preopen, now, {"status": self.preopen.status(), "reserved_usd": self.preopen.risk()})
+        return dict(held[2])
+
+    async def control_action(self, data: dict) -> dict:
+        try:
+            return await super().control_action(data)
+        finally:
+            self.__dict__.pop("preopen_page_held", None)  # whatever the action did shows at the page's next poll
 
     def live_status(self, now_ms: int) -> dict:
         """The real-trading block of the control page: readiness, the switches' state, limits and their use, the
