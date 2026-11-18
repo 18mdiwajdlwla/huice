@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.17"
+VERSION = "1.154.18"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -15051,7 +15051,7 @@ function rulesSection(ru){  // 规则吃单 (1.153.0): each rule's totals, the r
       r.watch.offer_lead==null?"—":"中位 "+Math.round(r.watch.offer_lead)+" 分钟",  // 1.154.13: the makers' lead, and the offers a faster taker had
       r.watch.lost?num(r.watch.lost)+" 场"+(r.watch.life==null?"":"（存活中位 "+(r.watch.life/1000).toFixed(1)+" 秒）"):"—",
       r.watch.won?num(r.watch.won)+" 场"+(r.watch.won_life==null?"":"（出现到被吃掉中位 "+(r.watch.won_life/1000).toFixed(1)+" 秒）"):"—"])));
-  const rc=ru.races||[],sec=v=>v==null?"—":(v/1000).toFixed(2)+" 秒",ord=o=>"要 "+num(o.shares)+" 成交 "+num(o.filled)+(o.after==null?"":"，出现后 "+o.after+" ms 发出")
+  const rc=ru.races||[],sec=v=>v==null?"—":(v/1000).toFixed(2)+" 秒",ord=o=>o.error||["rejected","not_sent","not_found"].includes(o.state)?"要 "+num(o.shares)+"：没下成"+(o.error?"（"+o.error+"）":""):"要 "+num(o.shares)+" 成交 "+num(o.filled)+(o.after==null?"":"，出现后 "+o.after+" ms 发出")
     +(o.lag==null?"":"，推送 "+o.lag+" ms")+(o.own==null?"":"，到达→发出 "+o.own+" ms"+(o.fresh===false?"（不是盘口一到就下的）":""))+(o.trip==null?"":"，往返 "+o.trip+" ms");
   // 1.154.16: each window's race — when the offer at the rule's price showed, how soon it was first taken from and gone (Predict's own stamps), what was bought, each order against the clock
   if(rc.length)kids.push(...bigTable("抢单记录（北京时间；开始被吃 / 被吃光 = 卖单出现之后多久，按 Predict 盘口的时间戳）",table(["场次","规则","卖单出现","开场前","最多份数","开始被吃","被吃光","买到","我们的单"],
