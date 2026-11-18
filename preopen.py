@@ -70,6 +70,15 @@ REFRESH_MS = 30_000       # an active window's market is read again this often (
 REFRESH_FAR_MS = 900_000  # ...a window starting more than an hour away: this often (a day's windows must not cost a read a second; 1.134.1: 15 min, was 5)
 ACCOUNT_PAGE_S = 1.5      # the account snapshot's pace: this long per page of open orders (1,140 orders = 23 pages every 35 s, not every 5), the poll at least
 REFRESH_BATCH = 8         # refresh_active: at most this many market reads an iteration, three at a time (a burst of due windows is spread)
+# 1.154.21 — the rule taker's own key (RULE_API_KEY) borrowed while that taker is idle (Controller.lender). 11-17: this mode's key ran
+# at its pace all day (220 a minute: a new window's orders 13 s behind its listing, the account snapshot 481 s a read), the rule
+# taker's key idle but for its hours (01:00–07:00 Beijing) and the makers' moments
+LEND_BEFORE_MS = 5 * 60_000   # that key is the rule taker's alone from this long before it next needs it at speed (rules.RuleTaker.busy_in)
+LEND_PAGE_S = 0.5             # ...and a snapshot read is begun on it only with this long a page (and LEND_BEFORE_MS) to spare before then
+LEND_SNAPSHOT_LEAVE = 2.0     # ...its pages leaving this many tokens more than the placements and reads borrowed there (PredictApi.leave): those go first
+LEND_YIELD_MIN_S = 20.0       # ...but for half the read's own pace at the most (this at least): then beside them, so a backlog borrowing on and on never keeps it from finishing
+LEND_OFF_S = 600.0            # after that key refused a request (a 429, a 401 / 403) nothing more goes out on it for this long
+LEND_WARM_S = 60.0            # the sign-in on that key is kept fresh this often while it may be borrowed
 HOLD_RETRY_MS = 5_000     # a held candidate (hold(): a stale snapshot, the cooldown, the pause; or the budget) waits this long on the side, then is placed again — never read again meanwhile
 FRESH_FIRST_MS = 10 ** 13  # 1.154.8: a window found at its listing is queued this far ahead of any start — placed before the backlog (queue_rank)
 FIRST_SNAPSHOT_GRACE_MS = 300_000  # 1.154.8: after a start, the status re-reads and the known windows' re-reads wait for the first account snapshot
@@ -157,6 +166,25 @@ class Ledger:
         self.conn.commit()
         self.rows = {slug: json.loads(body) for slug, body in self.conn.execute("SELECT slug,body FROM pairs")}
         self.by_hash: dict[str, str] = {}  # order hash -> its record's key (holder); "" for a hash two records hold
+        # 1.154.20 — what the loops walk instead of every record (11-17: 39,116 of them, 26,956 accounted and only history; the day's
+        # P&L alone was summed over all of them a dozen times a second — withdrawing(), asked by every placement's gates and by the
+        # cancellation loop — and with the other walks it held the event loop a quarter of the time: the model trader's orders and
+        # the pushed books waited behind it). Both are kept by index() as a record is saved, and both hold MORE than what counts
+        # now, never less: a record leaves them only when it is saved accounted / without a day's P&L, and whoever walks them
+        # still judges each record as it stands (a pair accounted a moment ago and not saved yet is skipped by its own flag)
+        self.working: dict[str, dict] = {}  # the records not accounted when last saved, in the records' own order (pending)
+        self.scored: dict[str, dict[str, dict]] = {}  # Beijing day -> the records accounted that day with a P&L (day_pnl)
+        self.scored_day: dict[str, str] = {}  # ...and the day each is filed under
+        self.tries: dict[str, dict[str, int]] = {}  # record key (a window's level) -> its records' attempt + 1 each (attempt_after: the discovery's salt)
+        self.tries_key: dict[str, str] = {}  # ...and the record key each record is filed under
+        self.struck: dict[str, dict] = {}  # the records that counted against their window's MAX_ATTEMPTS when last saved (strikes)
+        self.ids: dict[str, int] = {}  # order id -> how many records' orders carry it (known: Controller.unmanaged_rows)
+        self.hashes: dict[str, int] = {}  # ...and their hashes (hash, api_hash), lower case
+        self.marks: dict[str, tuple[tuple, tuple, str]] = {}  # record -> (the ids, the hashes, the window) it was counted with
+        self.windows: dict[str, int] = {}  # window -> its records here (the status's 已记录 N 场)
+        self.seq: dict[str, int] = {}  # a record's place in ``rows`` (its order of entry): what the walks' own order was
+        self.seq_next = 0
+        self.unordered = False  # a record put back among the working ones out of its place (never by this code: a test's): sorted again at the next walk
         for slug, row in self.rows.items():
             self.index(slug, row)
         self.archived_count = self.archive_count()  # (the status says how many)
@@ -175,12 +203,142 @@ class Ledger:
                 self.by_hash[digest] = ""
             elif kept != "":
                 self.by_hash[digest] = slug
+        if slug not in self.seq:  # (its place in ``rows``: entered now, or loaded — a record saved again keeps its place there, and here)
+            self.seq[slug] = self.seq_next
+            self.seq_next += 1
+        if row.get("accounted"):
+            self.working.pop(slug, None)
+        elif slug not in self.working:
+            if self.working and self.seq[slug] < self.seq[next(reversed(self.working))]:
+                self.unordered = True  # back among the working records, out of its place: sorted at the next walk (pending)
+            self.working[slug] = row
+        else:
+            self.working[slug] = row  # (the same key keeps its place; the row may be a new object: a test's, a reload's)
+        orders = (row.get("orders") or {}).values()
+        mark = (tuple(str(o["id"]) for o in orders if o.get("id")),
+                tuple(str(o[k]).lower() for o in orders for k in ("hash", "api_hash") if o.get(k)), window_of(row))
+        if self.marks.get(slug) != mark:
+            self.unmark(slug)
+            for i in mark[0]:
+                self.ids[i] = self.ids.get(i, 0) + 1
+            for h in mark[1]:
+                self.hashes[h] = self.hashes.get(h, 0) + 1
+            self.windows[mark[2]] = self.windows.get(mark[2], 0) + 1
+            self.marks[slug] = mark
+        key = record_key(row)
+        if self.tries_key.get(slug, key) != key:
+            self.untry(slug)
+        self.tries.setdefault(key, {})[slug] = int(row.get("attempt") or 0) + 1
+        self.tries_key[slug] = key
+        if row.get("accounted") and row.get("phase") != "active" and counts_against(row):
+            self.struck[slug] = row
+        else:
+            self.struck.pop(slug, None)
+        try:
+            scored = bool(float(row.get("pnl") or 0))
+        except (TypeError, ValueError):
+            scored = True  # (a figure that is no number: filed, and left for the sum to stumble on as the walk did — never here, in a save)
+        day = str(row.get("accounted_day") or "") if scored else ""
+        was = self.scored_day.get(slug, "")
+        if was and was != day:
+            self.scored.get(was, {}).pop(slug, None)
+            if not self.scored.get(was):
+                self.scored.pop(was, None)
+            self.scored_day.pop(slug, None)
+        if day:
+            self.scored.setdefault(day, {})[slug] = row
+            self.scored_day[slug] = day
 
     def unindex(self, slug: str, row: dict) -> None:
         """A record leaving ``rows`` (deleted, renamed, archived): its entries in by_hash go with it."""
         for order in (row.get("orders") or {}).values():
             if order.get("hash") and self.by_hash.get(order["hash"]) == slug:
                 del self.by_hash[order["hash"]]
+        self.seq.pop(slug, None)
+        self.working.pop(slug, None)
+        self.struck.pop(slug, None)
+        self.untry(slug)
+        self.unmark(slug)
+        if was := self.scored_day.pop(slug, ""):
+            self.scored.get(was, {}).pop(slug, None)
+            if not self.scored.get(was):
+                self.scored.pop(was, None)
+
+    def unmark(self, slug: str) -> None:
+        mark = self.marks.pop(slug, None)
+        if mark is None:
+            return
+        for held, keys in ((self.ids, mark[0]), (self.hashes, mark[1]), (self.windows, (mark[2],))):
+            for k in keys:
+                if held.get(k, 0) <= 1:
+                    held.pop(k, None)
+                else:
+                    held[k] -= 1
+
+    def known(self) -> tuple[dict[str, int], dict[str, int]]:
+        """The ids and the hashes (lower case) of every record's orders, as they were when each record was last saved: an
+        order's hash is saved before the order is sent and its id with the answer, so an order on the account's list is
+        found by either. (Counted, not sets: for a membership test.)"""
+        if not self.in_step():
+            self.reindex()
+        return self.ids, self.hashes
+
+    def untry(self, slug: str) -> None:
+        key = self.tries_key.pop(slug, None)
+        if key is not None and (held := self.tries.get(key)) is not None:
+            held.pop(slug, None)
+            if not held:
+                del self.tries[key]
+
+    def reindex(self) -> None:
+        """Every index made again from ``rows`` as they stand (a test that put records in by hand; index and unindex keep them
+        in step otherwise)."""
+        self.by_hash, self.working, self.scored, self.scored_day, self.seq, self.seq_next, self.unordered = {}, {}, {}, {}, {}, 0, False
+        self.tries, self.tries_key, self.struck = {}, {}, {}
+        self.ids, self.hashes, self.marks, self.windows = {}, {}, {}, {}
+        for slug, row in self.rows.items():
+            self.index(slug, row)
+
+    def attempt_after(self, key: str, default: int = 0) -> int:
+        """The attempt after a record key's last record, the superseded ones included (the discovery's ``attempts``): an
+        attempt that left no record is not reused — its salt would be the first attempt's."""
+        if not self.in_step():
+            self.reindex()
+        held = self.tries.get(key)
+        return max(held.values()) if held else default
+
+    def strikes(self) -> dict[str, int]:
+        """window_strikes of every record, from the few that counted against their window when last saved (a record is
+        judged as it stands: one marked free since counts no more)."""
+        if not self.in_step():
+            self.reindex()
+        return window_strikes(self.struck.values())
+
+    def in_step(self) -> bool:
+        """Whether the indexes cover ``rows`` as they are: every record that came in or left through this class did (save,
+        save_many, delete, rename, archive_old), so a count that differs means records were put in or taken out by hand."""
+        return len(self.seq) == len(self.rows)
+
+    def pending(self) -> list[dict]:
+        """The records not accounted when last saved — every record that is not accounted now is among them — in the order
+        ``rows`` holds them: what a walk of ``rows`` that skips the accounted ones would have gone through, without the
+        accounted ones' tens of thousands. Whoever walks it still skips a record by its own flag."""
+        if not self.in_step():
+            self.reindex()
+        if self.unordered:
+            self.working = dict(sorted(self.working.items(), key=lambda kv: self.seq[kv[0]]))
+            self.unordered = False
+        return list(self.working.values())
+
+    def day_pnl(self, day: str) -> float:
+        """The P&L of the records accounted on a Beijing day: the sum a walk of every record made (Controller.daily_pnl), term
+        for term and in the same order, over the day's records that have one — a record without a P&L added 0.0 there."""
+        if not self.in_step():
+            self.reindex()
+        held = self.scored.get(day)
+        if not held:
+            return 0.0
+        return sum(float(p.get("pnl") or 0) for _, p in sorted(held.items(), key=lambda kv: self.seq[kv[0]]) if p.get("accounted_day") == day)
 
     def holder(self, digest: str) -> dict | None:
         """The record one of whose orders has this hash (Controller.before_send). By the index: the walk it replaces went
@@ -298,6 +456,90 @@ class Ledger:
         return bool(json.loads(row[0])) if row else False
 
 
+class KeyLending:
+    """The rule taker's own key (RULE_API_KEY), lent while that taker is idle (1.154.21, RULE_KEY_LEND). Predict limits each key
+    by itself (240 requests a minute); 11-17 the bot's key and the pre-open mode's ran at their pace all day — a new window's
+    orders 13 s behind its listing, the account snapshot 481 s a read, ninety 429s on the bot's key in 2.3 hours — while the
+    rule taker's key, its own since 1.154.12, did nothing outside its hours (01:00–07:00 Beijing) and the makers' moments. So,
+    outside those: the orderbook feed's reads go out on it (the bot's key left to the model trader) and the pre-open mode's
+    requests overflow onto it. One policy for both (the bot's, LiveBot.key_lending):
+
+    - never from LEND_BEFORE_MS before the rule taker next needs the key at speed (rules.RuleTaker.busy_in), nor while it does;
+    - behind the rule taker's own requests there (the borrowers' are low: PredictPacer.LOW_RESERVE), at the key's pace as ever;
+    - a refusal of a borrowed request by that key (a 429, a 401 / 403) pauses all borrowing for LEND_OFF_S, and a 429's
+      cooldown is the rule taker's client's too (one key, one limit at Predict).
+
+    Also what a borrowing client shares its cooldown with (safe_api's ``shared``: blocked_until)."""
+
+    def __init__(self, owner: Any):
+        self.owner = owner
+        self.off_until, self.off_why = 0.0, ""  # after a refusal: nothing more on the key until then, and why
+
+    def taker(self) -> Any:
+        rules = getattr(self.owner, "rules", None)
+        return rules if rules is not None and getattr(rules, "alive", True) else None
+
+    def key(self) -> str:
+        """The key, when it is one to lend at all: set, the rule taker's alone (not the bot's own), the lending on."""
+        c = self.owner.config
+        key = str(getattr(c, "rule_api_key", "") or "")
+        others = {str(getattr(c, name, "") or "") for name in ("predict_api_key", "preopen_api_key", "predict_book_api_key")}
+        return key if key and getattr(c, "rule_key_lend", True) and key not in others else ""
+
+    def busy_in(self) -> int | None:
+        """ms until the rule taker needs the key at speed (0: now); None: not for any window it follows, or none runs."""
+        taker = self.taker()
+        return taker.busy_in(taker.now()) if taker is not None else None
+
+    def why(self, spare_ms: int = 0) -> str:
+        """Why the key is not lent now ("" when it is): none to lend, a refusal's pause, its cooldown, or the rule taker
+        needing it within LEND_BEFORE_MS (and ``spare_ms`` more: a read that takes that long — the snapshot's)."""
+        if not self.key():
+            return "没有可借的 Key"
+        if time.monotonic() < self.off_until:
+            return f"{self.off_why}，{-(-int(self.off_until - time.monotonic()) // 60)} 分钟内不借"
+        if self.blocked_until - time.monotonic() > 0:
+            return "那把 Key 在限流冷却中"
+        busy = self.busy_in()
+        if busy is not None and busy <= LEND_BEFORE_MS + spare_ms:
+            return "规则吃单正在用" if busy <= 0 else f"规则吃单 {-(-busy // 60_000)} 分钟后要用"
+        return ""
+
+    def off(self, why: str, seconds: float = LEND_OFF_S) -> None:
+        self.off_until, self.off_why = time.monotonic() + seconds, why
+        LOG.warning("暂停借用规则吃单的 Key %d 分钟：%s", int(seconds // 60), why)
+
+    def refused(self, until: float, limited: bool = True) -> None:
+        """The key answered a borrowed request with its limit (the orderbook feed's: PredictFeed.fetch): the rule taker's
+        client pauses until ``until`` (monotonic) as it would on a 429 of its own, and the borrowing pauses."""
+        self.blocked_until = until
+        self.off("那把 Key 被限流（429）" if limited else "那把 Key 要求稍后再试")
+
+    @property
+    def blocked_until(self) -> float:
+        taker = self.taker()
+        return float(getattr(getattr(taker, "api", None), "blocked_until", 0.0) or 0.0) if taker is not None else 0.0
+
+    @blocked_until.setter
+    def blocked_until(self, value: float) -> None:
+        api = getattr(self.taker(), "api", None)
+        if api is not None and value > float(getattr(api, "blocked_until", 0.0) or 0.0):
+            api.blocked_until = value
+
+
+class Attempts:
+    """The discovery's ``attempts`` (record key -> the attempt after its last record), answered from the ledger's index as it
+    stands when asked (1.154.20) instead of a dict made by walking every record at each pass. A key's figure only changes
+    when a record of that key is saved, and the discovery asks for a key it is about to queue — one with no placement under
+    way — so what it reads is what the walk at the pass's start would have held."""
+
+    def __init__(self, ledger: Ledger):
+        self.ledger = ledger
+
+    def get(self, key: str, default: int = 0) -> int:
+        return self.ledger.attempt_after(key, default)
+
+
 class NotSent(core.RemoteError):
     """A local gate refused the request before its bytes were dispatched."""
 
@@ -305,8 +547,11 @@ class NotSent(core.RemoteError):
 def queue_rank(c: dict) -> int:
     """The placement queue's order (1.154.8): a window found at its listing first — 一有新的就挂、排在最前 (11-17: behind a backlog of
     557 listed windows, the new listings waited 57 minutes: the queue went by start alone, theirs the latest) — then the backlog, the
-    soonest start first. An int, as the queue's entries always were (start, key, candidate)."""
-    return int(c["start_ms"]) - (FRESH_FIRST_MS if c.get("fresh") else 0)
+    soonest start first. An int, as the queue's entries always were (start, key, candidate). 1.154.21: among the windows of one
+    start (a listing brings every card's next window at once), level by level — every card's first level, the bid nearest the
+    market and the one whose place in the queue counts, before anyone's deeper ones: the key ordered them card by card, so
+    the last card's first level went out behind six deeper levels of every card before it."""
+    return int(c["start_ms"]) - (FRESH_FIRST_MS if c.get("fresh") else 0) + int(c.get("level") or 0)
 
 
 def safe_api(base: str, key: str, wallet: Any, before_send: Any = None, shared: Any = None) -> Any:
@@ -1433,7 +1678,31 @@ class Controller:
         self.snap_api = safe_api(live.API_BASES[owner.config.live_chain], key, owner.live.wallet, None, shared)
         self.api_made = self.api
         self.api.low = True
-        self.api.ORDERS_PAGE = self.cancel_api.ORDERS_PAGE = self.snap_api.ORDERS_PAGE = int(getattr(owner.config, "live_orders_page", 50) or 50)  # LIVE_ORDERS_PAGE: fewer pages a snapshot (1.136.1)
+        # 1.154.21: a fresh listing's probe and its orders on a client of their own, ahead of the mode's low traffic on the key (the
+        # re-reads, the backlog's placements) and beside the snapshot's pages — the first seconds after a listing are the queue
+        # position; first(): this one, unless the tests put their own client in as the api
+        self.first_api = safe_api(live.API_BASES[owner.config.live_chain], key, owner.live.wallet, self.before_send, shared)
+        self.first_api.patient = True
+        # ...and the rule taker's own key, borrowed while that taker is idle (lender): a second budget for this mode's reads, its
+        # snapshot and its placements. Only a key that is the rule taker's alone (not this mode's, not the bot's)
+        self.lending = getattr(owner, "key_lending", None) or KeyLending(owner)  # the bot's (the orderbook feed borrows by it too); a stand-in owner: this mode's own
+        lend_key = self.lending.key()
+        self.lent_api: Any = None
+        self.lent_snap_api: Any = None  # ...the snapshot's pages there on a client of their own, behind what else is borrowed (leave: LEND_SNAPSHOT_LEAVE)
+        if lend_key and lend_key != key:
+            self.lent_api = safe_api(live.API_BASES[owner.config.live_chain], lend_key, owner.live.wallet, self.before_send, self.lending)
+            self.lent_api.patient = self.lent_api.low = True  # behind the rule taker's own requests there (PredictPacer.LOW_RESERVE)
+            self.lent_snap_api = safe_api(live.API_BASES[owner.config.live_chain], lend_key, owner.live.wallet, None, self.lending)
+            self.lent_snap_api.patient = self.lent_snap_api.low = True
+            self.lent_snap_api.leave = LEND_SNAPSHOT_LEAVE
+        self.lent_made = self.lent_api  # (the tests put their own in: used whatever the api)
+        self.lent_at: collections.deque = collections.deque(maxlen=4096)  # monotonic times of the requests that went out on the borrowed key (lent_last)
+        self.lent_warm: asyncio.Task | None = None  # the sign-in on that key, kept fresh while it may be borrowed (lent_keep_warm)
+        self.lent_warmed = -1e9
+        self.lent_warm_error = ""  # why this mode's sign-in on that key last failed (tried again LEND_WARM_S on; the orderbook feed needs none and borrows on)
+        for client in (self.api, self.cancel_api, self.snap_api, self.first_api, self.lent_api, self.lent_snap_api):
+            if client is not None:
+                client.ORDERS_PAGE = int(getattr(owner.config, "live_orders_page", 50) or 50)  # LIVE_ORDERS_PAGE: fewer pages a snapshot (1.136.1)
         self.settling: dict[str, asyncio.Task] = {}
         self.settle_gate = asyncio.Semaphore(2)
         self.reconcile_gate = asyncio.Semaphore(2)  # the withdrawn pairs' final reads (launch_reconcile) have their own two: thousands of them never starve the monitors and settlements (1.141.0)
@@ -1499,7 +1768,7 @@ class Controller:
         def late(p: dict) -> bool:  # a pair with a fill waits for the result (FILL_SETTLE_MS past the start); one without should clear in minutes
             filled = any(float(o.get("filled") or 0) > 0 for o in p["orders"].values())
             return now_ms > (settle_from(p) + FILL_SETTLE_MS - 15 * 60_000 if filled else int(p.get("cancel_ms") or 0) + STUCK_MS)
-        return [p for p in self.ledger.rows.values() if not p.get("accounted") and p["phase"] != "active" and late(p)]
+        return [p for p in self.ledger.pending() if not p.get("accounted") and p["phase"] != "active" and late(p)]
 
     def check_stuck(self, now_ms: int) -> None:
         """The stuck pairs announced (once in a while each; at most three a pass, the count of the rest)."""
@@ -1593,6 +1862,105 @@ class Controller:
         """The client the account snapshot reads through (1.154.11): its own (snap_api, ahead of the mode's other reads on the key),
         unless the api was put in from outside (the tests): then that one, as before."""
         return self.snap_api if self.api is getattr(self, "api_made", None) else self.api
+
+    def first(self) -> Any:
+        """The client a fresh listing's probe and orders go out on (1.154.21): the mode's key, ahead of its low traffic — unless
+        the api was put in from outside (the tests): then that one."""
+        return self.first_api if self.api is getattr(self, "api_made", None) else self.api
+
+    def borrow_why(self, spare_ms: int = 0) -> str:
+        """Why the rule taker's key is not borrowed now ("" when it may be): none to borrow, a refusal's pause, its cooldown,
+        the rule taker needing it within LEND_BEFORE_MS (KeyLending.why: the bot's one policy), or this mode's sign-in on it
+        not made yet."""
+        lent = self.lent_api
+        if lent is None or (lent is self.lent_made and self.api is not getattr(self, "api_made", None)):
+            return "没有可借的 Key"
+        if why := self.lending.why(spare_ms):
+            return why
+        if getattr(lent, "blocked_until", 0.0) - time.monotonic() > 0:
+            return "那把 Key 在限流冷却中"
+        if not getattr(lent, "jwt", "signed"):
+            return "那把 Key 还在登录" + (f"（上次没登上：{self.lent_warm_error}）" if self.lent_warm_error else "")
+        return ""
+
+    def lender(self) -> Any:
+        """The client on the rule taker's key, while this mode may use that key (borrow_why); else None."""
+        return self.lent_api if not self.borrow_why() else None
+
+    def lane(self, home: Any) -> Any:
+        """The client a request goes out on: ``home`` (one of this mode's own key) when that key has a token for it this
+        instant, or when nothing can be borrowed; else the borrowed key's client when that key has one to spare (1.154.21).
+        Both keys short: home — it waits there, as it always did."""
+        if self.lent_api is None or core.predict_pacer(str(getattr(home, "api_key", "") or "")).spare(low=bool(getattr(home, "low", False))):
+            return home
+        lent = self.lender()
+        if lent is None or not core.predict_pacer(str(getattr(lent, "api_key", "") or "")).spare(low=True):
+            return home
+        self.lent_at.append(time.monotonic())
+        return lent
+
+    async def through(self, home: Any, call: Any) -> Any:
+        """``call(client)`` on the lane's client. The borrowed key refusing the request before anything is done with it — a
+        429 or its cooldown, a 401 / 403 — is no answer about the request: it goes out once more on this mode's own key, and
+        nothing more is borrowed for LEND_OFF_S (lent_refused). Any other failure is the request's own, raised as it is — a
+        timeout, above all, is never sent again (an order may have been placed)."""
+        client = self.lane(home)
+        if client is home:
+            return await call(home)
+        try:
+            return await call(client)
+        except Exception as error:
+            if not self.lent_refused(error):
+                raise
+        return await call(home)
+
+    def lent_refused(self, error: BaseException) -> bool:
+        """Whether a failure on the borrowed key is that key's refusal of the request, unprocessed (through): if so, the
+        borrowing pauses."""
+        import live
+        status, text = live.http_status(error), core.clean_error(error) or type(error).__name__
+        if status not in (401, 403, 429) and "限流冷却中" not in text:
+            return False
+        self.lending.off("那把 Key 被限流（429）" if status == 429 or "限流冷却中" in text else f"那把 Key 拒绝了请求（HTTP {status}）")
+        return True
+
+    def lent_last(self, seconds: float = 60.0) -> int:
+        """The requests that went out on the borrowed key in the last ``seconds`` (the status, /diag)."""
+        cut = time.monotonic() - seconds
+        return sum(1 for t in self.lent_at if t >= cut)
+
+    def lent_keep_warm(self) -> None:
+        """The sign-in on the borrowed key made, and renewed every LEND_WARM_S, while that key may be borrowed — beside the loop:
+        the first request sent there never waits for it (lender asks for the sign-in)."""
+        lent = self.lent_api
+        if lent is None or not callable(getattr(lent, "ensure_auth", None)) or time.monotonic() - self.lent_warmed < LEND_WARM_S:
+            return
+        if self.lent_warm is not None and not self.lent_warm.done():
+            return
+        if (why := self.borrow_why()) and not why.startswith("那把 Key 还在登录"):
+            return
+        self.lent_warmed = time.monotonic()
+        clients = [lent] + ([self.lent_snap_api] if lent is self.lent_made and self.lent_snap_api is not None else [])
+
+        async def warm() -> None:
+            try:
+                for client in clients:
+                    await client.ensure_auth()
+                self.lent_warm_error = ""
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # (this mode's own sign-in: tried again LEND_WARM_S on, nothing of the lending paused for it)
+                self.lent_warm_error = core.clean_error(error) or type(error).__name__
+        self.lent_warm = asyncio.create_task(warm(), name="preopen-lent-warm")
+
+    def snapshot_lane(self) -> Any:
+        """The client the next account snapshot is read through (1.154.21): the borrowed key's while that key may be borrowed
+        for as long as the read takes — its pages (LEND_PAGE_S each, as the last read counted them) done LEND_BEFORE_MS before
+        the rule taker needs the key — else this mode's own (snapshot_client)."""
+        if self.borrow_why(int(self.account_pages * LEND_PAGE_S * 1000) + 60_000):
+            return self.snapshot_client()
+        lent = self.lent_snap_api if self.lent_api is self.lent_made and self.lent_snap_api is not None else self.lent_api
+        return lent if getattr(lent, "jwt", "signed") else self.snapshot_client()
 
     def first_snapshot_pending(self) -> bool:
         """Whether the first account snapshot since the start is still to come (1.154.8): every placement waits for it (hold), so
@@ -1736,17 +2104,15 @@ class Controller:
         return ""
 
     def known(self) -> tuple[set[str], set[str]]:
-        ids, hashes = set(), set()
-        for pair in self.ledger.rows.values():
-            for order in pair["orders"].values():
-                if order.get("id"):
-                    ids.add(str(order["id"]))
-                hashes.update(str(order[k]).lower() for k in ("hash", "api_hash") if order.get(k))
-        return ids, hashes
+        """The ids and the hashes of this mode's orders (1.154.20: from the ledger's index — the walk of every record's orders
+        it replaces took 100 ms with 39,000 records, at every account snapshot and, until the model trader kept the answer by
+        snapshot, at every step of its sync)."""
+        ids, hashes = self.ledger.known()
+        return set(ids), set(hashes)
 
     def unmanaged_rows(self, rows: list[dict]) -> list[dict]:
         import live
-        ids, hashes = self.known()
+        ids, hashes = self.ledger.known()
         return [r for r in rows if str(r.get("id")) not in ids and live.order_hash_of(r) not in hashes]
 
     def risk(self) -> float:
@@ -1754,7 +2120,7 @@ class Controller:
         size, until its pair is accounted — by the final reads after a cancel (nothing filled) or by the official
         result. A refusal or a never-sent order ties up nothing."""
         total = 0.0
-        for p in self.ledger.rows.values():
+        for p in self.ledger.pending():  # (1.154.20: the records not accounted, not every record — Ledger.pending)
             if p.get("accounted"):
                 continue
             price, shares = pair_quote(p)  # the pair's own size and price: a pair from older settings keeps its own figure
@@ -1769,7 +2135,7 @@ class Controller:
 
     def daily_pnl(self) -> float:
         day = dt.datetime.fromtimestamp(self.now() / 1000, core.BEIJING).date().isoformat()
-        return sum(float(p.get("pnl") or 0) for p in self.ledger.rows.values() if p.get("accounted_day") == day)
+        return self.ledger.day_pnl(day)  # 1.154.20: over the day's records with a P&L, not every record (asked a dozen times a second)
 
     async def account(self) -> None:
         """The account snapshot: the open orders (every page) and the USDT balance, read outside the placement lock (1.133.0:
@@ -1778,9 +2144,26 @@ class Controller:
         import live
         fetched = self.now()
         self.account_started_ms = fetched  # 1.154.8: the hold's progress note
-        client = self.snapshot_client()  # 1.154.11: its own, ahead of the mode's other reads
+        client = self.snapshot_lane()  # 1.154.11: its own, ahead of the mode's other reads; 1.154.21: the borrowed key's while that key is idle
         try:
-            rows = await client.orders("OPEN")
+            # (on the borrowed key the pages go behind what else is borrowed there — leave — for half the read's own pace at the
+            # most: a backlog's placements borrowing without end must not keep the snapshot from ever finishing)
+            yielding, lent = None, client if client is not self.snapshot_client() else None
+            if lent is not None and getattr(lent, "leave", 0.0):
+                yielding = asyncio.get_running_loop().call_later(max(LEND_YIELD_MIN_S, self.account_pages * ACCOUNT_PAGE_S / 2), lambda: setattr(lent, "leave", 0.0))
+            try:
+                rows = await client.orders("OPEN")
+            except Exception as error:
+                if lent is None or not self.lent_refused(error):
+                    raise
+                client = self.snapshot_client()  # the borrowed key refused a page: the whole read on the mode's own
+                rows = await client.orders("OPEN")
+            finally:
+                if yielding is not None:
+                    yielding.cancel()
+                    lent.leave = LEND_SNAPSHOT_LEAVE
+            if client is not self.snapshot_client():
+                self.lent_at.extend([time.monotonic()] * max(1, int((getattr(client, "paged_stats", None) or {}).get("/orders", (0, 0))[0] or 0)))
             page = int(getattr(client, "ORDERS_PAGE", 50) or 50)
             # 1.154.7: the pages counted as requested, and the rows Predict really put on a full page (LIVE_ORDERS_PAGE asks for `page`;
             # a cap of the server's below it would halve nothing, and the pages reckoned as rows / page would read the snapshot twice
@@ -1793,16 +2176,28 @@ class Controller:
                 raise core.RemoteError(f"账户挂单分页未读取完整（读了 {len(rows)} 条、{pages_read} 页仍没到底，上限 {getattr(client, 'ORDERS_PAGES_MAX', '?')} 页），暂停新增订单")
             self.account_pages = max(1, pages_read)
             other = self.unmanaged_rows(rows)
-            known_core = {str(t.get("live", {}).get("order_id")) for t in self.owner.sim_trades().values() if isinstance(t.get("live"), dict)}
+            known_core = {str(t.get("live", {}).get("order_id")) for t in self.owner.sim_trades().values() if isinstance(t.get("live"), dict)} if other else set()
             rule_ids, rule_hashes = getattr(self.owner, "rules_known", lambda: (set(), set()))()  # the rule taker's orders (1.153.3)
-            strangers = [r for r in other if str(r.get("id")) not in known_core | rule_ids and live.order_hash_of(r) not in rule_hashes]
+            mine = known_core | rule_ids
+            strangers = [r for r in other if str(r.get("id")) not in mine and live.order_hash_of(r) not in rule_hashes]
             unmanaged = len(strangers)
             detail = [order_brief(r) for r in strangers[:5]]  # /preopen check names them (1.132.1)
             reserved = 0.0
+            whole: dict[str, float] = {}  # makerAmount -> the USDT of a buy order of it with nothing filled (1.154.20: worked out once an amount, not once an order)
             for row in rows:
                 order = row.get("order") or {}
                 if int(order.get("side") or 0) == 0:
-                    amount, filled = D(str(row.get("amount") or "0")), D(str(row.get("amountFilled") or "0"))
+                    amount_s, filled_s = str(row.get("amount") or "0"), str(row.get("amountFilled") or "0")
+                    if filled_s == "0" and amount_s.isascii() and amount_s.isdigit() and amount_s.strip("0"):
+                        # nothing filled of a whole positive amount — nearly every row (24,000 resting bids): the same figure the
+                        # arithmetic below gives (1 − 0 / amount is 1), without three decimals and a division an order
+                        maker_s = str(order["makerAmount"])
+                        usd = whole.get(maker_s)
+                        if usd is None:
+                            usd = whole[maker_s] = float(D(maker_s) / live.WEI * (1 - D(filled_s) / D(amount_s)))
+                        reserved += usd
+                        continue
+                    amount, filled = D(amount_s), D(filled_s)
                     if amount <= 0 or not 0 <= filled <= amount:
                         raise core.RemoteError("账户订单缺少有效数量，暂停新增订单")
                     reserved += float(D(str(order["makerAmount"])) / live.WEI * (1 - filled / amount))
@@ -1817,7 +2212,7 @@ class Controller:
             self.unmanaged, self.open_reserved, self.balance, self.unmanaged_detail = unmanaged, reserved, balance, detail
             self.listed_ids = {str(r.get("id")) for r in rows}
             self.account_rows = rows
-            by_hash = {live.order_hash_of(r): r for r in rows if live.order_hash_of(r)}
+            by_hash = {digest: r for r in rows if (digest := live.order_hash_of(r))}
             for pair in self.ledger.rows.values():
                 changed = False
                 for order in pair["orders"].values():
@@ -1872,8 +2267,13 @@ class Controller:
                     pair.update(price=str(price), shares=str(int(shares) if shares == int(shares) else shares))
                     self.ledger.save(pair)
             if pair["phase"] == "active" and self.resumable(pair):
-                pair["cancel_ms"] = pair["start_ms"] - self.settings.timing(str(pair.get("key") or "")).cancel_seconds * 1000
-                self.ledger.save(pair)
+                cancel_ms = pair["start_ms"] - self.settings.timing(str(pair.get("key") or "")).cancel_seconds * 1000
+                if pair.get("cancel_ms") != cancel_ms:
+                    # 1.154.20: saved only when its cancel time changes (the setting did). A restart with the same settings took
+                    # over 12,000 resting pairs with a committed write each (synchronous=FULL: an fsync a pair, on the event loop)
+                    # that changed nothing — the whole bot stood still for that long at every start, a deploy included
+                    pair["cancel_ms"] = cancel_ms
+                    self.ledger.save(pair)
                 self.resumed += 1
                 if pair.get("key"):  # the listing horizon as the records know it: the status's 发布到, and the discovery's "beyond the listing", from the start
                     self.listed_by_card[pair["key"]] = max(self.listed_by_card.get(pair["key"], 0), int(pair["start_ms"]))
@@ -1894,7 +2294,7 @@ class Controller:
         if any(o["state"] == "rejected" and not o.get("limited") or o.get("refused") for o in pair["orders"].values()):
             return False  # Predict's refusal, outright or deferred (monitor_pair): the same order would be refused again
         if strikes is None:
-            strikes = window_strikes(self.ledger.rows.values()).get(record_key(pair), 0)
+            strikes = self.ledger.strikes().get(record_key(pair), 0)
         return strikes < MAX_ATTEMPTS
 
     async def on_stop(self) -> None:
@@ -1967,10 +2367,12 @@ class Controller:
         st = self.scan_state
         st.update(reads=0, asked=0, found=0, deferred=0, pending=0, stopped="", probed=0)
         known_before = dict(self.listed_by_card)  # the latest windows known listed as this pass starts: a window beyond them is a listing seen now
-        attempts: dict[str, int] = {}  # record (a window's level) -> the attempt after its last record, the superseded ones included: an attempt that left no record is not reused (its salt would be the first attempt's)
-        for p in self.ledger.rows.values():
-            attempts[record_key(p)] = max(attempts.get(record_key(p), 0), int(p.get("attempt") or 0) + 1)
-        strikes = window_strikes(self.ledger.rows.values())  # 1.131.6: the cap counts failures, not the salt's attempts
+        # record (a window's level) -> the attempt after its last record, the superseded ones included: an attempt that left no
+        # record is not reused (its salt would be the first attempt's). 1.154.20: asked of the ledger's index as a candidate is
+        # queued (Attempts), and the failures counted from the records that have one (Ledger.strikes) — both were worked out by
+        # walking every record at each pass, twice a second while a listing is expected: 39,000 records, some 40 ms a pass
+        attempts = Attempts(self.ledger)
+        strikes = self.ledger.strikes()  # 1.131.6: the cap counts failures, not the salt's attempts
         sprint = self.sprinting()  # judged as the pass begins: a pass that started for a listing stays with the listings (the next tick re-reads)
         try:
             await self.probe_listings(known_before, full, attempts, strikes, st)
@@ -2044,7 +2446,8 @@ class Controller:
                     continue
                 st["asked"] += 1
                 try:
-                    market = await category_market(self.api, slug)
+                    # (1.154.21: a listing's probe ahead of the mode's low traffic on its key — first — or on the borrowed key)
+                    market = await self.through(self.first(), lambda api: category_market(api, slug))
                 except Exception as error:
                     st["stopped"] = f"{slug.rsplit('-', 1)[-1]}：{core.clean_error(error) or type(error).__name__}"
                     self.error = f"扫描 {st['stopped']}"
@@ -2088,7 +2491,7 @@ class Controller:
             st["reads"] += 1
             st["asked"] += 1
             try:
-                market = await category_market(self.api, slug)
+                market = await self.through(self.api, lambda api: category_market(api, slug))
             except Exception as error:
                 st["stopped"] = f"{slug.rsplit('-', 1)[-1]}：{core.clean_error(error) or type(error).__name__}"
                 self.error = f"扫描 {st['stopped']}"
@@ -2155,7 +2558,7 @@ class Controller:
             async with gate:
                 for pair in pairs:
                     pair["meta_ms"] = self.now()
-                market = {**(await self.api.market(pairs[0]["market_id"])), "categorySlug": pairs[0].get("window") or window_of(pairs[0])}
+                market = {**(await self.through(self.api, lambda api: api.market(pairs[0]["market_id"]))), "categorySlug": pairs[0].get("window") or window_of(pairs[0])}
                 self.note_open(market)
                 status, trading = str(market.get("status") or "").upper(), str(market.get("tradingStatus") or "").upper()
                 if status != "REGISTERED" or trading not in {"OPEN", "MATCHING_NOT_ENABLED"}:
@@ -2187,8 +2590,9 @@ class Controller:
             read_ms, kept = self.details.get(str(c["market_id"]), (0, None))
             ttl = MARKET_FRESH_MS if int(c.get("start_ms") or 0) - self.now() <= REUSE_NEAR_MS else MARKET_REUSE_MS
             fresh = kept if kept is not None and self.now() - read_ms <= ttl else None
+        home = self.first() if c.get("fresh") else self.api  # 1.154.21: a fresh listing's requests ahead of the mode's low traffic on its key
         if fresh is None:
-            fresh = await self.api.market(c["market_id"])
+            fresh = await self.through(home, lambda api: api.market(c["market_id"]))
             self.keep_details(str(c["market_id"]), fresh)
         market = {**fresh, "categorySlug": c.get("window", c["slug"])}  # the window the category named: the details' own slug may differ
         current = candidate(market, self.now(), self.owner.config, self.settings)
@@ -2253,7 +2657,9 @@ class Controller:
         async def send(side: str) -> None:
             order = pair["orders"][side]
             try:
-                result = await self.api.create_order(order["body"])
+                # 1.154.21: on the mode's key when it has a token now, else on the rule taker's idle one (through: that key's
+                # refusal — unprocessed — sends the order on the mode's own; the signed order is the same on either)
+                result = await self.through(home, lambda api: api.create_order(order["body"]))
                 order.update(id=result["order_id"], state="open", api_hash=str(result.get("hash") or "").lower())
             except NotSent as error:
                 order.update(state="not_sent", error=core.clean_error(error))
@@ -2507,6 +2913,18 @@ class Controller:
                 # markets unjudged the round spent its reads elsewhere and the win waited for a later one)
                 soon(str(pair.get("market_id") or ""))
 
+    def monitor_reads(self, pair: dict, now_ms: int, covered: bool) -> bool:
+        """Whether a look at this resting pair (monitor_pair) would read one of its orders: an open one the account snapshot
+        does not cover (``covered``: the snapshot is fresh), or one found ended whose final read has come. The cancellation
+        loop asks before it makes the look's task (1.154.20)."""
+        for order in pair["orders"].values():
+            if order["state"] != "open" and not (order["state"] == "removed" and now_ms >= self.final_read_ms(order, pair)):
+                continue
+            if covered and order.get("id") in self.listed_ids:
+                continue
+            return True
+        return False
+
     async def monitor_pair(self, pair: dict) -> None:
         """An order ID is not proof that a deferred post-only order was accepted."""
         if (pair["phase"] != "active" or not self.account_at or self.now() - int(pair.get("created_ms") or 0) < 10_000
@@ -2520,7 +2938,7 @@ class Controller:
                 continue
             if order.get("id") in self.listed_ids and self.now() - self.account_at <= self.account_stale_ms():
                 continue  # one paginated account snapshot covers every healthy resting order
-            row = await self.api.order(order["id"], order.get("api_hash") or order["hash"])
+            row = await self.through(self.api, lambda api: api.order(order["id"], order.get("api_hash") or order["hash"]))
             if row is None:
                 continue  # replication lag is not a zero-fill rejection
             read = True
@@ -2699,7 +3117,7 @@ class Controller:
         start)."""
         if self.bulk_task is not None and not self.bulk_task.done():
             return False
-        rows = [p for p in self.ledger.rows.values() if not p.get("accounted")]
+        rows = [p for p in self.ledger.pending() if not p.get("accounted")]
         if any(p["phase"] == "active" or resting_orders(p, now_ms) for p in rows):
             self.rest_clear_ms = 0
             return False
@@ -2746,7 +3164,7 @@ class Controller:
         closing or unverified ones whose next try has come (bookkeep: RETRY_MS doubling to RETRY_MAX_MS)."""
         blocked = bool(self.withdrawing())  # an operator's stop withdraws the active pairs; not the stop itself (on_stop decides), not an account not verified yet
         out = []
-        for p in self.ledger.rows.values():
+        for p in self.ledger.pending():  # (1.154.20: the records not accounted — this runs twice a second)
             if p.get("accounted"):
                 continue
             if p["phase"] == "active" and (now_ms >= p["cancel_ms"] or blocked):
@@ -2823,7 +3241,15 @@ class Controller:
         own = bool(getattr(self.owner.config, "preopen_api_key", ""))
         per_min = float(getattr(self.owner.config, "predict_rate_per_min", 0) or 0)
         pace = (f"每分钟最多 {per_min:g} 次（PREDICT_RATE_PER_MIN，读等节拍、下单撤单优先）" if per_min and core.PREDICT_PACING else "不节流")
-        return ("用预挂自己的 API Key（PREOPEN_API_KEY），" if own else "和原策略、盘口共用一个 API Key，") + f"请求{pace}；"
+        return ("用预挂自己的 API Key（PREOPEN_API_KEY），" if own else "和原策略、盘口共用一个 API Key，") + f"请求{pace}；" + self.borrow_line()
+
+    def borrow_line(self) -> str:
+        """What /preopen says of the rule taker's key (1.154.21): borrowed now and how much went out on it, or why not."""
+        if self.lent_api is None:
+            return ""
+        why = self.borrow_why()
+        return ("规则吃单的 Key 空闲时借来用（RULE_KEY_LEND）：" + (f"现在不借——{why}" if why else "现在在借")
+                + f"，最近一分钟走了 {self.lent_last()} 次；")
 
     def sprint_lead_ms(self) -> int:
         """How long after a window's entry into the range the fast probing starts: SPRINT_EARLY_MS before the soonest of the recent
@@ -2864,7 +3290,9 @@ class Controller:
             def count(client: Any) -> int:  # a fake's calls are a list
                 made = getattr(client, "calls", 0)
                 return len(made) if isinstance(made, list) else int(made or 0)
-            calls = sum(count(client) for client in {id(x): x for x in (self.api, self.cancel_api, self.bulk_client(), self.snapshot_client())}.values())
+            calls = sum(count(client) for client in {id(x): x for x in (self.api, self.cancel_api, self.bulk_client(), self.snapshot_client(), self.first(),
+                                                                        self.lent_api, self.lent_snap_api) if x is not None}.values())
+            self.lent_keep_warm()
             if not self.rate_samples or now - self.rate_samples[-1][0] >= 500:
                 self.rate_samples.append((now, calls))
             await self.check_cards(now)
@@ -2905,10 +3333,21 @@ class Controller:
                 LOG.info("开盘前预挂收尾完成：%s", self.winding)
                 self.stop.set()
                 return
-            for pair in list(self.ledger.rows.values()):
+            # 1.154.20: the records not accounted (Ledger.pending), and a look's task only for a pair it would read an order of.
+            # 11-17: 12,143 resting pairs, every one covered by the account snapshot — and every five seconds a task was made for
+            # each (a coroutine, the gate, monitor_pair finding nothing to read), 12,000 at once: the event loop held some 200 ms
+            # each time, and at every pass until the first snapshot after a start. What such a task did is done here: the look
+            # is noted (checked_ms), nothing else
+            clock = self.now()
+            covered = bool(self.account_at) and clock - self.account_at <= self.account_stale_ms()
+            for pair in self.ledger.pending():
                 if pair["phase"] == "active" and now - int(pair.get("checked_ms") or 0) >= MONITOR_MS and now - int(pair.get("created_ms") or 0) >= 10_000:
                     key = "monitor:" + pair["slug"]  # (a look due: not a task for every active pair twice a second)
-                    if key not in self.settling or self.settling[key].done():
+                    if not self.account_at:
+                        pass  # no snapshot yet: monitor_pair looks at nothing (the first one covers every resting order at once)
+                    elif not self.monitor_reads(pair, clock, covered):
+                        pair["checked_ms"] = clock  # every order of it covered by the snapshot, or not open: the look, as monitor_pair notes it
+                    elif key not in self.settling or self.settling[key].done():
                         async def monitor(p: dict = pair) -> None:
                             async with self.settle_gate:
                                 try:
@@ -2918,7 +3357,7 @@ class Controller:
                                 except Exception as error:
                                     self.error = core.clean_error(error)
                         self.settling[key] = asyncio.create_task(monitor(), name=key)
-                if pair.get("accounted") or self.now() < settle_from(pair):
+                if pair.get("accounted") or clock < settle_from(pair):
                     continue
                 key = "settle:" + pair["slug"]
                 if key in self.settling and not self.settling[key].done():
@@ -2956,7 +3395,7 @@ class Controller:
                     if job.done() and not job.cancelled() and job.exception():
                         raise job.exception()
             finally:
-                bulk = [self.bulk_task] if self.bulk_task is not None else []
+                bulk = [task for task in (self.bulk_task, self.lent_warm) if task is not None]
                 for job in [*stops, *jobs, *bulk]:
                     job.cancel()
                 await asyncio.gather(*stops, *jobs, *bulk, return_exceptions=True)
@@ -3011,9 +3450,12 @@ class Controller:
         """The coming windows' levels (start beyond the new-order cutoff) this mode will not quote again, the soonest first:
         (their failures at MAX_ATTEMPTS, refused by Predict) — each level's latest record (1.131.6: /preopen says so; a
         window that went missing used to say nothing)."""
-        strikes = window_strikes(self.ledger.rows.values())
+        strikes = self.ledger.strikes()
         latest: dict[str, dict] = {}
+        now = self.now()
         for p in self.ledger.rows.values():
+            if int(p.get("start_ms") or 0) <= now:
+                continue  # 1.154.20: a window that has begun is listed by nothing below (its start is under every cutoff): its level's records — one start a level — need no look
             k = record_key(p)
             if k not in latest or int(p.get("attempt") or 0) > int(latest[k].get("attempt") or 0):
                 latest[k] = p
@@ -3035,7 +3477,7 @@ class Controller:
         windows up to the latest one seen listed count as listed; a level with its failures at the cap does not count."""
         now = self.now()
         active = {record_key(p) for p in self.ledger.rows.values() if p["phase"] == "active"}
-        strikes = window_strikes(self.ledger.rows.values())
+        strikes = self.ledger.strikes()
         windows: set[str] = set()
         pairs, usd = 0, 0.0
         for rolling, start in window_starts(now, self.owner.config, self.settings):
@@ -3054,12 +3496,18 @@ class Controller:
         return len(windows), pairs, usd
 
     def status(self) -> str:
-        rows = list(self.ledger.rows.values())
+        # 1.154.20: the counts in one pass and from the ledger's own (Ledger.pending, windows, strikes) — the status walked every
+        # record a dozen times (39,000: 0.2 s on the event loop), and the control page asked for it every five seconds
+        total, resting = len(self.ledger.rows), 0
+        cleared = total - sum(1 for p in self.ledger.pending() if not p.get("accounted"))
+        reserved = self.risk()
         spent, refused = self.unquotable()
         quoted_to: dict[str, int] = {}  # card -> the latest window with a quote resting (the first level's, the deeper ones wait for the start)
-        for p in rows:
-            if p["phase"] == "active" and p.get("key"):
-                quoted_to[p["key"]] = max(quoted_to.get(p["key"], 0), int(p.get("start_ms") or 0))
+        for p in self.ledger.rows.values():  # (one pass for the resting ones: their count, and each card's latest)
+            if p["phase"] == "active":
+                resting += 1
+                if p.get("key"):
+                    quoted_to[p["key"]] = max(quoted_to.get(p["key"], 0), int(p.get("start_ms") or 0))
         windows_left, pairs_left, usd_left = self.unplaced()
         shut_cards = {h: "、".join(r.coin for r in core.preopen_cards() if getattr(r, "hours", "") == h and r.key in self.settings.markets) for h in SHUT_TEXT}  # 1.150.1: the cards a shut keeps back
         quiet = open_quiet_ms(self.settings) // 60_000  # 1.151.1: the minutes in force (the first window after an open always)
@@ -3093,12 +3541,12 @@ class Controller:
                 + (f"BTC 5 分钟自己的时间：开场前 {b5.cancel_seconds} 秒撤单、{b5.expiry_seconds} 秒签名到期，不足 {b5.entry_seconds} 秒不再新挂，"
                    + ("挂 24 小时内已发布的全部场次" if b5.ahead_minutes >= 1440 else f"只挂 {b5.ahead_minutes} 分钟内开始的场次") + "\n"
                    if "BTC-5M" in self.settings.markets and (b5 := self.settings.timing("BTC-5M")) is not self.settings else "") +  # 1.152.0
-                f"已记录 {len({window_of(p) for p in rows})} 场、{len(rows)} 条（{sum(1 for p in rows if p['phase'] == 'active')} 条挂着，{sum(1 for p in rows if p.get('accounted'))} 条已结清）"
+                f"已记录 {len(self.ledger.windows)} 场、{total} 条（{resting} 条挂着，{cleared} 条已结清）"
                 + (f"，另有 {self.ledger.archived_count} 条已归档（结束超过 {ARCHIVE_AFTER_MS // core.DAY_MS} 天、已撤且没成交的；复盘页照常统计）" if self.ledger.archived_count else "") + "，"
                 f"队列 {self.queue.qsize() + len(self.parked)} 场" + (f"（{len(self.parked)} 场在等，见暂不新挂）" if self.parked else "") + f"；{listed}"
                 + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"
-                f"预留 {self.risk():.2f}U{f' / 限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '，不设上限'}（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉的场次在撤单 {LATE_FILL_MS // 1000} 秒后读到一份没成交才释放）"
-                + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {self.risk() + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，新发布的先挂，其余按开场先后补挂中") if pairs_left else "")
+                f"预留 {reserved:.2f}U{f' / 限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '，不设上限'}（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉的场次在撤单 {LATE_FILL_MS // 1000} 秒后读到一份没成交才释放）"
+                + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {reserved + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，新发布的先挂，其余按开场先后补挂中") if pairs_left else "")
                 + (f"\n请求约 {self.request_rate():.1f} 次/秒（最近一分钟）；" if self.request_rate() is not None else "\n")
                 + self.pace_line()
                 + f"账户快照每 {self.account_interval_s():.0f} 秒（{self.account_pages} 页挂单" + self.page_rows_note()

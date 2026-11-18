@@ -50,7 +50,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.19"
+VERSION = "1.154.21"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -1057,6 +1057,9 @@ class Config:
     live_orders_page: int = 50         # LIVE_ORDERS_PAGE: orders per page when the account's open list is read (a page is a round trip; 1.112.1)
     predict_rate_per_min: float = 220.0  # PREDICT_RATE_PER_MIN: every API key's requests paced to this many a minute (PredictPacer, 1.154.0); 0 = no pacing
     preopen_api_key: str = ""          # PREOPEN_API_KEY: a second Predict API key for the pre-open mode alone — its own request budget (1.154.0)
+    rule_key_lend: bool = True         # RULE_KEY_LEND: on = while the rule taker is idle its own key (RULE_API_KEY) also carries the orderbook feed's
+    #                                    reads and the pre-open mode's overflow — never from five minutes before the rule taker needs it
+    #                                    (preopen.KeyLending, 1.154.21); off = that key is the rule taker's alone
     rule_api_key: str = ""             # RULE_API_KEY: a Predict API key for the rule taker alone (its reads, orders and push) — its own budget and its own
     #                                    429 cooldown: the bot's key's cooldowns no longer blind it (1.154.12); unset: PREDICT_API_KEY
     predict_book_api_key: str = ""     # PREDICT_BOOK_API_KEY: a Predict API key for the orderbook feed alone (its REST reads and push) — its own budget,
@@ -1282,6 +1285,7 @@ class Config:
             live_orders_page=bounded_int(e, "LIVE_ORDERS_PAGE", 50, 10, 500),
             predict_rate_per_min=float(bounded_int(e, "PREDICT_RATE_PER_MIN", 220, 0, 100_000)),
             preopen_api_key=str(e.get("PREOPEN_API_KEY", "")).strip(),
+            rule_key_lend=not off(e.get("RULE_KEY_LEND", "on")),
             predict_book_api_key=str(e.get("PREDICT_BOOK_API_KEY", "")).strip(),
             rule_api_key=str(e.get("RULE_API_KEY", "")).strip(),
             live_max_open_usd=parse_bounded(e, "LIVE_MAX_OPEN_USD", "500", 1, 100_000_000),
@@ -5520,6 +5524,119 @@ async def predict_blocking(fn: Any, *args: Any) -> Any:
 PREDICT_PACING = os.environ.get("PREDICT_PACING", "on").strip().lower() != "off"  # the offline tests switch it off (tests/offline.py)
 
 
+class LoopWatch:
+    """How late the event loop runs, and what held it (1.154.20, /diag: 主循环). Everything the bot does — the pushed books and
+    prices, the trader's looks, every request's answer, the pre-open mode, the pages — takes its turn on one loop: a piece of
+    work that holds it for 300 ms makes everything else 300 ms late, an order's request included. 11-18: the model trader's
+    takers had become slow, and nothing said why — it was the pre-open mode's 39,000 records and 24,000 open orders walked
+    over and over on the loop (the trader's own sync digesting that mode's account snapshot at every step, the day's P&L
+    summed a dozen times a second, a task made every five seconds for each resting pair, the control page's status every
+    five seconds while it was open).
+
+    A beat sleeps BEAT_S and notes by how much it woke late; a thread beside the loop looks, whenever a beat is overdue, at
+    what the loop's thread is running just then (its stack: the innermost functions of this code), so a beat late by
+    STALL_MS or more is filed under the work that held it. The last KEEP_S are kept."""
+    BEAT_S = 0.05
+    STALL_MS = 100.0
+    KEEP_S = 600.0
+    OWN = {"main.py": "main", "live.py": "live", "preopen.py": "preopen", "rules.py": "rules"}
+
+    def __init__(self) -> None:
+        self.lags: collections.deque = collections.deque()  # (monotonic, ms late) of each beat of the last KEEP_S
+        self.stalls: collections.deque = collections.deque(maxlen=2000)  # (monotonic, ms late, what held the loop) of the beats late by STALL_MS or more
+        self.beat_at = 0.0       # when the beat under way began (the thread reads it)
+        self.caught: tuple[float, dict[str, int]] | None = None  # (the beat it belongs to, what the thread saw running -> how often)
+        self.ident = 0           # the loop's thread
+        self.alive = False
+        self.started = 0.0
+
+    async def run(self, stopping: asyncio.Event) -> None:
+        self.ident, self.alive, self.started = threading.get_ident(), True, time.monotonic()
+        threading.Thread(target=self.spy, name="loop-watch", daemon=True).start()
+        try:
+            while not stopping.is_set():
+                began = self.beat_at = time.monotonic()
+                await asyncio.sleep(self.BEAT_S)
+                self.note(began, time.monotonic())
+        finally:
+            self.alive = False
+
+    def note(self, began: float, now: float) -> None:
+        """A beat begun at ``began`` woke at ``now``: how late, and — late by STALL_MS or more — under what."""
+        late = max(0.0, (now - began - self.BEAT_S) * 1000)
+        self.lags.append((now, late))
+        while self.lags and now - self.lags[0][0] > self.KEEP_S:
+            self.lags.popleft()
+        if late >= self.STALL_MS:
+            caught = self.caught
+            seen = caught[1] if caught is not None and caught[0] == began else {}
+            self.stalls.append((now, late, max(seen, key=seen.get) if seen else "没抓到是哪一段"))
+
+    def spy(self) -> None:
+        """The thread: while a beat is overdue by more than half of STALL_MS, the loop's thread's stack is read every 20 ms
+        and what it is running counted for that beat (the commonest is the stall's name)."""
+        while self.alive:
+            time.sleep(0.02)
+            began = self.beat_at
+            if not began or (time.monotonic() - began - self.BEAT_S) * 1000 < self.STALL_MS / 2:
+                continue
+            try:
+                where = self.where(sys._current_frames().get(self.ident))
+            except Exception:  # (a look that failed names nothing; it never ends the thread)
+                continue
+            caught = self.caught
+            if caught is None or caught[0] != began:
+                caught = self.caught = (began, {})
+            caught[1][where] = caught[1].get(where, 0) + 1
+
+    @classmethod
+    def where(cls, frame: Any) -> str:
+        """A stack in a few words: the innermost three functions of this code, the caller after each ←."""
+        names: list[str] = []
+        inner = ""
+        while frame is not None and len(names) < 3:
+            base = os.path.basename(frame.f_code.co_filename)
+            if not inner:
+                inner = f"{base.rsplit('.', 1)[0]}.{frame.f_code.co_name}"
+            if base in cls.OWN:
+                names.append(f"{cls.OWN[base]}.{frame.f_code.co_name}")
+            frame = frame.f_back
+        return " ← ".join(names) or inner or "?"
+
+    def summary(self, span_s: float | None = None) -> dict | None:
+        """The last ``span_s`` (KEEP_S at the most): the beats' delay (median, 99%, longest, ms), the stalls (how many, their
+        seconds, by what held the loop: [what, count, seconds, longest ms], the most seconds first) and the seconds covered."""
+        now = time.monotonic()
+        span = min(span_s or self.KEEP_S, self.KEEP_S)
+        lags = sorted(late for at, late in self.lags if now - at <= span)
+        if not lags:
+            return None
+        by: dict[str, list] = {}
+        for at, late, what in self.stalls:
+            if now - at <= span:
+                row = by.setdefault(what, [what, 0, 0.0, 0.0])
+                row[1], row[2], row[3] = row[1] + 1, row[2] + late / 1000, max(row[3], late)
+        rows = sorted(by.values(), key=lambda r: -r[2])
+        return {"n": len(lags), "median": lags[len(lags) // 2], "p99": lags[min(len(lags) - 1, int(len(lags) * 0.99))], "max": lags[-1],
+                "stalls": sum(r[1] for r in rows), "stall_s": sum(r[2] for r in rows), "by": rows,
+                "seconds": min(span, now - self.started) if self.started else span}
+
+    def line(self) -> str:
+        """/diag's line."""
+        s = self.summary()
+        if s is None:
+            return "还没有数据（启动后几秒开始记）"
+        took = f"{s['seconds'] / 60:.0f} 分钟" if s["seconds"] >= 90 else f"{s['seconds']:.0f} 秒"
+        ms = lambda v: f"{v:.0f}" if v >= 10 else f"{v:.1f}"
+        text = f"最近 {took}延迟中位 {ms(s['median'])} ms、99% 的时候不超过 {ms(s['p99'])} ms、最长 {ms(s['max'])} ms"
+        if not s["stalls"]:
+            return text + f"；没有卡过 {self.STALL_MS:.0f} ms 以上（延迟 = 别的活儿占着主循环、盘口和下单请求在后面排队的时间）"
+        share = s["stall_s"] / max(s["seconds"], 1e-9)
+        text += f"；卡 {self.STALL_MS:.0f} ms 以上 {s['stalls']} 次、共 {s['stall_s']:.1f} 秒（占 {share:.1%}）"
+        return text + "；卡在：" + "；".join(f"{what} {n} 次共 {secs:.1f} 秒（最长 {longest:.0f} ms）" for what, n, secs, longest in s["by"][:5]) \
+            + "（延迟 = 别的活儿占着主循环、盘口和下单请求在后面排队的时间；← 后面是调用它的地方）"
+
+
 class PredictPacer:
     """An API key's request budget (1.154.0): Predict allows a key so many requests a minute (240 by default) and answers more
     with a 429 — and each 429 stopped every request on the key for twenty seconds: the account snapshot started over from its
@@ -5537,6 +5654,7 @@ class PredictPacer:
         self.tokens = 0.0
         self.at = time.monotonic()
         self.waited = 0.0  # seconds the reads have waited for a token, in all (/diag)
+        self.waits: collections.deque = collections.deque(maxlen=4096)  # (monotonic, seconds) of each request that waited for its token (waited_last, 1.154.21)
         self.sent: collections.deque = collections.deque(maxlen=4096)  # monotonic times of the requests let through (/diag: the key's minute)
         self.limits: collections.deque = collections.deque(maxlen=200)  # (monotonic, the minute's count then) at each 429 on the key (note_429)
 
@@ -5545,13 +5663,15 @@ class PredictPacer:
         self.tokens = min(self.BURST, self.tokens + (now - self.at) * self.per_min / 60.0)
         self.at = now
 
-    async def take(self, write: bool = False, low: bool = False) -> None:
+    async def take(self, write: bool = False, low: bool = False, leave: float = 0.0) -> None:
         """A token for one request: a read waits for a whole one; an order or a cancel (``write``) may borrow up to a burst ahead;
         a ``low`` read (1.154.9: the orderbook feed's — its rounds ask for dozens at once) leaves LOW_RESERVE behind, so the
         trader's reads on the same key go first: 11-17 14:41, 主 Key 220 次 a minute, the trader's sync (its order reads, the
-        minute's positions pages) queued 22 s behind the book rounds."""
+        minute's positions pages) queued 22 s behind the book rounds. ``leave`` (1.154.21): that many more left behind — the
+        account snapshot's pages on a borrowed key, behind the placements borrowed there (PredictApi.leave)."""
         if self.per_min > 0 and PREDICT_PACING:
-            need = 1.0 - self.BURST if write else 1.0 + (self.LOW_RESERVE if low else 0.0)  # what must be in the bucket for this one to go
+            need = 1.0 - self.BURST if write else 1.0 + (self.LOW_RESERVE if low else 0.0) + max(0.0, leave)  # what must be in the bucket for this one to go
+            began = 0.0
             while True:
                 self.refill()
                 if self.tokens >= need - 1e-9:
@@ -5559,8 +5679,27 @@ class PredictPacer:
                     break
                 wait = (need - self.tokens) * 60.0 / self.per_min
                 self.waited += wait
+                began = began or time.monotonic()
                 await asyncio.sleep(wait)
+            if began:
+                self.waits.append((time.monotonic(), time.monotonic() - began))
         self.sent.append(time.monotonic())
+
+    def spare(self, low: bool = False, leave: float = 0.0) -> bool:
+        """Whether a read (a ``low`` one, leaving ``leave`` more behind) would get its token this instant: what a request that
+        may go out on another key asks before it queues on this one (preopen.Controller.lane, 1.154.21). Always, with the
+        pacing off."""
+        if not (self.per_min > 0 and PREDICT_PACING):
+            return True
+        self.refill()
+        return self.tokens >= 1.0 + (self.LOW_RESERVE if low else 0.0) + max(0.0, leave) - 1e-9
+
+    def waited_last(self, seconds: float = 60.0) -> tuple[int, float]:
+        """(requests that waited for a token, the seconds they waited together) in the last ``seconds``: a key at its pace
+        shows them, an idle one none (/diag: 等节拍)."""
+        cut = time.monotonic() - seconds
+        waits = [w for t, w in self.waits if t >= cut]
+        return len(waits), sum(waits)
 
     def last_minute(self) -> int:
         """The requests let through on the key in the last 60 seconds, every client's (what Predict's per-minute limit counts)."""
@@ -6153,6 +6292,8 @@ class PredictFeed:
         self.absent_at: dict[str, float] = {}                    # item key -> monotonic time its book was answered 404 (1.154.9: PREDICT_ABSENT_SECONDS)
         self.row_asked: dict[str, dict[str, float]] = {}         # item key -> market id -> the same, for a ladder's levels
         self.blocked_until = 0.0                                 # monotonic: after a 429, no request before this
+        self.lend: Any = None                                    # the rule taker's key, lent while that taker is idle (preopen.KeyLending; LiveBot sets it, 1.154.21)
+        self.lent_at: collections.deque = collections.deque(maxlen=4096)  # monotonic times of the reads that went out on it (lent_last)
         self.calls = 0                                           # requests sent (/diag: the request rate on the API key, 1.137.2)
         self.limited: collections.deque = collections.deque(maxlen=500)  # monotonic times of the 429s answered (/diag, 1.138.0)
         self.rate_samples: collections.deque = collections.deque(maxlen=130)  # (monotonic, calls), sampled as the rounds run
@@ -6168,6 +6309,28 @@ class PredictFeed:
         else the bot's PREDICT_API_KEY (the trading clients' too)."""
         return str(getattr(self.config, "predict_book_api_key", "") or "") or self.config.predict_api_key
 
+    def lent_key(self) -> str:
+        """The rule taker's own key, for this read (1.154.21): while that taker is idle (preopen.KeyLending) and its key has a
+        token to spare this instant — the feed's reads go out there, and the bot's key is left to the model trader (its order
+        reads and its sync never queue behind a round of books; and a key shared with anyone else stays further from its
+        limit: 11-17, ninety 429s on it in 2.3 hours, the trader silent twenty seconds each). "" otherwise: the feed's own."""
+        lending = self.lend
+        if lending is None or self.api_key() != self.config.predict_api_key:
+            return ""  # nothing to borrow; or the feed has a key of its own (PREDICT_BOOK_API_KEY): the bot's key carries none of its reads anyway
+        try:
+            lent = lending.key()
+            if not lent or lent == self.api_key() or lending.why() or not predict_pacer(lent).spare(low=True):
+                return ""
+        except Exception:  # (a lender that cannot answer lends nothing)
+            return ""
+        self.lent_at.append(time.monotonic())
+        return lent
+
+    def lent_last(self, seconds: float = 60.0) -> int:
+        """The reads that went out on the borrowed key in the last ``seconds`` (/diag)."""
+        cut = time.monotonic() - seconds
+        return sum(1 for t in self.lent_at if t >= cut)
+
     def rate(self) -> float | None:
         """Requests a second over the last minute (the REST reads: books, markets), or None before two samples."""
         now = time.monotonic()
@@ -6178,13 +6341,45 @@ class PredictFeed:
         return (n1 - n0) / (t1 - t0) if t1 - t0 >= 5 else None
 
     async def fetch(self, url: str, payload: dict | None = None) -> Any:
-        """One Predict request, at most PREDICT_PARALLEL at a time; a 429 (or any retry_after) pauses them all."""
+        """One Predict request, at most PREDICT_PARALLEL at a time; a 429 (or any retry_after) pauses them all. 1.154.21: a
+        REST read goes out on the rule taker's key while that one is idle and has a token to spare (lent_key); refused there
+        before anything was read — that key's limit, a 401 / 403 — it is asked once more on the feed's own key, and nothing
+        more is borrowed for a while (lent_refusal)."""
         left = self.blocked_until - time.monotonic()
         if left > 0:
             raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
-        if url.startswith(PREDICT_REST):
+        rest = url.startswith(PREDICT_REST)
+        lent = self.lent_key() if rest else ""
+        if lent:
+            try:
+                return await self.fetch_with(url, payload, lent)
+            except RemoteError as error:
+                if not self.lent_refusal(error, lent):
+                    raise
+        return await self.fetch_with(url, payload, self.api_key())
+
+    def lent_refusal(self, error: RemoteError, key: str) -> bool:
+        """Whether a read's failure on the borrowed key is that key's refusal of it (fetch): its limit — the rule taker's
+        client pauses with it, as on a 429 of its own — or a 401 / 403; either way the borrowing pauses."""
+        text = str(error)
+        limited = "429" in text
+        with contextlib.suppress(Exception):
+            if error.retry_after or limited:
+                if limited:
+                    predict_pacer(key).note_429()
+                self.lend.refused(time.monotonic() + max(error.retry_after, PREDICT_BACKOFF_SECONDS), limited)
+                return True
+            if "HTTP 401" in text or "HTTP 403" in text:
+                self.lend.off(f"那把 Key 拒绝了请求（{'HTTP 401' if 'HTTP 401' in text else 'HTTP 403'}）")
+                return True
+        return False
+
+    async def fetch_with(self, url: str, payload: dict | None, key: str) -> Any:
+        """fetch, with ``key`` in x-api-key (the feed's own, or the borrowed one): the key's budget, the gate, the request."""
+        rest = url.startswith(PREDICT_REST)
+        if rest:
             # the key's budget, shared with the trading clients (1.154.0) unless the feed has its own (1.154.5); behind their reads (1.154.9)
-            await predict_pacer(self.api_key()).take(low=True)
+            await predict_pacer(key).take(low=True)
         async with self.gate:
             # 1.150.0: a cooldown that began while this request waited for its slot (another read's 429) is honoured here too,
             # as live.py's send() does since 1.138.0: nothing queued behind the PREDICT_PARALLEL in flight goes out into it.
@@ -6192,14 +6387,14 @@ class PredictFeed:
             # once it really goes out, so /diag's rate is the requests sent, not the ones refused
             if (left := self.blocked_until - time.monotonic()) > 0:
                 raise RemoteError(f"Predict 接口限流冷却中（{int(left) + 1} 秒后重试）", int(left) + 1)
-            if url.startswith(PREDICT_REST):
+            if rest:
                 self.calls += 1
                 if not self.rate_samples or time.monotonic() - self.rate_samples[-1][0] >= 1:
                     self.rate()  # sampled as the reads go, so /diag has a minute of them
             try:
-                raw = await predict_blocking(_http_get, url, payload, SOURCE_TIMEOUT, self.headers() if url.startswith(PREDICT_REST) else {})
+                raw = await predict_blocking(_http_get, url, payload, SOURCE_TIMEOUT, ({"x-api-key": key} if key else {}) if rest else {})
             except RemoteError as error:
-                if error.retry_after or "429" in str(error):
+                if (error.retry_after or "429" in str(error)) and key == self.api_key():  # (the borrowed key's limit is not this feed's: lent_refusal)
                     self.blocked_until = max(self.blocked_until, time.monotonic() + max(error.retry_after, PREDICT_BACKOFF_SECONDS))
                     if "429" in str(error):
                         self.limited.append(time.monotonic())  # /diag (1.138.0)
@@ -12378,6 +12573,7 @@ class TradeMap(dict):
         self._by_market: dict[str, list[dict]] | None = None
         self._by_driver: dict[str, list[dict]] | None = None
         self._ids_by_market: dict[str, list[str]] | None = None
+        self.taken: tuple[int, int] | None = None  # sim_trades: which reading of the kept records this map holds, and as of which write; None once it is changed
 
     def of_market(self, market: str) -> list[dict]:
         """The records of one market, in the map's order (not to be changed by the caller)."""
@@ -12410,6 +12606,7 @@ class TradeMap(dict):
 
     def _changed(self) -> None:
         self._by_market = self._by_driver = self._ids_by_market = None
+        self.taken = None
 
     def __setitem__(self, key: str, value: dict) -> None:
         super().__setitem__(key, value)
@@ -16861,6 +17058,7 @@ class Bot:
         self.fair_sig: tuple | None = None  # the fair prices as of the last feed refresh (note_job): a change wakes the trader
         self.fair_sig_at = -1e9
         self.sim_lock = asyncio.Lock()      # the step's decisions and the express lane never run side by side
+        self.loop_watch = LoopWatch()       # how late the event loop runs and what held it (run starts it; /diag: 主循环)
         self.sim_follow_readonly = False    # sim_why's look: the follow's settle clocks are read, never started or reset (1.138.0)
         self.sim_cooling_timers: dict[str, asyncio.TimerHandle] = {}  # slot -> the express look armed for its cooldown's end (sim_cooling_wake)
         self.sim_express_count = 0          # decisions made by the express lane (for /diag)
@@ -16919,6 +17117,7 @@ class Bot:
         self.last_send_error = ""  # the latest Telegram send failure, for /status
         self.sim_cache: dict[str, dict] | None = None  # in-memory view of the sim: records (sim_trades)
         self.sim_gen = -1
+        self.sim_built = 0  # how many times that view was read afresh from the store (TradeMap.taken)
         self.notice_cache: dict[str, dict] | None = None  # in-memory view of the notice: records
         self.notice_gen = -1
         self.pred_pruned = 0.0  # when old prediction snapshots were last pruned
@@ -19463,7 +19662,10 @@ class Bot:
             self.sim_cache = {k.removeprefix("sim:"): sim_upgrade(v) for k, v in self.store.items("sim:")
                               if isinstance(v, dict) and "status" in v}
             self.sim_gen = generation
-        return TradeMap(self.sim_cache)
+            self.sim_built = getattr(self, "sim_built", 0) + 1  # (the view read afresh: its records are new objects)
+        view = TradeMap(self.sim_cache)
+        view.taken = (getattr(self, "sim_built", 0), self.sim_gen)  # 1.154.20: the records as kept — this reading of them, at this write — until the map itself is changed (TradeMap._changed)
+        return view
 
     def sim_save(self, pairs: Any) -> None:
         """Persist (trade id, trade) pairs in one transaction and keep the in-memory view current."""
@@ -24308,12 +24510,22 @@ class Bot:
         """The page's record list: every resting order and position, and the last ``history`` finished ones (withdrawn,
         failed, lapsed, settled), newest first — with the group the page files them under (resting / position / history),
         the status and the reason, and the real order's id and state when one was sent."""
-        rows = []
+        # 1.154.20: which records are shown is settled first (the group and the time alone), and only those are written out — the
+        # status, the state and the link of every record ever kept (12,800 on 11-17) were worked out at each of the page's
+        # five-second polls to show two hundred of them: a tenth of a second on the event loop, every poll
+        light = []
         for tid, t in trades.items():
-            st = t.get("live") if isinstance(t.get("live"), dict) else {}
             status = t.get("status")
             group = "resting" if status == "resting" else "position" if status == "filled" else "history"
             when = int((t.get("settled") or (t.get("withdrawn") or {}).get("at") or t.get("opened") or 0) if group == "history" else (t.get("opened") or 0))
+            light.append((when, group, tid, t))
+        light.sort(key=lambda r: r[0], reverse=True)
+        kept = [r for r in light if r[1] != "history"] + [r for r in light if r[1] == "history"][:history]
+        kept.sort(key=lambda r: r[0], reverse=True)
+        rows = []
+        for when, group, tid, t in kept:
+            st = t.get("live") if isinstance(t.get("live"), dict) else {}
+            status = t.get("status")
             failed = st.get("final") == "failed"
             why = str((t.get("withdrawn") or {}).get("why") or st.get("error") or (t.get("note") if status in {"expired", "cancelled"} else "") or "")
             rows.append({"id": tid, "opened": stamp(int(t.get("opened") or 0), seconds=False), "when": when, "item": str(t.get("item") or ""),
@@ -24324,10 +24536,7 @@ class Bot:
                          "order_id": str(st.get("order_id") or ""), "live_state": str(st.get("state") or ""),
                          "cancellable": status == "resting" and st.get("state") in {"open", "placing"} and bool(st.get("order_id")),
                          "url": self.sim_url(t)})
-        rows.sort(key=lambda r: r["when"], reverse=True)
-        kept = [r for r in rows if r["group"] != "history"] + [r for r in rows if r["group"] == "history"][:history]
-        kept.sort(key=lambda r: r["when"], reverse=True)
-        return kept
+        return rows
 
     def control_payload(self) -> dict:
         """What the control page shows: whether it may act, each setting (in force, saved, from the environment), the
@@ -24976,6 +25185,8 @@ class Bot:
         lines.append("📡 行情推送：" + "｜".join(f"{name} {stream.line()}" for name, stream in (
             ("币安合约", self.binance_streams["futures"]), ("币安现货", self.binance_streams["spot"]), ("Hyperliquid", self.hl_stream))))
         lines.append(f"💾 数据库：{self.store.line()}")
+        if (watch := getattr(self, "loop_watch", None)) is not None:
+            lines.append(f"⏱️ 主循环：{watch.line()}")
         if self.reference_state:
             lines.append("🔄 后台刷新")
             for name, _ in self.reference_jobs():
@@ -25977,6 +26188,7 @@ class Bot:
                 asyncio.create_task(self.commands_loop(), name="commands"),
                 asyncio.create_task(self.watchdog(), name="watchdog")]
         tasks = [*core, *self.reference_tasks]
+        tasks.append(asyncio.create_task(self.loop_watch.run(self.stopping), name="loop-watch"))  # 1.154.20: the loop's own delay, and what holds it
         if self.config.predict:  # Predict's WebSocket beside the REST rounds (PREDICT_WS=off: it idles)
             tasks.append(asyncio.create_task(self.predict.stream.run(self.stopping), name="predict-ws"))
         for name, stream in (("binance-ws-futures", self.binance_streams["futures"]), ("binance-ws-spot", self.binance_streams["spot"]),

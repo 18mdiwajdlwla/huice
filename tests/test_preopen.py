@@ -1036,6 +1036,199 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(again.queue.qsize(), 0, "not quoted again: the window is left out")
             await self.finish(again)
 
+    async def test_the_loops_walk_the_working_records_and_the_ledgers_own_counts(self):
+        """1.154.20 — 11-17: 39,116 records, 26,956 of them accounted and only history, and every walk of the loops went through
+        all of them: the day's P&L a dozen times a second (withdrawing: every placement's gates, the cancellation loop), the
+        due list twice a second, the attempts and the failures at every discovery, the orders' ids and hashes at every account
+        snapshot — a quarter of the one event loop the model trader's orders share. The ledger keeps what those walks need as
+        its records are saved; each answer is the walk's own."""
+        def walked(ctl):  # what the walks of every record gave (1.154.19)
+            rows = list(ctl.ledger.rows.values())
+            day = dt.datetime.fromtimestamp(ctl.now() / 1000, m.BEIJING).date().isoformat()
+            ids, hashes, attempts = set(), set(), {}
+            for pair in rows:
+                attempts[p.record_key(pair)] = max(attempts.get(p.record_key(pair), 0), int(pair.get("attempt") or 0) + 1)
+                for order in pair["orders"].values():
+                    if order.get("id"):
+                        ids.add(str(order["id"]))
+                    hashes.update(str(order[k]).lower() for k in ("hash", "api_hash") if order.get(k))
+            return {"pending": [x["slug"] for x in rows if not x.get("accounted")],
+                    "pnl": sum(float(x.get("pnl") or 0) for x in rows if x.get("accounted_day") == day),
+                    "known": (ids, hashes), "strikes": p.window_strikes(rows), "attempts": attempts,
+                    "windows": len({p.window_of(x) for x in rows})}
+
+        def same(ctl, note=""):
+            want = walked(ctl)
+            self.assertEqual([x["slug"] for x in ctl.ledger.pending()], want["pending"], note)
+            self.assertEqual(ctl.daily_pnl(), want["pnl"], note)
+            self.assertEqual(ctl.known(), want["known"], note)
+            self.assertEqual(ctl.ledger.strikes(), want["strikes"], note)
+            self.assertEqual({k: p.Attempts(ctl.ledger).get(k, 0) for k in want["attempts"]}, want["attempts"], note)
+            self.assertEqual((p.Attempts(ctl.ledger).get("没有这一场", 0), len(ctl.ledger.windows)), (0, want["windows"]), note)
+            return want
+
+        with tempfile.TemporaryDirectory() as folder:
+            db = {"STATE_DB": str(Path(folder) / "state.sqlite3")}
+            ctl, api, clock = controller(LIVE_MAX_DAILY_LOSS_USD="100", **db)
+            pairs = await self.book_of(ctl, api, 12)
+            same(ctl, "twelve resting pairs")
+            day = dt.datetime.fromtimestamp(clock.ms / 1000, m.BEIJING).date().isoformat()
+            # settled with a result: a P&L of the day (three of them, so the sum's order matters); withdrawn with nothing filled: 0;
+            # one that failed by its own doing counts against its window; one accounted yesterday counts on no figure of today's
+            for k, pnl in ((1, -12.3), (4, 7.1), (9, -0.7)):
+                pairs[k].update(phase="closed", accounted=True, accounted_day=day, pnl=pnl, result="up")
+            pairs[2].update(phase="closed", accounted=True, accounted_day=day, pnl=0.0, reason="到时撤单或真实交易暂停", free=True)
+            pairs[3].update(phase="closed", accounted=True, accounted_day=day, pnl=0.0, reason="一边未成交即结束，撤掉另一边")
+            pairs[5].update(phase="closed", accounted=True, accounted_day="2026-11-05", pnl=-40.0)
+            ctl.ledger.save_many(pairs)
+            want = same(ctl, "six accounted")
+            self.assertEqual((len(want["pending"]), want["pnl"]), (6, sum([-12.3, 7.1, -0.7])))
+            self.assertEqual(want["strikes"], {pairs[k]["slug"]: 1 for k in (1, 3, 4, 5, 9)}, "every accounted one but the free withdrawal")
+            self.assertEqual(set(ctl.ledger.struck), {pairs[k]["slug"] for k in (1, 3, 4, 5, 9)})
+            self.assertEqual(set(ctl.ledger.scored), {day, "2026-11-05"})
+            self.assertEqual(ctl.risk(), sum(49.0 for _ in want["pending"]))
+            # a pair accounted a moment ago and not saved yet: still among the working records, passed by its own flag
+            pairs[7].update(accounted=True, accounted_day=day, pnl=0.0)
+            self.assertIn(pairs[7], ctl.ledger.pending())
+            clock.ms = pairs[0]["cancel_ms"] + 1
+            self.assertNotIn(pairs[7], ctl.due(clock.ms))
+            self.assertEqual(sorted(x["slug"] for x in ctl.due(clock.ms)), sorted(x["slug"] for x in pairs if not x.get("accounted")))
+            ctl.ledger.save(pairs[7])
+            same(ctl, "saved accounted: out of the working records")
+            # the day's loss cap, asked by every gate: over the day's records with a P&L
+            self.assertEqual(ctl.withdrawing(), "")
+            pairs[8].update(phase="closed", accounted=True, accounted_day=day, pnl=-95.0, result="down")
+            ctl.ledger.save(pairs[8])
+            self.assertEqual((ctl.daily_pnl(), ctl.withdrawing()), (walked(ctl)["pnl"], "已达到今日真实亏损上限"))
+            pairs[8]["pnl"] = -1.0  # a result corrected: saved, the figure follows
+            ctl.ledger.save(pairs[8])
+            self.assertEqual((ctl.daily_pnl(), ctl.withdrawing()), (walked(ctl)["pnl"], ""))
+            # a record stepping aside (quoted again), one deleted, an order's id learned: the indexes follow
+            ctl.ledger.rename(pairs[3]["slug"], pairs[3]["slug"] + "@0")
+            again = copy.deepcopy(pairs[0])
+            again.update(slug=p.record_key(pairs[3]), attempt=1)
+            for side, order in again["orders"].items():
+                order.update(id=f"again{side}", hash=f"0xagain{side}", api_hash=f"0xAPI{side}".lower())
+            ctl.ledger.save(again)
+            want = same(ctl, "a superseded record and its window's next attempt")
+            self.assertEqual((want["attempts"][p.record_key(pairs[3])], want["strikes"][p.record_key(pairs[3])]), (2, 1))
+            self.assertTrue({"againup", "againdown"} <= ctl.known()[0] and {"0xagainup", "0xapiup"} <= ctl.known()[1])
+            ctl.ledger.delete(pairs[6]["slug"])
+            again["orders"]["up"]["id"] = "renumbered"
+            ctl.ledger.save(again)
+            want = same(ctl, "deleted, renumbered")
+            self.assertTrue("againup" not in want["known"][0] and "renumbered" in want["known"][0] and pairs[6]["orders"]["up"]["hash"] not in want["known"][1])
+            self.assertEqual(ctl.unmanaged_rows([{"id": "renumbered", "order": {"hash": "0xelse"}}, {"id": "x", "order": {"hash": "0xAGAINdown"}},
+                                                 {"id": "manual", "order": {"hash": "0xmanual"}}]), [{"id": "manual", "order": {"hash": "0xmanual"}}])
+            # the status counts as the walk did
+            text = ctl.status()
+            rows = list(ctl.ledger.rows.values())
+            self.assertIn(f"已记录 {want['windows']} 场、{len(rows)} 条（{sum(1 for x in rows if x['phase'] == 'active')} 条挂着，"
+                          f"{sum(1 for x in rows if x.get('accounted'))} 条已结清）", text)
+            self.assertIn(f"预留 {ctl.risk():.2f}U", text)
+            # records put in or taken out by hand (a test's, never this code): the next walk makes the indexes again
+            ghost = copy.deepcopy(pairs[0])
+            ghost.update(slug="ghost", accounted=True, accounted_day=day, pnl=-3.0, phase="closed")
+            ctl.ledger.rows["ghost"] = ghost
+            self.assertFalse(ctl.ledger.in_step())
+            same(ctl, "a record put in by hand")
+            del ctl.ledger.rows["ghost"]
+            same(ctl, "and taken out")
+            # a record back among the working ones out of its place: walked in the records' own order again
+            pairs[2]["accounted"] = False
+            ctl.ledger.save(pairs[2])
+            same(ctl, "back among the working records")
+            # the archive: the old accounted records leave every index with the records
+            for x in (pairs[2], pairs[5]):
+                x.update(accounted=True, phase="closed", start_ms=NOW - 4 * m.DAY_MS, end_ms=NOW - 4 * m.DAY_MS + 900_000, pnl=0.0)
+                x.pop("result", None)
+                for order in x["orders"].values():
+                    order.update(state="final", verified=True, filled=0.0)
+            ctl.ledger.save_many([pairs[2], pairs[5]])
+            self.assertEqual(ctl.ledger.archive_old(clock.ms), 2)
+            self.assertTrue(pairs[2]["slug"] not in ctl.ledger.rows and pairs[2]["slug"] not in ctl.ledger.seq and pairs[5]["slug"] not in ctl.ledger.struck)
+            same(ctl, "after the archive")
+            await self.finish(ctl)
+            # a restart: the same answers from the file
+            ctl2, _, _ = controller(LIVE_MAX_DAILY_LOSS_USD="100", **db)
+            ctl2.owner.market.now_ms = lambda: clock.ms
+            same(ctl2, "loaded at a start")
+            await self.finish(ctl2)
+
+    async def test_a_resting_pair_the_snapshot_covers_gets_no_task_and_a_restart_writes_nothing(self):
+        """1.154.20 — every five seconds the cancellation loop made a task for each resting pair (12,143 on 11-17) only for
+        monitor_pair to find every order covered by the account snapshot: the event loop held 0.2 s each time, and at every
+        pass until the first snapshot after a start. The look is noted where the task would have been made; a task only for
+        a pair an order of which is to be read. And taking the pairs over at a start writes only the ones it changes."""
+        with tempfile.TemporaryDirectory() as folder:
+            db = {"STATE_DB": str(Path(folder) / "state.sqlite3")}
+            ctl, api, clock = controller(**db)
+            pairs = await self.book_of(ctl, api, 40)
+            for pair in pairs:
+                pair["created_ms"] = clock.ms - 60_000
+            ctl.ledger.save_many(pairs)
+            ctl.listed_ids = {o["id"] for pair in pairs for o in pair["orders"].values()}
+            ctl.account_at = clock.ms
+            reads = []
+            real_order = api.order
+
+            async def order(oid, digest=""):
+                reads.append(oid)
+                return await real_order(oid, digest)
+            api.order = order
+            made = []
+            real_task = asyncio.create_task
+
+            def counting(coro, **kw):
+                made.append(kw.get("name") or "")
+                return real_task(coro, **kw)
+
+            async def one_pass():
+                made.clear()
+                with patch.object(asyncio, "create_task", counting):
+                    task = real_task(ctl.cancellation_loop())
+                    await asyncio.sleep(0.05)
+                    ctl.stop.set()
+                    await asyncio.gather(task, return_exceptions=True)
+                    await self.settle_tasks(ctl)
+                ctl.stop.clear()
+                return [name for name in made if name.startswith("monitor:")]
+
+            self.assertEqual(await one_pass(), [], "every order covered by a fresh snapshot: no task")
+            self.assertTrue(all(pair["checked_ms"] == clock.ms for pair in pairs) and reads == [], "the look is noted, nothing read")
+            clock.ms += 1_000
+            self.assertEqual(await one_pass(), [], "looked at a second ago")
+            # an order the snapshot does not show: that pair's task, and its read
+            clock.ms += p.MONITOR_MS
+            ctl.account_at = clock.ms
+            ctl.listed_ids.discard(pairs[7]["orders"]["up"]["id"])
+            self.assertEqual(await one_pass(), ["monitor:" + pairs[7]["slug"]])
+            self.assertEqual(reads, [pairs[7]["orders"]["up"]["id"]])
+            self.assertTrue(ctl.monitor_reads(pairs[7], clock.ms, True) and not ctl.monitor_reads(pairs[8], clock.ms, True))
+            self.assertTrue(ctl.monitor_reads(pairs[8], clock.ms, False), "a stale snapshot covers nothing")
+            # no snapshot yet (a start): nothing to look with — no task, and the look not noted
+            clock.ms += p.MONITOR_MS
+            ctl.account_at, before = 0, [pair["checked_ms"] for pair in pairs]
+            self.assertEqual(await one_pass(), [])
+            self.assertEqual([pair["checked_ms"] for pair in pairs], before)
+            await self.finish(ctl)
+            # a restart with the same settings takes the pairs over without a write; a changed cancel time writes each
+            ctl2, _, _ = controller(**db)
+            saves = []
+            real_save = ctl2.ledger.save
+            ctl2.ledger.save = lambda row: (saves.append(row["slug"]), real_save(row))[1]
+            ctl2.adopt()
+            self.assertEqual((ctl2.resumed, saves), (40, []))
+            await self.finish(ctl2)
+            ctl3, _, _ = controller(PREOPEN_CANCEL_SECONDS="30", **db)
+            saves3 = []
+            real_save3 = ctl3.ledger.save
+            ctl3.ledger.save = lambda row: (saves3.append(row["slug"]), real_save3(row))[1]
+            ctl3.adopt()
+            self.assertEqual((ctl3.resumed, len(saves3)), (40, 40))
+            self.assertTrue(all(x["cancel_ms"] == x["start_ms"] - 30_000 for x in ctl3.ledger.rows.values()))
+            await self.finish(ctl3)
+
     async def test_golds_0515_new_york_window_is_not_quoted(self):
         """1.154.19 — a window whose outcome is known to lean is not one to bid on both sides of. Gold's 05:15 New York quarter hour
         (the rule taker's 黄金纽约 05:15: Down 65% over a year): 11-18 the mode's Up bids there were sold into down the whole
