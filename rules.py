@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import statistics
+import sys
 import time
 from decimal import Decimal as D
 from typing import Any, Callable
@@ -65,6 +66,27 @@ OFFER_STATUS_S = 10.0         # 1.153.1: an offer at the rule's price on a marke
 # left 2.7 s after the book that showed the offer had arrived (203 of 300 bought: nobody else was there before 3.4 s). The read is
 # some 260 ms from this region: at this pace the reads follow one another, eighty of them at the most; RUSH_READS_MAX a window
 STATUS_RUSH_S, STATUS_RUSH_MS, RUSH_READS_MAX = 0.25, 20_000, 240
+# 1.154.23 — the rule taker first (the user: "每天凌晨 00:59 分开始规则吃单的优先级就要调到最高"). From WARM_MS before the per-second
+# hours (00:59 for 01:00–07:00) to their end, and while a window is at the makers' moment or bought in its course outside them
+# (first_now): a pushed book is looked at in the very turn of the loop that brought it, its order signed and its request handed to
+# a thread before anything else gets a turn (pushed_now — it used to wait for the loop to come round to the taker: three or four
+# turns, each behind whatever else was ready); its requests have threads of their own (core.first_pool); and around a makers'
+# moment — QUIET_BEFORE_MS before it to QUIET_AFTER_MS after, while the window can still be bought — the rest of the bot keeps
+# out of the loop's way (quiet_ms: the pre-open mode sends no new pair and applies no account snapshot, the model trader's step
+# and the minute's checks wait). 11-18: offers showed 2.4–7.2 s after the quarter hour, the very seconds the pre-open mode signs
+# and sends the pairs of the windows listed at that quarter hour; one race was lost by some 25 ms.
+QUIET_BEFORE_MS, QUIET_AFTER_MS = 1_000, 15_000
+GC_BEFORE_MS = 5_000  # ...and from this long before the moment to the end of those seconds no automatic garbage collection (gc_guard)
+EAGER = sys.version_info >= (3, 12)  # asyncio.Task(eager_start=True): a coroutine run at once, up to its first real wait
+
+
+def start_now(coro: Any, name: str) -> "asyncio.Task":
+    """A task whose coroutine runs now, in this turn of the loop, up to its first real wait (Python 3.12's eager start) — on an
+    older Python a task like any other, begun at the loop's next turn."""
+    loop = asyncio.get_running_loop()
+    if EAGER:
+        return asyncio.Task(coro, loop=loop, name=name, eager_start=True)
+    return loop.create_task(coro, name=name)
 STOP_MS = 15_000              # nothing placed this close to the start: the rule is about the window before it begins
 EXPIRY_BEFORE_S = 5           # an order's signed expiry: this long before the start, always — a cancel that cannot get through leaves
 #                               nothing matchable once the window runs (1.153.3: an order sent in the last 70 s was signed for 65 s,
@@ -668,6 +690,7 @@ class RuleStream:
         self.changed: set[str] = set()       # markets whose book changed since the taker last looked
         self.arrivals = 0                    # ...and how many changes have come in all (the loop goes round at once for one that came mid-tick: rest)
         self.pushed = asyncio.Event()        # ...set as one comes: the taker's loop wakes at once
+        self.on_change: Any = None           # ...and told right then (1.154.23: RuleTaker.pushed_now — looked at in this very turn when the taker goes first; True: all taken)
         self.wake = asyncio.Event()
         self.pending: dict[int, tuple[str, str]] = {}
         self.request_id = 0
@@ -706,7 +729,13 @@ class RuleStream:
         in hand): marked as a change that has just come — the loop goes round at once for one, mid-tick too (rest_s: REST_SOON_S)."""
         self.changed.add(mid)
         self.arrivals += 1
-        self.pushed.set()
+        self.told()
+
+    def told(self) -> None:
+        """A change just noted: the taker told of it on the spot (on_change, 1.154.23: it may take it in this very turn), and
+        its loop woken unless that took everything there was to take."""
+        if not (self.on_change is not None and self.on_change()):
+            self.pushed.set()
 
     def merge(self, mid: str, bids: tuple, asks: tuple, asked: float) -> bool:
         """A REST read of a window's book beside the pushes (RuleTaker.verify, the per-second hours): dropped when a push came after
@@ -720,7 +749,7 @@ class RuleStream:
             self.stamps[mid] = (0, int(time.time() * 1000))  # a REST read carries no stamp of the book's own
             self.changed.add(mid)
             self.arrivals += 1
-            self.pushed.set()
+            self.told()
             return old is not None
         return False
 
@@ -858,7 +887,7 @@ class RuleStream:
                 self.lags.append(wall - stamp)
             self.changed.add(mid)
             self.arrivals += 1
-            self.pushed.set()
+            self.told()
 
 
 # --- the taker --------------------------------------------------------------------------------------------------------------------
@@ -881,6 +910,7 @@ class RuleTaker:
         self.own_key = bool(own) and own != owner.config.predict_api_key
         shared = None if self.own_key else getattr(owner.live, "api", None)
         self.api = preopen.safe_api(live.API_BASES[owner.config.live_chain], self.key, owner.live.wallet, self.before_send, shared)
+        self.api.pool = core.first_pool()  # 1.154.23: its requests on threads of their own — never in the shared pool's queue
         self.fast = False                  # in the per-second hours now (RULE_FAST_HOURS; pace)
         self.warm_ms = 0                   # when their preparation last began (warm)
         self.warming: asyncio.Task | None = None
@@ -889,6 +919,13 @@ class RuleTaker:
         self.verifies = self.verify_diffs = self.fast_looks = 0  # REST reads beside the pushes, those that differed, the per-second looks (status)
         self.status_reads = 0              # ...and the reads of matching's status at the makers' moment (verify_status, 1.154.22)
         self.rush_tasks: set = set()       # the windows' rushes under way (rush): they share the key's pace, and end with the taker
+        self.tick_lock = asyncio.Lock()    # one tick at a time: the loop's own, or one begun by a pushed book (pushed_now, 1.154.23)
+        self.ticking = 0                   # ...the ticks running or waiting for their turn
+        self.running = False               # the loop runs (run): only then is a pushed book looked at on the spot
+        self.first_ticks = 0               # ticks begun by a pushed book in the turn that brought it (status)
+        self.first_tasks: set = set()      # ...those still waiting for something (an order's answer): ended with the taker
+        self.quiet_held = (0.0, 0)         # (monotonic, ms) of quiet_ms as last worked out (asked by every placement of the pre-open mode)
+        self.gc_off = False                # the garbage collector held off by this taker now (gc_guard)
         self.verify_error = ""
         self.verify_ms: collections.deque = collections.deque(maxlen=120)  # the last REST reads' round trips, ms
         self.collect: list | None = None   # the orders' requests of the tick under way: sent side by side, awaited at its end (send)
@@ -1025,6 +1062,8 @@ class RuleTaker:
     async def run(self) -> None:
         streaming = asyncio.create_task(self.stream.run(), name="rules-stream")
         lagging = asyncio.create_task(self.lag_loop(), name="rules-lag")
+        self.stream.on_change = self.pushed_now
+        self.running = True
         try:
             while not self.stop.is_set() and not self.owner.stopping.is_set():
                 try:
@@ -1034,9 +1073,17 @@ class RuleTaker:
                 except Exception as error:
                     self.note(core.clean_error(error) or type(error).__name__)
                 await self.rest()
+            self.running = False  # (no tick begun by a pushed book from here on)
+            # 1.154.23: a tick a pushed book began may still wait for its order's answer — it ends first, as the loop's own
+            # tick would have (the bot allows the taker ten seconds: LiveBot.rules_stop); cancelled only with the taker itself
+            async with self.tick_lock:
+                pass
         finally:
-            self.alive = False
-            side = [t for t in (streaming, lagging, self.warming, self.verifying, *self.rush_tasks) if t is not None]
+            self.alive = self.running = False
+            if self.gc_off:  # (never left off)
+                self.gc_off = False
+                core.GC_WATCH.release()
+            side = [t for t in (streaming, lagging, self.warming, self.verifying, *self.rush_tasks, *self.first_tasks) if t is not None]
             for task in side:
                 task.cancel()
             await asyncio.gather(*side, return_exceptions=True)
@@ -1069,12 +1116,94 @@ class RuleTaker:
             await asyncio.gather(*waits, return_exceptions=True)
 
     async def tick(self) -> None:
-        self.ticks += 1
-        self.in_tick = True
+        self.ticking += 1
         try:
-            await self.turn()
+            async with self.tick_lock:  # (1.154.23: the loop's tick and one a pushed book began never run side by side)
+                self.ticks += 1
+                self.in_tick = True
+                try:
+                    await self.turn()
+                finally:
+                    self.in_tick = False
         finally:
-            self.in_tick = False
+            self.ticking -= 1
+
+    def first_now(self, now: int | None = None) -> bool:
+        """Whether the rule taker goes first now (1.154.23): real orders, and the per-second hours run or begin within WARM_MS
+        (00:59 for hours from 01:00), or a window is at the makers' moment or bought in its course (self.fast, as pace last
+        found it)."""
+        if self.settings.mode != "on":
+            return False
+        if self.fast:
+            return True
+        wait = self.settings.fast_in(self.now() if now is None else now)
+        return wait is not None and wait <= WARM_MS
+
+    def pushed_now(self) -> bool:
+        """A followed window's book just changed (RuleStream.told: a push, a REST read that differed, matching seen open with
+        an offer in hand). While the taker goes first (first_now) and no tick runs or waits for its turn, the tick begins here
+        — in the turn of the loop that brought the book: the window is looked at, its order signed and the request handed to
+        its thread (place: start_now) before any other task gets a turn. Otherwise the loop's own tick takes it, as before:
+        woken by the stream's event, some seven turns of the loop on, each behind whatever else was ready. Not once the taker
+        or the bot is stopping (as the loop begins no tick then: an order begun into a shutdown is one nobody follows). True
+        when the tick ended here with nothing left to take: the loop need not be woken for this change."""
+        if not (EAGER and self.running) or self.ticking or self.stop.is_set() or self.owner.stopping.is_set() or not self.first_now():
+            return False
+        self.first_ticks += 1
+        task = start_now(self.tick_first(), "rules-first")
+        if not task.done():
+            self.first_tasks.add(task)
+            task.add_done_callback(self.first_tasks.discard)
+            return False
+        return not self.stream.changed
+
+    def gc_guard(self, now: int) -> None:
+        """No automatic garbage collection from GC_BEFORE_MS before a makers' moment to the end of the seconds around it
+        (quiet_ms: a window this taker can still buy), 1.154.23. A collection of the oldest generation walks every object the
+        bot keeps — 220–370 ms measured with the records of 11-18, the whole process stopped — and comes when enough new
+        long-lived objects have piled up (an account snapshot of the pre-open mode's is enough): in one of twenty of those
+        quarter minutes, by the snapshot's pace. Looked at each tick; let go as the seconds end and when the taker stops."""
+        want = self.running and (self.quiet_ms(now) > 0 or self.quiet_ms(now + GC_BEFORE_MS) > 0)  # (the taker's own loop running: run lets go of it as it ends)
+        if want and not self.gc_off:
+            self.gc_off = True
+            core.GC_WATCH.hold()
+        elif not want and self.gc_off:
+            self.gc_off = False
+            core.GC_WATCH.release()
+
+    async def tick_first(self) -> None:
+        try:
+            await self.tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # (as run notes a tick's failure)
+            self.note(core.clean_error(error) or type(error).__name__)
+
+    def quiet_ms(self, now: int | None = None) -> int:
+        """The ms left of the seconds in which the rest of the bot keeps out of the loop's way (1.154.23): around the makers'
+        moment — QUIET_BEFORE_MS before it to QUIET_AFTER_MS after — of a window this taker can still buy before its start (real
+        orders, a price set, not bought in full or done with, and nothing that keeps every order back: block). 0 outside them.
+        Asked by the pre-open mode before each pair and by the model trader before each step (LiveBot.rules_quiet): worked out
+        at most every 50 ms."""
+        mono = time.monotonic()
+        if now is None and mono - self.quiet_held[0] < 0.05:
+            return self.quiet_held[1]
+        at_ms = self.now() if now is None else now
+        left = 0
+        if self.settings.mode == "on":
+            for slug, w in self.track.items():
+                at = self.moment(w)
+                if not at or not (at - QUIET_BEFORE_MS <= at_ms < at + QUIET_AFTER_MS) or at_ms >= w["start"] - STOP_MS:
+                    continue
+                rule = RULE_OF[w["rule"]]
+                if self.settings.price(rule.key) <= 0 or self.finished(slug, rule):
+                    continue
+                left = max(left, at + QUIET_AFTER_MS - at_ms)
+            if left and self.block(0.0):
+                left = 0  # (no order could go out now: nobody waits for it)
+        if now is None:
+            self.quiet_held = (mono, left)
+        return left
 
     async def turn(self) -> None:
         """One tick's work: the plan, the pace, every window's look, the orders' sends, a REST read beside the pushes, the follow-ups."""
@@ -1083,6 +1212,7 @@ class RuleTaker:
             self.plan(now)
             self.planned_ms = now
         self.pace(now)
+        self.gc_guard(now)
         watched = {str(w["market"]["id"]) for w in self.track.values() if w["market"] is not None}
         self.stream.changed &= watched  # a change of a window no longer watched is nobody's to take (1.153.3)
         if self.settings.mode == "off" or self.cooling() > 0:
@@ -1836,13 +1966,15 @@ class RuleTaker:
         # 1.154.12: the request itself — the hash onto the disk, the POST, its answer — goes beside the other windows' (send). The
         # looks still go one by one and the record above is made within this one, so the next window's look counts this order (the
         # day's cap) while it is on its way; the tick waits for every send before it follows the orders ("placing" = in flight)
-        task = asyncio.ensure_future(self.send(slug, w, rule, rec, order, body, take, limit))
+        # 1.154.22: ...and it starts now — its line in the journal, the request handed to its thread — not when the tick next
+        # waits for something: the looks of the windows after this one (and their reads) stood between an order signed and its
+        # request (signed_wall to sent_wall). 1.154.23: within this very call (start_now: Python 3.12's eager start), not a turn
+        # of the loop on; on an older Python the tick lets go of the loop once for it, as 1.154.22 did
+        task = start_now(self.send(slug, w, rule, rec, order, body, take, limit), "rules-send")
         if self.collect is not None:
             self.collect.append(task)
-            # 1.154.22: ...and it starts now — its line in the journal, the request handed to its thread — not when the tick next
-            # waits for something: the looks of the windows after this one (and their reads) stood between an order signed and
-            # its request (signed_wall to sent_wall)
-            await asyncio.sleep(0)
+            if not EAGER:
+                await asyncio.sleep(0)
         else:
             await task
 
@@ -1854,7 +1986,9 @@ class RuleTaker:
         # the hash where a restart finds it, before the request: a crash in between is found by it. 1.154.15: a line in the taker's own
         # journal (journal) — the store's flush waited for every record the whole bot had queued, in a thread it first had to wait
         # for; the flush only where there is no such file (a store in memory)
-        if not self.journal(rec, order) and not await asyncio.to_thread(self.store.flush):
+        # (1.154.23: a store with no writer of its own — one in memory — has nothing queued to wait for: no thread asked, so the
+        # request is made in this very turn there too)
+        if not self.journal(rec, order) and not (getattr(self.store, "writer", True) is None or await asyncio.to_thread(self.store.flush)):
             order.update(state="not_sent", error="数据库写入未完成，没有发单")
             self.save(rec)
             return
@@ -1869,7 +2003,11 @@ class RuleTaker:
             text = core.clean_error(error) or type(error).__name__
             status = live.http_status(error)
             definite = isinstance(error, live.OrderRejected) or 400 <= status < 500
-            if status == 429 or "限流冷却中" in text:
+            if isinstance(error, RuntimeError) and "shutdown" in str(error):
+                # 1.154.23: the threads are gone (the process is ending: "cannot schedule new futures after shutdown") — the
+                # request was never handed to one, let alone sent. Not "unknown": that holds the window as ordered until its start
+                order.update(state="not_sent", error="进程正在停止，请求没有发出")
+            elif status == 429 or "限流冷却中" in text:
                 order.update(state="not_sent", error=text)  # the rate limiter, not the order: not one of MAX_REJECTS (1.153.3)
             elif definite and not any(word in text.lower() for word in preopen.DUPLICATE_WORDS):
                 order.update(state="rejected", error=text)
@@ -2089,6 +2227,28 @@ class RuleTaker:
             text += "：推送一有变化就看，另外每 30 秒读一次、开场前 15 分钟每 2 秒"
         return text + moment + key
 
+    def first_line(self, now: int) -> str:
+        """The rule taker first, in a line (/rules, 1.154.23): when it goes first, what that means, whether it does now. "" unless
+        real orders are on."""
+        s = self.settings
+        if s.mode != "on":
+            return ""
+        clock = lambda minutes: f"{minutes % 1440 // 60:02d}:{minutes % 60:02d}"
+        hours = "、".join(f"{clock(a - WARM_MS // 60_000)}–{clock(b)}" for a, b in s.fast) if s.fast else ""
+        lead = int(getattr(s, "lead_minutes", 0) or 0)
+        when = "、".join(x for x in (f"每天 {hours}（每秒检查时段和它前 {WARM_MS // 60_000} 分钟）" if hours else "", "对手挂单时刻前后和盘中吃单时" if lead or not hours else "盘中吃单时") if x)
+        what = ("盘口一推到就在同一回合里看、签单、把请求交出去（不等主循环轮到）" if EAGER else f"当场处理需要 Python 3.12（现在 {sys.version_info[0]}.{sys.version_info[1]}）：盘口到了仍等主循环轮到"
+                ) + "；请求走规则吃单自己的线程" + ("；这把 Key 不外借" if self.own_key else "")
+        if lead:
+            what += f"；对手挂单时刻前 {QUIET_BEFORE_MS // 1000} 秒到后 {QUIET_AFTER_MS // 1000} 秒（这一场还能买时），预挂不发新单、不处理账户快照，原策略的整步和每分钟的核对顺延（快车道照常）"
+        if self.first_now(now):
+            quiet = self.quiet_ms(now)
+            state = "现在：优先中" + (f"，其他活儿正在让路（还有 {quiet / 1000:.0f} 秒）" if quiet else "") + (f"；本次启动当场处理 {self.first_ticks} 次" if self.first_ticks else "")
+        else:
+            wait = s.fast_in(now)
+            state = "现在不在优先时段" + (f"，下一次 {bj(now + max(0, wait - WARM_MS), False)} 开始" if wait else "")
+        return f"优先：{when}，规则吃单排最前——{what}｜{state}"
+
     def net_line(self) -> str:
         """How far Predict is, in a line (/rules, 1.154.17) — 11-18 02:00: an order that left a tenth of a second after its book came
         found the offers gone; what was left of the half second was the way there and back. The region the bot runs in (Railway's
@@ -2143,6 +2303,8 @@ class RuleTaker:
             lines.append(f"⏸ 现在不下单：{why}")
         if s.mode != "off":
             lines.append(self.fast_line(now))
+            if first := self.first_line(now):
+                lines.append(first)
             if speed := self.speed_line(now):
                 lines.append(speed)
             if net := self.net_line():

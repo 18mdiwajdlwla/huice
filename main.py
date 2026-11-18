@@ -17,6 +17,7 @@ import csv
 import copy
 import datetime as dt
 import functools
+import gc
 import decimal
 import gzip
 import html
@@ -51,7 +52,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.22"
+VERSION = "1.154.23"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -880,7 +881,9 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("RULE_FAST_HOURS", "规则吃单：每秒检查的时段（北京时间）", "写成 01:00-07:00（可写多段，用逗号分开；结束早于开始 = 跨过半夜；off = 不做）。这段时间里，已发布的规则场次每秒看一次盘口，"
      "符合规则价就立刻下单，几场同时出现时一起发；开始前 1 分钟先准备好（登录、授权额度、撮合状态、推送订阅）。盘口靠推送，变化约 0.3 秒到；"
      "另外每秒用 REST 轮流核对一场，推送断了也能在几秒内看到（规则吃单有自己的 Key——RULE_API_KEY——时每秒核对 3 场）。"
-     "时段外照旧：推送一有变化就看，另外每 30 秒读一次、开场前 15 分钟每 2 秒"),
+     "时段外照旧：推送一有变化就看，另外每 30 秒读一次、开场前 15 分钟每 2 秒。"
+     "1.154.23：这段时间和它前 1 分钟（默认就是每天 00:59–07:00），真实吃单的规则吃单在机器人里排最前——盘口一推到当场看、当场发单，"
+     "请求走自己的线程；对手挂单时刻前 1 秒到后 15 秒，预挂不发新单、原策略的整步顺延（/rules 的“优先”一行写着现在是不是）"),
     ("RULE_LEAD_MINUTES", "规则吃单：对手提前多少分钟挂单", "0～1440，默认 300（5 小时）：有人在每场开场前这么久把单挂出来（06:00 的场 01:00 挂）。每个规则场次在这个时刻的前 1 分钟到后 15 分钟"
      "每秒检查，并先做好准备；时刻前 10 秒到后 2 分钟里这一场的盘口每秒用 REST 读一次（推送之外的第二条路）。按场次算，不受上面时段和夏令时影响；0 = 不按这个时刻。"
      "/rules 会写出卖单实际出现在开场前多久，可以对着调"),
@@ -5517,12 +5520,101 @@ def predict_pool() -> ThreadPoolExecutor:
     return _PREDICT_POOL
 
 
-async def predict_blocking(fn: Any, *args: Any) -> Any:
-    """A blocking Predict request on Predict's own thread pool: never queued behind a hanging quote feed."""
-    return await asyncio.get_running_loop().run_in_executor(predict_pool(), fn, *args)
+FIRST_POOL_WORKERS = 6  # the rule taker's own threads (first_pool): its client lets five requests through at once, an order always among them
+_FIRST_POOL: ThreadPoolExecutor | None = None
+
+
+def first_pool() -> ThreadPoolExecutor:
+    """Threads for the rule taker's requests alone (1.154.23: the rule taker first). The shared pool has forty for every other
+    client — the orderbook feed's sixteen, the model trader's, the pre-open mode's seven clients — and its queue is first come,
+    first served: with every thread held (Predict slow, the reads at their 8–12 s timeouts) an order would wait there for one,
+    its client's priority slot notwithstanding. Its own never wait for anybody else's."""
+    global _FIRST_POOL
+    if _FIRST_POOL is None:
+        _FIRST_POOL = ThreadPoolExecutor(max_workers=FIRST_POOL_WORKERS, thread_name_prefix="predict-first")
+    return _FIRST_POOL
+
+
+async def predict_blocking(fn: Any, *args: Any, pool: ThreadPoolExecutor | None = None) -> Any:
+    """A blocking Predict request on Predict's own thread pool: never queued behind a hanging quote feed. ``pool``: on that
+    one instead (the rule taker's: first_pool)."""
+    return await asyncio.get_running_loop().run_in_executor(pool or predict_pool(), fn, *args)
 
 
 PREDICT_PACING = os.environ.get("PREDICT_PACING", "on").strip().lower() != "off"  # the offline tests switch it off (tests/offline.py)
+
+
+class GcWatch:
+    """How long Python's cyclic garbage collector holds the process (1.154.23, /diag: 垃圾回收). A collection of the oldest
+    generation walks every container object the process keeps — with the pre-open mode's 39,000 records, its account
+    snapshot's 24,000 rows and the model trader's 12,800 records that is the better part of a million objects: 220–370 ms
+    measured at that scale, everything stopped meanwhile (the event loop, every thread: it runs under the interpreter's
+    lock), and it comes whenever enough new long-lived objects have piled up — a new account snapshot is enough. /diag says
+    how often and how long over the last KEEP_S; ``hold`` / ``release`` switch the automatic collection off for a stretch
+    that must not be interrupted (the rule taker's seconds around a makers' moment: rules.RuleTaker.gc_guard) — the
+    reference counts free nearly everything all the same, only garbage in cycles waits."""
+    KEEP_S = 600.0
+    NOTE_MS = 5.0  # a collection of a younger generation is kept when it took this long
+
+    def __init__(self) -> None:
+        self.runs: collections.deque = collections.deque(maxlen=4000)  # (monotonic, generation, ms)
+        self.began = 0.0
+        self.watching = False
+        self.holders = 0   # how many asked for no automatic collection now (hold)
+        self.held = 0      # ...and how many times in all
+
+    def start(self) -> None:
+        if not self.watching:
+            gc.callbacks.append(self.note)
+            self.watching = True
+
+    def stop(self) -> None:
+        if self.watching:
+            with contextlib.suppress(ValueError):
+                gc.callbacks.remove(self.note)
+            self.watching = False
+        if self.holders:
+            self.holders = 0
+            gc.enable()
+
+    def note(self, phase: str, info: dict) -> None:
+        """The collector's own callback (gc.callbacks): a collection begins, a collection is over."""
+        if phase == "start":
+            self.began = time.perf_counter()
+        elif self.began:
+            ms, self.began = (time.perf_counter() - self.began) * 1000, 0.0
+            generation = int(info.get("generation", -1))
+            if generation >= 2 or ms >= self.NOTE_MS:
+                self.runs.append((time.monotonic(), generation, ms))
+
+    def hold(self) -> None:
+        """No automatic collection from now (until every holder has released)."""
+        self.holders += 1
+        self.held += 1
+        if self.holders == 1:
+            gc.disable()
+
+    def release(self) -> None:
+        if self.holders:
+            self.holders -= 1
+            if not self.holders:
+                gc.enable()
+
+    def line(self) -> str:
+        """/diag's line."""
+        cut = time.monotonic() - self.KEEP_S
+        runs = list(self.runs)  # (a copy in one go: a collection — in any thread — may add to the deque while this line is made)
+        full = [ms for at, generation, ms in runs if at >= cut and generation >= 2]
+        young = [ms for at, generation, ms in runs if at >= cut and generation < 2]
+        text = (f"最近 10 分钟整堆回收 {len(full)} 次、共 {sum(full) / 1000:.1f} 秒、最长 {max(full):.0f} ms" if full else "最近 10 分钟没有整堆回收")
+        if young:
+            text += f"；另有 {len(young)} 次小回收超过 {self.NOTE_MS:g} ms（最长 {max(young):.0f} ms）"
+        text += "（整堆回收时整个进程停着，盘口和下单都在等"
+        text += f"；规则吃单抢单的十几秒里不自动回收，本次启动 {self.held} 次" + ("，现在正暂停着" if self.holders else "") if self.held else "；规则吃单抢单的十几秒里不自动回收"
+        return text + "）" + ("" if gc.isenabled() or self.holders else "｜⚠️ 自动回收是关着的")
+
+
+GC_WATCH = GcWatch()
 
 
 class LoopWatch:
@@ -20188,6 +20280,8 @@ class Bot:
         index = self.__dict__.get("sim_index")
         if index is None or (not force and time.monotonic() - getattr(self, "sim_index_checked", 0.0) < self.SIM_INDEX_CHECK_SECONDS):
             return []
+        if not force and (quiet := getattr(self, "rules_quiet", None)) is not None and quiet() > 0:
+            return []  # 1.154.23: not in the seconds the rule taker has the loop to itself (a walk of every record: milliseconds)
         self.sim_index_checked = time.monotonic()
         self.sim_index_checks = getattr(self, "sim_index_checks", 0) + 1
         off = index.drift()
@@ -25725,6 +25819,8 @@ class Bot:
         lines.append(f"💾 数据库：{self.store.line()}")
         if (watch := getattr(self, "loop_watch", None)) is not None:
             lines.append(f"⏱️ 主循环：{watch.line()}")
+        if GC_WATCH.watching:
+            lines.append(f"🧹 垃圾回收：{GC_WATCH.line()}")
         if self.reference_state:
             lines.append("🔄 后台刷新")
             for name, _ in self.reference_jobs():
@@ -26731,6 +26827,7 @@ class Bot:
                 asyncio.create_task(self.watchdog(), name="watchdog")]
         tasks = [*core, *self.reference_tasks]
         tasks.append(asyncio.create_task(self.loop_watch.run(self.stopping), name="loop-watch"))  # 1.154.20: the loop's own delay, and what holds it
+        GC_WATCH.start()  # 1.154.23: how long the garbage collector holds the process (/diag)
         if self.config.predict:  # Predict's WebSocket beside the REST rounds (PREDICT_WS=off: it idles)
             tasks.append(asyncio.create_task(self.predict.stream.run(self.stopping), name="predict-ws"))
         for name, stream in (("binance-ws-futures", self.binance_streams["futures"]), ("binance-ws-spot", self.binance_streams["spot"]),
@@ -26772,6 +26869,8 @@ class Bot:
             await asyncio.gather(*tasks, *pending, stopper, return_exceptions=True)
             if _PREDICT_POOL is not None:
                 _PREDICT_POOL.shutdown(wait=False)
+            if _FIRST_POOL is not None:
+                _FIRST_POOL.shutdown(wait=False)
             if self.reference_pool:
                 self.reference_pool.shutdown(wait=False, cancel_futures=True)
             if self.web:

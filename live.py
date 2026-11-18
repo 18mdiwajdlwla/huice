@@ -713,6 +713,8 @@ class PredictApi:
         if method == "POST" and path == "/orders" and (check := ORDER_SEND_CHECK.get()) is not None and (why := check()):
             raise SendRefused(why)  # 1.150.0: judged again inside the slot (see ORDER_SEND_CHECK) — never sent
         try:
+            if (pool := getattr(self, "pool", None)) is not None:  # 1.154.23: threads of this client's own (the rule taker's: core.first_pool)
+                return await core.predict_blocking(core._http_get, self.base + path, payload, timeout, self.headers(), pool=pool)
             return await core.predict_blocking(core._http_get, self.base + path, payload, timeout, self.headers())
         except core.RemoteError as error:
             if error.retry_after or http_status(error) == 429:
@@ -2329,8 +2331,30 @@ class LiveBot(core.Bot):
                 "live_max_order_usd": c.live_max_order_usd, "live_max_open_usd": c.live_max_open_usd}
 
     # --- the step: prefetch, decide (the paper trader), place, read back --------------------------------------------
+    STEP_QUIET_MAX_S = 20.0  # the step waits for the rule taker's seconds (rules_quiet) no longer than this since its last run
+
+    def rules_quiet(self) -> float:
+        """Seconds left in which the rule taker has the event loop to itself (1.154.23: rules.RuleTaker.quiet_ms — around the
+        makers' moment of a window it can still buy); 0.0 when it does not, or is not running. What takes the loop for a
+        while and can wait a quarter of a minute asks this first: this trader's step and its minute's checks, the pre-open
+        mode's new pairs and its account snapshot's digest."""
+        taker = getattr(self, "rules", None)
+        if taker is None or not getattr(taker, "running", False):
+            return 0.0
+        try:
+            return max(0.0, taker.quiet_ms() / 1000)
+        except Exception:  # (a figure that cannot be had keeps nobody waiting)
+            return 0.0
+
     async def sim_step(self, now_ms: int) -> Any:
         if not self.sim_step_due():
+            return False
+        if self.rules_quiet() > 0 and time.monotonic() - self.sim_ran < self.STEP_QUIET_MAX_S:
+            # 1.154.23, the rule taker first: the step — tens of milliseconds of the loop in one piece — waits out the seconds
+            # around a makers' moment (STEP_QUIET_MAX_S at the most since its last run). The express lane goes on meanwhile: a
+            # pushed book is still judged and its orders and cancels sent; what waits is the settlements, the markouts and the
+            # sync of the orders already out
+            self.live_step_waits = getattr(self, "live_step_waits", 0) + 1
             return False
         marks, t0 = {}, time.monotonic()
 
@@ -3772,6 +3796,8 @@ class LiveBot(core.Bot):
         read, or came cut at the page cap, changes nothing."""
         if now_ms - self.live_late_checked < self.LIVE_LATE_FILLS_MS:
             return
+        if self.rules_quiet() > 0:
+            return  # 1.154.23: the minute's check (a walk of every record: a tenth of a second of the loop) after the rule taker's seconds
         self.live_late_checked = now_ms
         trades = self.sim_trades()
         key_of = lambda t: (str((t["live"].get("want") or {}).get("market_id") or t.get("market_id") or ""), int((t["live"].get("want") or {}).get("index_set") or 0))

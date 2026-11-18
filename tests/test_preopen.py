@@ -1036,6 +1036,74 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(again.queue.qsize(), 0, "not quoted again: the window is left out")
             await self.finish(again)
 
+    async def test_no_new_pair_in_the_rule_takers_seconds(self):
+        """1.154.23 — the rule taker first. The windows listed at a quarter hour are signed and sent in the very seconds the
+        rule taker's offers show (2.4–7.2 s after it on 11-18): two signatures and three saves a pair, each on the event loop
+        that taker's order waits for. While the bot says those seconds run (rules_quiet) no new pair goes out — held, parked
+        for that long and placed right after; the account snapshot's digest (a tenth of a second of the loop) waits them out;
+        the cancels at their time go on."""
+        ctl, api, clock = controller()
+        quiet = [0.0]
+        ctl.owner.rules_quiet = lambda: quiet[0]
+        ctl.account_at = clock.ms  # (a snapshot in hand: nothing else holds)
+        self.assertEqual((ctl.yielding(), ctl.hold()), (0.0, ""))
+        quiet[0] = 12.4
+        self.assertEqual((ctl.yielding(), ctl.hold()), (12.4, "规则吃单在抢单时刻，先让路（约 12 秒后继续）"))
+        c = p.candidate(market(), clock.ms, ctl.owner.config, ctl.settings)
+        self.assertEqual((await ctl.place_pair(c), api.sent, len(ctl.ledger.rows)), ("held", [], 0), "nothing signed, saved or sent")
+        # the worker parks it for those seconds — not HOLD_RETRY_MS — and it is placed as they end
+        quiet[0] = 0.3
+        ctl.queue.put_nowait((p.queue_rank(c), c["slug"], c))
+        ctl.queued.add(c["slug"])
+        worker = asyncio.create_task(ctl.placement_worker())
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if c["slug"] in ctl.parked:
+                break
+        self.assertEqual(ctl.parked[c["slug"]][0] - clock.ms, 400, "parked for the rule taker's seconds (and a tenth)")
+        quiet[0] = 16.0  # ...for all of them, however many: not tried again every HOLD_RETRY_MS meanwhile
+        del ctl.parked[c["slug"]]
+        ctl.queue.put_nowait((p.queue_rank(c), c["slug"], c))
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if c["slug"] in ctl.parked:
+                break
+        self.assertEqual(ctl.parked[c["slug"]][0] - clock.ms, 16_100)
+        ctl.parked[c["slug"]] = (clock.ms + 400, c)
+        quiet[0] = 0.0
+        clock.ms += 400
+        ctl.unpark()
+        for _ in range(200):
+            await asyncio.sleep(0)
+            if c["slug"] in ctl.ledger.rows and not ctl.placing:
+                break
+        self.assertEqual((len(api.sent), list(ctl.ledger.rows)), (2, [c["slug"]]), "placed right after")
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        # what holds the loop for a while waits those seconds out, GIVE_WAY_MAX_S at the most
+        quiet[0] = 0.05
+        asyncio.get_running_loop().call_later(0.02, lambda: quiet.__setitem__(0, 0.0))
+        began = time.monotonic()
+        await ctl.give_way()
+        self.assertTrue(0.02 <= time.monotonic() - began < 10.0)
+        quiet[0] = 99.0
+        with patch.object(p, "GIVE_WAY_MAX_S", 0.05):
+            began = time.monotonic()
+            await ctl.give_way()
+            self.assertTrue(0.04 <= time.monotonic() - began < 10.0, "never for good")
+        # the account snapshot: read as ever, its digest after those seconds — dated when its read began all the same
+        quiet[0] = 0.06
+        asyncio.get_running_loop().call_later(0.03, lambda: quiet.__setitem__(0, 0.0))
+        ctl.account_at, began = 0, time.monotonic()
+        await ctl.account()
+        self.assertTrue(0.03 <= time.monotonic() - began < 10.0 and ctl.account_at == clock.ms and ctl.hold() == "", (time.monotonic() - began, ctl.account_at))
+        # a bot without a rule taker (or one that cannot answer) keeps nobody waiting
+        del ctl.owner.rules_quiet
+        self.assertEqual((ctl.yielding(), ctl.hold()), (0.0, ""))
+        ctl.owner.rules_quiet = lambda: 1 / 0
+        self.assertEqual(ctl.yielding(), 0.0)
+        await self.finish(ctl)
+
     async def test_the_positions_check_is_told_a_fill_before_its_record_is_saved(self):
         """1.154.22 — the model trader's positions check asks this mode, once a minute, what its orders filled (30 days) and
         which outcomes hold a fill of its own not read for certain yet; both walked every record's orders (78,000 on 11-18) and

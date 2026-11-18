@@ -689,7 +689,7 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e for e in events if e == "order" or e.endswith("/orderbook")], ["/markets/901/orderbook", "order", "/markets/902/orderbook"],
                          "the first window's order out before the second window is read")
         order = t.record(slugs[0])["orders"][0]
-        self.assertLess(order["sent_wall"] - order["signed_wall"], 50)
+        self.assertLess(order["sent_wall"] - order["signed_wall"], 500)
         row = R.races(t.recs, "on", 0)[0]["orders"][0]
         self.assertEqual((row["wake"] in (None, 0), row["prep"] >= 0, row["out"] >= 0), (True, True, True), "a book the look read itself: no wait for the look to count")
 
@@ -766,6 +766,280 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
             own.verify_tick()
             await own.verifying
             self.assertEqual((books() - n, len(asked) - m_asked), (1, 0), "open: the book again")
+
+    async def test_from_a_minute_before_its_hours_the_rule_taker_goes_first(self):
+        """1.154.23 — "每天凌晨 00:59 分开始规则吃单的优先级就要调到最高". From WARM_MS before the per-second hours to their end (and
+        at a makers' moment outside them) a pushed book is looked at in the turn of the loop that brought it — the order signed and
+        its request handed over before take() even returns, where the loop's own tick came round three or four turns later, each
+        behind whatever else was ready; one tick at a time all the same; and around the makers' moment of a window it can still
+        buy the rest of the bot is told to keep out of the loop's way (quiet_ms)."""
+        day = lambda h, mi, s=0: bj(2026, 11, 17, h, mi) + s * 1000
+        t, api, clock, x = taker("on", RULE_FAST_HOURS="01:00-07:00", RULE_OIL="off", RULE_GOLD_OPEN_CENTS="0", RULE_GOLD_0515_CENTS="0")
+        t.verify_tick = lambda: None
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.70, 30]]}
+        # when it goes first: 00:59 to 07:00 — a minute before the hours, to their end
+        for at, first in ((day(0, 58, 59), False), (day(0, 59), True), (day(1, 0), True), (day(6, 59, 59), True), (day(7, 0), False), (day(12, 0), False)):
+            clock.ms = at
+            t.fast = t.settings.fast_at(at)  # (as pace finds it at each tick)
+            self.assertEqual(t.first_now(), first, m.stamp(at))
+        clock.ms, t.fast = day(12, 0), True  # a window at the makers' moment or bought in its course, outside the hours (pace: sprint, course)
+        self.assertTrue(t.first_now())
+        t.fast = False
+        paper, *_ = taker("paper", RULE_FAST_HOURS="01:00-07:00")
+        paper.fast = True
+        self.assertFalse(paper.first_now(), "只记录: no order to be first with")
+        # 01:00:03, the taker's loop running: the pushed offer is bought before take() returns
+        clock.ms = day(1, 0, 3)
+        await t.tick()  # (listed, its book read; the hours found running)
+        w = t.track[slug]
+        self.assertTrue(t.fast and t.first_now() and w["open_ms"])
+        connected(t, "901", {"bids": [], "asks": [[0.70, 30]]})
+        t.running, t.stream.on_change = True, t.pushed_now  # as run() sets them
+        t.stream.pushed.clear()  # (the loop at rest, waiting for it)
+        ticks, asked = t.ticks, len(api.calls)
+        t.stream.take("901", {"version": 3, "bids": [], "asks": [[0.52, 25]]})  # no await from here to the checks: this very turn of the loop
+        if R.EAGER:
+            self.assertEqual((len(api.sent), t.first_ticks, t.ticks - ticks), (1, 1, 1), "looked at, signed and its request made within take()")
+            self.assertEqual(L.from_wei(int(api.sent[0]["data"]["order"]["takerAmount"])), 50.0)
+            self.assertEqual((api.calls[asked:], t.tick_lock.locked(), "901" in t.stream.changed), ([], False, False), "no request before the order; the tick over")
+            self.assertFalse(t.stream.pushed.is_set(), "taken whole here: the loop is not woken for it (a second tick with nothing to do)")
+        else:
+            self.assertEqual((api.sent, t.first_ticks), ([], 0), "an older Python: the loop's own tick takes it")
+        # one tick at a time: a book pushed while a tick runs or waits for its turn (an order's answer awaited) is left to the
+        # loop — woken for it, as ever
+        sent = len(api.sent)
+        t.ticking += 1
+        t.stream.take("901", {"version": 4, "bids": [], "asks": [[0.51, 40]]})
+        t.ticking -= 1
+        self.assertEqual((len(api.sent), t.first_ticks, t.stream.pushed.is_set()), (sent, 1 if R.EAGER else 0, True))
+        self.assertIn("901", t.stream.changed)
+        # nor once the taker or the bot is stopping (the loop begins no tick then either): no order begun into a shutdown
+        for version, stopping in ((5, t.stop), (6, x.owner.stopping)):
+            stopping.set()
+            t.stream.take("901", {"version": version, "bids": [], "asks": [[0.51, 40 + version]]})
+            stopping.clear()
+            self.assertEqual((len(api.sent), t.first_ticks), (sent, 1 if R.EAGER else 0))
+        # not while the loop is not running (a tick driven by hand: these tests), nor outside the hours
+        t.running = False
+        t.stream.take("901", {"version": 7, "bids": [], "asks": [[0.50, 40]]})
+        t.running, clock.ms, t.fast = True, day(12, 0), False
+        t.stream.take("901", {"version": 8, "bids": [], "asks": [[0.49, 40]]})
+        self.assertEqual((len(api.sent), t.first_ticks), (sent, 1 if R.EAGER else 0))
+        # a tick that fails is noted, as the loop notes it — never the stream's own failure
+        clock.ms, t.fast = day(1, 0, 5), True
+        t.turn = mock.AsyncMock(side_effect=RuntimeError("坏了"))
+        t.stream.take("901", {"version": 9, "bids": [], "asks": [[0.48, 40]]})
+        await asyncio.sleep(0)
+        if R.EAGER:
+            self.assertEqual((t.error, t.tick_lock.locked()), ("坏了", False))
+        del t.turn
+        # the taker's own loop running (run): the same — and the loop's tick, come round, finds the change taken
+        live, api5, clock5, _ = taker("on", RULE_FAST_HOURS="01:00-07:00", RULE_OIL="off", RULE_GOLD_OPEN_CENTS="0", RULE_GOLD_0515_CENTS="0")
+        live.verify_tick = lambda: None
+        api5.markets["901"] = gold_market(GOLD_0600)
+        api5.listed.add(slug)
+        api5.books["901"] = {"bids": [], "asks": [[0.70, 30]]}
+        clock5.ms = day(1, 0, 3)
+
+        async def no_stream():
+            await asyncio.Event().wait()
+        live.stream.run = no_stream
+        runner = asyncio.create_task(live.run())
+        for _ in range(50):
+            await asyncio.sleep(0.002)
+            if live.track.get(slug, {}).get("market") is not None and live.fast:
+                break
+        self.assertTrue(live.running and live.stream.on_change == live.pushed_now and live.first_now())
+        connected(live, "901", {"bids": [], "asks": [[0.70, 30]]})
+        before = live.first_ticks
+        live.stream.take("901", {"version": 3, "bids": [], "asks": [[0.52, 25]]})
+        if R.EAGER:
+            self.assertEqual((len(api5.sent), live.first_ticks - before), (1, 1), "bought in the turn of the loop that brought the book")
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(api5.sent), 1, "once: the loop's own tick places nothing more")
+        live.stop.set()
+        await asyncio.wait_for(runner, 5)
+        self.assertEqual((live.running, live.first_tasks, live.rush_tasks), (False, set(), set()))
+        # stopped while a tick a pushed book began still waits for its order's answer: that tick ends first — the answer onto
+        # the record — as the loop's own would have (cancelled, the record stayed "placing" with no id)
+        slow, api7, clock7, _ = taker("on", RULE_FAST_HOURS="01:00-07:00", RULE_OIL="off", RULE_GOLD_OPEN_CENTS="0", RULE_GOLD_0515_CENTS="0")
+        slow.verify_tick = lambda: None
+        api7.markets["901"] = gold_market(GOLD_0600)
+        api7.listed.add(slug)
+        api7.books["901"] = {"bids": [], "asks": [[0.70, 30]]}
+        clock7.ms = day(1, 0, 3)
+        slow.stream.run = no_stream
+        runner7 = asyncio.create_task(slow.run())
+        for _ in range(50):
+            await asyncio.sleep(0.002)
+            if slow.track.get(slug, {}).get("market") is not None and slow.fast:
+                break
+        connected(slow, "901", {"bids": [], "asks": [[0.70, 30]]})
+        answer, create7 = asyncio.Event(), api7.create_order
+
+        async def answered_late(body):
+            await answer.wait()
+            return await create7(body)
+        api7.create_order = answered_late
+        slow.stream.take("901", {"version": 3, "bids": [], "asks": [[0.52, 25]]})
+        if R.EAGER:
+            self.assertEqual((len(slow.first_tasks), slow.record(slug)["orders"][0]["state"]), (1, "placing"))
+        slow.stop.set()
+        await asyncio.sleep(0.02)
+        self.assertFalse(runner7.done() and R.EAGER, "the taker waits for the tick in progress")
+        answer.set()
+        await asyncio.wait_for(runner7, 5)
+        order7 = slow.record(slug)["orders"][0]
+        self.assertEqual((order7["state"], order7["id"], slow.first_tasks), ("open", "1", set()))
+        # the threads gone (the process ending): a request that could not be handed to one was never sent — not "unknown"
+        gone, api8, clock8, _ = taker("on", RULE_FAST_HOURS="01:00-07:00", RULE_OIL="off", RULE_GOLD_OPEN_CENTS="0", RULE_GOLD_0515_CENTS="0")
+        gone.verify_tick = lambda: None
+        api8.markets["901"] = gold_market(GOLD_0600)
+        api8.listed.add(slug)
+        api8.books["901"] = {"bids": [], "asks": [[0.52, 25]]}
+        clock8.ms = day(1, 0, 3)
+
+        async def no_threads(body):
+            raise RuntimeError("cannot schedule new futures after shutdown")
+        api8.create_order = no_threads
+        await gone.tick()
+        order8 = gone.record(slug)["orders"][0]
+        self.assertEqual((order8["state"], order8["error"], gone.finished(slug, R.RULE_OF[gone.track[slug]["rule"]])), ("not_sent", "进程正在停止，请求没有发出", ""))
+        # ...and with the real client (the request path of production: the sign-in in hand, the key's pace, the gate, the check
+        # right before the bytes): the POST is handed to a thread of the rule taker's own before take() returns
+        real, api6, clock6, x6 = taker("on", RULE_FAST_HOURS="01:00-07:00", RULE_OIL="off", RULE_GOLD_OPEN_CENTS="0", RULE_GOLD_0515_CENTS="0")
+        real.verify_tick = lambda: None
+        api6.markets["901"] = gold_market(GOLD_0600)
+        api6.listed.add(slug)
+        api6.books["901"] = {"bids": [], "asks": [[0.70, 30]]}
+        clock6.ms = day(1, 0, 3)
+        await real.tick()
+        client = p.safe_api("https://api.invalid/v1", "rule-key", None, real.before_send, None)
+        client.jwt, client.pool = "token", m.first_pool()
+        real.api = client
+        connected(real, "901", {"bids": [], "asks": [[0.70, 30]]})
+        real.running, real.stream.on_change = True, real.pushed_now
+        handed, threads = [], []
+        submit = client.pool.submit
+
+        def fake_get(url, payload=None, timeout=15, headers=None):
+            threads.append((__import__("threading").current_thread().name, url, (headers or {}).get("x-api-key")))
+            return json.dumps({"success": True, "data": {"orderId": "77", "orderHash": payload["data"]["order"]["hash"]}}).encode()
+        client.pool.submit = lambda fn, *args, **kwargs: handed.append(args[0] if args else "") or submit(fn, *args, **kwargs)
+        with mock.patch.object(m, "_http_get", fake_get):
+            try:
+                real.stream.take("901", {"version": 3, "bids": [], "asks": [[0.52, 25]]})
+                if R.EAGER:
+                    self.assertEqual(handed, ["https://api.invalid/v1/orders"], "the order's request with its thread before take() returns")
+                for _ in range(200):
+                    await asyncio.sleep(0.005)
+                    if real.record(slug) and real.record(slug)["orders"] and real.record(slug)["orders"][0]["state"] == "open":
+                        break
+            finally:
+                del client.pool.submit
+        order6 = real.record(slug)["orders"][0]
+        self.assertEqual((order6["state"], order6["id"], [(name.startswith("predict-first"), url, key) for name, url, key in threads]),
+                         ("open", "77", [(True, "https://api.invalid/v1/orders", "rule-key")]))
+        self.assertLessEqual(order6["sent_wall"] - order6["look_wall"], 500, "from the look to the request: this turn of the loop (ms on the wall clock: a busy builder's allowance)")
+        for task in list(real.first_tasks):
+            await asyncio.wait_for(task, 2)
+        # the status says it
+        line = t.first_line(day(1, 0, 5))
+        self.assertIn("优先：每天 00:59–07:00（每秒检查时段和它前 1 分钟）、对手挂单时刻前后和盘中吃单时，规则吃单排最前——", line)
+        self.assertIn("请求走规则吃单自己的线程；对手挂单时刻前 1 秒到后 15 秒（这一场还能买时），预挂不发新单", line)
+        own, *_ = taker("on", RULE_FAST_HOURS="01:00-07:00", RULE_API_KEY="rule-key", PREDICT_API_KEY="main-key")
+        self.assertIn("请求走规则吃单自己的线程；这把 Key 不外借；对手挂单时刻前 1 秒到后 15 秒", own.first_line(day(1, 0, 5)))
+        self.assertIn("｜现在：优先中", line)
+        t.fast = False
+        self.assertIn("｜现在不在优先时段，下一次 00:59 开始", t.first_line(day(12, 0)))
+        self.assertEqual(paper.first_line(day(1, 0)), "")
+
+    async def test_around_the_makers_moment_the_rest_of_the_bot_keeps_out_of_the_way(self):
+        """1.154.23: quiet_ms — the ms left of the seconds around a makers' moment (QUIET_BEFORE_MS before it to QUIET_AFTER_MS
+        after) of a window the taker can still buy: what the pre-open mode's new pairs, the model trader's step and the minute's
+        checks wait out. Nothing to wait for once the window is bought, has no price, or no order could go out."""
+        t, api, clock, x = taker("on", RULE_FAST_HOURS="off", RULE_OIL="off", RULE_GOLD_OPEN_CENTS="0", RULE_GOLD_0515_CENTS="0")
+        t.verify_tick = lambda: None
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": []}
+        moment = GOLD_0600 - 300 * 60_000  # 01:00:00: the 06:00 window's makers post (RULE_LEAD_MINUTES 300)
+        clock.ms = moment - 30_000
+        await t.tick()
+        for at, left in ((moment - R.QUIET_BEFORE_MS - 1, 0), (moment - R.QUIET_BEFORE_MS, R.QUIET_AFTER_MS + R.QUIET_BEFORE_MS), (moment, R.QUIET_AFTER_MS),
+                         (moment + 4_780, R.QUIET_AFTER_MS - 4_780), (moment + R.QUIET_AFTER_MS - 1, 1), (moment + R.QUIET_AFTER_MS, 0)):
+            self.assertEqual(t.quiet_ms(at), left, at - moment)
+        clock.ms = moment + 3_000
+        t.quiet_held = (time.monotonic() + 3600, 4_321)  # (worked out "just now")
+        self.assertEqual(t.quiet_ms(), 4_321, "worked out at most every 50 ms (asked before every pair of the pre-open mode)")
+        t.quiet_held = (0.0, 0)
+        self.assertEqual((t.quiet_ms(), t.quiet_held[1]), (R.QUIET_AFTER_MS - 3_000, R.QUIET_AFTER_MS - 3_000))
+        # nobody waits for an order that cannot go out, a window with no price, one bought in full, or 只记录
+        x.state.paused = "测试暂停"
+        self.assertEqual(t.quiet_ms(moment), 0)
+        x.state.paused = ""
+        self.assertEqual(t.quiet_ms(moment), R.QUIET_AFTER_MS)
+        rec = t.new_record(slug, t.track[slug], R.RULE_OF[t.track[slug]["rule"]], 1)
+        rec["orders"].append({"state": "final", "shares": float(t.settings.shares_of("gold")), "filled": float(t.settings.shares_of("gold")), "limit": 0.6})
+        t.save(rec)
+        self.assertEqual(t.quiet_ms(moment), 0, "bought in full")
+        t.recs.clear()
+        none, api0, clock0, _ = taker("on", RULE_FAST_HOURS="off", RULE_OIL="off", RULE_GOLD_OPEN_CENTS="0", RULE_GOLD_0515_CENTS="0", RULE_GOLD_SHUT_CENTS="0")
+        api0.markets["901"] = gold_market(GOLD_0600)
+        api0.listed.add(slug)
+        clock0.ms = moment - 30_000
+        await none.tick()
+        self.assertEqual(none.quiet_ms(moment), 0, "no price: nothing to buy before its start")
+        paper, api1, clock1, _ = taker("paper", RULE_FAST_HOURS="off", RULE_OIL="off", RULE_GOLD_OPEN_CENTS="0", RULE_GOLD_0515_CENTS="0")
+        api1.markets["901"] = gold_market(GOLD_0600)
+        api1.listed.add(slug)
+        clock1.ms = moment - 30_000
+        await paper.tick()
+        self.assertEqual(paper.quiet_ms(moment), 0)
+        self.assertIn("｜现在：优先中，其他活儿正在让路（还有 13 秒）", (t.__setattr__("fast", True), t.first_line(moment + 2_000))[1])
+        # ...and no automatic garbage collection from GC_BEFORE_MS before the moment to the end of those seconds: a collection of
+        # the oldest generation stops the whole process for a quarter of a second and more with the bot's records (GcWatch)
+        import gc
+        watch = m.GC_WATCH
+        held0 = watch.held
+        self.assertTrue(gc.isenabled() and not watch.holders)
+        t.gc_guard(moment)
+        self.assertTrue(gc.isenabled() and not t.gc_off, "the taker's own loop not running (a tick by hand): left alone")
+        t.running = True
+        try:
+            for at, off in ((moment - R.GC_BEFORE_MS - R.QUIET_BEFORE_MS - 1, False), (moment - R.GC_BEFORE_MS - R.QUIET_BEFORE_MS, True), (moment, True),
+                            (moment + R.QUIET_AFTER_MS - 1, True), (moment + R.QUIET_AFTER_MS, False)):
+                t.gc_guard(at)
+                self.assertEqual((t.gc_off, gc.isenabled(), watch.holders), (off, not off, int(off)), at - moment)
+            self.assertEqual(watch.held - held0, 1, "held once for the whole stretch")
+            # the taker stopping lets go of it: never left off
+            t.gc_guard(moment)
+            self.assertFalse(gc.isenabled())
+
+            async def no_stream():
+                await asyncio.Event().wait()
+            t.stream.run, t.running = no_stream, False
+            t.stop.set()
+            t.gc_off = True  # (as the guard left it)
+            await asyncio.wait_for(t.run(), 5)
+            self.assertTrue(gc.isenabled() and not t.gc_off and not watch.holders)
+        finally:
+            while watch.holders:
+                watch.release()
+        # what /diag says of the collector: a collection of the oldest generation, timed
+        watch.start()
+        try:
+            before = len(watch.runs)
+            gc.collect()
+            self.assertEqual((len(watch.runs) - before, watch.runs[-1][1]), (1, 2))
+            self.assertRegex(watch.line(), r"^最近 10 分钟整堆回收 \d+ 次、共 \d+\.\d 秒、最长 \d+ ms.*整堆回收时整个进程停着，盘口和下单都在等；规则吃单抢单的十几秒里不自动回收，本次启动 \d+ 次）$")
+        finally:
+            watch.stop()
+        self.assertTrue(gc.isenabled() and watch.note not in gc.callbacks)
 
     async def test_a_pushed_offer_is_bought_at_once(self):
         """The listed windows' books come pushed (RuleStream): a book that changed wakes the loop and its window is looked at

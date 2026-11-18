@@ -79,6 +79,7 @@ LEND_SNAPSHOT_LEAVE = 2.0     # ...its pages leaving this many tokens more than 
 LEND_YIELD_MIN_S = 20.0       # ...but for half the read's own pace at the most (this at least): then beside them, so a backlog borrowing on and on never keeps it from finishing
 LEND_OFF_S = 600.0            # after that key refused a request (a 429, a 401 / 403) nothing more goes out on it for this long
 LEND_WARM_S = 60.0            # the sign-in on that key is kept fresh this often while it may be borrowed
+GIVE_WAY_MAX_S = 20.0     # 1.154.23: what waits for the rule taker's seconds (Controller.yielding) waits no longer than this
 HOLD_RETRY_MS = 5_000     # a held candidate (hold(): a stale snapshot, the cooldown, the pause; or the budget) waits this long on the side, then is placed again — never read again meanwhile
 FRESH_FIRST_MS = 10 ** 13  # 1.154.8: a window found at its listing is queued this far ahead of any start — placed before the backlog (queue_rank)
 FIRST_SNAPSHOT_GRACE_MS = 300_000  # 1.154.8: after a start, the status re-reads and the known windows' re-reads wait for the first account snapshot
@@ -1892,6 +1893,11 @@ class Controller:
         older version's) are not a hold since 1.126.0: they are shown, and their money is in the balance check."""
         if why := self.blocked():
             return why
+        if (left := self.yielding()) > 0:
+            # 1.154.23, the rule taker first: no new pair in the seconds around a makers' moment — the windows listed at a quarter
+            # hour are signed and sent in the very seconds the rule taker's offers show (two signatures and three saves a pair,
+            # each on the event loop its order waits for); placed right after (the worker parks the candidate for that long)
+            return f"规则吃单在抢单时刻，先让路（约 {left:.0f} 秒后继续）"
         if not self.account_at:
             if self.account_failed:
                 return f"账户快照上次读取失败（{self.account_failed}），正在重读"
@@ -1904,6 +1910,21 @@ class Controller:
             return (f"账户快照过期（{(self.now() - self.account_at) // 1000} 秒前读到，每 {self.account_interval_s():.0f} 秒读一次"
                     + (f"，上次读了 {self.account_read_s:.0f} 秒" if self.account_read_s >= 1 else "") + "）")
         return self.cooldown()
+
+    def yielding(self) -> float:
+        """Seconds left in which the rule taker has the event loop to itself (the bot's rules_quiet, 1.154.23); 0.0 otherwise."""
+        quiet = getattr(self.owner, "rules_quiet", None)
+        try:
+            return float(quiet() or 0.0) if callable(quiet) else 0.0
+        except Exception:
+            return 0.0
+
+    async def give_way(self) -> None:
+        """Waits out the rule taker's seconds (yielding; GIVE_WAY_MAX_S at the most) ahead of a piece of work that takes the
+        event loop for a while in one go — the account snapshot's digest: a tenth of a second and more with 24,000 open orders."""
+        began = time.monotonic()
+        while (left := self.yielding()) > 0 and time.monotonic() - began < GIVE_WAY_MAX_S and not self.stopped():
+            await asyncio.sleep(min(left + 0.05, GIVE_WAY_MAX_S))
 
     def snapshot_client(self) -> Any:
         """The client the account snapshot reads through (1.154.11): its own (snap_api, ahead of the mode's other reads on the key),
@@ -2227,6 +2248,7 @@ class Controller:
             if not client.orders_complete:
                 raise core.RemoteError(f"账户挂单分页未读取完整（读了 {len(rows)} 条、{pages_read} 页仍没到底，上限 {getattr(client, 'ORDERS_PAGES_MAX', '?')} 页），暂停新增订单")
             self.account_pages = max(1, pages_read)
+            await self.give_way()  # 1.154.23: the digest below holds the loop a tenth of a second and more — after the rule taker's seconds
             other = self.unmanaged_rows(rows)
             known_core = {str(t.get("live", {}).get("order_id")) for t in self.owner.sim_trades().values() if isinstance(t.get("live"), dict)} if other else set()
             rule_ids, rule_hashes = getattr(self.owner, "rules_known", lambda: (set(), set()))()  # the rule taker's orders (1.153.3)
@@ -3234,7 +3256,10 @@ class Controller:
             wait = 0
             try:
                 if await self.place_pair(c) == "held":
-                    wait = HOLD_RETRY_MS
+                    # (held for the rule taker's seconds: parked for all of them and placed as they end — not tried again every
+                    # HOLD_RETRY_MS meanwhile, the whole backlog through the workers each time)
+                    left = self.yielding()
+                    wait = int(left * 1000) + 100 if left > 0 else HOLD_RETRY_MS
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -3351,10 +3376,11 @@ class Controller:
                 self.rate_samples.append((now, calls))
             await self.check_cards(now)
             self.note_cooldown()
-            if now - self.stuck_checked_ms >= 60_000:
+            yielding = self.yielding() > 0  # 1.154.23: the housekeeping after the rule taker's seconds (the cancels at their time go on)
+            if now - self.stuck_checked_ms >= 60_000 and not yielding:
                 self.stuck_checked_ms = now
                 self.check_stuck(now)
-            if now - self.archived_ms >= ARCHIVE_EVERY_MS:
+            if now - self.archived_ms >= ARCHIVE_EVERY_MS and not yielding:
                 self.archive(now)  # (never raises; only accounted, closed records go: none this loop or a task of it still works on)
             due = self.due(now)
             if due:

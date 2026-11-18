@@ -445,11 +445,78 @@ async def control_page():
     assert bot.control_payload()["preopen"]["status"] == "另一个"
 
 
+async def the_rule_taker_first():
+    """1.154.23 — "每天凌晨 00:59 分开始规则吃单的优先级就要调到最高". Around a makers' moment the rule taker says how long the
+    rest of the bot keeps out of the event loop's way (rules.RuleTaker.quiet_ms, the bot's rules_quiet): the model trader's
+    step — tens of milliseconds of the loop in one piece — waits those seconds out, STEP_QUIET_MAX_S at the most since its
+    last run, and so do the minute's positions check and the index's own check; the rule taker's requests have threads of
+    their own (core.first_pool), never in the shared pool's queue."""
+    import threading
+    bot = make_bot()
+    await bot.live_prepare()
+    await taker(bot, NOW, "101")
+    assert bot.rules_quiet() == 0.0, "no rule taker: nobody waits"
+    quiet = [7_000]
+    bot.rules = types.SimpleNamespace(running=False, quiet_ms=lambda: quiet[0], recs={})
+    assert bot.rules_quiet() == 0.0, "one that is not running: nobody waits"
+    bot.rules.running = True
+    assert bot.rules_quiet() == 7.0
+    # the step: due, and it waits; the express lane does not ask
+    due = lambda ago: time.monotonic() - bot.config.sim_seconds - ago
+    bot.sim_ran = at = due(0.5)
+    assert await bot.sim_step(NOW + 10_000) is False and bot.sim_ran == at and bot.live_step_waits == 1, "not run: the rule taker's seconds"
+    world["markets"] = [mk("hsi-101", 0.70, [], [("0.90", "400")], NOW + 10_000, "101")]
+    bot.market.now = NOW + 10_000
+    await bot.sim_express_look("K101", NOW + 10_000)  # (a pushed book is still judged)
+    bot.sim_ran = time.monotonic() - bot.STEP_QUIET_MAX_S - 1
+    assert await bot.sim_step(NOW + 10_000) and bot.live_step_waits == 1, "never longer than STEP_QUIET_MAX_S since its last run"
+    quiet[0] = 0
+    bot.sim_ran = due(0.5)
+    assert await bot.sim_step(NOW + 15_000) and bot.live_step_waits == 1, "the seconds over: as ever"
+    # the minute's positions check and the index's own check wait too
+    quiet[0] = 7_000
+    bot.live_late_checked = 0
+    await bot.live_late_fills(NOW + 200_000)
+    assert bot.live_late_checked == 0
+    due_check = lambda: time.monotonic() - bot.SIM_INDEX_CHECK_SECONDS - 1  # (its minute over — whatever the host's clock reads)
+    bot.sim_index_checked, checks = due_check(), bot.sim_index_checks
+    assert bot.sim_index_check() == [] and bot.sim_index_checks == checks and bot.sim_index_check(force=True) == [] and bot.sim_index_checks == checks + 1
+    quiet[0] = 0
+    await bot.live_late_fills(NOW + 200_000)
+    bot.sim_index_checked = due_check()
+    assert bot.live_late_checked == NOW + 200_000 and bot.sim_index_check() == [] and bot.sim_index_checks == checks + 2
+    bot.rules.quiet_ms = lambda: 1 / 0
+    assert bot.rules_quiet() == 0.0, "a figure that cannot be had keeps nobody waiting"
+    # threads of the rule taker's own
+    pool = m.first_pool()
+    assert pool is m.first_pool() and pool._max_workers == m.FIRST_POOL_WORKERS and pool is not m.predict_pool()
+    name = lambda: threading.current_thread().name
+    assert (await m.predict_blocking(name, pool=pool)).startswith("predict-first") and (await m.predict_blocking(name)).startswith("predict_")
+    seen = []
+
+    async def blocking(fn, *args, **kwargs):
+        seen.append(kwargs)
+        return b'{"success": true}'
+    real, m.predict_blocking = m.predict_blocking, blocking
+    try:
+        api = L.PredictApi("https://x.invalid/v1", "k", None)
+        await api.call("GET", "/markets/1")
+        api.pool = pool
+        await api.call("GET", "/markets/1")
+    finally:
+        m.predict_blocking = real
+    assert seen == [{}, {"pool": pool}], seen
+    import rules as R
+    owner = types.SimpleNamespace(config=bot.config, market=bot.market, stopping=asyncio.Event(), store=m.Store(":memory:"), live=bot.live)
+    assert R.RuleTaker(owner).api.pool is pool, "the rule taker's client: on them"
+
+
 async def main():
     await loop_watch()
     await snapshot_once()
     await gates()
     await control_page()
+    await the_rule_taker_first()
 
 
 asyncio.run(main())
