@@ -310,9 +310,17 @@ async def gates():
     assert 0 < len(calls) < 900, f"only the records that may hold something are worked out ({len(calls)} of 1501)"
     # the day's settled P&L: the walk's figure, from the day's own records
     assert bot.live_daily_pnl(trades, NOW) == plain_pnl(bot, trades, NOW) != 0
-    rows = bot.live_pnl_held[1]
+    rows = bot.live_pnl_held[2]
     assert 0 < len(rows) < 600 and all(t["status"] == "settled" for t in rows), len(rows)
-    assert bot.live_daily_pnl(bot.sim_trades(), NOW) == plain_pnl(bot, trades, NOW) and bot.live_pnl_held[1] is rows, "asked again with nothing written: not looked for again"
+    assert bot.live_daily_pnl(bot.sim_trades(), NOW) == plain_pnl(bot, trades, NOW) and bot.live_pnl_held[2] is rows, "asked again with nothing written: not looked for again"
+    # 1.154.22: ...nor after a write of a record that is not a settled one — an order's own record is written on its way out, and
+    # each of its gates began with a walk of every record again; a settled record saved is looked for again
+    resting = next((k, t) for k, t in trades.items() if t.get("status") == "resting" and isinstance(t.get("live"), dict))
+    bot.sim_save([resting])
+    assert bot.live_daily_pnl(bot.sim_trades(), NOW) == plain_pnl(bot, trades, NOW) and bot.live_pnl_held[2] is rows, "another record written: the day's rows stand"
+    bot.sim_save([next((k, t) for k, t in trades.items() if t is rows[0])])
+    assert bot.live_daily_pnl(bot.sim_trades(), NOW) == plain_pnl(bot, trades, NOW) and bot.live_pnl_held[2] is not rows, "a settled record written: looked for again"
+    rows = bot.live_pnl_held[2]
     assert bot.live_daily_pnl(dict(trades), NOW) == plain_pnl(bot, trades, NOW), "a dict of the caller's own is walked whole"
     # a record settled this very moment counts before it is even saved (sim_settle): no order goes out past a loss just settled
     loser = next(t for t in trades.values() if t.get("status") == "filled" and isinstance(t.get("live"), dict))
@@ -338,7 +346,7 @@ async def gates():
     late["live"].update(state="done", order_id="999999", hash="0x" + "9" * 64)
     bot.sim_save([("late|up|吃", late)])
     assert bot.live_daily_pnl(bot.sim_trades(), NOW) == plain_pnl(bot, bot.sim_trades(), NOW)
-    assert late in bot.live_pnl_held[1]
+    assert late in bot.live_pnl_held[2]
     # a map the caller changed is no longer "the records as kept": walked whole
     view = bot.sim_trades()
     extra = copy.deepcopy(late)
@@ -356,7 +364,7 @@ async def gates():
     bot.sim_cache = None
     fresh = bot.sim_trades()
     assert bot.sim_built == built + 1 and fresh.taken == (built + 1, bot.sim_gen)
-    assert bot.live_daily_pnl(fresh, NOW) == plain_pnl(bot, fresh, NOW) and all(any(t is x for x in fresh.values()) for t in bot.live_pnl_held[1])
+    assert bot.live_daily_pnl(fresh, NOW) == plain_pnl(bot, fresh, NOW) and all(any(t is x for x in fresh.values()) for t in bot.live_pnl_held[2])
     # a bot made without its start (a test's) has no kept records: the walk
     bare = L.LiveBot.__new__(L.LiveBot)
     assert bare.live_daily_pnl({"a": late}, NOW) == plain_pnl(bot, {"a": late}, NOW)
@@ -437,11 +445,94 @@ async def control_page():
     assert bot.control_payload()["preopen"]["status"] == "另一个"
 
 
+async def the_rule_taker_first():
+    """1.154.23 — "每天凌晨 00:59 分开始规则吃单的优先级就要调到最高". Around a makers' moment the rule taker says how long the
+    rest of the bot keeps out of the event loop's way (rules.RuleTaker.quiet_ms, the bot's rules_quiet): the model trader's
+    step — tens of milliseconds of the loop in one piece — waits those seconds out, STEP_QUIET_MAX_S at the most since its
+    last run, and so do the minute's positions check and the index's own check; the rule taker's requests have threads of
+    their own (core.first_pool), never in the shared pool's queue."""
+    import threading
+    bot = make_bot()
+    await bot.live_prepare()
+    await taker(bot, NOW, "101")
+    assert bot.rules_quiet() == 0.0, "no rule taker: nobody waits"
+    quiet = [7_000]
+    bot.rules = types.SimpleNamespace(running=False, quiet_ms=lambda: quiet[0], recs={})
+    assert bot.rules_quiet() == 0.0, "one that is not running: nobody waits"
+    bot.rules.running = True
+    assert bot.rules_quiet() == 7.0
+    # 1.154.24: a price that moved is told to the rule taker first (its windows in their course hang on the index: looked at
+    # in the turn that brought it), then to the express lane as ever — the taker's failure its own
+    told = []
+    bot.rules.priced = lambda keys: told.append((list(keys), set(bot.price_dirty)))
+    bot.priced(["XAU-15M"])
+    assert told == [(["XAU-15M"], set())] and bot.price_dirty == {"XAU-15M"} and bot.price_look is not None, told
+    bot.rules.priced = lambda keys: 1 / 0
+    bot.priced({"K101"})
+    assert bot.price_dirty == {"XAU-15M", "K101"}
+    bot.rules.running = False
+    bot.rules.priced = lambda keys: told.append("not running")
+    bot.priced(["K101"])
+    assert len(told) == 1
+    bot.rules.running = True
+    await bot.price_look
+    del bot.rules.priced
+    # the step: due, and it waits; the express lane does not ask
+    due = lambda ago: time.monotonic() - bot.config.sim_seconds - ago
+    bot.sim_ran = at = due(0.5)
+    assert await bot.sim_step(NOW + 10_000) is False and bot.sim_ran == at and bot.live_step_waits == 1, "not run: the rule taker's seconds"
+    world["markets"] = [mk("hsi-101", 0.70, [], [("0.90", "400")], NOW + 10_000, "101")]
+    bot.market.now = NOW + 10_000
+    await bot.sim_express_look("K101", NOW + 10_000)  # (a pushed book is still judged)
+    bot.sim_ran = time.monotonic() - bot.STEP_QUIET_MAX_S - 1
+    assert await bot.sim_step(NOW + 10_000) and bot.live_step_waits == 1, "never longer than STEP_QUIET_MAX_S since its last run"
+    quiet[0] = 0
+    bot.sim_ran = due(0.5)
+    assert await bot.sim_step(NOW + 15_000) and bot.live_step_waits == 1, "the seconds over: as ever"
+    # the minute's positions check and the index's own check wait too
+    quiet[0] = 7_000
+    bot.live_late_checked = 0
+    await bot.live_late_fills(NOW + 200_000)
+    assert bot.live_late_checked == 0
+    due_check = lambda: time.monotonic() - bot.SIM_INDEX_CHECK_SECONDS - 1  # (its minute over — whatever the host's clock reads)
+    bot.sim_index_checked, checks = due_check(), bot.sim_index_checks
+    assert bot.sim_index_check() == [] and bot.sim_index_checks == checks and bot.sim_index_check(force=True) == [] and bot.sim_index_checks == checks + 1
+    quiet[0] = 0
+    await bot.live_late_fills(NOW + 200_000)
+    bot.sim_index_checked = due_check()
+    assert bot.live_late_checked == NOW + 200_000 and bot.sim_index_check() == [] and bot.sim_index_checks == checks + 2
+    bot.rules.quiet_ms = lambda: 1 / 0
+    assert bot.rules_quiet() == 0.0, "a figure that cannot be had keeps nobody waiting"
+    # threads of the rule taker's own
+    pool = m.first_pool()
+    assert pool is m.first_pool() and pool._max_workers == m.FIRST_POOL_WORKERS and pool is not m.predict_pool()
+    name = lambda: threading.current_thread().name
+    assert (await m.predict_blocking(name, pool=pool)).startswith("predict-first") and (await m.predict_blocking(name)).startswith("predict_")
+    seen = []
+
+    async def blocking(fn, *args, **kwargs):
+        seen.append(kwargs)
+        return b'{"success": true}'
+    real, m.predict_blocking = m.predict_blocking, blocking
+    try:
+        api = L.PredictApi("https://x.invalid/v1", "k", None)
+        await api.call("GET", "/markets/1")
+        api.pool = pool
+        await api.call("GET", "/markets/1")
+    finally:
+        m.predict_blocking = real
+    assert seen == [{}, {"pool": pool}], seen
+    import rules as R
+    owner = types.SimpleNamespace(config=bot.config, market=bot.market, stopping=asyncio.Event(), store=m.Store(":memory:"), live=bot.live)
+    assert R.RuleTaker(owner).api.pool is pool, "the rule taker's client: on them"
+
+
 async def main():
     await loop_watch()
     await snapshot_once()
     await gates()
     await control_page()
+    await the_rule_taker_first()
 
 
 asyncio.run(main())
