@@ -956,14 +956,21 @@ async def november():
         assert (hype["name"], hype["source"], hype["ladder"]["window_word"]) == ("HYPE 11月价格", "币安合约", "本月") and hype["close_ms"] == ETH11.end_ms
         assert (await bot.ranges["HYPE-HIT-11"].get("ticker/price", symbol="HYPEUSDT"))["price"] == "45.12"
         assert market.paths == [("/fapi/v1/ticker/price", {"symbol": "HYPEUSDT"})]  # the bot's own futures feed (BINANCE_BASE_URL)
-        items = [(i["group"], i["name"]) for i in bot.odds_payload()["items"] if i["group"] in {"crypto", "levels", "ladder"}]
-        assert items == [("crypto", "SOL 先触 60/140"), ("crypto", "ETH 先触 1k/3k"), ("crypto", "BTC 先触 70k/90k"),  # 1.132.0: to May 2027 (1.154.10: BNB 600/800 taken off)
-                         ("crypto", "BTC 11-05 涨跌"), ("crypto", "ETH 11-05 涨跌"), ("crypto", "BNB 11-05 涨跌"), ("crypto", "BTC 15分涨跌 16:00–16:15"),  # 1.109.0: in 加密
-                         ("crypto", "ETH 15分涨跌 16:00–16:15"), ("crypto", "BNB 15分涨跌 16:00–16:15"),  # 1.129.1
-                         ("crypto", "BTC 5分涨跌 16:05–16:10"), ("crypto", "ETH 5分涨跌 16:05–16:10"), ("crypto", "BNB 5分涨跌 16:05–16:10"),  # 1.137.0
-                         ("crypto", "HYPE 反超 SOL"),  # 1.132.0: by December
-                         ("levels", "BTC 11月价格"), ("levels", "ETH 11月价格"), ("levels", "SOL 11月价格"), ("levels", "HYPE 11月价格"),
-                         ("levels", "BTC 2027前价格"), ("levels", "ZEC 2027前价格")], items
+        shown = lambda: [(i["group"], i["name"]) for i in bot.odds_payload()["items"] if i["group"] in {"crypto", "levels", "ladder"}]
+        every = [("crypto", "SOL 先触 60/140"), ("crypto", "ETH 先触 1k/3k"), ("crypto", "BTC 先触 70k/90k"),  # 1.132.0: to May 2027 (1.154.10: BNB 600/800 taken off)
+                 ("crypto", "BTC 11-05 涨跌"), ("crypto", "ETH 11-05 涨跌"), ("crypto", "BNB 11-05 涨跌"), ("crypto", "BTC 15分涨跌 16:00–16:15"),  # 1.109.0: in 加密
+                 ("crypto", "ETH 15分涨跌 16:00–16:15"), ("crypto", "BNB 15分涨跌 16:00–16:15"),  # 1.129.1
+                 ("crypto", "BTC 5分涨跌 16:05–16:10"), ("crypto", "ETH 5分涨跌 16:05–16:10"), ("crypto", "BNB 5分涨跌 16:05–16:10"),  # 1.137.0
+                 ("crypto", "HYPE 反超 SOL"),  # 1.132.0: by December
+                 ("levels", "BTC 11月价格"), ("levels", "ETH 11月价格"), ("levels", "SOL 11月价格"), ("levels", "HYPE 11月价格"),
+                 ("levels", "BTC 2027前价格"), ("levels", "ZEC 2027前价格")]
+        # 1.154.30: the 15- / 5-minute cards nobody uses are not on the page (PREDICT_FOLLOW_UNTRADED off, the default — this bot's
+        # trader is on the daily cards alone: test_follow.py); with it on, the page of before
+        assert shown() == [x for x in every if "分涨跌" not in x[1]], shown()
+        plain = bot.config
+        bot.config = m.dataclasses.replace(plain, predict_follow_untraded=True)
+        assert shown() == every, shown()
+        bot.config = plain
         # the price streams follow: HYPEUSDT on futures for its ladder; HYPE and SOL on Hyperliquid for the flip (1.132.0: by December)
         assert bot.binance_streams["spot"].symbols() == ["SOLUSDT", "ETHUSDT", "BTCUSDT", "BNBUSDT", "ZECUSDT"]  # BNBUSDT for BNB's daily card
         assert bot.binance_streams["futures"].symbols() == ["UNITREEUSDT", "SKHYNIXUSDT", "XAUUSDT", "CLUSDT", "ZHIPUUSDT", "MUUSDT", "SNDKUSDT", "AVGOUSDT", "SPCXUSDT", "NVDAUSDT", "GOOGLUSDT", "METAUSDT", "TSMUSDT", "AMZNUSDT", "QQQUSDT", "SPYUSDT", "MSFTUSDT", "HYPEUSDT"] and {"HYPE", "SOL"} <= set(bot.hl_stream.coins())
