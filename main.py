@@ -52,7 +52,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.30"
+VERSION = "1.154.31"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -2557,6 +2557,7 @@ class StockMarket:
         self.live_errors: dict[str, str] = {}
         self.still = Stillness()                # when each stock's price last changed (closure_problem)
         self.live_refreshed = -1e9
+        self.live_refreshed_part: dict[str, float] = {}  # "kr" / "rest" -> the monotonic time of that part's last round (refresh_live's ``only``)
         for symbol in config.tickers:
             saved = store.get(f"stock_close:{symbol}") if store else None
             if saved:
@@ -2642,16 +2643,24 @@ class StockMarket:
 
     LIVE_STALE_MS = 10 * 60_000
 
-    async def refresh_live(self, now_ms: int, force: bool = False) -> Refreshed | bool:
+    LIVE_DUE_SLACK = 0.05  # a round asked for this much before its second is up is due (the loop that asks comes round on the second)
+
+    async def refresh_live(self, now_ms: int, force: bool = False, only: str = "") -> Refreshed | bool:
         """Realtime quotes, only for the stocks whose session is running now, every QUOTE_REFRESH_SECONDS (1 s by
         default). The A-share / HK stocks share one request per source (Tencent, then Sina for the ones it left
         stale or unknown); each Korean stock is one Naver request. A lagging or undated feed (delayed quotes) does
-        not end the search, and the round keeps the newest print it saw."""
+        not end the search, and the round keeps the newest print it saw. ``only`` (1.154.31, Bot.refresh_stock_live):
+        "kr" the Korean stocks alone, "rest" the others — each part on its own cadence, neither waiting for the other's source."""
         due = {symbol: ticker for symbol, ticker in self.config.tickers.items()
-               if stock_live_window(ticker.market, now_ms, self.config.holidays.get(ticker.market, frozenset()))}
-        if not due or (not force and time.monotonic() - self.live_refreshed < self.config.quote_refresh):
+               if stock_live_window(ticker.market, now_ms, self.config.holidays.get(ticker.market, frozenset()))
+               and (not only or (ticker.market == "kr") == (only == "kr"))}
+        last = self.live_refreshed_part.get(only, -1e9) if only else self.live_refreshed
+        if not due or (not force and time.monotonic() - last < self.config.quote_refresh - self.LIVE_DUE_SLACK):
             return False  # nothing trading / not due: nothing fetched
-        self.live_refreshed = time.monotonic()
+        if only:
+            self.live_refreshed_part[only] = time.monotonic()
+        else:
+            self.live_refreshed = time.monotonic()
         failures: dict[str, list[str]] = {symbol: [] for symbol in due}
         fresh: set[str] = set()
         newest: dict[str, IndexQuote] = {}
@@ -23730,6 +23739,17 @@ class Bot:
                self.config.sim_edge, self.config.sim_shares, self.config.sim_group_usd, sim_scope(self.config))
         if key in self.sim_report_cache:  # the page asks every few seconds; the records change only when the step changes them
             return self.sim_report_cache[key]
+        # 1.154.31: ...which, with a real maker, is every second (11-19 10:12: 4,338 re-quotes in an hour and a half, the records
+        # written at each) — so every answer of the probability page summed all 14,668 records afresh on the event loop: 142
+        # stalls of 0.1–0.48 s in ten minutes, 5.4% of the loop, for as long as the page was open (sim_stats ← sim_report). The
+        # page's report (``public``) is kept SIM_REPORT_KEEP_FACTOR times the seconds its build held the loop, whatever was
+        # written meanwhile: a hundredth of the loop at the most, its totals half a minute old. One that cost nothing to build
+        # (SIM_REPORT_KEEP_MIN_S: a few hundred records) is built afresh as before; /sim and the control page ask their own
+        settings = (recent, public) + key[4:]
+        kept = self.__dict__.get("sim_report_kept")
+        if public and kept is not None and kept[0] == settings and time.monotonic() < kept[1]:
+            return kept[2]
+        began = time.perf_counter()
         trades = sorted(self.sim_trades().items(), key=lambda kv: kv[1].get("opened", 0))
         private = public and (bool(getattr(self.config, "live_key", "")) or self.sim_has_real())  # real trades in the records: an account's activity, key or no key
         rows = [{"id": tid, "opened": stamp(t["opened"], seconds=False), "item": t["item"], "label": t["label"],
@@ -23749,7 +23769,14 @@ class Bot:
                   "blocks": [] if private else self.sim_blocks(),  # the public page: the totals only, never a position's name or cost
                   "group_cap": self.config.sim_group_usd, "rows": [] if private else rows, "private": private}
         self.sim_report_cache = {key: report}
+        took = time.perf_counter() - began
+        if public and took >= self.SIM_REPORT_KEEP_MIN_S:
+            self.sim_report_kept = (settings, time.monotonic() + min(self.SIM_REPORT_KEEP_MAX_S, self.SIM_REPORT_KEEP_FACTOR * took), report)
         return report
+
+    SIM_REPORT_KEEP_FACTOR = 100.0  # the page's report: kept this many times the seconds its build took (sim_report)...
+    SIM_REPORT_KEEP_MAX_S = 120.0   # ...two minutes at the most...
+    SIM_REPORT_KEEP_MIN_S = 0.02    # ...and not at all when it took less than this
 
     def sim_text(self) -> str:
         r = self.sim_report(recent=10)
@@ -26480,6 +26507,10 @@ class Bot:
                     if note := self.predict.graphql_note():
                         detail += "｜" + note
                 lines.append(f"  {mark} {name}：{what}｜上次用时 {state['ms'] / 1000:.1f}s｜共 {state['runs']} 轮{busy}{detail}{err}")
+                takers = getattr(self, "live_taker_lines", None)
+                if name == "模拟交易" and takers:  # 1.154.31: the real taker orders by market — which fill, which never do, and why
+                    with contextlib.suppress(Exception):  # (a note: never the reason /diag has no trader line)
+                        lines.extend("    " + row for row in takers(now_ms))
         else:
             lines.append("🔄 后台刷新：未启动（命令行诊断或测试环境）")
         cooling = SOURCE_HEALTH.lines()
@@ -26726,7 +26757,7 @@ class Bot:
     def reference_jobs(self) -> list[tuple[str, Any]]:
         """(name, coroutine factory) per reference feed; each has its own refresh cadence inside."""
         now = self.market.now_ms
-        jobs = [("交易所收盘", lambda: self.stocks.refresh(now())), ("股票实时", lambda: self.stocks.refresh_live(now())),
+        jobs = [("交易所收盘", lambda: self.stocks.refresh(now())), ("股票实时", lambda: self.refresh_stock_live(now())),
                 ("汇率", self.fx.refresh),
                 ("恒指期货", lambda: self.refresh_hsi(now())), ("Hyperliquid", self.hl.refresh),
                 ("KOSPI", lambda: self.kospi.refresh(now())), ("上证/A50", lambda: self.cn.refresh(now()))]
@@ -26747,6 +26778,52 @@ class Bot:
         if self.config.edge_alert and self.config.predict:
             jobs.append(("优势提醒", lambda: self.edge_alerts(now())))
         return jobs
+
+    async def refresh_stock_live(self, now_ms: int) -> Refreshed | bool:
+        """The stocks' realtime quotes (the 股票实时 job). 1.154.31 — the user: "宇树 海力士 长鑫一直吃不到单": a daily card of a stock
+        is taken on the exchange's own price while it trades, and that price was as old as this job is slow. It read Tencent (the
+        A-shares and Hong Kong in one request, some 0.2 s from here) and then Naver (each Korean stock: 0.3–0.8 s) one after
+        the other, and came round a second after both: a round every 1.8 s on 11-19 (3,051 in 5,458 s). Now the Korean part
+        runs beside it, a task of its own (stock_kr_round), and the job comes round on the second (reference_loop): Tencent
+        once a second, Naver as often as it answers, neither waiting for the other; and a stock whose price moved has its card
+        looked at now (stock_live_round), not at the next fair-signature slot. With one kind of source alone: as it was."""
+        markets = {ticker.market == "kr" for ticker in self.config.tickers.values()}
+        if markets != {True, False}:
+            return await self.stock_live_round(now_ms, "")
+        task = self.__dict__.get("stock_kr_task")
+        if (task is None or task.done()) and not self.stopping.is_set():
+            self.stock_kr_task = asyncio.create_task(self.stock_kr_round(), name="stock-live-kr")
+        rest = await self.stock_live_round(now_ms, "rest")
+        ended, self.stock_kr_ended = self.__dict__.get("stock_kr_ended", False), False  # a Korean round ended since this job last said so
+        if rest is False and not ended:
+            return False
+        due = [symbol for symbol, ticker in self.config.tickers.items()
+               if stock_live_window(ticker.market, now_ms, self.config.holidays.get(ticker.market, frozenset()))]
+        errors = self.stocks.live_errors
+        return refreshed([f"{symbol}：{errors[symbol]}" for symbol in due if symbol in errors], sum(1 for symbol in due if symbol not in errors))
+
+    async def stock_kr_round(self) -> None:
+        """One round of the Korean stocks' quotes beside the job (refresh_stock_live): its failures are the stocks' own
+        (StockMarket.live_errors), never this task's."""
+        try:
+            if await self.stock_live_round(self.market.now_ms(), "kr") is not False:
+                self.stock_kr_ended = True
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self.log_limited("stock-live-kr", f"韩国个股实时价读取异常：{clean_error(error) or type(error).__name__}")
+
+    async def stock_live_round(self, now_ms: int, only: str) -> Refreshed | bool:
+        """A round of realtime quotes (StockMarket.refresh_live) and, for the stocks whose price it moved, a look at their
+        cards now — the express lane's (priced: the book key of a stock's daily card is its symbol) — where the move used to
+        wait for the next fair-signature slot, a second apart for all the feeds together (note_job)."""
+        before = {symbol: q.last for symbol, q in self.stocks.live.items() if q is not None}
+        result = await self.stocks.refresh_live(now_ms, only=only)
+        if result is not False:
+            moved = {symbol for symbol, q in self.stocks.live.items() if q is not None and before.get(symbol) != q.last}
+            if moved:
+                self.priced(moved)
+        return result
 
     async def refresh_books(self, now_ms: int) -> Refreshed | bool:
         """The orderbook round: the hot keys every round, the cold ones now and then (PredictFeed.refresh); a round
@@ -27218,6 +27295,9 @@ class Bot:
         failed = [f"{key}：{touch.error}" for key, touch in self.touches.items() if touch.error]
         return refreshed(failed, len(self.touches) - len(failed))
 
+    ON_THE_SECOND = frozenset({"股票实时"})  # the jobs whose rounds begin REFERENCE_TICK apart (reference_loop)...
+    ON_THE_SECOND_MIN = 0.2                  # ...with this much rest after a round at the least
+
     async def reference_loop(self, name: str, job: Any) -> None:
         """Refresh one reference feed forever, isolated from the price-alert loop and from the other feeds."""
         token = HTTP_POOL.set(self.reference_pool)  # this task's blocking requests stay off the default pool
@@ -27245,7 +27325,10 @@ class Bot:
                 if ran:
                     state.update(ms=int((time.monotonic() - started) * 1000), runs=state["runs"] + 1)
                     self.note_job(name, self.market.now_ms())  # a fair price that moved: the trader looks now
-                await self.wait(REFERENCE_TICK)
+                # 1.154.31: the stocks' quotes come round on the second, not a second after each round ended (a round of 0.5–0.8 s
+                # made it one every 1.8 s: refresh_stock_live) — never sooner than ON_THE_SECOND_MIN after a round
+                tick = max(self.ON_THE_SECOND_MIN, REFERENCE_TICK - (time.monotonic() - started)) if name in self.ON_THE_SECOND else REFERENCE_TICK
+                await self.wait(tick)
         finally:
             HTTP_POOL.reset(token)
 

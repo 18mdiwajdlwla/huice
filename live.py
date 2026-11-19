@@ -3195,6 +3195,83 @@ class LiveBot(core.Bot):
                 "requotes": sum(1 for r in rows if r[4]), "parts": parts,
                 "flush": span([int(r[7]) for r in rows if r[7] is not None])}  # the wait for the writer before the request (1.111.1)
 
+    TAKER_LINES_HOURS = 24   # /diag's taker lines cover the real taker orders this far back...
+    TAKER_LINES_MARKETS = 8  # ...of this many markets at the most (the most orders first)
+
+    def live_taker_lines(self, now_ms: int) -> list[str]:
+        """/diag (1.154.31 — the user: "宇树 海力士 长鑫一直吃不到单…检查下原因", with nothing to go by but the feeds' health): the real
+        taker orders of the last TAKER_LINES_HOURS by market — how many went out, how many filled anything, the shares got of
+        those asked; of the latest that filled nothing, when, what it asked at what limit against the ask it was sized on,
+        how old the quote behind its fair price was when it was decided (the exchange's own time, and when the bot read it),
+        the way out in its parts and why it ended; and the latest taker look that was refused (sim_note_block: no order at
+        all). A market that cannot be taken says here which it is: too late for the offer, or never sent."""
+        since = now_ms - self.TAKER_LINES_HOURS * 3_600_000
+        by: dict[str, dict] = {}
+        for t in self.sim_trades().values():
+            st = t.get("live")
+            if t.get("maker") or not isinstance(st, dict) or int(t.get("opened") or 0) < since:
+                continue
+            g = by.setdefault(str(t.get("key") or t.get("item") or ""), {"name": str(t.get("item") or t.get("key") or ""), "sent": 0, "hit": 0,
+                                                                      "asked": 0.0, "got": 0.0, "unsent": 0, "miss": None})
+            if not st.get("sent_at"):
+                g["unsent"] += 1  # decided, never sent: dropped at the re-check before the request, refused in its slot
+                continue
+            got = float(t.get("shares") or 0)
+            g["sent"], g["asked"], g["got"] = g["sent"] + 1, g["asked"] + float(t.get("order") or 0), g["got"] + got
+            if got > 1e-9:
+                g["hit"] += 1
+            elif g["miss"] is None or int(t.get("opened") or 0) > int(g["miss"].get("opened") or 0):
+                g["miss"] = t
+        refused: dict[str, dict] = {}
+        for b in self.sim_blocks():  # (newest first)
+            if str(b.get("label") or "").startswith("吃") and int(b.get("at") or 0) >= since:
+                refused.setdefault(str(b.get("key") or b.get("item") or ""), b)
+        clock = lambda ms: dt.datetime.fromtimestamp(int(ms) / 1000, core.BEIJING).strftime("%m-%d %H:%M:%S")
+        rows = []
+        for key in sorted(set(by) | set(refused), key=lambda k: (-(by.get(k) or {}).get("sent", 0), k))[:self.TAKER_LINES_MARKETS]:
+            g, b = by.get(key), refused.get(key)
+            text = f"· {(g or {}).get('name') or (b or {}).get('item') or key}："
+            if g is not None and g["sent"]:
+                text += f"发 {g['sent']} 张、有成交 {g['hit']} 张（{g['got']:g}/{g['asked']:g} 份）"
+            else:
+                text += "没发过吃单"
+            if g is not None and g["unsent"]:
+                text += f"，另有 {g['unsent']} 张决定了没发出"
+            if g is not None and g["miss"] is not None:
+                text += "｜最近没成交的：" + self.live_taker_miss(g["miss"])
+            if b is not None:
+                text += f"｜最近一次没下单：{clock(b['at'])} {b.get('label', '')}（{core.brief_error(str(b.get('why') or ''), 80)}）"
+            rows.append(text)
+        return [f"吃单结果（真实订单，近 {self.TAKER_LINES_HOURS} 小时，按市场）："] + rows if rows else []
+
+    @staticmethod
+    def live_taker_miss(t: dict) -> str:
+        """A real taker order that filled nothing, in a line (live_taker_lines)."""
+        st = t["live"]
+        want, entry = st.get("want") or {}, t.get("entry") or {}
+        clock = lambda ms: dt.datetime.fromtimestamp(int(ms) / 1000, core.BEIJING).strftime("%m-%d %H:%M:%S")
+        num = lambda v: float(str(v))
+        text = f"{clock(t['opened'])} {t.get('label', '')}"
+        with contextlib.suppress(Exception):
+            text += f" 限价 {num(want.get('limit') or want.get('cap') or 0) * 100:g}¢×{num(t.get('order') or 0):g}"
+            ask = (want.get("asks") or [None])[0]
+            if ask:
+                text += f"（当时卖1 {num(ask[0]) * 100:g}¢×{num(ask[1]):g}）"
+        why = str(st.get("cancel_why") or "") or next((str(e.get("what") or "") for e in reversed(st.get("events") or []) if e.get("what")), "") or core.sim_status(t)
+        timing = []
+        with contextlib.suppress(Exception):
+            at = int(entry.get("at") or t["opened"])
+            live = [x for x in entry.get("sources") or [] if int(x.get("quoted_ms") or 0) > 0]
+            if live:  # the freshest of them is the live quote (the reference close is hours old by its nature)
+                x = max(live, key=lambda x: int(x["quoted_ms"]))
+                timing.append(f"行情（{x.get('source') or x.get('what') or ''}）是 {max(0.0, (at - int(x['quoted_ms'])) / 1000):.1f} 秒前的"
+                              + (f"、{max(0.0, (at - int(x['fetched_ms'])) / 1000):.1f} 秒前读到" if int(x.get("fetched_ms") or 0) > 0 else ""))
+            if st.get("sent_at"):
+                timing.append(f"决定→发出 {max(0, int(st['sent_at']) - int(t['opened']))} ms")
+            if st.get("sent_at") and st.get("answered_at"):
+                timing.append(f"发出→应答 {max(0, int(st['answered_at']) - int(st['sent_at']))} ms")
+        return text + (" → " + core.brief_error(why, 60) if why else "") + ("｜" + "、".join(timing) if timing else "")
+
     def live_redeem_tick(self, now_ms: int | None = None) -> None:
         """An automatic redeem round started when one is due (LIVE_REDEEM_SECONDS since the last, sooner after a win:
         live_redeem_soon) and none runs — beside the caller: a round of chain calls (a dozen positions failing on gas took
