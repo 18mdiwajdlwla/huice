@@ -138,7 +138,12 @@ async def run():
     assert "✅ Predict 盘口：3 秒前成功｜上次用时 1.8s｜共 90 轮｜上轮 14 个市场（阶梯 5 档），最慢 NIULAI 1.2s" in st, st
     assert "✅ 模拟交易：2 秒前成功｜上次用时 0.9s｜共 50 轮（决策内：盘口 0.1s、判断 0.0s、结算 0.0s、保存 0.0s；172 个市场、3000 条记录）" in st, st
     bot.predict.round_info = {"keys": 3, "rows": 0, "ms": 500, "slowest": None}
-    assert "｜上轮 3 个市场｜推送：尚未连接\n" in "\n".join(bot.diag_state(NOW)) + "\n"  # 1.86.0: the stream's state follows the round's
+    # 1.86.0: the stream's state follows the round's. 1.154.29: ...and, after it, how many markets of 15- / 5-minute cards nobody
+    # trades the feed follows (Bot.follow_note; test_follow.py) — the line ends there
+    line = next(row for row in bot.diag_state(NOW) if "Predict 盘口：" in row)
+    assert "｜上轮 3 个市场｜推送：尚未连接" in line, line
+    assert line.endswith("｜推送：尚未连接" + ("｜" + bot.follow_note(NOW) if bot.follow_note(NOW) else "")), line
+    assert "张 15 / 5 分钟涨跌卡没有策略在做" in line or not bot.window_idle(NOW), line
     # 1.154.7: the sync's list — the pages as requested and the rows Predict really put on a full one, beside LIVE_ORDERS_PAGE's ask
     sync = {"pages": 1, "bounded": True, "list_s": 0.3, "markets": 0, "filter": False, "reads": 6, "later": 0, "work_s": 0.5, "records": 16}
     bot.live_sync_detail = {**sync, "page_rows": 50, "page_asked": 100}
