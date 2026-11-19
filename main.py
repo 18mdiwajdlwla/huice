@@ -52,7 +52,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.31"
+VERSION = "1.154.32"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -2054,6 +2054,14 @@ def newer(quote: Any, previous: Any) -> Any:
     return quote
 
 
+def quote_in(feed: Any) -> None:
+    """An index feed just stored a live price: whoever hangs on it is told now (``on_quote``, the Bot's quote_read: the card
+    is looked at) — at the price's arrival, not at the end of a round that reads other things beside it (1.154.32)."""
+    hook = getattr(feed, "on_quote", None)
+    if hook is not None:
+        hook()
+
+
 @dataclass(frozen=True)
 class Refreshed:
     """What one background refresh achieved. ok: valid new data for every part; partial: for some parts; failed:
@@ -3536,6 +3544,7 @@ class IndexFutures:
         if self.quote is not None and spot.quoted_ms >= self.quote.spot_time:
             self.quote = self.with_spot(self.quote, spot)
             self.spot_at, self.spot_error = time.monotonic(), ""
+            quote_in(self)  # the card's price while the cash session runs: told as it arrives (beside the page: refresh)
         return Refreshed("ok")
 
     def remember(self, q: FuturesQuote) -> None:
@@ -3583,11 +3592,21 @@ class IndexFutures:
     async def refresh(self, now_ms: int, force: bool = False) -> Refreshed | bool:
         if not self.enabled:
             return False
+        spot = (self.cash_open(now_ms) and self.quote is not None
+                and time.monotonic() - self.spot_refreshed >= self.SPOT_SECONDS)
         if not (force or time.monotonic() - self.refreshed >= self.cadence(now_ms) or self.cash_close_due(now_ms)):
-            if (self.cash_open(now_ms) and self.quote is not None
-                    and time.monotonic() - self.spot_refreshed >= self.SPOT_SECONDS):
-                return await self.refresh_spot(now_ms)
-            return False  # not due yet: nothing fetched
+            return await self.refresh_spot(now_ms) if spot else False  # (False: not due yet, nothing fetched)
+        if force or not spot:
+            return await self.refresh_page(now_ms)
+        # 1.154.32: the cash index beside the futures page, not in the page's stead. A round was the page or the index, never
+        # both: the index — the card's price while the cash session runs — was read every other round, 2 s and more apart
+        # (11-19) for a cadence of one (SPOT_SECONDS). The page keeps its own (SESSION_SECONDS)
+        page, cash = await asyncio.gather(self.refresh_page(now_ms), self.refresh_spot(now_ms))
+        return Refreshed("partial", cash.error) if page.status == "ok" and cash.status != "ok" else page
+
+    async def refresh_page(self, now_ms: int) -> Refreshed:
+        """The futures page's round (refresh): the futures, and the cash index it shows — or, where that cannot be trusted,
+        the timed feeds'."""
         self.refreshed, self.refreshed_ms = time.monotonic(), now_ms
         parsed: list[FuturesQuote] = []
 
@@ -3608,6 +3627,7 @@ class IndexFutures:
             await self.read_families(now_ms, attempted, parse)
         if error:  # nothing current: keep the newest quote known, with the reason shown
             self.quote, self.error = newer(quote, self.quote), error
+            quote_in(self)
             return Refreshed("failed", error)
         prev = self.quote
         if (self.cash_open(now_ms) and prev is not None and prev.spot is not None and prev.spot_source != quote.source
@@ -3637,6 +3657,7 @@ class IndexFutures:
         if not self.spot_error:
             self.spot_at = time.monotonic()
         self.quote, self.error = quote, ""
+        quote_in(self)
         return refreshed([f"恒指现货：{self.spot_error}" if self.spot_error else ""], 1)
 
     def line(self, now_ms: int, style: str) -> str:
@@ -4367,16 +4388,24 @@ class CnIndex:
             return False  # not due yet: nothing fetched
         self.refreshed, self.refreshed_ms = time.monotonic(), now_ms
         # a source whose answer parses but is stale or undated does not end the search; nothing current keeps the newest
-        quote, _, self.error = await pick_quote(self.SSE_SOURCES, lambda n, r: parse_cn_index(n, r, now_ms),
-                                                lambda q: self.sse_problem(q, now_ms))
-        self.quote = newer(quote, self.quote) if self.error else quote
-        self.note_minute(now_ms)
-        a50, skipped, self.a50_error = await pick_quote(self.A50_SOURCES, lambda n, r: self.parse_a50(n, r, now_ms),
-                                                        lambda q: self.a50_problem(q, now_ms))
-        self.a50 = newer(a50, self.a50) if self.a50_error else a50
-        self.a50_skipped = "" if self.a50_error else "；".join(skipped)  # why earlier sources were passed over
-        if self.a50_skipped:
-            LOG.info("A50 fell back to %s: %s", self.a50.source if self.a50 else "-", self.a50_skipped)
+
+        async def composite() -> None:
+            quote, _, self.error = await pick_quote(self.SSE_SOURCES, lambda n, r: parse_cn_index(n, r, now_ms),
+                                                    lambda q: self.sse_problem(q, now_ms))
+            self.quote = newer(quote, self.quote) if self.error else quote
+            self.note_minute(now_ms)
+            quote_in(self)  # the session's price: told as it arrives, whatever the A50's answer takes
+
+        async def proxy() -> None:
+            a50, skipped, self.a50_error = await pick_quote(self.A50_SOURCES, lambda n, r: self.parse_a50(n, r, now_ms),
+                                                            lambda q: self.a50_problem(q, now_ms))
+            self.a50 = newer(a50, self.a50) if self.a50_error else a50
+            self.a50_skipped = "" if self.a50_error else "；".join(skipped)  # why earlier sources were passed over
+            if self.a50_skipped:
+                LOG.info("A50 fell back to %s: %s", self.a50.source if self.a50 else "-", self.a50_skipped)
+            quote_in(self)  # (the after-hours price)
+        # 1.154.32: side by side — one after the other, each price was the other's request old before the round ended
+        await asyncio.gather(composite(), proxy())
         daily = await self.refresh_daily(now_ms, force)
         return refreshed([f"上证：{self.error}" if self.error else "", f"A50：{self.a50_error}" if self.a50_error else "",
                           f"上证日K：{daily}" if daily else ""],
@@ -4615,6 +4644,8 @@ class KospiIndex:
                ("东方财富", IndexFutures.EM + "100.KS11", {"Referer": "https://quote.eastmoney.com/"}))
     SOURCES_200 = (("Naver", "https://polling.finance.naver.com/api/realtime/domestic/index/KPI200",
                     {"Referer": "https://finance.naver.com/"}),)
+    K200_SECONDS = 5       # KOSPI200 — shown beside Hyperliquid's KR200, no card is taken on it — this often at the most (1.154.32: the
+    #                        index's own round now comes on the second; Naver is asked about as often as before, for the index alone)
 
     def __init__(self, enabled: bool = True, holidays: frozenset = frozenset()):
         self.enabled = enabled
@@ -4624,6 +4655,7 @@ class KospiIndex:
         self.error = ""
         self.error200 = ""
         self.refreshed = -1e9
+        self.refreshed200 = -1e9
         self.daily: dict[dt.date, D] = {}   # dated official closes (Yahoo ^KS11, else Naver's daily chart)
         self.daily_rank: dict[dt.date, int] = {}  # which source each close came from (0 = Yahoo, the settlement one)
         self.daily_refreshed = -1e9
@@ -4697,8 +4729,18 @@ class KospiIndex:
         if not self.enabled or (not force and time.monotonic() - self.refreshed < self.cadence(now_ms)):
             return False  # not due yet: nothing fetched
         self.refreshed = time.monotonic()
-        self.quote, self.error = await self._fetch(self.SOURCES, now_ms, self.quote)
-        self.quote200, self.error200 = await self._fetch(self.SOURCES_200, now_ms, self.quote200)
+
+        async def index() -> None:
+            self.quote, self.error = await self._fetch(self.SOURCES, now_ms, self.quote)
+            quote_in(self)  # the card's price: told as it arrives, whatever KOSPI200's answer takes
+
+        async def kospi200() -> None:
+            if not force and time.monotonic() - self.refreshed200 < self.K200_SECONDS:
+                return
+            self.refreshed200 = time.monotonic()
+            self.quote200, self.error200 = await self._fetch(self.SOURCES_200, now_ms, self.quote200)
+        # 1.154.32: side by side — one after the other, the index's price was a second request old before the round ended
+        await asyncio.gather(index(), kospi200())
         daily = await self.refresh_daily(now_ms)
         return refreshed([f"KOSPI：{self.error}" if self.error else "", f"KOSPI200：{self.error200}" if self.error200 else "",
                           f"日K：{daily}" if daily else ""],
@@ -17946,6 +17988,10 @@ class Bot:
             LOG.info("波动率历史已从数据库恢复：%d 个标的", restored)
         self.predict = PredictFeed(config)
         self.predict.on_update = self.sim_express  # a market's book in: its taker decided at once (1.66.0)
+        # 1.154.32: an index's price in: its card looked at at once (quote_read; the feeds say so as they store one: quote_in)
+        self.hsi.on_quote = lambda: self.quote_read("恒指期货")
+        self.kospi.on_quote = lambda: self.quote_read("KOSPI")
+        self.cn.on_quote = lambda: self.quote_read("上证/A50")
         self.hsi_daily = DailyCloses("hk", (
             ("tencent", "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=hkHSI,day,,,10,"),
             ("eastmoney", "https://push2his.eastmoney.com/api/qt/stock/kline/get?klt=101&fqt=0&end=20500101&lmt=10"
@@ -26822,7 +26868,7 @@ class Bot:
         if result is not False:
             moved = {symbol for symbol, q in self.stocks.live.items() if q is not None and before.get(symbol) != q.last}
             if moved:
-                self.priced(moved)
+                self.priced(moved, now=True)  # (1.154.32: at once — a polled quote, nothing to gather: priced)
         return result
 
     async def refresh_books(self, now_ms: int) -> Refreshed | bool:
@@ -26896,6 +26942,7 @@ class Bot:
         if time.monotonic() - self.fair_sig_at < 1.0:  # a dozen feeds tick every second: one look a second is enough
             return
         self.fair_sig_at = time.monotonic()
+        seen, self.price_seen = self.__dict__.get("price_seen") or set(), set()
         try:
             sig, keys = self.fair_signature_keys(now_ms)
         except Exception as error:
@@ -26907,7 +26954,8 @@ class Bot:
             first = self.fair_sig is None
             self.fair_sig, self.sim_wake = sig, True
             moved -= set(looked)  # a push's own keys were looked at by price_looks already (1.138.1: the rest — a REST proxy's move the
-            if moved and not first:  # push's look came after — go to the lane too; they were swallowed into the signature)
+            moved -= seen            # push's look came after — go to the lane too; they were swallowed into the signature); 1.154.32: and
+            if moved and not first:  # a polled quote's keys at its arrival (priced, now)
                 self.priced(moved)
 
     PRICE_LOOK_DELAY = 0.1  # pushes gathered this long before the keys they move are looked at (a busy pair ticks many times a second; 1.111.0: 0.1, was 0.2)
@@ -27044,9 +27092,18 @@ class Bot:
         quiet = getattr(self, "rules_quiet", None)
         return over >= self.DAY_PASS_S + self.DAY_PASS_LATE_S and not (quiet is not None and quiet() > 0)
 
-    def priced(self, keys: Any) -> None:
+    def priced(self, keys: Any, now: bool = False) -> None:
         """Book keys a pushed price moved: looked at together after PRICE_LOOK_DELAY (price_looks) — the express lane for
-        their takers, the trader woken for the rest (note_job) — not once per tick of a busy pair."""
+        their takers, the trader woken for the rest (note_job) — not once per tick of a busy pair. 1.154.32, ``now``: the keys
+        of a polled quote (a new price a second at the most: nothing to gather) are looked at right here; the fair signature's
+        next check takes them as looked at (price_seen, note_job) and wakes the trader for the rest."""
+        if now:
+            seen = self.__dict__.setdefault("price_seen", set())
+            for key in sorted(keys):
+                if key in self.predict.books or key in self.predict.ladders:
+                    self.predict.updated(key)
+                    seen.add(key)
+            return
         self.price_dirty.update(keys)
         if self.price_look is None or self.price_look.done():
             self.price_look = asyncio.create_task(self.price_looks(), name="price-look")
@@ -27295,8 +27352,43 @@ class Bot:
         failed = [f"{key}：{touch.error}" for key, touch in self.touches.items() if touch.error]
         return refreshed(failed, len(self.touches) - len(failed))
 
-    ON_THE_SECOND = frozenset({"股票实时"})  # the jobs whose rounds begin REFERENCE_TICK apart (reference_loop)...
-    ON_THE_SECOND_MIN = 0.2                  # ...with this much rest after a round at the least
+    ON_THE_SECOND = frozenset({"股票实时", "恒指期货", "KOSPI", "上证/A50"})  # the jobs whose rounds begin REFERENCE_TICK apart (reference_loop)...
+    ON_THE_SECOND_MIN = 0.2                  # ...with this much rest after a round at the least...
+    ON_THE_SECOND_EDGE = 0.02                # ...and this much past the second
+    QUOTE_KEYS = {"恒指期货": ("HSI",), "KOSPI": ("KOSPI",), "上证/A50": ("SSE",)}  # an index feed's job -> the book keys of the cards taken on its price
+
+    def quote_mark(self, name: str) -> dict[str, D]:
+        """The live prices an index feed's card is taken on, as they stand, each by its name (quote_read) — the cash index
+        and, for the hours it is the proxy, the future: the HSI futures of every family the after-hours card may use
+        (hsi_choices), the A50. (KOSPI's after-hours price is Hyperliquid's KR200, pushed: hl_pushed.) One not in hand has no
+        entry."""
+        if name == "恒指期货":
+            q = self.hsi.quote
+            parts = {"期货": q.last if q else None, "现货": q.spot if q else None,
+                     **{f"期货·{family}": other.last for family, other in self.hsi.families.items()}}
+        elif name == "KOSPI":
+            parts = {"现货": self.kospi.quote.last if self.kospi.quote else None}
+        else:
+            parts = {"现货": self.cn.quote.last if self.cn.quote else None, "A50": self.cn.a50.last if self.cn.a50 else None}
+        return {part: price for part, price in parts.items() if price is not None}
+
+    def quote_read(self, name: str) -> None:
+        """An index feed just stored a live price (its on_quote, set in __init__: at the price's arrival; and the end of its
+        round, reference_loop): when a price its card is taken on moved, the card is looked at now (priced, at once). 1.154.32.
+        Until then an index's move waited for the round to end — the second request of the round, the page beside the cash
+        index — and then for the fair signature's next check, one a second for all the feeds together (note_job), and the
+        gathering of the pushes after that (PRICE_LOOK_DELAY): half a second and more on average, on a quote already a second
+        behind its exchange. A stock's daily card has its Binance pair's pushes to bring the express lane round meanwhile;
+        an index has none. Never an error of the feed's: a look that cannot be asked for is logged and left to the signature."""
+        try:
+            marks = self.__dict__.setdefault("quote_marks", {})
+            mark, old = self.quote_mark(name), marks.get(name) or {}
+            marks[name] = mark
+            # (a price first in hand — after a start, or its source back — moved nothing: the signature's check has it)
+            if any(part in old and old[part] != price for part, price in mark.items()):
+                self.priced(self.QUOTE_KEYS[name], now=True)
+        except Exception as error:
+            self.log_limited("quote-read", f"{name} 的报价到了，当场看这张卡时出错：{clean_error(error) or type(error).__name__}")
 
     async def reference_loop(self, name: str, job: Any) -> None:
         """Refresh one reference feed forever, isolated from the price-alert loop and from the other feeds."""
@@ -27324,10 +27416,16 @@ class Bot:
                     state["running_since"] = 0.0
                 if ran:
                     state.update(ms=int((time.monotonic() - started) * 1000), runs=state["runs"] + 1)
+                    if name in self.QUOTE_KEYS:
+                        self.quote_read(name)  # (whatever the round stored without saying so: the card is looked at before the signature)
                     self.note_job(name, self.market.now_ms())  # a fair price that moved: the trader looks now
                 # 1.154.31: the stocks' quotes come round on the second, not a second after each round ended (a round of 0.5–0.8 s
-                # made it one every 1.8 s: refresh_stock_live) — never sooner than ON_THE_SECOND_MIN after a round
-                tick = max(self.ON_THE_SECOND_MIN, REFERENCE_TICK - (time.monotonic() - started)) if name in self.ON_THE_SECOND else REFERENCE_TICK
+                # made it one every 1.8 s: refresh_stock_live) — never sooner than ON_THE_SECOND_MIN after a round. 1.154.32: the
+                # index feeds too (their own cadence in a session is a second: SESSION_SECONDS; 11-19, a round every 1.5–2 s), a
+                # hair past the second (ON_THE_SECOND_EDGE: each feed's own "is a second up" is asked of a stamp taken a moment
+                # after this loop's)
+                tick = (max(self.ON_THE_SECOND_MIN, REFERENCE_TICK - (time.monotonic() - started)) + self.ON_THE_SECOND_EDGE
+                        if ran and name in self.ON_THE_SECOND else REFERENCE_TICK)
                 await self.wait(tick)
         finally:
             HTTP_POOL.reset(token)
