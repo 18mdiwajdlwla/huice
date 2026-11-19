@@ -480,6 +480,17 @@ async def run():
     assert 0 < bot.live_backoff[("deep", "up", "吃")][0] - time.monotonic() <= 30, "the timer's cancel: the taker's short wait (1.90.0), not a failure's"
     await step(bot, NOW + 131_000, deep(NOW + 131_000))  # within LIVE_TAKER_RETRY_SECONDS: refused, and the refusal recorded
     assert "deep|up|吃" not in bot.sim_trades() and any(b["id"] == "deep|up|吃" and "再试" in b["why"] for b in bot.sim_blocks())
+    # 1.154.31: /diag says it by market — how many real taker orders went out and how many filled anything; of the latest that
+    # filled nothing, what it asked at what limit against the ask it was sized on, its way out and why it ended; the latest refusal
+    lines = bot.live_taker_lines(NOW + 131_000)
+    assert lines[0] == "吃单结果（真实订单，近 24 小时，按市场）：" and "· 恒生指数：发 1 张、有成交 1 张（100/100 份）" in lines, lines
+    assert ("· deep：发 1 张、有成交 0 张（0/100 份）｜最近没成交的：10-05 10:01:00 吃涨 限价 58¢×100（当时卖1 58¢×100） → 吃单 60 秒未全部成交"
+            "｜决定→发出 0 ms、发出→应答 0 ms｜最近一次没下单：10-05 10:02:11 吃涨（吃单未成交（吃单 60 秒未全部成交），30 秒后再试）") in lines, lines
+    bot.reference_state["模拟交易"] = {"ok_at": time.time() - 2, "error": "", "error_at": 0.0, "ms": 900, "runs": 50, "running_since": 0.0, "status": "ok"}
+    state = bot.diag_state(NOW + 131_000)
+    at = next(i for i, row in enumerate(state) if "模拟交易：" in row)
+    assert state[at + 1] == "    吃单结果（真实订单，近 24 小时，按市场）：" and any(row.startswith("    · deep：发 1 张、有成交 0 张") for row in state[at + 2:at + 4]), state[at:at + 4]
+    del bot.reference_state["模拟交易"]
     bot.live_backoff[("deep", "up", "吃")] = (time.monotonic() - 1, "x")
     await step(bot, NOW + 141_000, deep(NOW + 141_000))
     t = bot.sim_trades()["deep|up|吃"]
@@ -488,6 +499,14 @@ async def run():
     await step(bot, NOW + 203_000, deep(NOW + 203_000))  # 62 s: the rest cancelled, the 60 shares are the position
     t = bot.sim_trades()["deep|up|吃"]
     assert t["status"] == "filled" and t["shares"] == 60 and t["unfilled"] == 40 and "真实成交 60/100 份" in t["note"], t
+    lines = bot.live_taker_lines(NOW + 203_000)  # the most orders first; the one that filled nothing is still the latest miss
+    assert lines[1].startswith("· deep：发 2 张、有成交 1 张（60/200 份）｜最近没成交的：10-05 10:01:00 吃涨 限价 58¢×100") and lines[2] == "· 恒生指数：发 1 张、有成交 1 张（100/100 份）", lines
+    # ...the quote behind the fair price, when the record keeps it: the exchange's own time and when the bot read it
+    miss = {**bot.sim_trades()["deep|up|吃#1"]}
+    miss["entry"] = {"at": miss["opened"], "sources": [m.price_evidence("参考收盘", "腾讯日K", "sh688836", "日K收盘", 600, miss["opened"] - 60_000_000, miss["opened"] - 50_000),
+                                                       m.price_evidence("现货", "腾讯", "sh688836", "最新价", 610.92, miss["opened"] - 2_300, miss["opened"] - 400)]}
+    assert bot.live_taker_miss(miss).endswith("｜行情（腾讯）是 2.3 秒前的、0.4 秒前读到、决定→发出 0 ms、发出→应答 0 ms"), bot.live_taker_miss(miss)
+    assert bot.live_taker_lines(NOW + 203_000 + 25 * 3_600_000) == [], "a day on: none of the last 24 hours"
 
     # --- a refused request: no record under the slot, the attempt journaled, the market backed off ------------------------------
     fake.fail_create = "HTTP 400: insufficient balance"
