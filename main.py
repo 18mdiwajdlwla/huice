@@ -52,7 +52,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.27"
+VERSION = "1.154.30"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -778,6 +778,11 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("SIM_WAYS", "做哪种单", "吃单 = 算出仍留足净优势的最高价位（封顶价），盘口在它之下的立即买（真实交易用封顶限价单）；挂单 = 按建议价挂着等成交"),
     ("SIM_MARKETS", "做哪些市场", "可多选；全选 = all；展开详细选项可按市场逐个排除"),
     ("SIM_SKIP", "不做的市场（详细选项）", "逗号分隔的市场代码；在“做哪些市场”卡片展开详细选项点选，空 = 所选类型里的市场都做；没设过时默认排除美股的 12 张 15 分钟卡（只给预挂用），要原策略也做就在详细选项里恢复"),
+    ("PREDICT_FOLLOW_UNTRADED", "没人做的 15 分钟 / 5 分钟涨跌卡：跟不跟、显示不显示", "不跟、不显示（默认，1.154.30）= 只跟有人用的卡：原策略在做的（上面选了“加密涨跌”且没在详细选项里排除）、"
+     "原策略还有没结算的单的、规则吃单盘中要看的（黄金）；其余的不订阅 Predict 盘口、不读市场详情和起点价，概率页上也不显示（页脚写着有几张没显示）。"
+     "跟并显示 = 1.154.29 以前的样子：每张卡的当前场次都跟着、都显示，不管有没有策略在做——Predict 的推送一条连接最多订 80 个市场，这些卡占着 20 多个名额，"
+     "把原策略在做的价格阶梯档位挤去靠轮询读，它们的读取也占主 Key 的额度。不跟的卡照常算模型价、记定时样本（样本里“盘口中间价”一栏是空的）、攒 σ 校准；"
+     "预挂和规则吃单不受影响（它们自己读自己的）。日涨跌卡照旧都跟、都显示。随时可以改，改了下一轮就生效"),
     ("SIM_GROUP_USD", "每组最坏单一事件亏损上限（$）", "容不下想买的份数时只买到刚好不超过的份数，一份都容不下才不买；0 = 不限"),
     ("SIM_TAKER_SESSION", "只在标的开盘时段吃单", "开 = 指数/个股日涨跌的吃单只在标的开盘时段（卡片按现货定价时）进行，盘后只挂单；挂单不受影响"),
     ("SOURCES_OFF", "关闭的行情源", "海外机房常被东方财富拒绝（502 / 直接断开）：关掉后每一轮、每个锚点查找和 /diag 都不再问它，由腾讯、新浪、Yahoo、Naver 顶上（A50 的 15:00 锚点只能用新浪 5 分钟 K 的近似值）"),
@@ -987,6 +992,13 @@ class Config:
     big_move_sigmas: float = 1.5               # PROB_BIG_MOVE_SIGMAS: a daily card's σ ahead is widened once the day's move passes this many daily σ (big_move_widen); 0 = never
     sim_after_hours_max_shares: float = 300.0  # SIM_AFTER_HOURS_MAX_SHARES: after hours a market's side holds at most this many shares (positions and orders); 0 = no limit
     sigma_calib: bool = True      # SIGMA_CALIB: a 15-minute card's σ times the factor its windows' moves imply (Bot.sigma_calib)
+    # PREDICT_FOLLOW_UNTRADED (1.154.29): on (as before) — every 15- / 5-minute card's market is followed on Predict (its book pushed,
+    # its details and start price read) whoever trades it; off — only a card somebody uses (Bot.window_use: the model trader trades
+    # it, holds an open record on it, or the rule taker buys in its windows' course). 11-18: 23 of the feed's 40 keys were such
+    # cards with the model trader on none of them — 23 of the stream's 80 topics (PREDICT_WS_MAX_TOPICS: full, the ladders' levels
+    # it does trade left to the REST rounds) and most of the feed's reads on a key at its pace.
+    # 1.154.30 (the user: "没做的直接不显示"): off is the default, and a card not followed is not on the page either (Bot.window_shown)
+    predict_follow_untraded: bool = False
     lead_quote: str = "on"        # LEAD_QUOTE: a 15-minute card priced on its stock's exchange quote (on), recorded only (shadow), or not (off): IndexUpDownMarket.effective
     sim_shares_net: bool = True   # SIM_SHARES_NET: the share caps count a side's net position — what it holds less the other side's fills; off = each side on its own
     sim_open_quiet_minutes: int = 3            # SIM_OPEN_QUIET_MINUTES: no new order on a daily card this long after its underlying opens; 0 = none
@@ -1267,6 +1279,7 @@ class Config:
             sim_maker_points=not off(e.get("SIM_MAKER_POINTS", "on")),
             sim_shares_net=not off(e.get("SIM_SHARES_NET", "on")),
             sigma_calib=not off(e.get("SIGMA_CALIB", "on")),
+            predict_follow_untraded=not off(e.get("PREDICT_FOLLOW_UNTRADED", "off")),
             lead_quote=parse_choice(e, "LEAD_QUOTE", "on", ("on", "shadow", "off")),
             touch=e.get("BNB_TOUCH", "on").strip().lower() not in {"off", "0", "false", "no"},
             ladder_deadlines=parse_deadlines(e.get("LADDER_DEADLINES", "")),
@@ -12576,6 +12589,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "SIM_WAYS": {"kind": "choice", "group": "策略", "options": [["taker", "只吃单"], ["maker", "只挂单"], ["both", "挂单和吃单"]]},
     "SIM_MARKETS": {"kind": "multi", "group": "策略", "options": [[k, n] for k, n in SIM_KINDS.items()]},
     "SIM_SKIP": {"kind": "detail", "group": "策略"},  # drawn inside the SIM_MARKETS card: one chip per market of the chosen kinds
+    "PREDICT_FOLLOW_UNTRADED": {"kind": "choice", "group": "策略", "options": [["off", "不跟、不显示"], ["on", "跟并显示"]]},
     "SIM_TAKER_SESSION": {"kind": "choice", "group": "策略", "options": [["off", "全天都吃单"], ["on", "只在开盘时段吃单"]]},
     "SOURCES_OFF": {"kind": "choice", "group": "高级", "options": [["", "全部启用"], ["eastmoney", "关闭东方财富"]]},
     "SIM_TAKER_AFTER_HOURS_CENTS": {"kind": "number", "group": "策略", "presets": ["0", "10", "15", "20", "30"], "unit": "¢", "zero": "关"},
@@ -20278,7 +20292,7 @@ class Bot:
     def odds_payload(self) -> dict:
         """JSON for the web page: one entry per item, numbers raw, text already plain."""
         now_ms = self.market.now_ms()
-        items = []
+        items, hidden = [], 0
         for title, odds in (self.odds_items(now_ms) if self.config.probability else []):
             name, _, symbol = title.partition("｜")
             base = {"name": name, "symbol": symbol, "group": "contract" if symbol else "index"}
@@ -20309,8 +20323,12 @@ class Bot:
         if self.config.touch:  # one broken card must not take the whole page down with it
             items.extend(self.safe_card(f"{t.spec.symbol.removesuffix('USDT')} 先触", t.spec.key, t.GROUP, self.touch_payload, t, now_ms)
                          for t in self.touches.values())
+            # 1.154.30 (the user: "没做的直接不显示"): a 15- / 5-minute card nobody uses is not followed (updown_wanted) and not shown
+            busy = None if self.config.predict_follow_untraded else self.window_busy()
+            shown = [u for u in self.updowns.values() if self.window_shown(u, busy)]
+            hidden = len(self.updowns) - len(shown)
             items.extend(self.safe_card(u.spec.name, u.spec.key, u.GROUP if isinstance(u, IndexUpDownMarket) else "crypto",
-                                        self.updown_payload, u, now_ms) for u in self.updowns.values())
+                                        self.updown_payload, u, now_ms) for u in shown)
             items.extend(self.safe_card(f.spec.name, f.spec.key, "crypto", self.flip_payload, f, now_ms) for f in self.flips.values())
             items.extend(self.safe_card(r.spec.name, r.spec.key, "crypto", self.range_payload, r, now_ms) for r in self.ranges.values())
             items.extend(self.safe_card(c.spec.name, c.spec.key, "crypto", self.cap_payload, c, now_ms) for c in self.caps.values())
@@ -20343,9 +20361,11 @@ class Bot:
                 "today": f"{today:%m-%d} {WEEKDAYS[today.weekday()]}",
                 "mode": BASELINE_SHORT.get(self.settings()["mode"], self.settings()["mode"]),
                 "color_style": self.config.color_style, "items": items, "notional": self.config.predict_trade_usd,
+                "hidden": hidden,
                 "note": ("模型参考，非投资建议。有效价 = 参考收盘 × 代理现价 ÷ 代理在参考收盘时刻的价格；"
                          "P(涨) = 1 − Φ(ln((参考+半跳)/有效)/σ剩余)，平盘两边各计一半。目标日跳过周末和已配置的交易所假期。"
-                         if self.config.probability else "概率功能已关闭（PROBABILITY=off）。")}
+                         if self.config.probability else "概率功能已关闭（PROBABILITY=off）。")
+                        + (f"｜没有策略在做的 15 分钟 / 5 分钟涨跌卡 {hidden} 张没显示（控制台“没人做的 15 分钟 / 5 分钟涨跌卡”选“跟并显示”恢复）。" if hidden else "")}
 
     def odds_numbers(self, title: str, name: str, odds: CloseOdds) -> dict:
         """A daily card's figures that move with every quote: shared by data.json and the event stream (live.json), so
@@ -25134,13 +25154,64 @@ class Bot:
         if self.config.touch:
             targets.update({spec.key: spec.slug for spec in (*TOUCH_MARKETS, *FLIP_MARKETS, *CAP_MARKETS, *RANGE_MARKETS,
                                                               *STOCK_HIT_MARKETS)})
-            targets.update({key: mkt.spec.slug for key, mkt in self.updowns.items() if self.updown_wanted(mkt, now_ms)})  # a daily card: the day it is on; a 15-minute card: its window, from a quarter hour before
+            busy = None if self.config.predict_follow_untraded else self.window_busy()  # (the open records' cards, once a round)
+            targets.update({key: mkt.spec.slug for key, mkt in self.updowns.items() if self.updown_wanted(mkt, now_ms, busy)})  # a daily card: the day it is on; a 15-minute card: its window, from a quarter hour before
         return targets
 
-    def updown_wanted(self, mkt: UpDownMarket, now_ms: int) -> bool:
+    def updown_wanted(self, mkt: UpDownMarket, now_ms: int, busy: set | None = None) -> bool:
         """Whether the Predict feed follows this card's market now: a daily card's always; a 15-minute card's from
-        WINDOW_LEAD_MS before its window — not through a lunch break or a night for a window hours away."""
-        return not isinstance(mkt, IndexUpDownMarket) or now_ms >= mkt.spec.start_ms + 60_000 - WINDOW_LEAD_MS
+        WINDOW_LEAD_MS before its window — not through a lunch break or a night for a window hours away. 1.154.29: ...and,
+        with PREDICT_FOLLOW_UNTRADED off, only while somebody uses the card (window_use)."""
+        if not isinstance(mkt, IndexUpDownMarket):
+            return True
+        if now_ms < mkt.spec.start_ms + 60_000 - WINDOW_LEAD_MS:
+            return False
+        return self.config.predict_follow_untraded or bool(self.window_use(mkt.spec.key, busy))
+
+    def window_busy(self) -> set[str]:
+        """The cards (book keys) the model trader has an open record on: an order out or a position not settled."""
+        return {str(t.get("key") or "") for _, t in trades_open(self.sim_trades())}
+
+    def window_use(self, key: str, busy: set | None = None) -> str:
+        """Who uses a 15- / 5-minute card's market on Predict — its book, its details, its start price — "" for nobody
+        (PREDICT_FOLLOW_UNTRADED, 1.154.29): the model trader trades the card (the kind chosen in SIM_MARKETS, the card not left
+        out in SIM_SKIP) or still has an open record on it (``busy``: window_busy — an order to withdraw, a position to see
+        out). LiveBot adds the rule taker, for a card whose index its windows' course is judged by. The pre-open mode reads
+        its own (its discovery, its orders; of the card, the exchange quote alone: card_hold) and is no user of the feed's."""
+        c = self.config
+        if c.sim and "updown" in c.sim_markets and key.upper() not in c.sim_skip:
+            return "原策略在做"
+        if key in (self.window_busy() if busy is None else busy):
+            return "原策略还有没结算的单"
+        return ""
+
+    def window_shown(self, mkt: UpDownMarket, busy: set | None = None) -> bool:
+        """Whether the page shows this card (1.154.30 — the user: "没做的直接不显示"): every daily card; a 15- / 5-minute card with
+        PREDICT_FOLLOW_UNTRADED on, or one somebody uses (window_use) — what is not followed is not shown, in a window or between
+        two. With no Predict feed at all (PREDICT=off) nothing is followed and nobody trades: the page is the model's alone, every
+        card on it as ever."""
+        c = self.config
+        return c.predict_follow_untraded or not c.predict or not isinstance(mkt, IndexUpDownMarket) or bool(self.window_use(mkt.spec.key, busy))
+
+    def window_idle(self, now_ms: int) -> list[str]:
+        """The 15- / 5-minute cards nobody uses (window_use) whose window is on or about to begin — the ones PREDICT_FOLLOW_UNTRADED
+        decides about (/diag, the page)."""
+        busy = self.window_busy()
+        return [key for key, mkt in self.updowns.items() if isinstance(mkt, IndexUpDownMarket)
+                and now_ms >= mkt.spec.start_ms + 60_000 - WINDOW_LEAD_MS and not self.window_use(key, busy)]
+
+    def follow_note(self, now_ms: int) -> str:
+        """/diag, on the feed's line: how many markets of cards nobody uses the feed follows (and that the stream's topics
+        are full of them), or leaves alone — "" with none such."""
+        idle = self.window_idle(now_ms) if self.config.touch and self.config.predict else []
+        if not idle:
+            return ""
+        if not self.config.predict_follow_untraded:
+            return f"没人做的 15 / 5 分钟涨跌卡 {len(idle)} 张没跟（PREDICT_FOLLOW_UNTRADED=off：不订阅、不读起点价，概率页不显示）"
+        full = len(self.predict.stream.wanted) >= PREDICT_WS_MAX_TOPICS
+        return (f"其中 {len(idle)} 张 15 / 5 分钟涨跌卡没有策略在做，也订阅着、读着起点价"
+                + (f"——推送名额 {PREDICT_WS_MAX_TOPICS} 个已满，在做的阶梯档位有的只能靠轮询读" if full else "")
+                + "（控制页“没人做的 15 分钟 / 5 分钟涨跌卡”选“不跟、不显示”可省）")
 
     def edge_costs(self) -> EdgeCosts:
         return EdgeCosts(self.config.predict_fee_bps, self.config.predict_trade_usd)
@@ -25571,6 +25642,7 @@ class Bot:
                   "SIM_CRYPTO_15M_OPEN_USD": plain(c.sim_crypto_15m_open_usd), "SIM_CRYPTO_15M_MAKER_QUIET_SECONDS": str(c.sim_crypto_15m_maker_quiet),
                   "SIM_MAKER_EXIT_CENTS": f"{c.sim_maker_exit * 100:g}", "SIM_MAKER_FOLLOW_SETTLE_SECONDS": plain(c.sim_maker_follow_settle), "SIM_MAKER_SESSION": flag(c.sim_maker_session), "SIM_MAKER_POINTS": flag(c.sim_maker_points), "SIM_MAKER_DEEPER": flag(c.sim_maker_deeper),
                   "SIM_SHARES_NET": flag(c.sim_shares_net), "SIGMA_CALIB": flag(c.sigma_calib),
+                  "PREDICT_FOLLOW_UNTRADED": flag(c.predict_follow_untraded),
                   "SIM_MAKER_AFTER_HOURS_CENTS": f"{c.sim_maker_after_hours * 100:g}", "SIM_MAKER_DEEP_CENTS": f"{c.sim_maker_deep * 100:g}",
                   "SIM_MAKER_SPREAD_CENTS": f"{c.sim_maker_spread * 100:g}", "SIM_MAKER_DEEP_ONLY": flag(c.sim_maker_deep_only),
                   "SIM_MAKER_AFTER_HOURS_MARKETS": ",".join(sorted(c.sim_maker_after_hours_markets)), "SIM_MAKER_DEEP_MARKETS": ",".join(sorted(c.sim_maker_deep_markets)),
@@ -26402,6 +26474,9 @@ class Bot:
                                + (f"，最慢 {r['slowest'][0]} {r['slowest'][1] / 1000:.1f}s" if r.get("slowest") else ""))
                 if name == "Predict 盘口":
                     detail += f"｜推送：{self.predict.stream.line()}"
+                    with contextlib.suppress(Exception):  # (a note: never the reason /diag has no feed line)
+                        if note := self.follow_note(self.market.now_ms()):
+                            detail += "｜" + note
                     if note := self.predict.graphql_note():
                         detail += "｜" + note
                 lines.append(f"  {mark} {name}：{what}｜上次用时 {state['ms'] / 1000:.1f}s｜共 {state['runs']} 轮{busy}{detail}{err}")

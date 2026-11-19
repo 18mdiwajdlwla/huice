@@ -7167,6 +7167,19 @@ class LiveBot(core.Bot):
             LOG.warning("预挂按市场的归档统计没用上（较早日子的记录数会少算）：%s", core.clean_error(error) or type(error).__name__)
         return cards_between(rows, first, last, share)
 
+    def window_use(self, key: str, busy: set | None = None) -> str:
+        """...and the rule taker (1.154.29): a card whose index a rule's windows are judged by in their course (rules.live_guard —
+        the card's window, its start by the candle and by Predict's own figure, its index): gold's, with a RULE_GOLD_*_LIVE_CENTS
+        set and the taker not off. A rule that buys before its windows alone reads its own books and needs no card."""
+        if why := super().window_use(key, busy):
+            return why
+        settings = self.config.rules
+        if settings.mode != "off":
+            import rules
+            if any(rule.card == key and rules.live_price_of(settings, rule) > 0 for rule in rules.RULES):
+                return "规则吃单盘中要用"
+        return ""
+
     def preopen_unverified(self) -> set[tuple[str, int]]:
         """The outcomes where a pre-open order's fills are not read for certain yet (preopen.unverified_outcomes): a position
         there may be its fill — the positions check leaves them alone until the mode has read them (1.131.5)."""
