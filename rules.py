@@ -112,6 +112,14 @@ REST_SOON_S = 0.005           # ...this short for a book that changed while the 
 FOLLOW_EVERY_MS = 1_000       # a withdrawn order read again this often until Predict's word is final...
 UNKNOWN_EVERY_MS = 10_000     # ...an order whose placement's answer went missing, looked for by its hash this often
 GIVE_UP_MS = 15 * 60_000      # ...and given up as never placed this long after its signed expiry
+# 1.154.33 (an outside review, R01 / R07 / CR-08): a withdrawal Predict answered "nothing to remove" (noop) while the order's read
+# still shows it open is asked again this long on; one asked for with no read to go by (the read failed or found nothing, the
+# taker's key cooling down) after such an answer, this long on
+NOOP_AGAIN_MS, BLIND_AGAIN_MS = 5_000, 30_000
+# ...doubled for each such answer in a row, up to this (the review of the fix: a record that never caught up had the order read
+# every second and asked every five, inside the taker's tick, until its signed expiry — hours for one placed at the makers'
+# moment). Never taken for its word: an order Predict says it cannot remove while its record shows it open keeps its window spoken for
+NOOP_MAX_MS = 60_000
 REJECT_PAUSE_MS = 30_000      # a window whose order Predict refused is looked at again this long on...
 MAX_REJECTS = 5               # ...and left alone after this many refusals
 SETTLE_AFTER_MS = 120_000     # Predict's result asked for this long after the window's end, then every SETTLE_EVERY_MS
@@ -151,7 +159,8 @@ HOT_BEFORE_MS, HOT_AFTER_MS = 10_000, 120_000  # ...and around the moment itself
 VERIFY_HOT_S = 1.0
 ALLOWANCE_MS = 60_000         # the exchange allowance read again this often
 ALLOWANCE_UNLIMITED, ALLOWANCE_LONG_MS = 10 ** 40, 3_600_000  # ...one this large (an unlimited approval: 2^256 − 1) only this often
-RECHECKED = ("规则吃单的设置刚改过", "盘中：")  # before_send's words for an order held back on what its look had judged (send: no pause for these)
+STOP_WORD = f"开场前 {STOP_MS // 1000} 秒内不再发单"  # (1.154.33, R18: before_send's word for an order whose way ran into STOP_MS)
+RECHECKED = ("规则吃单的设置刚改过", "盘中：", STOP_WORD)  # before_send's words for an order held back on what its look had judged (send: no pause for these)
 HELD_BACK_MAX = 3             # ...up to this many in a row a window: then it pauses like a refusal (a record of them, one a look, helps nobody)
 CONFLICT_GRACE_MS = 90_000    # an order Predict answered 409 for and then cannot show by its hash is given up as never placed after this long...
 CONFLICT_MISSES = 6           # ...and this many reads that found nothing (an answer gone missing waits for its expiry, as before: GIVE_UP_MS)
@@ -423,6 +432,8 @@ WATCH = {"best": None, "offer_max": 0.0, "offer_ms": 0, "listed_ms": 0, "open_ms
          "bids_before": None, "bids_at": None, "bids_after": None, "looked_ms": 0,
          "rival_ms": 0, "rival_ts": 0, "rival_px": None, "rival_sz": None, "rival_first": False}
 OPEN_STATES = {"placing", "open", "unknown"}  # an order on its way or on the book: it may still take what the book offers
+REST_STATES = {"open", "cancelling", "unknown"}  # ...one whose rest may stand on the book, to be withdrawn by its id (withdraw_rest)
+PENDING_STATES = OPEN_STATES | {"cancelling"}   # ...one that may still fill, its removal not confirmed (pending_usd)
 
 
 def open_orders(rec: dict) -> list[dict]:
@@ -487,8 +498,9 @@ def known_orders(recs: dict[str, dict], now_ms: int) -> tuple[set[str], set[str]
         for o in rec.get("orders") or []:
             if o.get("id"):
                 ids.add(str(o["id"]))
-            if o.get("hash"):
-                hashes.add(str(o["hash"]).lower())
+            for key in ("hash", "api_hash"):  # (1.154.33, R07: Predict's own hash too, where it gave one of its own — RuleTaker.send)
+                if o.get(key):
+                    hashes.add(str(o[key]).lower())
     return ids, hashes
 
 
@@ -781,6 +793,7 @@ class RuleStream:
     SILENT_S = 45.0              # no frame for this long (three heartbeats): the connection is made anew
     BACKOFF = (2.0, 120.0)       # the wait before a new connection, doubled per failure
     SYNC_S = 30.0                # the subscriptions brought in step at least this often (at once when the wants change)
+    RESUBSCRIBE_S = 2.0          # a subscription the server refused asked for again this soon (resubscribe, 1.154.33)
 
     def __init__(self, taker: "RuleTaker", connect: Any = None):
         self.taker = taker
@@ -795,6 +808,7 @@ class RuleStream:
         self.on_change: Any = None           # ...and told right then (1.154.23: RuleTaker.pushed_now — looked at in this very turn when the taker goes first; True: all taken)
         self.wake = asyncio.Event()
         self.pending: dict[int, tuple[str, str]] = {}
+        self.refused: dict[str, float] = {}  # market id -> monotonic time of the server's last refusal of its subscription (resubscribe)
         self.request_id = 0
         self.ws: Any = None
         self.connects = 0
@@ -821,6 +835,13 @@ class RuleStream:
         """The connection lives: a frame — a book, or the heartbeat every 15 s — within ALIVE_S. While it does, the book it holds of a
         subscribed market is the market's (a quiet one's is not sent again: 11-17, 75 topics and 1.2 re-sends a second in all)."""
         return self.ws is not None and time.monotonic() - self.last_frame <= ALIVE_S
+
+    def vouches(self, mid: str) -> bool:
+        """Whether the book held of this market stands for it however old (alive): the connection lives and the market is one of its
+        subscriptions. 1.154.33 (an outside review, CR-04): of any market it held, before — one whose subscription the server had
+        refused is pushed nothing, and what it held of it was a REST read's (merge), looked at as current for as long as the
+        connection lived (the REST reads beside the pushes go to one window alone around its makers' moment: two minutes)."""
+        return self.alive() and mid in self.subscribed
 
     def held(self, mid: str) -> tuple | None:
         """(bids, asks, when) as last pushed — or read over REST beside the pushes (merge) — however long ago; None for none."""
@@ -943,6 +964,15 @@ class RuleStream:
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self.wake.wait(), self.SYNC_S)
 
+    def resubscribe(self, mid: str) -> None:
+        """A subscription the server refused, asked for again RESUBSCRIBE_S on (sync_loop woken) — the first refusal of the market in
+        SYNC_S; refused again within it, at the sync's own pace (no request a round trip, however long it keeps refusing)."""
+        now = time.monotonic()
+        last, self.refused[mid] = self.refused.get(mid, -1e9), now
+        if now - last >= self.SYNC_S:
+            with contextlib.suppress(RuntimeError):  # (no loop running: nothing to wake)
+                asyncio.get_running_loop().call_later(self.RESUBSCRIBE_S, self.wake.set)
+
     async def request(self, ws: Any, method: str, mid: str) -> None:
         self.request_id += 1
         self.pending[self.request_id] = (method, mid)
@@ -961,6 +991,12 @@ class RuleStream:
                 if mid and (msg.get("success") is False or (msg.get("success") is None and msg.get("error"))):
                     if method == "subscribe":
                         self.subscribed.discard(mid)  # asked for again at the next sync
+                        # 1.154.33 (an outside review, CR-04): nothing of it is pushed on this connection — what is held of it (a
+                        # REST read's) is dropped, and it is asked for again in a moment rather than at the next sync (SYNC_S)
+                        self.books.pop(mid, None)
+                        self.versions.pop(mid, None)
+                        self.stamps.pop(mid, None)
+                        self.resubscribe(mid)
                     self.error = f"{method} {mid}：{msg.get('error') or '拒绝'}"
         elif msg.get("type") == "M":
             topic = str(msg.get("topic") or "")
@@ -1107,9 +1143,11 @@ class RuleTaker:
         self.planned_ms = 0
 
     # -- the gates --
-    def block(self, usd: float) -> str:
+    def block(self, usd: float, net: bool = False) -> str:
         """Why no real order goes out now ("" to send): the mode, real trading off or paused, the day's loss stop, the account,
-        the API's cooldown, the balance."""
+        the API's cooldown, the balance. ``net`` (1.154.33, an outside review, CR-03): the balance less what this taker's orders
+        still out may take (pending_usd) — for an order being decided (place); not at its bytes (before_send: orders of one turn
+        go out side by side, and each would count the others there)."""
         owner, c = self.owner, self.owner.config
         if self.settings.mode != "on":
             return f"规则吃单是“{MODES.get(self.settings.mode, self.settings.mode)}”，不下单"
@@ -1134,7 +1172,24 @@ class RuleTaker:
         usd_left = owner.live.usd() if callable(getattr(owner.live, "usd", None)) else None
         if usd_left is not None and usd_left < usd:
             return f"USDT 余额 ${usd_left:,.2f} 不足本单 ${usd:,.2f}"
+        if usd_left is not None and net and usd > 0 and (pending := self.pending_usd()) > DUST and usd_left - pending < usd:
+            return f"USDT 余额 ${usd_left:,.2f}，在途的规则单还要 ${pending:,.2f}，剩下的不足本单 ${usd:,.2f}"
         return ""
+
+    def pending_usd(self) -> float:
+        """USDT this taker's real orders may still take (1.154.33, an outside review, CR-03): each one on its way, on the book, of
+        unknown answer or withdrawn unconfirmed — its unfilled shares at its limit; those of the turn under way too (place records
+        an order before its request leaves). The balance (LiveTrader.usd: the chain's, read every minute) knows nothing of them —
+        Predict holds no money for an order — so the windows of one turn were each sized on all of it (two orders of $29 on $30)."""
+        now = self.now()
+        # (the review of the fix: not an order past its signed expiry — it fills nothing more — nor one whose answer went missing and
+        # whose hash finds nothing past CONFLICT_GRACE_MS, what a 409's is given: held at its full price until GIVE_UP_MS past its
+        # expiry, it cut every other window's size for hours. Its own window stays spoken for whatever: held)
+        return sum(max(float(o.get("shares") or 0) - float(o.get("filled") or 0), 0.0) * float(o.get("limit") or 0)
+                   for rec in self.recs.values() if rec.get("mode") == "on"
+                   for o in rec.get("orders") or () if o.get("state") in PENDING_STATES and not o.get("removed") and not o.get("paper")
+                   and int(o.get("expires") or 0) * 1000 > now
+                   and not (o.get("state") == "unknown" and not o.get("id") and now - int(o.get("at") or now) > CONFLICT_GRACE_MS))
 
     def before_send(self, body: dict) -> str:
         """Judged right before an order's bytes go out (preopen.safe_api): the gates again, and the window's start not passed."""
@@ -1158,6 +1213,14 @@ class RuleTaker:
             return "订单记录不见了"
         if int(order.get("expires") or 0) * 1000 - self.now() < SEND_MIN_LEFT_MS:
             return "距订单到期不足 5 秒（开场前 5 秒到期；盘中的单在这一场结束前 5 秒到期），不再发送"
+        # 1.154.33 (an outside review, R18): nothing is placed within STOP_MS of the start (in a window's course, LIVE_STOP_MS of its
+        # end) — held at the look alone (phase): an order decided 16 s before the start whose way took 4 (the sign-in, the allowance's
+        # read, a token of the key's pace) still left at 12. Held back here as the look's own judgment (RECHECKED: not a refusal)
+        live_order = bool(order.get("live"))
+        edge = int(rec.get("end_ms") or 0) - LIVE_STOP_MS if live_order else int(rec.get("start_ms") or 0) - STOP_MS
+        if edge > 0 and self.now() >= edge:
+            return ((f"盘中：这一场结束前 {LIVE_STOP_MS // 1000} 秒内不再发单" if live_order else STOP_WORD)
+                    + "（这张单在那之前决定，发出时已到这段时间）")
         if why := self.block(float(order.get("shares") or 0) * float(order.get("limit") or 0)):
             return why
         if order.get("live") and (rule := RULE_OF.get(rec.get("rule"))) is not None:
@@ -1229,7 +1292,18 @@ class RuleTaker:
             side = [t for t in (streaming, lagging, self.warming, self.verifying, *self.rush_tasks, *self.first_tasks) if t is not None]
             for task in side:
                 task.cancel()
-            await asyncio.gather(*side, return_exceptions=True)
+            try:
+                await asyncio.gather(*side, return_exceptions=True)
+            finally:
+                self.close_journal()
+
+    def close_journal(self) -> None:
+        """1.154.33 (an outside review, CR-11): the orders' journal closed as the loop ends (its last withdrawal done, nothing more is
+        sent: a send after it would wait for the store, as one with no journal does) — it was left open to the process's end."""
+        fd, self.journal_fd = self.journal_fd, None
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
     async def lag_loop(self) -> None:
         """How late the loop wakes (1.154.15, /rules): a sleep of LAG_EVERY_S, and by how much it overran — the time a pushed book
@@ -1673,10 +1747,11 @@ class RuleTaker:
         slug = min(due)[1]
         w = self.track[slug]
         w["rest_at"] = self.verify_at = mono
-        if hot and not w["open_ms"] and self.stream.alive() and self.stream.held(str(w["market"]["id"])) is not None:
+        if hot and not w["open_ms"] and self.stream.vouches(str(w["market"]["id"])) and self.stream.held(str(w["market"]["id"])) is not None:
             # 1.154.22: at the makers' moment a market not yet seen open for matching is asked for its status, not its book — while
-            # its book comes pushed (the connection alive, a book of it in hand): an offer found on it would wait for this very
-            # read. With the push down the read stays the book's, as before: the looks go on on these reads alone then
+            # its book comes pushed (the connection alive, a book of it in hand; 1.154.33: and subscribed to it — vouches): an offer
+            # found on it would wait for this very read. With the push down the read stays the book's, as before: the looks go on on
+            # these reads alone then
             self.verifying = asyncio.create_task(self.verify_status(slug, w), name="rules-verify-status")
         else:
             self.verifying = asyncio.create_task(self.verify(str(w["market"]["id"])), name="rules-verify")
@@ -1911,7 +1986,8 @@ class RuleTaker:
             self.fast_looks += 1
             if pushed is None:
                 got = self.stream.held(mid)
-                if got is not None and (self.stream.alive() or asked - got[2] <= FAST_STALE_S):
+                # (1.154.33, an outside review, CR-04: the live connection vouches for its subscriptions' books alone — vouches)
+                if got is not None and (self.stream.vouches(mid) or asked - got[2] <= FAST_STALE_S):
                     pushed = got[:2]
                 elif asked - w.get("rest_at", -1e9) < FAST_STALE_S:
                     w["word"] = "每秒检查：等盘口（推送还没送到，REST 轮流读取中）"
@@ -1996,9 +2072,13 @@ class RuleTaker:
             take = room if fresh >= SWEEP_SHARES and (fresh >= room / SWEEP_PART or self.sprinting(w, now)) else min(fresh, room)
             usd_left = self.owner.live.usd() if callable(getattr(self.owner.live, "usd", None)) else None
             if usd_left is not None:  # no more than the USDT at hand buys at the order's price
-                afford = (D(str(max(usd_left, 0.0))) / limit).to_integral_value(rounding="ROUND_FLOOR")
+                # 1.154.33 (an outside review, CR-03): ...less what this taker's orders still out may take — those of this very turn
+                # too (several windows' orders go out side by side, each sized on the whole balance before)
+                pending = self.pending_usd()
+                afford = (D(str(max(usd_left - pending, 0.0))) / limit).to_integral_value(rounding="ROUND_FLOOR")
                 if afford < 1 or float(afford * limit) < 1.0:
-                    w["word"] = f"USDT 余额 ${usd_left:,.2f} 不够一张最小订单"
+                    w["word"] = (f"USDT 余额 ${usd_left:,.2f}，在途的规则单还要 ${pending:,.2f}，剩下的不够一张最小订单" if pending > DUST
+                                 else f"USDT 余额 ${usd_left:,.2f} 不够一张最小订单")
                     return
                 take = min(take, afford)
         if self.settings.max_day_usd:
@@ -2225,7 +2305,7 @@ class RuleTaker:
         import live
         import preopen
         usd = float(take * limit)
-        if why := self.block(usd):
+        if why := self.block(usd, net=True):  # (1.154.33, CR-03: net of the orders still out, this turn's included)
             w["word"] = why
             return
         settings = self.settings  # (the look's: nothing waited for between its own check and here)
@@ -2322,6 +2402,12 @@ class RuleTaker:
         try:
             result = await self.api.create_order(body)
             order.update(id=str(result.get("order_id") or ""), state="open", next_ms=self.now() + FILL_READ_MS)
+            # 1.154.33 (an outside review, R07): Predict's own hash, where its answer gives one other than the one signed here, is the
+            # one its reads answer to — kept, as the model trader and the pre-open mode keep it (api_hash); read by the local one
+            # alone, such an order was found by no read (and its rest, withdrawn after a read, never withdrawn)
+            platform = str(result.get("hash") or "").lower()
+            if platform and platform != order["hash"]:
+                order["api_hash"] = platform
         except preopen.NotSent as error:
             order.update(state="not_sent", error=core.clean_error(error))
             order.pop("sent_wall", None)  # (it never left: not one of the orders timed — speed_stats)
@@ -2450,14 +2536,21 @@ class RuleTaker:
     # -- the orders --
     async def follow(self) -> None:
         """Each real order to Predict's final word: read FILL_READ_MS after its answer, its rest withdrawn, read again until
-        final; an order whose answer went missing looked for by its hash until GIVE_UP_MS past its signed expiry."""
+        final; an order whose answer went missing looked for by its hash until GIVE_UP_MS past its signed expiry. While the
+        taker's key cools down its reads wait (they are the key's) — 1.154.33 (an outside review, CR-08): and its withdrawals go
+        on the bot's own client meanwhile (withdraw_cooling), as the stop's do; they waited too, the rest standing on the book
+        the whole cooldown (a 429: twenty seconds and more) at the rule's price — in a window's course at its own."""
         import live
         now = self.now()
         for slug, rec in list(self.recs.items()):
             if rec.get("mode") != "on" or not in_flight(rec):
                 continue
             for order in rec["orders"]:
-                if order.get("paper") or order.get("state") in FINAL_STATES or now < int(order.get("next_ms") or 0) or self.cooling() > 0:
+                if order.get("paper") or order.get("state") in FINAL_STATES or now < int(order.get("next_ms") or 0):
+                    continue
+                if self.cooling() > 0:
+                    if await self.withdraw_cooling(order, now):
+                        self.save(rec)
                     continue
                 try:
                     await self.follow_order(rec, order, now)
@@ -2477,7 +2570,14 @@ class RuleTaker:
             state = "unknown"
         late = now >= int(order.get("expires") or 0) * 1000 + GIVE_UP_MS
         self.reads += 1
-        row = await self.api.order(order.get("id") or "", order["hash"])
+        try:  # (1.154.33, an outside review, R07: by Predict's own hash where its answer gave one — send)
+            row = await self.api.order(order.get("id") or "", order.get("api_hash") or order["hash"])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if not late:
+                await self.withdraw_unread(order, now)  # (R07: its rest withdrawn all the same — the read's failure then, as ever)
+            raise
         if row is None:
             if late:
                 if state == "unknown" and not order.get("id"):
@@ -2497,7 +2597,8 @@ class RuleTaker:
                 else:
                     order["next_ms"] = now + UNKNOWN_EVERY_MS
             else:
-                order["next_ms"] = now + (UNKNOWN_EVERY_MS if state == "unknown" else FOLLOW_EVERY_MS)
+                await self.withdraw_unread(order, now)  # (R07: an order with an id Predict's read cannot show — its rest withdrawn by the id)
+                order["next_ms"] = now + (UNKNOWN_EVERY_MS if order["state"] == "unknown" else FOLLOW_EVERY_MS)
             return
         order["id"] = str(row.get("id") or order.get("id") or "")
         self.take_fills(rec, order, row)
@@ -2515,12 +2616,117 @@ class RuleTaker:
             order.update(state="final", error="到期后仍显示挂着：按已知成交记")
             return
         if order.get("id"):  # still open: the rest withdrawn (a taker never waits on the book)
-            result = await self.api.remove_orders([order["id"]])
-            if order["id"] in (result.get("removed") or []) or order["id"] in (result.get("noop") or []):
-                order.update(removed=now, left_ms=now)
-            order.update(state="cancelling", next_ms=now + FOLLOW_EVERY_MS)
+            if self.rest_due(order, now, NOOP_AGAIN_MS):
+                await self.withdraw_rest(order, now)
+            else:  # (1.154.33, R01: Predict said "nothing to remove" a moment ago and still shows it open — read again when it is asked again)
+                order.update(state="cancelling", next_ms=max(now + FOLLOW_EVERY_MS, int(order.get("noop_ms") or 0) + self.noop_wait(order)))
         else:
             order["next_ms"] = now + UNKNOWN_EVERY_MS
+
+    def clients(self) -> list:
+        """The taker's client, then the bot's own (owner.live.api) when it is another: a request the first fails (its key cooling
+        down, an error) goes on the second — the orders are the same account's on either (withdraw_all's removals, 1.154.26)."""
+        main = getattr(getattr(self.owner, "live", None), "api", None)
+        return [self.api] + ([main] if main is not None and main is not self.api else [])
+
+    def spare_client(self) -> Any:
+        """The bot's own client when it is another than the taker's, can withdraw orders and is not in a cooldown of its own: the
+        way to Predict while the taker's key cools down (withdraw_cooling)."""
+        main = self.clients()[1:]
+        if not main or not callable(getattr(main[0], "remove_orders", None)):
+            return None
+        return None if float(getattr(main[0], "blocked_until", 0.0) or 0.0) > time.monotonic() else main[0]
+
+    async def remove_ids(self, ids: list[str], clients: list | None = None) -> dict:
+        """POST /orders/remove for ``ids`` on the first of ``clients`` (clients() by default) that answers: its answer; the last
+        failure raised when none does. 1.154.33 (an outside review, CR-08): withdraw_one and the follow-up asked the taker's
+        client alone (withdraw_all already went on to the bot's own) — in its key's cooldown an order answered after the stop
+        stood until the cooldown was over."""
+        failure: BaseException | None = None
+        for api in clients or self.clients():
+            if not callable(getattr(api, "remove_orders", None)):
+                continue
+            try:
+                return await api.remove_orders(ids)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                failure = error
+        raise failure or core.RemoteError("没有可用的撤单客户端")
+
+    async def look_up(self, order: dict) -> tuple[dict | None, str]:
+        """An order whose placement's answer went missing, looked for by its hash on the first client that answers (clients()):
+        (its record — None when Predict knows nothing of it —, "") or (None, why every client failed). 1.154.33 (an outside
+        review, CR-08): on the taker's client alone, before — in its key's cooldown the stop found nothing and said 查不到."""
+        why = ""
+        for api in self.clients():
+            if not callable(getattr(api, "order", None)):
+                continue
+            try:
+                return await api.order("", order.get("api_hash") or order["hash"]), ""
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                why = core.clean_error(error) or type(error).__name__
+        return None, why or "没有可用的查询客户端"
+
+    @staticmethod
+    def noop_wait(order: dict) -> int:
+        """How long after Predict's last "nothing to remove" the order is asked again: NOOP_AGAIN_MS, doubled for each such answer
+        in a row, NOOP_MAX_MS at the most (withdraw_rest counts them: noops)."""
+        return min(NOOP_AGAIN_MS * 2 ** max(int(order.get("noops") or 0) - 1, 0), NOOP_MAX_MS)
+
+    @classmethod
+    def rest_due(cls, order: dict, now: int, again_ms: int) -> bool:
+        """Whether an order's rest is to be asked to be withdrawn now: an id to withdraw it by, its removal not confirmed by
+        Predict, and no "nothing to remove" from Predict within ``again_ms`` (withdraw_rest) — or within noop_wait, when longer."""
+        return (bool(order.get("id")) and not order.get("removed")
+                and now - int(order.get("noop_ms") or 0) >= max(again_ms, cls.noop_wait(order)))
+
+    async def withdraw_rest(self, order: dict, now: int, clients: list | None = None) -> None:
+        """An order's rest asked to be withdrawn by its id (remove_ids): off the book on Predict's word that it removed it — final
+        by a read LATE_FILL_MS on (follow_order). 1.154.33 (an outside review, R01): "nothing to remove" (noop) is no such word.
+        It was taken for one: an order Predict answered so while it still stood (one a moment old, as withdraw_one has it) was
+        ended LATE_FILL_MS on though its reads showed it open, never asked again — the window's shares freed beside it (a second
+        order for them) and its later fills booked nowhere. Now its next read decides: ended or filled, it goes the way of any
+        order off the book; still open, it is asked again (NOOP_AGAIN_MS on)."""
+        oid = str(order["id"])
+        result = await self.remove_ids([oid], clients)
+        if oid in {str(i) for i in (result.get("removed") or [])}:
+            order.update(removed=now, left_ms=now)
+        elif oid in {str(i) for i in (result.get("noop") or [])}:
+            order.update(noop_ms=now, noops=int(order.get("noops") or 0) + 1)  # (noop_wait: the next ask waits longer each time)
+        order.update(state="cancelling", next_ms=now + FOLLOW_EVERY_MS)
+
+    async def withdraw_unread(self, order: dict, now: int) -> None:
+        """1.154.33 (an outside review, R07): an order with an id whose read failed or found nothing (Predict's record lagging, a
+        hash its reads do not answer to) — its rest asked to be withdrawn by that id all the same: a taker never waits on the
+        book, and the withdrawal came only after a read that showed the order open, so reads that kept failing left the rest
+        standing (to its signed expiry at the worst). At most every BLIND_AGAIN_MS after a "nothing to remove"; a failure of its
+        own is noted on the order, never raised (the read's is)."""
+        if order.get("state") not in REST_STATES or not self.rest_due(order, now, BLIND_AGAIN_MS):
+            return
+        try:
+            await self.withdraw_rest(order, now)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            order["error"] = core.clean_error(error) or type(error).__name__
+
+    async def withdraw_cooling(self, order: dict, now: int) -> bool:
+        """An order's rest withdrawn on the bot's own client while the taker's key cools down (follow; 1.154.33, CR-08): one that
+        may stand on the book (REST_STATES, an id, its removal not confirmed), at most every BLIND_AGAIN_MS after a "nothing to
+        remove" (no read goes with it: the reads are the key's). True when it was asked."""
+        spare = self.spare_client()
+        if spare is None or order.get("state") not in REST_STATES or not self.rest_due(order, now, BLIND_AGAIN_MS):
+            return False
+        try:
+            await self.withdraw_rest(order, now, [spare])
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            order.update(error=core.clean_error(error) or type(error).__name__, next_ms=now + FOLLOW_EVERY_MS)
+        return True
 
     def halted(self) -> bool:
         """No real order may be opened now by the operator's word or the bot's own stop: the mode not 真实吃单, LIVE not on, a
@@ -2533,10 +2739,11 @@ class RuleTaker:
     async def withdraw_one(self, order: dict) -> None:
         """An order answered while real trading is stopped (send: halted): its rest asked to be withdrawn at once, by its id.
         Off the book only on Predict's word that it removed it — "nothing to remove" for an order a moment old proves
-        nothing; else it is read at the next tick, and asked again (follow_order)."""
+        nothing; else it is read at the next tick, and asked again (follow_order). 1.154.33 (an outside review, CR-08): on the
+        bot's own client when the taker's fails (remove_ids) — in its key's cooldown the order stood until the cooldown ended."""
         now = self.now()
         try:
-            result = await self.api.remove_orders([order["id"]])
+            result = await self.remove_ids([str(order["id"])])
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -2556,39 +2763,45 @@ class RuleTaker:
         withdrawn, on the taker's key or, that failing, on the bot's own; one whose request is still out has no id to
         withdraw by — withdrawn the moment its answer brings one (send: halted). The line for the reply — "没撤成" in it for
         what could not be withdrawn, "结果未知" for an order that may exist and could not be found (neither is a stop that
-        worked: LiveBot.live_control) — and "" when the taker has no real order out."""
+        worked: LiveBot.live_control) — and "" when the taker has no real order out. 1.154.33 (an outside review): Predict's
+        "nothing to remove" is no confirmation (R01: said apart, read at the next tick and asked again while the order shows
+        open — not a miss either: most often an order that filled or ended a moment before); the look-ups go on the bot's own
+        client too, and one that failed on both is said as such, not as 查不到 (CR-08)."""
         out = [(rec, o) for rec in self.recs.values() if rec.get("mode") == "on"
                for o in rec.get("orders") or [] if not o.get("paper") and o.get("state") not in FINAL_STATES]
         if not out:
             return ""
         lost = [(rec, o) for rec, o in out if not o.get("id") and o.get("state") == "unknown" and o.get("hash")]
+        unread: dict[int, str] = {}  # id(order) -> why its look-up failed on every client (CR-08)
         if lost:
             self.reads += len(lost)
-            rows = await asyncio.gather(*(self.api.order("", o["hash"]) for _, o in lost), return_exceptions=True)
-            for (rec, o), row in zip(lost, rows):
-                if isinstance(row, asyncio.CancelledError):
-                    raise row
-                if isinstance(row, dict) and row.get("id") not in (None, "") and not o.get("id"):
+            found = await asyncio.gather(*(self.look_up(o) for _, o in lost), return_exceptions=True)
+            for (rec, o), got in zip(lost, found):
+                if isinstance(got, asyncio.CancelledError):
+                    raise got
+                if isinstance(got, BaseException):
+                    unread[id(o)] = core.clean_error(got) or type(got).__name__
+                    continue
+                row, why_not = got
+                if why_not:
+                    unread[id(o)] = why_not
+                elif isinstance(row, dict) and row.get("id") not in (None, "") and not o.get("id"):
                     o["id"] = str(row["id"])  # found: withdrawn below (its fills are follow's to read, as ever)
-        resting = [(rec, o) for rec, o in out if o.get("id") and not o.get("removed") and o.get("state") in {"open", "cancelling", "unknown"}]
+        resting = [(rec, o) for rec, o in out if o.get("id") and not o.get("removed") and o.get("state") in REST_STATES]
         done: set[str] = set()
+        quiet: set[str] = set()  # Predict's "nothing to remove" (R01)
         error = ""
         if resting:
-            ids = [str(o["id"]) for _, o in resting]
-            for api in (self.api, getattr(getattr(self.owner, "live", None), "api", None)):
-                if api is None or not callable(getattr(api, "remove_orders", None)):
-                    continue
-                try:
-                    result = await api.remove_orders(ids)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as failed:
-                    error = core.clean_error(failed) or type(failed).__name__
-                    continue
-                done = {str(i) for i in (result.get("removed") or [])} | {str(i) for i in (result.get("noop") or [])}
-                error = ""
-                break
-        now, off = self.now(), 0
+            try:  # (the taker's client, then the bot's own: remove_ids)
+                result = await self.remove_ids([str(o["id"]) for _, o in resting])
+            except asyncio.CancelledError:
+                raise
+            except Exception as failed:
+                error = core.clean_error(failed) or type(failed).__name__
+            else:
+                done = {str(i) for i in (result.get("removed") or [])}
+                quiet = {str(i) for i in (result.get("noop") or [])} - done
+        now, off, gone = self.now(), 0, 0
         for rec, o in resting:
             if o.get("state") in FINAL_STATES or o.get("removed") or o.get("state") == "closing":
                 off += 1  # ended, or taken off by the taker's own follow-up, while this pass waited for its answer: left as it is
@@ -2597,7 +2810,9 @@ class RuleTaker:
                 o.update(removed=now, left_ms=int(o.get("left_ms") or now), state="cancelling", next_ms=now + FOLLOW_EVERY_MS)
                 off += 1
             else:
-                o["next_ms"] = 0  # read, and asked again, at the taker's next tick
+                o["next_ms"] = 0  # read, and asked again, at the taker's next tick (a "nothing to remove" too: R01)
+                if str(o["id"]) in quiet:
+                    gone += 1
             self.save(rec)
         unknown = [(rec, o) for rec, o in out if not o.get("id") and o.get("state") == "unknown"]
         flying = [(rec, o) for rec, o in out if not o.get("id") and o.get("state") == "placing"]
@@ -2606,11 +2821,16 @@ class RuleTaker:
             self.save(rec)
         parts = []
         if resting:
-            missed = len(resting) - off
+            missed = len(resting) - off - gone
             parts.append(f"{len(resting)} 张挂着的单已请求撤回，Predict 确认 {off} 张"
+                         + (f"，{gone} 张 Predict 称已不在簿上，下一轮读回确认" if gone else "")
                          + (f"，{missed} 张没撤成（{error or 'Predict 的应答里没有它'}），规则吃单每秒再撤" if missed else ""))
         if unknown:
-            parts.append(f"{len(unknown)} 张下单结果未知，按哈希现在查不到（可能没下成，也可能还挂着）：规则吃单接着核对，一查到就撤")
+            failed_ones = [unread[id(o)] for _, o in unknown if id(o) in unread]
+            if len(failed_ones) < len(unknown):
+                parts.append(f"{len(unknown) - len(failed_ones)} 张下单结果未知，按哈希现在查不到（可能没下成，也可能还挂着）：规则吃单接着核对，一查到就撤")
+            if failed_ones:
+                parts.append(f"{len(failed_ones)} 张下单结果未知，按哈希查询失败（{failed_ones[-1]}）：规则吃单接着核对，一查到就撤")
         if flying:
             parts.append(f"{len(flying)} 张还在发送途中，应答一到就撤")
         if not parts:

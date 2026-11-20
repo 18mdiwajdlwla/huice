@@ -3490,6 +3490,382 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(t.record(slug, "on")["orders"][0]["state"], "cancelling", "its order still followed to the end")
         self.assertIn("规则吃单：关", t.status())
 
+    # --- 1.154.33: an outside review of the rule taker (R01, R07, R18, CR-03, CR-04, CR-08, CR-11) ---
+    async def test_nothing_to_remove_is_no_word_that_an_order_is_off_the_book(self):
+        """R01: Predict's "nothing to remove" (noop) was taken for a removal — the order ended LATE_FILL_MS on whatever its reads
+        showed, never asked again, the window's shares freed beside it (a second order for them, its own later fills booked
+        nowhere). Now the next read decides: still open, it is asked again NOOP_AGAIN_MS on and the window stays spoken for;
+        filled meanwhile, final on its fills. The stop says it apart: not confirmed, and no miss either (its verdict stays green)."""
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+
+        async def resting(fill=0.0):
+            t, api, clock, x = taker("on", RULE_SHARES="40")
+            api.markets["901"] = gold_market(GOLD_0600)
+            api.listed.add(slug)
+            api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+            api.fill[1] = fill
+            await t.tick()
+            return t, api, clock, x, t.record(slug)["orders"][0]
+        asked = []
+
+        async def noop(ids):  # Predict: nothing to remove — and the order stands on (the stand-in's row stays OPEN)
+            asked.append(list(ids))
+            return {"removed": [], "noop": list(ids)}
+
+        t, api, clock, x, order = await resting()
+        real_remove, api.remove_orders = api.remove_orders, noop
+        api.books["901"] = {"bids": [], "asks": []}
+        clock.ms += R.FILL_READ_MS
+        await t.tick()
+        self.assertEqual((order["state"], order.get("removed"), order["noop_ms"], asked), ("cancelling", None, clock.ms, [["1"]]))
+        clock.ms += R.FOLLOW_EVERY_MS
+        await t.tick()
+        self.assertEqual((order["state"], len(asked)), ("cancelling", 1), "still shown open: read again, not asked again at once")
+        clock.ms = order["noop_ms"] + R.NOOP_AGAIN_MS
+        await t.tick()
+        self.assertEqual(len(asked), 2, "asked again NOOP_AGAIN_MS on")
+        # well past LATE_FILL_MS, still open on Predict: never ended on that word — the window spoken for, no second order beside it;
+        # asked again ever more seldom (5, 10, 20, 40 s, then a minute — the review of the fix), read only when it is asked again
+        api.books["901"] = {"bids": [], "asks": [[0.51, 40]]}
+        api.fill[2] = 40.0
+        reads = api.reads if hasattr(api, "reads") else None
+        for _ in range(14):
+            clock.ms += R.NOOP_AGAIN_MS
+            await t.tick()
+        self.assertEqual((order["state"], len(api.sent), R.held(t.record(slug))), ("cancelling", 1, 40.0))
+        self.assertEqual(api.rows[order["hash"]]["status"], "OPEN")
+        self.assertEqual((len(asked), order["noops"], R.RuleTaker.noop_wait(order)), (5, 5, R.NOOP_MAX_MS), asked)
+        # removed at last on Predict's word: off the book, final by a read LATE_FILL_MS on — as ever
+        api.remove_orders = real_remove
+        clock.ms = order["noop_ms"] + R.NOOP_MAX_MS
+        await t.tick()
+        self.assertEqual((order["state"], order["removed"]), ("cancelling", clock.ms))
+        clock.ms += R.FOLLOW_EVERY_MS
+        await t.tick()
+        self.assertEqual(order["state"], "closing")
+        clock.ms = order["left_ms"] + R.LATE_FILL_MS
+        await t.tick()
+        self.assertEqual((order["state"], order["filled"]), ("final", 0.0))
+        # "nothing to remove" as it most often is — filled meanwhile: its next read says so, final on its fills
+        t, api, clock, x, order = await resting(fill=30.0)
+
+        async def filled_meanwhile(ids):
+            api.rows[order["hash"]].update(amountFilled=str(L.to_wei(40)), status="FILLED")
+            return {"removed": [], "noop": list(ids)}
+        api.remove_orders = filled_meanwhile
+        clock.ms += R.FILL_READ_MS
+        await t.tick()
+        clock.ms += R.FOLLOW_EVERY_MS
+        await t.tick()
+        self.assertEqual((order["state"], order["filled"]), ("final", 40.0))
+        # the stop: said apart — neither confirmed nor a miss — and read at the next tick, asked again while it shows open
+        t, api, clock, x, order = await resting(fill=30.0)
+        real_remove, api.remove_orders = api.remove_orders, noop
+        x.state.paused = "紧急停止"
+        line = await t.withdraw_all("紧急停止")
+        self.assertEqual(line, "规则吃单：1 张挂着的单已请求撤回，Predict 确认 0 张，1 张 Predict 称已不在簿上，下一轮读回确认。")
+        self.assertEqual((order["state"], order.get("removed"), order["next_ms"]), ("open", None, 0))
+        api.remove_orders = real_remove
+        await t.tick()
+        self.assertEqual((order["state"], order["removed"], api.removed), ("cancelling", clock.ms, ["1"]))
+
+    async def test_an_order_is_read_by_predicts_own_hash_and_withdrawn_unread(self):
+        """R07: the hash Predict's answer gives, when it is not the one signed here, is the one its reads answer to — kept and read
+        by (as the model trader and the pre-open mode do), and the bot's own checks know it; an order whose read fails or finds
+        nothing has its rest withdrawn by its id all the same (it came only after a read that showed the order open), asked
+        again BLIND_AGAIN_MS after a "nothing to remove" while nothing can be read."""
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+
+        def placed():
+            t, api, clock, x = taker("on", RULE_SHARES="40")
+            api.markets["901"] = gold_market(GOLD_0600)
+            api.listed.add(slug)
+            api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+            api.fill[1] = 30.0
+            return t, api, clock, x
+        t, api, clock, x = placed()
+        plain = api.create_order
+
+        async def own_hash(body):
+            got = await plain(body)
+            api.rows["0xplatform"] = api.rows.pop(body["data"]["order"]["hash"].lower())  # Predict knows it by its own hash alone
+            return {**got, "hash": "0xPlatform"}
+        api.create_order = own_hash
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        self.assertEqual(order["api_hash"], "0xplatform")
+        self.assertTrue({order["hash"], "0xplatform"} <= R.known_orders(t.recs, clock.ms)[1], "the account checks take both for this taker's")
+        clock.ms += R.FILL_READ_MS
+        await t.tick()
+        self.assertEqual((order["filled"], order["state"], api.removed), (30.0, "cancelling", ["1"]), "read by Predict's hash: fills booked, rest withdrawn")
+        # a read that finds nothing (a record lagging): the rest withdrawn by the id all the same — read once it can be, as ever
+        t, api, clock, x = placed()
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        hidden = api.rows.pop(order["hash"])
+        clock.ms += R.FILL_READ_MS
+        await t.tick()
+        self.assertEqual((api.removed, order["state"], order["removed"]), (["1"], "cancelling", clock.ms))
+        api.rows[order["hash"]] = hidden
+        clock.ms += R.FOLLOW_EVERY_MS
+        await t.tick()
+        self.assertEqual((order["state"], order["filled"]), ("closing", 30.0))
+        # a read that fails: withdrawn all the same, the read's failure noted and read again UNKNOWN_EVERY_MS on (as before)
+        t, api, clock, x = placed()
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+
+        async def failing(oid, digest=""):
+            raise m.RemoteError("HTTP 502: bad gateway")
+        api.order = failing
+        clock.ms += R.FILL_READ_MS
+        await t.tick()
+        self.assertEqual((api.removed, order["removed"], order["next_ms"]), (["1"], clock.ms, clock.ms + R.UNKNOWN_EVERY_MS))
+        self.assertIn("502", order["error"])
+        # nothing to be read and "nothing to remove": not asked again before BLIND_AGAIN_MS
+        t, api, clock, x = placed()
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        api.rows.pop(order["hash"])
+        asked = []
+
+        async def noop(ids):
+            asked.append(list(ids))
+            return {"removed": [], "noop": list(ids)}
+        api.remove_orders = noop
+        clock.ms += R.FILL_READ_MS
+        await t.tick()
+        for _ in range(5):
+            clock.ms += R.FOLLOW_EVERY_MS
+            await t.tick()
+        self.assertEqual((len(asked), order["state"]), (1, "cancelling"))
+        clock.ms = order["noop_ms"] + R.BLIND_AGAIN_MS
+        await t.tick()
+        self.assertEqual(len(asked), 2)
+
+    async def test_the_bots_own_client_stands_in_while_the_takers_key_cools(self):
+        """CR-08: the taker's key cooling down (a 429) — the stop's look-up of an order whose answer went missing goes on the bot's
+        own client too, and one that failed on both is said as such (结果未知: the stop not green), not as 查不到; an order
+        answered after the stop is withdrawn at once on the bot's own client; and the routine follow-up's withdrawals (not its
+        reads) go there meanwhile — they waited out the whole cooldown, the rest standing on the book."""
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        cool = lambda: m.RemoteError("Predict 接口限流冷却中（18 秒后重试）", 18)
+
+        def setup():
+            t, api, clock, x = taker("on", RULE_SHARES="40")
+            api.markets["901"] = gold_market(GOLD_0600)
+            api.listed.add(slug)
+            api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+            api.fill[1] = 30.0
+            return t, api, clock, x
+
+        async def cooling_read(oid, digest=""):
+            raise cool()
+
+        async def cooling_remove(ids):
+            raise cool()
+        own_reads, own_removes = [], []
+
+        def own_client(x, api):  # the bot's own client: the same account's orders (the stand-in's), on a key of its own
+            async def read(oid, digest=""):
+                own_reads.append(digest)
+                return await type(api).order(api, oid, digest)
+
+            async def remove(ids):
+                own_removes.append(list(ids))
+                return {"removed": list(ids), "noop": []}
+            x.owner.live.api.order, x.owner.live.api.remove_orders = read, remove
+        # (1) the stop's look-up: the taker's client cooling, the bot's own finds it — withdrawn there
+        t, api, clock, x = setup()
+        api.timeout = True
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        self.assertEqual((order["state"], order["id"]), ("unknown", ""))
+        own_client(x, api)
+        api.order, api.remove_orders = cooling_read, cooling_remove
+        x.state.paused = "紧急停止"
+        line = await t.withdraw_all("紧急停止")
+        self.assertEqual(line, "规则吃单：1 张挂着的单已请求撤回，Predict 确认 1 张。")
+        self.assertEqual((order["id"], order["state"], own_reads, own_removes), ("1", "cancelling", [order["hash"]], [["1"]]))
+        # ...failing on both: a failed look-up, said so — 结果未知, no green stop
+        t, api, clock, x = setup()
+        api.timeout = True
+        await t.tick()
+        api.order = x.owner.live.api.order = cooling_read
+        x.state.paused = "紧急停止"
+        line = await t.withdraw_all("紧急停止")
+        self.assertTrue(line.startswith("规则吃单：1 张下单结果未知，按哈希查询失败（") and "查不到" not in line, line)
+        # (2) an order answered after the stop, the taker's key cooling: withdrawn at once on the bot's own client
+        t, api, clock, x = setup()
+        plain_create = api.create_order
+        del own_removes[:]
+
+        async def stop_meanwhile(body):
+            got = await plain_create(body)
+            x.state.paused = "紧急停止"
+            return got
+        own_client(x, api)
+        api.create_order, api.remove_orders = stop_meanwhile, cooling_remove
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        self.assertEqual((order["state"], order["removed"], own_removes), ("cancelling", clock.ms, [["1"]]))
+        # (3) the follow-up while the taker's key cools: no read (they are the key's), the rest withdrawn on the bot's own client
+        t, api, clock, x = setup()
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        reads, plain_read = [], api.order
+
+        async def counted(oid, digest=""):
+            reads.append(digest)
+            return await plain_read(oid, digest)
+        api.order = counted
+        del own_removes[:]
+        own_client(x, api)
+        x.owner.live.api.blocked_until = time.monotonic() + 30  # the bot's own client in a cooldown of its own: not that way either
+        api.blocked_until = time.monotonic() + 30
+        clock.ms += R.FILL_READ_MS
+        await t.tick()
+        self.assertEqual((reads, own_removes, order["state"]), ([], [], "open"))
+        x.owner.live.api.blocked_until = 0.0
+        await t.tick()
+        self.assertEqual((reads, own_removes, order["state"], order["removed"]), ([], [["1"]], "cancelling", clock.ms))
+        api.blocked_until = 0.0  # the cooldown over: read, off the book on that word
+        clock.ms += R.FOLLOW_EVERY_MS
+        await t.tick()
+        self.assertEqual((len(reads), order["state"], order["filled"]), (1, "closing", 30.0))
+
+    async def test_only_a_subscribed_markets_book_is_vouched_for(self):
+        """CR-04: in the per-second hours the live connection vouches for the book it holds however old (a quiet market's is not
+        sent again) — of its subscriptions alone now. A market whose subscription the server refused is pushed nothing: what is
+        held of it is a REST read's, looked at only while young (FAST_STALE_S), as with the push down; the refusal drops it, and
+        the market is asked for again in a moment, not at the next sync — once in SYNC_S."""
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        old = {"bids": [], "asks": [[0.52, 25]]}  # an offer at the rule's price, in a book of five minutes ago
+        sent = {}
+        for refused in (False, True):
+            t, api, clock, x = taker("on", **FAST)
+            t.verify_tick = lambda: None
+            api.markets["901"] = gold_market(GOLD_0600)
+            api.listed.add(slug)
+            api.books["901"] = {"bids": [], "asks": [[0.70, 30]]}  # the book as a read shows it now: nothing at the price
+            await t.tick()
+            w = t.track[slug]
+            connected(t, "901", old, age=300)
+            if refused:
+                t.stream.RESUBSCRIBE_S = 0.0
+                t.stream.wake.clear()  # (set by the tick's wants: the sync loop is not running here)
+                t.stream.pending[7] = ("subscribe", "901")
+                await t.stream.handle(None, json.dumps({"type": "R", "requestId": 7, "success": False, "error": "unknown topic"}))
+                self.assertEqual(("901" in t.stream.subscribed, t.stream.held("901")), (False, None), "what was held of it dropped")
+                await asyncio.wait_for(t.stream.wake.wait(), 1.0)  # asked for again in a moment
+                t.stream.wake.clear()
+                t.stream.pending[8] = ("subscribe", "901")
+                await t.stream.handle(None, json.dumps({"type": "R", "requestId": 8, "success": False, "error": "unknown topic"}))
+                await asyncio.sleep(0.01)
+                self.assertFalse(t.stream.wake.is_set(), "refused again within SYNC_S: at the sync's own pace")
+                # a REST read's book of it, five minutes old: the book in hand — but nothing pushed vouches for it
+                t.stream.books["901"] = (m.predict_levels(old["bids"], True), m.predict_levels(old["asks"], False), time.monotonic() - 300)
+            w["rest_at"] = time.monotonic() - 60
+            t.stream.changed.add("901")
+            clock.ms += 1_000
+            await t.tick()
+            sent[refused] = len(api.sent)
+        self.assertEqual(sent, {False: 1, True: 0}, "subscribed: the quiet book stands (bought on it); refused: read over REST instead")
+
+    async def test_an_order_is_sized_on_what_the_orders_out_leave_of_the_usdt(self):
+        """CR-03: the USDT an order may spend is the balance less what this taker's orders still out may take (pending_usd) — those
+        of the same turn too: two windows' orders of one tick were each sized on the whole balance (the chain's, read every
+        minute: Predict holds no money for an order). Not at the bytes: orders of a turn go out side by side."""
+        for usd, want in ((30.0, [50.0]), (45.0, [50.0, 27.0]), (60.0, [50.0, 50.0])):
+            t, api, clock, x = taker("on", **FAST)
+            t.verify_tick = lambda: None
+            x.state.usd = usd
+            for i, mid in enumerate(("901", "902")):
+                api.markets[mid] = gold_market(GOLD_0600 + i * 900_000, mid=int(mid))
+                api.listed.add(api.markets[mid]["categorySlug"])
+                api.books[mid] = {"bids": [], "asks": [[0.51, 20]]}
+            await t.tick()
+            self.assertEqual([L.from_wei(int(b["data"]["order"]["takerAmount"])) for b in api.sent], want, usd)
+            if usd == 30.0:
+                self.assertEqual(t.track[api.markets["902"]["categorySlug"]]["word"], "USDT 余额 $30.00，在途的规则单还要 $29.00，剩下的不够一张最小订单")
+                self.assertAlmostEqual(t.pending_usd(), 29.0, 6)
+                self.assertEqual((t.block(10.0, net=True), t.block(10.0)), ("USDT 余额 $30.00，在途的规则单还要 $29.00，剩下的不足本单 $10.00", ""))
+                # (the review of the fix) not an order whose answer went missing and whose hash has found nothing for CONFLICT_GRACE_MS,
+                # nor one past its signed expiry: neither can take money any more
+                order = next(o for rec in t.recs.values() for o in rec["orders"])
+                order.update(state="unknown", id="")
+                clock.ms = int(order["at"]) + R.CONFLICT_GRACE_MS - 1
+                self.assertAlmostEqual(t.pending_usd(), 29.0, 6)
+                clock.ms += 2
+                self.assertEqual(t.pending_usd(), 0.0)
+                order.update(state="open", id="1")
+                self.assertAlmostEqual(t.pending_usd(), 29.0, 6)
+                clock.ms = int(order["expires"]) * 1000
+                self.assertEqual(t.pending_usd(), 0.0)
+
+    async def test_nothing_leaves_in_the_last_seconds_however_long_its_way(self):
+        """R18: nothing is placed within STOP_MS of the start — LIVE_STOP_MS of the end in a window's course — which the look alone
+        held: an order decided 16 s before whose way took 4 (the sign-in here) still left at 12. Held back at its bytes now, as
+        the look's own judgment (RECHECKED: no half minute's pause, not one of MAX_REJECTS)."""
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+        for wait in (0, 4_000):
+            t, api, clock, x = taker("on")
+            api.markets["901"] = gold_market(GOLD_0600)
+            api.listed.add(slug)
+            api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+            clock.ms = GOLD_0600 - R.STOP_MS - 1_000
+            t.warm_ms = clock.ms  # (no preparation beside the tick: its sign-in would take the same four seconds)
+
+            async def slow(wait=wait, clock=clock):
+                clock.ms += wait
+            api.ensure_auth = slow
+            await t.tick()
+            order = t.record(slug)["orders"][0]
+            if not wait:
+                self.assertEqual((len(api.sent), order["state"]), (1, "open"), "decided and sent 16 s before the start: as ever")
+                continue
+            self.assertEqual((api.sent, order["state"]), ([], "not_sent"))
+            self.assertTrue(order["error"].startswith(R.STOP_WORD) and order["error"].startswith(R.RECHECKED), order["error"])
+            self.assertEqual(t.track[slug]["look_ms"], 0, "held back, not refused: no pause")
+        # in a window's course: LIVE_STOP_MS before its end
+        t, api, clock, x = taker("on", RULE_GOLD_SHUT_LIVE_CENTS="90", **IN)
+        t.verify_tick = lambda: None
+        end = GOLD_0600 + 900_000
+        api.markets["901"] = gold_market(GOLD_0600)
+        api.listed.add(slug)
+        api.books["901"] = {"bids": [], "asks": [[0.88, 20]]}
+        clock.ms = end - R.LIVE_STOP_MS - 1_000
+        t.warm_ms = clock.ms
+        gold_card(x, clock, GOLD_0600, 4000, "4000.3")
+
+        async def slow_in_course():
+            clock.ms += 4_000
+        api.ensure_auth = slow_in_course
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        self.assertEqual((api.sent, order["state"]), ([], "not_sent"))
+        self.assertTrue(order["error"].startswith("盘中：这一场结束前 15 秒内不再发单"), order["error"])
+
+    async def test_the_journal_is_closed_as_the_taker_stops(self):
+        """CR-11: the orders' journal closed as the loop ends, after its last withdrawal (it was left open to the process's end); a
+        send after it would wait for the store, as one with no journal does."""
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            _, _, clock, x = taker("on")
+            x.owner.store = m.Store(os.path.join(folder, "state.db"))
+            try:
+                t = R.RuleTaker(x.owner)
+                fd = t.journal_fd
+                self.assertIsNotNone(fd)
+                t.stop.set()
+                with mock.patch.object(R.os, "close", wraps=os.close) as closing:
+                    await t.run()
+                closing.assert_any_call(fd)
+                self.assertEqual((t.journal_fd, t.journal({"slug": "s", "mode": "on"}, {})), (None, False))
+            finally:
+                x.owner.store.close()
+
 
 if __name__ == "__main__":
     result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(RuleTests))

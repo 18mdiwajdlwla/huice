@@ -795,7 +795,13 @@ class PredictApi:
     @staticmethod
     def rows(data: Any) -> list[dict]:
         """The records of a list answer ({success, data: [...]}, {data: {items: [...]}} or a bare list); success=false is an
-        error (1.122.0: it used to read as an empty list — every open order looked gone)."""
+        error (1.122.0: it used to read as an empty list — every open order looked gone). 1.154.33 (an outside review, R08): so
+        is an empty answer — an empty body (call reads it as {}): it read as an empty list, and a whole one (no cursor in it), the
+        open orders and positions it did not show counted as gone. Kept as an empty list (as ever): an answer that says something
+        of the kind — "success": true with no list, a "data" of null or {} — whose meaning for an empty list Predict's answers
+        have not shown here (a guess wrong the other way stopped every read of an account with nothing open)."""
+        if data == {}:
+            raise core.RemoteError("Predict 列表应答是空的（没有任何内容），这次没读到")
         if isinstance(data, dict):
             if data.get("success") is False:
                 raise core.RemoteError("Predict 接口返回 success=false：" + (core.http_error_text(data) or core.brief_error(json.dumps(data, ensure_ascii=False), 120)))
@@ -890,6 +896,9 @@ class PredictApi:
             cursor = data.get("cursor") if isinstance(data, dict) else None
             if isinstance(cursor, dict):
                 cursor = cursor.get("after") or cursor.get("next") or cursor.get("endCursor")
+            # (1.154.33, an outside review, R08: an empty page offering a cursor, or one handing back the cursor it was asked with,
+            # still ends the list as a whole one — how Predict ends a list whose rows fill its last page exactly has not been seen
+            # here, and taking such an end for a cut read would hold every reader of the account each time it happens)
             if not cursor or not page or str(cursor) == after:
                 self.__dict__.setdefault("paged_stats", {})[path] = (asked, full)
                 return rows, True
@@ -924,6 +933,11 @@ class PredictApi:
                 raise
             if isinstance(data, dict) and data.get("success") is False:  # 1.122.0: not "Predict knows nothing of it"
                 raise core.RemoteError("Predict 接口返回 success=false：" + (core.http_error_text(data) or core.brief_error(json.dumps(data, ensure_ascii=False), 120)))
+            if data == {}:
+                # 1.154.33 (an outside review, R08): an empty body (call reads it as {}) is no answer at all — read as "Predict knows
+                # nothing of it", as a 404 is, it counted toward an order's release as gone. An answer that says so ("data": {} or
+                # null: an empty answer is no order) still does
+                raise core.RemoteError("Predict 订单应答是空的（没有任何内容），这次没读到这张单")
             row = data.get("data", data) if isinstance(data, dict) else None
             if isinstance(row, list):
                 row = next((r for r in row if isinstance(r, dict) and (order_hash_of(r) == hash_.lower() or (order_id and str(r.get("id")) == str(order_id)))), None)
@@ -2714,6 +2728,46 @@ class LiveBot(core.Bot):
             return f"公平价变了：限价 {core.cents(limit)} 已高于现在的封顶价 {core.cents(cap)}，{age // 1000} 秒前的吃单决定作废", False
         return "", False
 
+    def live_slot_recheck(self, trade: dict, want: dict, at: int, gated_at: int, refusal: dict) -> str:
+        """The order judged once more inside its request slot, beyond the gates (live_send_block): why it is not sent, "" to send;
+        ``refusal`` says what kind of refusal it is (live_place_order). 1.154.33 (an outside review, R05): a taker's price, when the
+        wait for the key's pace and the slot (seconds when Predict is slow) came after the gate priced it — a resting order the lane
+        re-judges meanwhile (withdrawn: refused by the gate), a taker nothing does: it went out at a limit set on a fair price that
+        had moved, and filled at once. Judged again as live_send_gate judges one that waited: void, it is refused (the taker's short
+        wait); not to be judged now (no fresh book), it waits pending. R06: a resting order that would cross (live_maker_crossing)."""
+        if not want["maker"] and at - gated_at > self.LIVE_TAKER_RECHECK_MS:
+            why, wait = self.live_taker_recheck(trade, at)
+            if why:
+                refusal.update(why=why, wait=wait)
+                return why
+        elif want["maker"] and (why := self.live_maker_crossing(trade, at)):
+            refusal.update(why=why, void=True)
+            return why
+        return ""
+
+    def live_maker_crossing(self, trade: dict, now_ms: int) -> str:
+        """Why a resting order whose request is about to go out would take the book instead ("" when it would rest): its price is
+        at or above the lowest ask of its side on the market's latest fresh book. 1.154.33 (an outside review, R06): the model
+        trader's resting orders are plain LIMIT orders (not post-only, as the pre-open mode's are), placed under the ask as it
+        stood when they were decided (sim_maker_price); an ask that came down to the price meanwhile filled one at once as a
+        taker — the taker fee paid, on a price chosen for a maker's bar. Asked inside the request slot (live_place_order), the
+        last moment this bot can see; what moves after it is not seen (only post-only would cover that). A book that is stale,
+        crossed or not to be had leaves the order as it was decided. Not a floor order nor a sweep one: those are placed at their
+        price wherever the asks stand, by design (the review of the fix: refused, each was decided again and refused at every look)."""
+        if trade.get("floor") or trade.get("sweep"):
+            return ""
+        try:
+            mk = next((x for x in self.sim_markets_for(str(trade.get("key") or ""), now_ms) if x.market == trade.get("market")), None)
+        except Exception:
+            return ""  # the market cannot be priced now: nothing newer to judge the order by
+        if mk is None or mk.book.stale(now_ms) or core.book_crossed(mk.book):
+            return ""
+        asks = core.side_levels(mk.book, str(trade.get("side") or "up"))
+        price = float(((trade.get("live") or {}).get("want") or {}).get("price") or trade.get("price") or 0)
+        if asks and price > 0 and price >= asks[0][0] - 1e-9:
+            return f"盘口最低卖价已到 {core.cents(asks[0][0])}，挂单价 {core.cents(price)} 会直接吃单，这张挂单决定作废"
+        return ""
+
     async def live_place(self, tid: str, trade: dict, now_ms: int) -> None:
         """Build, sign and send the order of a pending record — once: the express lane and the step may both find it
         pending within the same second."""
@@ -2850,6 +2904,7 @@ class LiveBot(core.Bot):
         # nothing (1.83.0: the order went out, and with LIVE=off it then rested untouched)
         if not self.live_send_gate(tid, trade, self.sim_trades(), now_ms, self.market.now_ms()):
             return
+        refusal: dict = {}  # 1.154.33 (R05, R06): why the re-check inside the request slot refused the order, when it was its own judgement
         try:
             shares_wei = to_wei(want["shares"])
             if want["maker"]:
@@ -2883,7 +2938,8 @@ class LiveBot(core.Bot):
             if not flushed:
                 return self.live_unsend(tid, trade, f"数据库写入未完成（{self.store.write_error or '超时'}），暂不发单", now_ms)
             st["state"] = "pending"
-            if not self.live_send_gate(tid, trade, self.sim_trades(), now_ms, self.market.now_ms()):
+            gated_at = self.market.now_ms()  # (the price judged by the gate below: a taker's re-check inside the slot counts from here)
+            if not self.live_send_gate(tid, trade, self.sim_trades(), now_ms, gated_at):
                 st["hash"] = ""
                 self.sim_save([(st.get("rekeyed") or tid, trade)])  # 1.138.1: where live_fail moved it, not back at the slot
                 return
@@ -2899,7 +2955,16 @@ class LiveBot(core.Bot):
                 # the check above, and a pause, the emergency stop, LIVE=off or a withdrawal set meanwhile let the order out
                 if trade.get("withdrawn") or st.get("state") != "placing":
                     return "发出前已撤单"
-                return self.live_send_block(trade, self.sim_trades(), self.market.now_ms())
+                at = self.market.now_ms()
+                if why := self.live_send_block(trade, self.sim_trades(), at):
+                    return why
+                refusal.clear()
+                try:
+                    return self.live_slot_recheck(trade, want, at, gated_at, refusal)
+                except Exception as error:  # (the review of the fix: never an error here — that reads as "result unknown" for an order not sent)
+                    self.log_limited("slot-recheck", f"发送前复核出错（照原决定发出）：{core.clean_error(error) or type(error).__name__}")
+                    refusal.clear()
+                    return ""
 
             token = ORDER_SEND_CHECK.set(still_sendable)
             try:
@@ -2928,6 +2993,14 @@ class LiveBot(core.Bot):
                     self.live_end_unsent(tid, trade, now_ms)
                     return
                 st["state"] = "pending"
+                if refusal.get("wait"):  # 1.154.33 (R05): the taker cannot be judged now — pending, as live_send_gate leaves it (live_defer)
+                    self.live_unsend(tid, trade, text, now_ms)
+                    return
+                if refusal:  # 1.154.33 (R05, R06): the bot's own re-judgement — a void decision (a maker's, R06: no backoff, no alert)
+                    retry = 0 if refusal.get("void") else self.LIVE_MAKER_VOID_SECONDS if trade.get("maker") else self.config.live_taker_retry
+                    self.live_fail(tid, trade, f"未下单：{text}", now_ms, retry=retry)
+                    self.sim_save([(st.get("rekeyed") or tid, trade)])
+                    return
                 at_ms = self.market.now_ms()
                 own = text.startswith("决定已过时") or text == self.sim_quiet(trade.get("settle"), at_ms)
                 self.live_fail(tid, trade, f"未下单：{text}", now_ms, retry=0 if own else None)
@@ -3137,6 +3210,7 @@ class LiveBot(core.Bot):
             cancelling = [tid for tid, t in active.items() if t["live"].get("state") == "cancelling"]
             await self.live_sync_orders(active, now_ms)  # with nothing in flight the list is still read now and then: orders this bot did not place
             await self.live_requote_freed(cancelling, now_ms)  # the slots the confirmed cancels freed: quoted again now (once ready), not next step
+        self.live_fills_reread(now_ms)  # 1.154.33 (R02): the confirmed cancels whose fills read was not Predict's last word, read again beside the step
         checked, started = self.live_late_checked, time.monotonic()
         try:
             await self.live_late_fills(now_ms)  # 1.119.0: an order that ended with shares unfilled, against the account's positions
@@ -3722,6 +3796,14 @@ class LiveBot(core.Bot):
                 token = str((((o.get("body") or {}).get("data") or {}).get("order") or {}).get("tokenId") or "")
                 if token:
                     tokens[token] = name
+        # 1.154.33 (an outside review, CR-09): ...and the rule taker's windows with a real order. An order of its own whose record it lost
+        # rested on a market neither list above names: taken for somebody's manual order, never swept (a record's market id is all
+        # its order names here: it keeps no token)
+        has_rules = getattr(self, "rules", None) is not None or getattr(self, "store", None) is not None  # (a bot the tests build bare has neither)
+        for rec in (self.rules_records() if has_rules else {}).values():
+            mid = str(rec.get("market_id") or "")
+            if mid and rec.get("mode") == "on" and rec.get("orders"):
+                ids.setdefault(mid, str(rec.get("name") or rec.get("slug") or mid))
         return ids, tokens
 
     def live_market_of(self, row: dict, known: tuple[dict, dict] | None = None) -> str:
@@ -3768,9 +3850,15 @@ class LiveBot(core.Bot):
         limit = self.live_remove_limit()
         result = await remove_in_batches(self.live.api, ids, limit, workers=2, patient=False, stop=self.stopping.is_set)  # 1.141.0: at the measured batch size
         self.live_remove_saved(limit)
-        unsent = set(result["failed"]) | set(result["left"])  # the request failed or never went: asked again at the next sweep
-        if unsent and not (result["removed"] or result["noop"] or result["unanswered"]):
-            self.live_note_error("撤无记录挂单失败：" + (result["errors"][-1] if result["errors"] else "接口限流冷却中，下一轮再撤"))
+        # 1.154.33 (an outside review, R16): an id Predict's answer left out of both its lists (unanswered: one try, impatient) was
+        # counted with the "nothing to remove" ones — named so in the notice, dropped from the unrecorded list and timed afresh from
+        # the next list (LIVE_ORPHAN_GRACE_MS once more) while it may well rest. Kept as the failed ones are: as seen, asked again
+        # at the next sweep, and said apart
+        silent = [i for i in ids if i in result["unanswered"]]
+        unsent = set(result["failed"]) | set(result["left"]) | set(silent)  # the request failed, never went or went unanswered: asked again at the next sweep
+        if unsent and not (result["removed"] or result["noop"]):
+            self.live_note_error("撤无记录挂单失败：" + (result["errors"][-1] if result["errors"] else
+                                                     f"Predict 的应答里没有 #{'、#'.join(silent[:5])}，下一轮再撤" if silent else "接口限流冷却中，下一轮再撤"))
             return
         ids = [i for i in ids if i not in unsent]
         removed = [i for i in ids if i in set(result["removed"])]
@@ -3783,9 +3871,11 @@ class LiveBot(core.Bot):
         self.live_orphans = [*self.live_orphans[-49:], *({"at": now_ms, "id": i, "brief": briefs[i]} for i in removed)]
         if removed:
             self.live_notify(f"🧹 撤掉 {len(removed)} 张本机器人没有记录、却挂在本机器人市场上的挂单（丢失跟踪的单；LIVE_ORPHAN_CANCEL=off 可关）："
-                             + "；".join(briefs[i] for i in removed[:5]) + (f"；Predict 称 {len(noop)} 张无需撤" if noop else ""), key="orphans:" + ",".join(removed[:5]))
+                             + "；".join(briefs[i] for i in removed[:5]) + (f"；Predict 称 {len(noop)} 张无需撤" if noop else "")
+                             + (f"；{len(silent)} 张 Predict 的应答里没有，下一轮再撤" if silent else ""), key="orphans:" + ",".join(removed[:5]))
         elif noop:
-            self.live_note_error(f"撤无记录挂单：Predict 称 {len(noop)} 张无需撤（#{'、#'.join(noop[:5])}）")
+            self.live_note_error(f"撤无记录挂单：Predict 称 {len(noop)} 张无需撤（#{'、#'.join(noop[:5])}）"
+                                 + (f"；{len(silent)} 张 Predict 的应答里没有（#{'、#'.join(silent[:5])}），下一轮再撤" if silent else ""))
 
     async def live_cancel_blind(self, active: dict[str, dict], now_ms: int) -> None:
         """The open list could not be read (or the express lane cannot wait for one): the withdrawn records whose order id
@@ -3811,9 +3901,38 @@ class LiveBot(core.Bot):
 
     def live_fills_later(self, tid: str, trade: dict, mk: Any) -> None:
         """The fills of an order Predict just confirmed removed, read in a task beside the lane (live_cancel_fills)."""
+        oid = str(trade["live"].get("order_id") or "")
+        reading = self.__dict__.setdefault("live_fills_reading", set())  # 1.154.33 (R02): the orders whose fills read is on its way
+        reading.add(oid)
         task = asyncio.create_task(self.live_cancel_fills(tid, trade, mk), name=f"cancel-fills:{tid}")
         self.live_fill_tasks.add(task)
         task.add_done_callback(self.live_fill_tasks.discard)
+        task.add_done_callback(lambda _done, oid=oid: reading.discard(oid))
+
+    LIVE_FILLS_REREAD_MS = (3_000, 10_000, 30_000, 60_000)  # 1.154.33 (R02): a confirmed cancel's fills read again this long after a read that was
+    #                                                         not Predict's last word on the order (the last wait repeats), while fills_pending holds
+
+    def live_fills_again(self, tid: str, trade: dict, order_id: str, now_ms: int) -> None:
+        """A confirmed cancel's fills read that did not settle them (live_cancel_fills_read): the reservation stays (fills_pending) and
+        the order's record is read again at the step after the next wait of LIVE_FILLS_REREAD_MS (live_fills_reread) — until a read
+        is Predict's last word on it, or FILLS_PENDING_MAX_MS has passed since the cancel (core.fills_pending: nothing held then)."""
+        st = trade["live"]
+        reads = int(st.get("fills_reads") or 0) + 1
+        st.update(fills_reads=reads, fills_reread_at=now_ms + self.LIVE_FILLS_REREAD_MS[min(reads, len(self.LIVE_FILLS_REREAD_MS)) - 1])
+        if order_id in self.live_requote_looked:
+            st["requote_looked"] = True  # the slot's re-quote ran on the reservation: looked at again once the last read frees it
+        self.sim_save([(tid, trade)])
+
+    def live_fills_reread(self, now_ms: int) -> None:
+        """The step's look for confirmed cancels whose fills are due to be read again (live_fills_again): each read beside the step,
+        one at a time an order. 1.154.33 (an outside review, R02)."""
+        reading = self.__dict__.setdefault("live_fills_reading", set())
+        for tid, t in core.trades_open(self.sim_trades()):  # (a record with fills_pending is an open one)
+            st = t.get("live")
+            if (not isinstance(st, dict) or not st.get("fills_reread_at") or st.get("state") != "done" or not core.fills_pending(st)
+                    or now_ms < int(st["fills_reread_at"]) or str(st.get("order_id") or "") in reading):
+                continue
+            self.live_fills_later(tid, t, None)
 
     async def live_cancel_fills(self, tid: str, trade: dict, mk: Any) -> None:
         """What a removed order filled before its cancel (GET by its hash), onto its record — found by the order id, under
@@ -3826,6 +3945,7 @@ class LiveBot(core.Bot):
             self.live_requote_looked.discard(order_id)  # 1.138.1: on every end of the read (a failure kept it: the set filled up)
 
     async def live_cancel_fills_read(self, order_id: str, hash_: str, mk: Any) -> None:
+        final: Any = None
         for attempt in range(3):  # 1.138.0: tried again — one failed read kept the reservation (and the slot's re-quote cut short) for minutes
             try:
                 final = await self.live.api.order(order_id, hash_)
@@ -3833,30 +3953,47 @@ class LiveBot(core.Bot):
             except Exception as error:
                 if attempt == 2:
                     self.live_note_error(f"撤单后读成交失败（#{order_id}）：{core.clean_error(error) or type(error).__name__}")
-                    return
+                    break
                 await asyncio.sleep(max(1.0 + attempt, float(getattr(error, "retry_after", 0) or 0)))
-        if not isinstance(final, dict):
-            return
         trades = self.sim_trades()
         cur = next(((k, t) for k, t in trades.items() if isinstance(t.get("live"), dict) and str(t["live"].get("order_id") or "") == order_id), None)
         if cur is None:
             return
         tid, trade = cur
         st, now_ms = trade["live"], self.market.now_ms()
+        if not isinstance(final, dict):
+            # not read (the reads failed, or Predict knows no such order yet): the reservation stays; read again later (1.154.33, R02)
+            if core.fills_pending(st):
+                self.live_fills_again(tid, trade, order_id, now_ms)
+            return
         before = float(trade.get("shares") or 0)
         self.live_apply(tid, trade, final, mk, now_ms)
-        st.pop("fills_pending", None)  # read: the reservation is what filled
         after, order = float(trade.get("shares") or 0), float(trade.get("order") or 0)
         if after > before + 1e-9 and trade["status"] not in {"settled", "expired"}:
             trade.update(status="filled", unfilled=max(order - after, 0.0),
                          note=f"真实成交 {after:g}/{order:g} 份（撤单确认后读到），其余 {max(order - after, 0.0):g} 份{st.get('cancel_why') or '已撤'}")
             st["events"].append({"at": now_ms, "what": f"撤单确认后读到成交 {after - before:g} 份（累计 {after:g}/{order:g}）"})
+        if not order_final(final, order):
+            # 1.154.33 (an outside review, R02): Predict confirmed the removal, yet the order's own record still says it is open — a read
+            # that has not caught up with the matching (1.83.0: this read may lag; 1.119.0: a 300-share order read "0 filled" after its
+            # cancel while the account held 299.99). Taken as the last word, it freed the whole reservation at once: 90 of 100 shares
+            # filled just before the cancel read as none, and the slot was quoted again in full past LIVE_MAX_OPEN_USD and the share
+            # caps, the 90 shares outside the P&L and the loss stop until the minute's positions check (and never, with that list cut).
+            # What it shows is taken; the rest stays reserved and the record is read again (live_fills_again) until it is final
+            if int(st.get("fills_reads") or 0) == 0:
+                st["events"].append({"at": now_ms, "what": f"撤单已获 Predict 确认，但按哈希读到的订单记录仍是 {str(final.get('status') or '?')}"
+                                                           f"（成交 {after:g}/{order:g}）：记录可能还没跟上，未成交的部分继续占额度，稍后再读"})
+            self.live_fills_again(tid, trade, order_id, now_ms)
+            return
+        st.pop("fills_pending", None)  # read: the reservation is what filled
+        st.pop("fills_reread_at", None)
+        looked_before = bool(st.pop("requote_looked", None))  # (a re-quote that ran before an earlier read which did not settle it)
         self.sim_save([(tid, trade)])
         # 1.138.0: the reservation released — a re-quote the caps refused on it (live_requote_freed ran before this read) is looked
         # at again now, not at the next trigger; only while the slot is still empty (a re-quote that went out needs nothing)
         slot = tid.rpartition("#")[0] if "#" in tid.rsplit("|", 1)[-1] else tid
         held = self.sim_trades().get(slot)
-        looked = order_id in self.live_requote_looked  # the re-quote ran before this read (it reads the released room itself otherwise)
+        looked = order_id in self.live_requote_looked or looked_before  # the re-quote ran before this read (it reads the released room itself otherwise)
         self.live_requote_looked.discard(order_id)
         if looked and trade.get("key") and (trade.get("withdrawn") or {}).get("rule") and (held is None or held is trade or core.sim_spent(held)):
             with contextlib.suppress(Exception):
@@ -4172,6 +4309,14 @@ class LiveBot(core.Bot):
             pk = po.get(k, 0.0)  # 1.131.5: the pre-open mode's fills there are post-only makers, no fee taken: the shortfall is the records' alone
             total, got = recorded.get(k, 0.0) - pk, (held[k] - pk if k in held else None)
             short = total - got if got is not None and total > 1e-9 else 0.0
+            # 1.154.33 (an outside review, R10): Predict merges a market's two sides into USDT (1.104.11) — a pair of a 涨 and a 跌 share
+            # leaves both holdings, with every record of either still counting it. That part of the shortfall is no fee: trimmed as
+            # one (100 涨 recorded, 3 跌 bought, 97 涨 held: "3 份手续费"), the 涨 records lost the 3 shares the merge paid back in USDT
+            # — a win short by $3 in the P&L — while the records untrimmed were exact. What the other side lacks of its records, up to
+            # this side's own shortfall, is taken as merged (the same shares gone on both sides); only the rest is a fee
+            merged = min(max(short, 0.0), sum(max(0.0, recorded.get(o, 0.0) - held.get(o, 0.0)) for o in recorded if o[0] == k[0] and o[1] != k[1]))
+            if merged > 1e-9:
+                short, got = short - merged, got + merged
             if short <= 0.01 or short > self.LIVE_TRIM_MAX * total:
                 self.live_trim_seen.pop(k, None)
                 continue
@@ -4188,7 +4333,8 @@ class LiveBot(core.Bot):
                 cut = float(t.get("fee_shares") or 0)  # the shares earlier trims took off this record
                 t["shares"] = after
                 t["fee_shares"] = round(cut + before - after, 6)
-                what = f"按 Predict 持仓校正份数：{before:g} → {after:g}（账户在这一边共持有 {got:g} 份，比记录的 {total:g} 份少 {short:g} 份：手续费以份额扣除）"
+                what = (f"按 Predict 持仓校正份数：{before:g} → {after:g}（账户在这一边共持有 {got - merged:g} 份"
+                        + (f"、另有 {merged:g} 份已和另一边合并成 USDT" if merged > 1e-9 else "") + f"，比记录的 {total:g} 份少 {short:g} 份：手续费以份额扣除）")
                 if after > 0:
                     price = float(t["price"])
                     keep = price * before / after  # 1.122.0: the money spent is the same, over fewer shares
@@ -4230,7 +4376,8 @@ class LiveBot(core.Bot):
                                                            + ("；挂单的成本不变" if any(t.get("maker") for _, t in recs) else "")
                                                            + ("；按账户持仓记入的吃单本来就是扣过手续费的份数，成本不变"
                                                               if any(not t.get("maker") and self.live_from_holding(t) for _, t in recs) else "") + "）")
-            self.live_notify(f"📐 份数校正：{recs[0][1]['item']} {recs[0][1]['label']}：账户持有 {got:g} 份，记录 {total:g} 份，少的 {short:g} 份是手续费以份额扣除；"
+            self.live_notify(f"📐 份数校正：{recs[0][1]['item']} {recs[0][1]['label']}：账户持有 {got - merged:g} 份"
+                             + (f"（另有 {merged:g} 份已和另一边合并成 USDT，不算手续费）" if merged > 1e-9 else "") + f"，记录 {total:g} 份，少的 {short:g} 份是手续费以份额扣除；"
                              f"{len(recs)} 笔记录按比例改为持有的份数{costs}", key=f"trim:{k[0]}:{k[1]}")
 
     @staticmethod
@@ -4300,7 +4447,8 @@ class LiveBot(core.Bot):
         if not isinstance(row, dict):
             return 0.0
         self.live_apply(tid, t, row, None, now_ms)
-        st.pop("fills_pending", None)
+        if order_final(row, float(t.get("order") or 0)):
+            st.pop("fills_pending", None)  # 1.154.33 (R02): only Predict's last word on it frees a confirmed cancel's reservation (live_cancel_fills_read)
         return max(0.0, float(t.get("shares") or 0) - before)
 
     async def live_late_unread(self, k: tuple[str, int], key_of: Any, now_ms: int) -> str:
@@ -6457,15 +6605,39 @@ class LiveBot(core.Bot):
         lines = [f"🧪 挂单测试 {core.stamp(now_ms)}：{mk.item}（市场 {info.market_id}）买 {outcome['name']} {core.cents(price)}×{shares:g} 份，"
                  f"最多花 ${from_wei(amounts['maker']):.2f}，10 分钟后自动过期{caution}{sized}"]
         record = {"at": now_ms, "market": mk.item, "market_id": info.market_id, "price": price, "shares": shares, "hash": digest, "order_id": ""}
+        # 1.154.33 (an outside review, R12): the record — its hash above all — written before the request, not only after it: an order
+        # whose answer is lost is found again by that hash (below), and a restart in between leaves it where /live shows it
+        with contextlib.suppress(Exception):
+            self.store.put("live:test", {**record, "text": lines[0] + "\n（发送中，结果未知）"})
+        found = ""  # the order's answer lost, found again by its hash: what the first step says instead of 下单成功
         try:
             result = await self.live.api.create_order(body)
         except Exception as error:
-            lines.append(f"1/4 下单失败：{core.clean_error(error) or type(error).__name__}")
-            shown = {**body["data"], "order": {k: v for k, v in body["data"]["order"].items() if k != "signature"}}
-            lines.append("请求体（不含签名）：" + json.dumps(shown, ensure_ascii=False))
-            return self.live_test_done(record, lines)
+            text = core.clean_error(error) or type(error).__name__
+            limited = isinstance(error, core.RemoteError) and (http_status(error) == 429 or (error.retry_after and http_status(error) == 0))
+            duplicate = http_status(error) == 409 or any(w in text.lower() for w in ("already exist", "already placed", "duplicate", "exists"))
+            if limited or ((isinstance(error, OrderRejected) or 400 <= http_status(error) < 500) and not duplicate):
+                # Predict said no, or the request never left (a cooldown, a 429): nothing was placed
+                lines.append(f"1/4 下单失败：{text}")
+                shown = {**body["data"], "order": {k: v for k, v in body["data"]["order"].items() if k != "signature"}}
+                lines.append("请求体（不含签名）：" + json.dumps(shown, ensure_ascii=False))
+                return self.live_test_done(record, lines)
+            # 1.154.33 (R12): a timeout, a dropped connection, a 5xx, an answer without an order id, a 409 — the order may well rest on
+            # Predict for its ten minutes (and a second test beside it, sent again). It used to say 下单失败 and leave it there:
+            # looked for by its hash now, and withdrawn with the steps below when found
+            try:
+                row = await self.live.api.order("", digest.lower())
+            except Exception as lookup:
+                lines.append(f"1/4 下单结果未知：{text}；按哈希查找也失败（{core.clean_error(lookup) or type(lookup).__name__}）："
+                             "这张单若已被 Predict 接受，10 分钟后自动过期，也会作为“没有记录的挂单”报出，挂在本机器人做过的市场上的会被自动撤掉")
+                return self.live_test_done(record, lines)
+            if not isinstance(row, dict) or row.get("id") in (None, ""):
+                lines.append(f"1/4 下单结果未知：{text}；按哈希查不到这张单，多半没有下成（若之后出现，10 分钟后自动过期）")
+                return self.live_test_done(record, lines)
+            result = {"order_id": str(row["id"]), "code": None}
+            found = f"1/4 下单应答出错（{text}），但按哈希找到了订单 #{result['order_id']}（{row.get('status') or '?'}）：照常核对并撤掉"
         oid = record["order_id"] = result["order_id"]
-        lines.append(f"1/4 下单成功：订单 #{oid}" + (f"（code {result['code']}）" if result.get("code") else ""))
+        lines.append(found or f"1/4 下单成功：订单 #{oid}" + (f"（code {result['code']}）" if result.get("code") else ""))
         try:
             rows = await self.live.api.orders("OPEN")
             listed = next((r for r in rows if str(r.get("id")) == oid or order_hash_of(r) == digest.lower()), None)
@@ -6614,7 +6786,14 @@ class LiveBot(core.Bot):
         trades = self.sim_trades()
         withdrawable = lambda t: (isinstance(t.get("live"), dict) and t["status"] == "resting"
                                   and t["live"].get("state") in {"open", "placing", "pending", "unknown"})
+        # 1.154.33 (an outside review, R03): ...and the records already on their way out — withdrawn (or ended by their market) with the
+        # cancel failed, sent but not confirmed, or the order gone "unknown". Taken by neither list above (not resting) nor the account's
+        # (their ids are known), they were skipped: the emergency stop answered "没有真实挂单可撤。" with a green toast while Predict could
+        # still match such an order, its removal left to the step's next try (30 s on, for one Predict did not confirm). They are not
+        # withdrawn again: their removal goes out now (this command's own pass) and the reply counts them
+        withdrawing = lambda t: (isinstance(t.get("live"), dict) and not withdrawable(t) and t["live"].get("state") in {"cancelling", "unknown"})
         targets = {tid: t for tid, t in trades.items() if withdrawable(t)}
+        again = {tid: t for tid, t in trades.items() if withdrawing(t)}
         if not words:
             return "用法：/live cancel all（撤掉本策略的全部真实挂单）、/live cancel account（撤掉账户上的全部挂单，含手动单）或 /live cancel <订单号>；/live release <订单号> 把状态未知的订单按不存在处理"
         extra: list[str] = []  # the account's orders this bot has no record of
@@ -6627,6 +6806,9 @@ class LiveBot(core.Bot):
             known = {str(t["live"].get("order_id")) for t in trades.values() if isinstance(t.get("live"), dict)}
             preopen = getattr(self, "preopen", None)  # 1.141.1: the pre-open mode's own orders are its loop's to withdraw (in batches), not sent twice
             pre_ids, pre_hashes = preopen.known() if preopen is not None else (set(), set())
+            # 1.154.33 (an outside review, CR-09): the rule taker's orders likewise — withdrawn by that taker beside this command
+            # (rules_withdraw); listed here too they went out twice and were reported as orders nobody here placed
+            rule_ids, rule_hashes = self.rules_withdrawable()
             rows = await self.live.api.orders("OPEN")
             # 1.154.26 (the audit of 11-18, 2): this read stops at ORDERS_PAGES_MAX pages (1,000 orders at 50 a page) and says so
             # (orders_complete — read here with nothing run since the read returned: this read's own word) — and with the pre-open
@@ -6646,7 +6828,8 @@ class LiveBot(core.Bot):
                     cut = (f"账户挂单太多，这次只读到前 {len(rows)} 张：排在后面的挂单（手动单）没有撤到——"
                            "过一两分钟再发一次 /live cancel account（预挂的账户快照读完整后会补上）")
             extra = [str(r.get("id")) for r in rows
-                     if str(r.get("id")) not in known and str(r.get("id")) not in pre_ids and (order_hash_of(r) or "-") not in pre_hashes]
+                     if str(r.get("id")) not in known and str(r.get("id")) not in pre_ids and (order_hash_of(r) or "-") not in pre_hashes
+                     and str(r.get("id")) not in rule_ids and (order_hash_of(r) or "-") not in rule_hashes]
             # 1.150.0 (audit FR-CANCEL-ACCOUNT-STALE-KEY): that read is the whole account's — every page, many of them beside the
             # pre-open mode's thousands — and nothing holds the express lane meanwhile: this command takes no sim_lock, and the lane
             # sends its cancels and quotes a freed slot again outside it (sim_express_after, live_requote_freed). A record taken
@@ -6663,15 +6846,26 @@ class LiveBot(core.Bot):
             # nothing more is withdrawn or sent ("all" and a single order id take their records with no wait before the loop)
             view = self.sim_trades()
             targets = {tid: t for tid, t in targets.items() if view.get(tid) is t and withdrawable(t)}
+            again = {tid: t for tid, t in again.items() if view.get(tid) is t and withdrawing(t)}  # (as the targets: what the lane did meanwhile is its own)
         elif words[0] != "all":
             targets = {tid: t for tid, t in targets.items() if str(t["live"].get("order_id")) == words[0]}
-            if not targets:
+            again = {tid: t for tid, t in again.items() if str(t["live"].get("order_id")) == words[0]}
+            if not targets and not again:
                 return f"没有订单号为 {words[0]} 的真实挂单（/live 查看）"
         for tid, t in targets.items():
             self.sim_withdraw(t, "管理员撤单", now_ms)
             self.sim_save([(tid, t)])
-        if not targets and not extra:
+        was_unknown = {tid for tid, t in again.items() if t["live"].get("state") == "unknown"}
+        for tid, t in again.items():
+            st = t["live"]
+            if (st.get("state") == "cancelling" and st.get("cancel_sent") and not st.get("cancel_confirmed")
+                    and str(st.get("order_id") or "") not in self.live_cancels):
+                st["cancel_sent"] = 0  # (a removal in flight on another path, or one Predict confirmed, is left as it is)
+                st["events"].append({"at": now_ms, "what": "管理员撤单：之前的撤单请求未获 Predict 确认，现在再发一次"})
+                self.live_save(tid, t)
+        if not targets and not again and not extra:
             return "没有真实挂单可撤。" if not cut else f"❌ 读到的挂单里没有要撤的，但{cut}"
+        acting = {**targets, **again}
         problems = [cut] if cut else []
         if extra:
             limit = self.live_remove_limit()
@@ -6697,12 +6891,21 @@ class LiveBot(core.Bot):
                 problems.append(extra_text)
         list_error = ""
         try:
-            if targets:
-                await self.live_sync_orders(targets, now_ms)
+            if acting:
+                await self.live_sync_orders(acting, now_ms)
         except Exception as error:
             list_error = core.clean_error(error) or type(error).__name__
+        # an order of unknown state this pass found again (live_recheck: by the list or its hash) is removed now as well, by its id
+        found = {tid: t for tid, t in again.items() if tid in was_unknown and t["live"].get("state") in {"open", "cancelling"}
+                 and t["live"].get("order_id") and not t["live"].get("cancel_sent") and str(t["live"]["order_id"]) not in self.live_cancels}
+        for tid, t in found.items():
+            t["live"].update(state="cancelling", cancel_why=t["live"].get("cancel_why") or "管理员撤单")
+            t["live"]["events"].append({"at": now_ms, "what": "管理员撤单：状态未知的订单又找到了，随即撤单"})
+            self.live_save(tid, t)
+        if found:
+            await self.live_cancel_blind(found, now_ms)
         after = self.sim_trades()
-        states = [after.get(tid, t)["live"] for tid, t in targets.items()]
+        states = [after.get(tid, t)["live"] for tid, t in targets.items()] + [t["live"] for t in again.values()]
         confirmed = sum(s.get("state") == "done" for s in states)
         # 1.150.0: a removal another path has on its way (the step's sync, an express pass: live_cancels) is sent, its answer awaited —
         # this command's own pass left that order to it (live_cancel), and its cancel_sent is only set once Predict answers
@@ -6728,8 +6931,9 @@ class LiveBot(core.Bot):
         # record stays unknown, reserved and blocking until Predict's word, the evidence, its expiry or /live release ends it
         unknown = sum(s.get("state") == "unknown" for s in states)
         parts = []
-        if targets:
-            parts.append(f"策略挂单 {len(targets)} 笔：Predict 确认撤掉 {confirmed} 笔"
+        if acting:
+            parts.append(f"策略挂单 {len(acting)} 笔" + (f"（其中 {len(again)} 笔之前已在撤单、撤单未获确认或状态未知）" if again else "")
+                         + f"：Predict 确认撤掉 {confirmed} 笔"
                          + (f"，{sent} 笔撤单请求已发送、待确认（每 10 秒核对，确认前额度仍占用）" if sent else "")
                          + (f"，{unsent} 笔撤单请求尚未发出（下一轮重试，额度仍占用）" if unsent else "")
                          + (f"，{len(failed)} 笔出错（{failed[0]}）" if failed else "")
@@ -6742,7 +6946,7 @@ class LiveBot(core.Bot):
         parts.extend(p for p in problems if p != (extra_text if extra else None))
         pending = sent + unsent
         head = "❌ " if problems or failed or unknown else ("⏳ " if pending else "✅ ")
-        return head + "；".join(parts) + ("" if not targets else "\n" + "、".join(f"{t['item']} {t['label']}" for t in targets.values()))
+        return head + "；".join(parts) + ("" if not acting else "\n" + "、".join(f"{t['item']} {t['label']}" for t in acting.values()))
 
     @staticmethod
     def position_line(row: dict) -> str:
@@ -7374,6 +7578,26 @@ class LiveBot(core.Bot):
         import rules
         taker = getattr(self, "rules", None)  # (a bot the tests build without __init__ has none)
         return taker.recs if taker is not None else rules.records(self.store)
+
+    def rules_withdrawable(self) -> tuple[set[str], set[str]]:
+        """The ids and hashes of the rule taker's real orders that its own withdrawal takes (rules.RuleTaker.withdraw_all: mode on,
+        not ended, not removed) — what /live cancel account leaves to it (1.154.33, CR-09). Not every order it knows of (known_orders:
+        two days of them, ended ones too): the review of that fix — an order its record had ended while it still rested was then
+        withdrawn by nobody, and the command answered "没有真实挂单可撤"."""
+        import rules
+        ids, hashes = set(), set()
+        for rec in self.rules_records().values():
+            if rec.get("mode") != "on":
+                continue
+            for o in rec.get("orders") or ():
+                if o.get("paper") or o.get("state") in rules.FINAL_STATES or o.get("removed"):
+                    continue
+                if o.get("id"):
+                    ids.add(str(o["id"]))
+                for key in ("hash", "api_hash"):
+                    if o.get(key):
+                        hashes.add(str(o[key]).lower())
+        return ids, hashes
 
     def rules_known(self) -> tuple[set[str], set[str]]:
         """The rule taker's real orders' ids and hashes (rules.RuleTaker.known): never an "unrecorded" order of the account's."""

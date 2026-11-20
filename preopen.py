@@ -79,6 +79,7 @@ LEND_SNAPSHOT_LEAVE = 2.0     # ...its pages leaving this many tokens more than 
 LEND_YIELD_MIN_S = 20.0       # ...but for half the read's own pace at the most (this at least): then beside them, so a backlog borrowing on and on never keeps it from finishing
 LEND_OFF_S = 600.0            # after that key refused a request (a 429, a 401 / 403) nothing more goes out on it for this long
 LEND_WARM_S = 60.0            # the sign-in on that key is kept fresh this often while it may be borrowed
+FIRST_WARM_S = 60.0           # ...and the fresh listings' client's (first_keep_warm, 1.154.33)
 GIVE_WAY_MAX_S = 20.0     # 1.154.23: what waits for the rule taker's seconds (Controller.yielding) waits no longer than this
 HOLD_RETRY_MS = 5_000     # a held candidate (hold(): a stale snapshot, the cooldown, the pause; or the budget) waits this long on the side, then is placed again — never read again meanwhile
 FRESH_FIRST_MS = 10 ** 13  # 1.154.8: a window found at its listing is queued this far ahead of any start — placed before the backlog (queue_rank)
@@ -634,6 +635,15 @@ def safe_api(base: str, key: str, wallet: Any, before_send: Any = None, shared: 
 
         async def call(self, method: str, path: str, *args: Any, **kwargs: Any) -> Any:
             answer = await super().call(method, path, *args, **kwargs)
+            if method == "POST" and path == "/orders" and isinstance(answer, dict) and answer.get("success") is False:
+                # 1.154.33 (an outside review, R17): Predict's refusal of an order in a 2xx answer, in its own words, is what the
+                # bot's own client makes of it (live.PredictApi.create_order): OrderRejected, the same text — a definite refusal
+                # to place_pair and to the rule taker (rules.RuleTaker.send) alike, its duplicate's wording ("already exists")
+                # still an order that may exist. The plain error below, which has no status, made it "unknown" to both: its
+                # money held and its hash looked up over and over until the order's end (here every two minutes until a quarter
+                # hour past the window: a day of look-ups for a window quoted a day ahead), its outcome kept from the model
+                # trader's positions check meanwhile
+                raise live.OrderRejected("下单被拒绝：" + (core.http_error_text(answer) or "Predict 没有说明原因"))
             # an explicit success=false is a refusal, whatever the status; a dict without the key passes, as the bot's own
             # client takes it (1.127.1: POST /orders/remove answers {"success": true, "removed": [...], "noop": [...]} with
             # no "data" key — requiring one read every cancel as a failure, and the withdrawn pairs kept their money)
@@ -743,8 +753,12 @@ def market_shut(rolling: Any, start_ms: int) -> str:
 # out, by card (rules.RULES): gold's 05:15 New York quarter hour, Monday to Friday — Down 65% over a year (London's morning fix
 # ahead); 11-18 the mode's Up bids there were sold into down the whole ladder, 190 shares at 42.4¢ on average, hours before the
 # window, the Down bids left alone. (The shut quarter hours and the reopen's first, the taker's other windows on by default, are
-# left out already: market_shut, session_opening.)
-LEANING_RULES = {"XAU-15M": ("gold_0515",)}
+# left out already: market_shut, session_opening.) 1.154.33 (an outside review, CR-05): and the slot scan's other three (1.153.2:
+# leaning the same way in both halves of the year) — gold's 05:00 (Up 62%) and 16:45 (Up 60%), oil's 00:45 (Down 62%). The
+# rule taker has them off by default, but the lean is the window's, whoever trades it: both sides bid there, the losing one is
+# sold to it first. With one of them on in the rule taker, this mode's bid on the other side also held the taker's limit under it
+# (the self-trade guard: rules.RuleTaker.own_asks)
+LEANING_RULES = {"XAU-15M": ("gold_0515", "gold_0500", "gold_1645"), "CL-15M": ("oil_0045",)}
 
 
 def rules_of(key: str) -> Any:
@@ -1105,10 +1119,23 @@ def awaiting_finals(pair: dict, now_ms: int, days: int = 3) -> int:
     that only reads (nothing new goes out, nothing is left to cancel): its loop reads each record once LATE_FILL_MS has
     passed, the pair is accounted, it stops itself (wound_up) and, nothing left, is not started again. Should Predict's
     reads keep failing it stops after FINALS_WAIT_MS and the apply its stop calls starts it again — reads only, until a read
-    succeeds, the give-up (a read past start + GIVE_UP_MS ends the order) or the window leaves this span."""
+    succeeds, the give-up (a read past start + GIVE_UP_MS ends the order) or the window leaves this span.
+
+    1.154.33 (an outside review, R09): and the orders that may have been sent — open, placing, unknown — whose signed expiry
+    passed while no controller ran. The process's own stop leaves the orders on the book (LiveBot.run: the next controller
+    takes them over), so a start with the mode off finds them as they were: resting_orders counts an order only until its
+    expiry, it is not "removed", and with nothing filled on record awaiting_result does not name its pair either. What they
+    matched in the minutes the process was down went unread for as long as the mode stayed off — out of the day's P&L and
+    the loss stop, their outcomes held from the model trader's positions check for 3 days — unless some other order of the
+    mode still rested (the wind-down that starts then takes over every record). Counted here, they start that wind-down
+    controller themselves: adopt closes their pairs, cancel_pair reads each record (the removal answered noop, or the hash
+    looked up) and settle_pair books what filled. (After the expiry: no order is counted twice, resting_orders took it until
+    then; a "prepared" one was never sent, nothing to read.)"""
     if pair.get("accounted") or int(pair.get("start_ms") or 0) < now_ms - days * core.DAY_MS:
         return 0
-    return sum(1 for o in (pair.get("orders") or {}).values() if o.get("state") == "removed")
+    end = int(pair.get("expires") or 0) * 1000 or int(pair.get("start_ms") or 0)  # (resting_orders' own end)
+    return sum(1 for o in (pair.get("orders") or {}).values()
+               if o.get("state") == "removed" or (now_ms >= end and o.get("state") in {"open", "placing", "unknown"}))
 
 
 def counts_against(pair: dict) -> bool:
@@ -1180,6 +1207,19 @@ def pair_quote(pair: dict) -> tuple[float, float]:
         if signed.get("takerAmount") and data.get("pricePerShare"):
             return float(D(str(data["pricePerShare"])) / live.WEI), float(D(str(signed["takerAmount"])) / live.WEI)
     return 0.0, 0.0
+
+
+def drop_signature(order: dict) -> None:
+    """The order's signature out of its saved request, once the request is done with: answered or failed (place_pair's
+    send — never before Controller.through is through, which sends the same body once more on this mode's own key when the
+    borrowed one refuses it), or never to be sent (not_sent). 1.154.33 (an outside review, R24): the ledger kept every
+    order's whole signed request — the signature that makes the order good until its expiry — in the working records and
+    the archive alike, for good, and nothing reads it after the request: an order whose answer went missing is looked for
+    by its hash, never sent again. The rest of the request stays: resumable and pair_quote read its amounts and price,
+    live_known_markets its token."""
+    signed = ((order.get("body") or {}).get("data") or {}).get("order")
+    if isinstance(signed, dict):
+        signed.pop("signature", None)
 
 
 def read_rows(path: str) -> list[dict]:
@@ -1797,6 +1837,8 @@ class Controller:
         self.lent_warm: asyncio.Task | None = None  # the sign-in on that key, kept fresh while it may be borrowed (lent_keep_warm)
         self.lent_warmed = -1e9
         self.lent_warm_error = ""  # why this mode's sign-in on that key last failed (tried again LEND_WARM_S on; the orderbook feed needs none and borrows on)
+        self.first_warm: asyncio.Task | None = None  # the fresh listings' client's sign-in, kept fresh (first_keep_warm, 1.154.33)
+        self.first_warmed = -1e9
         for client in (self.api, self.cancel_api, self.snap_api, self.first_api, self.lent_api, self.lent_snap_api):
             if client is not None:
                 client.ORDERS_PAGE = int(getattr(owner.config, "live_orders_page", 50) or 50)  # LIVE_ORDERS_PAGE: fewer pages a snapshot (1.136.1)
@@ -2070,6 +2112,28 @@ class Controller:
             except Exception as error:  # (this mode's own sign-in: tried again LEND_WARM_S on, nothing of the lending paused for it)
                 self.lent_warm_error = core.clean_error(error) or type(error).__name__
         self.lent_warm = asyncio.create_task(warm(), name="preopen-lent-warm")
+
+    def first_keep_warm(self) -> None:
+        """The fresh listings' client signed in, and its token renewed before it expires (ensure_auth: five minutes ahead), beside
+        the loop — 1.154.33 (an outside review, CR-10): its first order after a start, or after the token's end, went out behind a
+        sign-in of its own (GET /auth/message, POST /auth: half a second, on the request that is about the queue position). Only
+        the made client (first: the tests' own api is used instead) and once every FIRST_WARM_S; a sign-in that fails is tried
+        again then (the order signs in itself, as before)."""
+        client = self.first()
+        if self.winding or client is not getattr(self, "first_api", None) or not callable(getattr(client, "ensure_auth", None)):
+            return  # (winding down: nothing more is placed)
+        if time.monotonic() - self.first_warmed < FIRST_WARM_S or (self.first_warm is not None and not self.first_warm.done()):
+            return
+        self.first_warmed = time.monotonic()
+
+        async def warm() -> None:
+            try:
+                await client.ensure_auth()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # (the order signs in itself: nothing waits on this one; said in /preopen check, not announced)
+                self.errors.append((self.now(), f"新盘专用客户端登录失败：{core.clean_error(error) or type(error).__name__}"))
+        self.first_warm = asyncio.create_task(warm(), name="preopen-first-warm")
 
     def snapshot_lane(self) -> Any:
         """The client the next account snapshot is read through (1.154.21): the borrowed key's while that key may be borrowed
@@ -2745,7 +2809,7 @@ class Controller:
             self.allowance_cache[exchange] = cached
         if not cached[1] >= live.to_wei(pair_usd):
             raise core.RemoteError("开盘前双边挂单授权额度不足")
-        await self.api.ensure_auth()
+        await home.ensure_auth()  # 1.154.33 (CR-10): the client the orders go out on (first_api for a fresh listing), before the lock — not self.api's alone
         async with self.account_lock:
             # Only one coroutine reserves a pair at a time; reservations are saved
             # before the lock is released, including orders not visible on REST yet.
@@ -2816,6 +2880,7 @@ class Controller:
                     # no order exists. Keep its hash and full reservation; do not retry.
                     order.update(state="unknown", error=text)
                 pair["phase"] = "closing"
+            drop_signature(order)  # 1.154.33 (an outside review, R24): through() is through — the request is never sent again (not before: a refusal on the borrowed key sends this same body on the mode's own)
             self.ledger.save(pair)
         if sides:
             await asyncio.gather(*(send(side) for side in sides))  # 1.131.0: side by side — the second side no longer waits a round trip
@@ -2851,6 +2916,18 @@ class Controller:
         order["filled"] = max(before, float(shares * filled / amount))
         if order["filled"] > before:  # 1.151.0: when a fill was first seen (the snapshot's pace: seconds, a minute with thousands of orders) — the review's 成交时距开场
             order.setdefault("fill_ms", self.now())
+            if pair.get("accounted") and not pair.get("result"):
+                # 1.154.33 (an outside review, CR-02): a fill read after its pair was accounted with nothing filled — the account
+                # snapshot's rows, read before the cancel (a read of thousands of orders takes minutes), applied after final
+                # reads that found nothing: the order's own record still lagging LATE_FILL_MS after the removal (Audit
+                # PRE-LATE-FILL: not covered). The shares were written in and the record left accounted at 0: settle_pair and
+                # the loop passed it by, its loss never in daily_pnl nor the day's loss stop. Back among the pairs to settle:
+                # settle_pair prices it on Predict's result (each caller saves the record, and Ledger.index puts it back
+                # among the working ones). A pair already settled on its result is left as it is
+                pair["accounted"] = False
+                pair.pop("accounted_day", None)
+                pair.pop("pnl", None)
+                LOG.warning("开盘前预挂 %s：已按没成交结清后又读到成交 %.2f 份，改为等结果结算", pair.get("slug"), order["filled"])
         if order["filled"] > 0:
             self.ledger.note_filled(pair)  # 1.154.22: counted among the mode's fills from this moment, not from the record's next save (Ledger.filled)
 
@@ -2978,6 +3055,7 @@ class Controller:
             for order in pair["orders"].values():
                 if order["state"] == "prepared":
                     order["state"] = "not_sent"
+                    drop_signature(order)  # (never to be sent: 1.154.33, R24)
                     self.ledger.save(pair)
                     continue
                 if order["state"] in NEVER_PLACED or order["state"] == "final":
@@ -3157,6 +3235,7 @@ class Controller:
             for order in pair["orders"].values():
                 if order["state"] == "prepared":
                     order["state"] = "not_sent"
+                    drop_signature(order)  # (never to be sent: 1.154.33, R24)
         self.ledger.save_many(pairs)
         return await self.remove_pairs(pairs, deadline_s=deadline_s)
 
@@ -3461,6 +3540,7 @@ class Controller:
             calls = sum(count(client) for client in {id(x): x for x in (self.api, self.cancel_api, self.bulk_client(), self.snapshot_client(), self.first(),
                                                                         self.lent_api, self.lent_snap_api) if x is not None}.values())
             self.lent_keep_warm()
+            self.first_keep_warm()
             if not self.rate_samples or now - self.rate_samples[-1][0] >= 500:
                 self.rate_samples.append((now, calls))
             await self.check_cards(now)
@@ -3565,7 +3645,7 @@ class Controller:
                     if job.done() and not job.cancelled() and job.exception():
                         raise job.exception()
             finally:
-                bulk = [task for task in (self.bulk_task, self.lent_warm) if task is not None]
+                bulk = [task for task in (self.bulk_task, self.lent_warm, self.first_warm) if task is not None]  # (first_warm: 1.154.33)
                 for job in [*stops, *jobs, *bulk]:
                     job.cancel()
                 await asyncio.gather(*stops, *jobs, *bulk, return_exceptions=True)
@@ -3703,7 +3783,7 @@ class Controller:
                 + f"；股票卡开盘、午后头 {quiet} 分钟内开始的场次不挂"
                 + (f"；{shut_cards['cme']}休市（{SHUT_TEXT['cme']}）期间的场次不挂" + f"、重开后头 {quiet} 分钟内开始的也不挂"
                    + (f"（北京时间 {when(cme_next[0], self.now())}–{when(cme_next[1], cme_next[0])}）" if cme_next else "") if shut_cards["cme"] else "")
-                + "".join(f"；{rules_of(key).name} 那一场不挂（结果偏{rules_of(key).word}，1.154.19）" for card, keys in LEANING_RULES.items()
+                + "".join(f"；{rules_of(key).name} 那一场不挂（结果偏{rules_of(key).word}）" for card, keys in LEANING_RULES.items()
                           if card in self.settings.markets for key in keys)
                 + (f"；{shut_cards['us']}只挂美股常规交易时段内的场次（纽约时间 09:30–16:00，美国假日、半日市按日历）"
                    + f"，开盘后头 {quiet} 分钟的不挂" if shut_cards["us"] else "")  # the end's date only when not the start's

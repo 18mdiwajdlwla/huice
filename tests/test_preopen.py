@@ -1079,19 +1079,21 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         for key in ("XAU-15M", "CL-15M"):
             self.assertFalse(set(by(key)) & shut, key)
             self.assertNotIn(et(18, 0), by(key), "the reopen's first window: quiet 15")
-            self.assertTrue({et(16, 45), et(18, 15)} <= set(by(key)), "the last window before the shut ends at 17:00: quoted")
-            self.assertEqual(len(by(key)), len(by("BTC-15M")) - 5 - (key == "XAU-15M"), "(gold's 05:15 New York window too: 1.154.19)")
+            self.assertTrue({et(16, 30), et(18, 15)} <= set(by(key)), "the windows before the shut and after the reopen's quiet: quoted")
+            self.assertEqual(len(by(key)), len(by("BTC-15M")) - 5 - (3 if key == "XAU-15M" else 1),
+                             "(the leaning windows too: gold's 05:00, 05:15 and 16:45 New York, 1.154.19 / 1.154.33; oil's 00:45, 1.154.33)")
+        self.assertTrue(et(16, 45) in by("CL-15M") and et(16, 45) not in by("XAU-15M"), "the last window before the shut, ending at 17:00: oil's quoted, gold's leans")
         self.assertTrue(shut | {et(18, 0)} <= set(by("BTC-15M")), "round the clock: untouched")
         xau = next(r for r in m.WINDOW_UPDOWN_MARKETS if r.key == "XAU-15M")
         why = "黄金休市（纽约时间每天 17:00–18:00、周五 17:00 到周日 18:00，CME 节假日从 12:00 起）"
         self.assertEqual(p.candidate_problem(market("xau", at=et(17, 15), mid=41), now, ctl.owner.config, ctl.settings), why)
         self.assertIsNone(p.candidate(market("xau", at=et(17, 15), mid=41), now, ctl.owner.config, ctl.settings))
-        self.assertEqual(p.candidate_problem(market("xau", at=et(16, 45), mid=42), now, ctl.owner.config, ctl.settings), "")
+        self.assertEqual(p.candidate_problem(market("xau", at=et(16, 30), mid=42), now, ctl.owner.config, ctl.settings), "")
         self.assertEqual(p.candidate_problem(market("btc", at=et(17, 15), mid=43), now, ctl.owner.config, ctl.settings), "")
         self.assertTrue(xau.exists(et(17, 15)) and xau.current(et(17, 20)).start_ms == et(17, 15) - 60_000, "the model trader's card: as before")
         # the weekend: Friday 17:00 to Sunday 18:00, then the reopen's first window left out too
         friday = p.window_starts(et(16, 0, 20), ctl.owner.config, ctl.settings)
-        self.assertEqual(by("XAU-15M", friday), [et(16, 15, 20), et(16, 30, 20), et(16, 45, 20)])
+        self.assertEqual(by("XAU-15M", friday), [et(16, 15, 20), et(16, 30, 20)], "(16:45, the last before the shut: gold's leans — 1.154.33)")
         self.assertEqual(len(by("BTC-15M", friday)), 96)
         self.assertEqual(min(by("XAU-15M", p.window_starts(et(12, 0, 22), ctl.owner.config, ctl.settings))), et(18, 15, 22), "Sunday's reopen")
         # New York's clock, DST followed: 05:00 Beijing in summer; the shut that spans the switch (11-01) keeps both ends right
@@ -1441,32 +1443,74 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(x["cancel_ms"] == x["start_ms"] - 30_000 for x in ctl3.ledger.rows.values()))
             await self.finish(ctl3)
 
+    async def test_the_fresh_listings_client_is_kept_signed_in(self):
+        """1.154.33 (an outside review, CR-10) — a fresh listing's orders go out on a client of their own (first_api, 1.154.21), and
+        place_pair signed in the mode's main client before them: the fresh one signed in inside its first order (two requests ahead
+        of the one that is about the queue position). Now the client the orders go out on is the one made sure of, and the fresh
+        one is kept signed in beside the loop — once a minute at the most, a failure noted and tried again then."""
+        ctl, api, clock = controller()
+        ctl.first_keep_warm()
+        self.assertIsNone(ctl.first_warm, "the tests' own api in place: theirs is the client, nothing to warm")
+        signed = []
+
+        class Client:
+            async def ensure_auth(self):
+                signed.append(1)
+        ctl.api, ctl.first_api = ctl.api_made, Client()
+        self.assertIs(ctl.first(), ctl.first_api)
+        ctl.first_keep_warm()
+        await ctl.first_warm
+        ctl.first_keep_warm()
+        self.assertEqual(len(signed), 1, "once a minute at the most")
+        ctl.first_warmed -= p.FIRST_WARM_S
+        ctl.first_keep_warm()
+        await ctl.first_warm
+        self.assertEqual(len(signed), 2)
+
+        class Broken:
+            async def ensure_auth(self):
+                raise m.RemoteError("HTTP 503")
+        ctl.first_api, ctl.first_warmed = Broken(), ctl.first_warmed - p.FIRST_WARM_S
+        ctl.first_keep_warm()
+        await ctl.first_warm
+        self.assertIn("新盘专用客户端登录失败：HTTP 503", ctl.errors[-1][1])
+        ctl.api = api
+        await self.finish(ctl)
+
     async def test_golds_0515_new_york_window_is_not_quoted(self):
         """1.154.19 — a window whose outcome is known to lean is not one to bid on both sides of. Gold's 05:15 New York quarter hour
         (the rule taker's 黄金纽约 05:15: Down 65% over a year): 11-18 the mode's Up bids there were sold into down the whole
         ladder — 190 shares at 42.4¢ on average, hours before the window — the Down bids left alone. Not quoted, not looked for;
         one resting from before is withdrawn at the next start (free). In New York time, as the rule is; oil and the crypto
-        cards, and gold's other windows, as before."""
+        cards, and gold's other windows, as before. 1.154.33 (an outside review, CR-05): and the slot scan's other leaning windows
+        — gold's 05:00 and 16:45, oil's 00:45."""
         et = lambda h, mi, day=6, month=11, offset=-5: m.et_ms(2026, month, day, h, mi, offset)
         ctl, api, clock = controller(PREOPEN_MARKETS="xau,cl,btc", PREOPEN_AHEAD_MINUTES="1440")
         starts = p.window_starts(NOW, ctl.owner.config, ctl.settings)  # Thursday 20:00 New York: Friday's 05:15 is nine hours on
         by = lambda key: [s for r, s in starts if r.key == key]
         self.assertNotIn(et(5, 15), by("XAU-15M"))
-        self.assertTrue({et(5, 0), et(5, 30)} <= set(by("XAU-15M")), "the quarter hours either side: quoted")
-        self.assertTrue(et(5, 15) in by("CL-15M") and et(5, 15) in by("BTC-15M"), "oil and BTC: as before")
+        # 1.154.33 (CR-05): the slot scan's other leaning windows too — gold's 05:00 and 16:45, oil's 00:45 (New York)
+        self.assertTrue(et(5, 0) not in by("XAU-15M") and et(16, 45) not in by("XAU-15M") and et(0, 45) not in by("CL-15M"), sorted(by("XAU-15M")))
+        self.assertTrue({et(4, 45), et(5, 30), et(16, 30)} <= set(by("XAU-15M")), "the quarter hours either side: quoted")
+        self.assertTrue(et(5, 15) in by("CL-15M") and et(5, 15) in by("BTC-15M") and et(0, 45) in by("BTC-15M"), "oil's other windows and BTC: as before")
         why = "黄金纽约 05:15 这一场不挂：结果有偏向（回测跌占多数），两边都挂只会被吃掉输的那边"
         self.assertEqual(p.candidate_problem(market("xau", at=et(5, 15), mid=41), NOW, ctl.owner.config, ctl.settings), why)
         self.assertIsNone(p.candidate(market("xau", at=et(5, 15), mid=41), NOW, ctl.owner.config, ctl.settings))
         self.assertEqual(p.candidate_problem(market("xau", at=et(5, 30), mid=42), NOW, ctl.owner.config, ctl.settings), "")
         self.assertEqual(p.candidate_problem(market("cl", at=et(5, 15), mid=43), NOW, ctl.owner.config, ctl.settings), "")
         xau, cl = (next(r for r in m.WINDOW_UPDOWN_MARKETS if r.key == key) for key in ("XAU-15M", "CL-15M"))
-        self.assertEqual((bool(p.leaning_window(xau, et(5, 15))), p.leaning_window(cl, et(5, 15)), p.leaning_window(xau, et(5, 0))), (True, "", ""))
+        self.assertEqual((bool(p.leaning_window(xau, et(5, 15))), p.leaning_window(cl, et(5, 15)), p.leaning_window(xau, et(4, 45))), (True, "", ""))
+        self.assertEqual((p.leaning_window(xau, et(5, 0)), p.leaning_window(xau, et(16, 45)), p.leaning_window(cl, et(0, 45))),
+                         ("黄金纽约 05:00 这一场不挂：结果有偏向（回测涨占多数），两边都挂只会被吃掉输的那边",
+                          "黄金休市前一档 这一场不挂：结果有偏向（回测涨占多数），两边都挂只会被吃掉输的那边",
+                          "原油纽约 00:45 这一场不挂：结果有偏向（回测跌占多数），两边都挂只会被吃掉输的那边"))
         # New York's clock: 17:15 Beijing in summer (18:15 Beijing is an ordinary window then); Monday to Friday
         summer = m.et_ms(2026, 7, 15, 5, 15, -4)
         self.assertEqual(dt.datetime.fromtimestamp(summer / 1000, m.BEIJING).strftime("%H:%M"), "17:15")
         self.assertEqual((bool(p.leaning_window(xau, summer)), p.leaning_window(xau, summer + 3_600_000)), (True, ""))
         self.assertEqual(p.leaning_window(xau, et(5, 15, 7)), "", "Saturday: none (and CME is shut)")
-        self.assertIn("；黄金纽约 05:15 那一场不挂（结果偏跌，1.154.19）", ctl.status())
+        self.assertIn("；黄金纽约 05:15 那一场不挂（结果偏跌）；黄金纽约 05:00 那一场不挂（结果偏涨）；黄金休市前一档 那一场不挂（结果偏涨）"
+                      "；原油纽约 00:45 那一场不挂（结果偏跌）", ctl.status())
         await self.finish(ctl)
         btc, _, _ = controller(PREOPEN_MARKETS="btc")
         self.assertNotIn("05:15", btc.status())
@@ -3035,9 +3079,11 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             ledger.save({"slug": "w1", "key": "BTC-15M", "phase": "closing", "start_ms": NOW + 3600_000, "expires": (NOW + 3590_000) // 1000,
                          "orders": {"up": {"id": "1", "hash": "0xh", "state": "open", "filled": 0.0}}})
             ledger.save({"slug": "w0", "key": "BTC-15M", "phase": "closing", "start_ms": NOW - 3600_000, "expires": (NOW - 3610_000) // 1000,
-                         "orders": {"up": {"id": "2", "hash": "0xg", "state": "open", "filled": 0.0}}})  # expired: rests nowhere
+                         "orders": {"up": {"id": "2", "hash": "0xg", "state": "open", "filled": 0.0}}})  # expired: rests nowhere...
             ledger.close()
-            self.assertEqual(bot.preopen_leftovers(), 1)
+            # ...but what it filled before its expiry is still unread: counted too (1.154.33, an outside review, R09 — it was 1, and
+            # with no order of the mode left resting nothing read it: test_a_mode_off_start_reads_the_orders_that_expired_while_it_was_down)
+            self.assertEqual((bot.preopen_left(), bot.preopen_leftovers()), ((2, 0), 2))
             await bot.preopen_apply()
             self.assertEqual(bot.preopen.winding, "预挂模式关着，但上次还有挂单没撤完")
             bot.config = m.Config.from_env({**env, "PREOPEN_15M": "on"})  # switched back on while winding down: a fresh controller takes the records over
@@ -3069,6 +3115,168 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(bot.preopen_left(), (0, 0))
             await bot.preopen_apply()
             self.assertIsNone(bot.preopen, "nothing left: none started")
+
+    # --- 1.154.33: an outside review of the pre-open mode ---------------------------------------------------------------------
+    async def test_a_fill_read_after_its_pair_was_accounted_takes_it_back_to_settle(self):
+        """1.154.33 (an outside review, CR-02) — the account snapshot reads every page of the open orders first and applies them
+        after (thousands of orders: minutes), so its rows are often from before a window's cancel. When the order's own record
+        still lagged a minute after the removal (Audit PRE-LATE-FILL's case not covered: LATE_FILL_MS), the final reads
+        accounted the pair with nothing filled, and the snapshot's fill landed on it after that: the shares written in, the
+        pair left accounted at 0 — settle_pair and the loop passed it by, its loss never in the day's P&L nor the loss stop.
+        Now such a fill takes the pair back among those to settle, and Predict's result prices it."""
+        ctl, api, clock = controller()
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        await ctl.place_pair(c)
+        pair = ctl.ledger.rows[c["slug"]]
+        up = pair["orders"]["up"]
+        clock.ms = ctl.account_at = c["cancel_ms"] - 30_000
+        row = api.rows[up["hash"]]
+        row["amountFilled"] = str(int(row["amount"]) * 20 // 50)  # 20 of Up's 50 shares matched: no snapshot has seen them yet
+        release, listed = asyncio.Event(), api.orders
+
+        async def pages(status="OPEN"):
+            rows = await listed(status)  # the page with Up read now: open, 20 filled...
+            await release.wait()  # ...the rest of the pages take their time
+            return rows
+        api.orders = pages
+        snapshot = asyncio.create_task(ctl.account())
+        await asyncio.sleep(0.05)
+        record = api.order
+
+        async def lagging(oid, digest=""):  # Up's own record: cancelled with nothing filled, a minute after the removal still
+            found = await record(oid, digest)
+            if found is not None and digest == up["hash"]:
+                found["amountFilled"] = "0"
+            return found
+        api.order = lagging
+        clock.ms = c["cancel_ms"]
+        await ctl.cancel_many([pair], "到时撤单或真实交易暂停", free=True)
+        await self.settle_tasks(ctl)
+        await self.read_finals(ctl, clock, pair)
+        self.assertEqual((pair.get("accounted"), pair.get("pnl"), up["state"], up["filled"]), (True, 0.0, "final", 0.0))
+        release.set()
+        await snapshot  # applied now: the fill read before the cancel
+        self.assertEqual((up["filled"], pair["accounted"], "pnl" in pair, "accounted_day" in pair), (20.0, False, False, False))
+        self.assertIn(pair, ctl.ledger.pending(), "back among the working records: the loop settles it on the result")
+        saved = json.loads(ctl.ledger.conn.execute("SELECT body FROM pairs WHERE slug=?", (pair["slug"],)).fetchone()[0])
+        self.assertEqual((saved["accounted"], saved["orders"]["up"]["filled"]), (False, 20.0), "and so on file")
+        api.markets["123"]["outcomes"][0]["status"] = "WON"  # Down won: Up's 20 shares at 49¢ are lost
+        clock.ms = p.settle_from(pair) + 61_000
+        await ctl.settle_pair(pair)
+        self.assertEqual((pair["accounted"], pair["result"]), (True, "down"))
+        self.assertAlmostEqual(pair["pnl"], -9.8)
+        self.assertAlmostEqual(ctl.daily_pnl(), -9.8, msg="in the day's figure the loss stop reads")
+        await self.finish(ctl)
+
+    async def test_a_mode_off_start_reads_the_orders_that_expired_while_it_was_down(self):
+        """1.154.33 (an outside review, R09) — the process's stop leaves the orders on the book (the next controller takes them
+        over), and a start with the mode off counted what may still rest (before the signed expiry), the withdrawn orders'
+        unread final fills and the windows with a fill on record: an order that expired while no process ran, matched
+        meanwhile, was none of them. With nothing else of the mode resting nothing ever read it — its loss out of the day's P&L
+        and the loss stop, its outcomes kept from the model trader's positions check for three days. Now it starts the
+        wind-down, which reads it and settles the window."""
+        with tempfile.TemporaryDirectory() as folder:
+            sized = dict(PREOPEN_DB=str(Path(folder) / "down.preopen.sqlite3"), PREOPEN_MARKETS="btc", PREOPEN_SHARES="100")
+            ctl, api, clock = controller(**sized)
+            c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+            await ctl.place_pair(c)
+            up, down = (ctl.ledger.rows[c["slug"]]["orders"][side] for side in ("up", "down"))
+            await self.finish(ctl)  # the process stops: the orders left on the book
+            # while no process runs: 40 of Up's 100 shares matched, then the signed expiry passes (a removal now: noop)
+            api.rows[up["hash"]].update(amountFilled=str(int(api.rows[up["hash"]]["amount"]) * 40 // 100), status="EXPIRED")
+            api.rows[down["hash"]]["status"] = "EXPIRED"
+            api.stuck = {up["id"], down["id"]}
+            clock.ms = c["start_ms"] + 5 * 60_000  # back five minutes into the window, PREOPEN_15M off
+            bot = L.LiveBot.__new__(L.LiveBot)
+            bot.config = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "STATE_DB": ":memory:", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64,
+                                            "PREOPEN_15M": "off", **sized})
+            bot.store, bot.stopping, bot.market = m.Store(":memory:"), asyncio.Event(), types.SimpleNamespace(now_ms=lambda: clock.ms)
+            bot.live_notify, bot.live_note_error = (lambda text, key="": None), (lambda text: None)
+            bot.preopen, bot.preopen_task, bot.preopen_lock = None, None, asyncio.Lock()
+            bot.preopen_tidied = 1e18  # (no archive pass in this check)
+            made = []
+
+            def factory(owner):  # the real controller on that ledger file, on the bot's clock, Predict as the fake answers
+                again, _, _ = controller(**sized)
+                again.owner.market, again.api, again.cancel_api, api.ctl = bot.market, api, api, again
+                made.append(again)
+                return again
+            bot.preopen_factory = factory
+            self.assertEqual(bot.preopen_left(), (2, 0), "both orders' fills unread (it was (0, 0): nothing started, nothing read them)")
+            await bot.preopen_apply()
+            self.assertEqual((len(made), bot.preopen is made[0], bot.preopen.winding), (1, True, "预挂模式关着，但上次还有挂单没撤完"))
+            pair = made[0].ledger.rows[c["slug"]]
+            orders = pair["orders"]
+            await self.until(lambda: orders["up"]["state"] == "removed" and orders["down"]["state"] == "removed")
+            self.assertEqual((orders["up"]["filled"], orders["down"]["filled"]), (40.0, 0.0), "the fill of the minutes the process was down: read")
+            clock.ms += p.LATE_FILL_MS  # the records' last word (PRE-LATE-FILL)
+            await self.until(lambda: orders["up"]["state"] == "final" and orders["down"]["state"] == "final")
+            api.markets["123"]["outcomes"][0]["status"] = "WON"  # Down won: Up's 40 shares at 49¢ are lost
+            clock.ms = p.settle_from(pair) + 61_000
+            await self.until(lambda: bot.preopen is None, 5.0)  # settled, wound up and cleared — and none started again
+            self.assertEqual((pair["accounted"], pair["result"]), (True, "down"))
+            self.assertAlmostEqual(pair["pnl"], -19.6)
+            self.assertAlmostEqual(bot.preopen_pnl(), -19.6, msg="in the day's loss stop (the file's, the mode off)")
+            self.assertEqual((bot.preopen_left(), bot.preopen_unverified()), ((0, 0), set()))
+
+    async def test_the_signature_leaves_the_record_once_its_request_is_done(self):
+        """1.154.33 (an outside review, R24) — the ledger kept every order's whole signed request, the signature that makes the
+        order good until its expiry, in the working records and the archive for good, though nothing reads it after the
+        request (an order whose answer went missing is looked for by its hash, never sent again). Dropped once the request is
+        done with — not before: a refusal on the rule taker's borrowed key sends the same body again on the mode's own (through)
+        — and from an order that will never be sent; what resumable, pair_quote and the model trader's market check read stays."""
+        with tempfile.TemporaryDirectory() as folder:
+            db = str(Path(folder) / "signed.preopen.sqlite3")
+            ctl, api, clock = controller(PREOPEN_DB=db)
+            seen = []  # (key, the body still signed) at each order request
+
+            class Lent:  # the rule taker's idle key: it refuses (its limit), and through() sends the request on the mode's own
+                api_key = "lent"
+
+                async def market(self, mid):
+                    raise m.RemoteError("HTTP 429: Too Many Requests", 20)
+
+                async def create_order(self, body):
+                    seen.append(("lent", "signature" in body["data"]["order"]))
+                    raise m.RemoteError("HTTP 429: Too Many Requests", 20)
+            lent = Lent()
+            ctl.lent_api, ctl.lane = lent, (lambda home: lent)
+            plain = api.create_order
+
+            async def create(body):
+                seen.append(("own", "signature" in body["data"]["order"]))
+                return await plain(body)
+            api.create_order = create
+            c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+            await ctl.place_pair(c)
+            pair = ctl.ledger.rows[c["slug"]]
+            self.assertEqual({side: o["state"] for side, o in pair["orders"].items()}, {"up": "open", "down": "open"})
+            self.assertEqual(sorted(seen), [("lent", True), ("lent", True), ("own", True), ("own", True)], "sent signed, the second time too")
+            self.assertTrue(all(sent["data"]["order"]["signature"] == "0xsignature" for sent in api.sent))
+            on_file = next(x for x in p.read_rows(db) if x["slug"] == c["slug"])
+            for side in ("up", "down"):
+                for body in (on_file["orders"][side]["body"], pair["orders"][side]["body"]):
+                    signed = body["data"]["order"]
+                    self.assertNotIn("signature", signed)
+                    self.assertTrue(signed["makerAmount"] and signed["takerAmount"] and signed["tokenId"] and body["data"]["pricePerShare"], body)
+            self.assertEqual(p.pair_quote({"orders": on_file["orders"]}), (0.49, 50.0), "an older record's price and size: still off the request")
+            await self.finish(ctl)
+            # a restart: the resting pair is taken over as before (resumable reads the amounts off the request)
+            again, _, _ = controller(PREOPEN_DB=db)
+            again.adopt()
+            pair = again.ledger.rows[c["slug"]]
+            self.assertEqual((again.resumed, pair["phase"]), (1, "active"))
+            # never to be sent: a "prepared" order (a process that ended between the record and its request) loses it as it
+            # is withdrawn — by the batch withdrawal (cancel_many) and by the pair's own (cancel_pair)
+            pair["orders"]["up"].update(state="prepared", body=copy.deepcopy(api.sent[0]))
+            await again.cancel_many([pair], "设置不同，撤掉后重新报价", free=True)
+            pair["orders"]["down"].update(state="prepared", body=copy.deepcopy(api.sent[1]))
+            await again.cancel_pair(pair, "撤单状态核对")
+            on_file = next(x for x in p.read_rows(db) if x["slug"] == c["slug"])
+            for side in ("up", "down"):
+                self.assertEqual((pair["orders"][side]["state"], on_file["orders"][side]["state"]), ("not_sent", "not_sent"))
+                self.assertNotIn("signature", on_file["orders"][side]["body"]["data"]["order"])
+            await self.finish(again)
 
 
 class BulkApi:

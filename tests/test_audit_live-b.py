@@ -580,6 +580,9 @@ def live_pool_threads():
     import time as _time
     import live as _live
     assert m.PREDICT_POOL_WORKERS >= m.PREDICT_PARALLEL + 4 * _live.PredictApi.PARALLEL, m.PREDICT_POOL_WORKERS
+    # 1.154.33 (an outside review, CR-07): the clients on it now — the feed, the trader's, the pre-open mode's seven (api, cancel,
+    # bulk, snapshot, fresh listings, and two on the borrowed key); the rule taker's run on their own pool (first_pool)
+    assert m.PREDICT_POOL_WORKERS >= m.PREDICT_PARALLEL + 8 * _live.PredictApi.PARALLEL, m.PREDICT_POOL_WORKERS
 
     def fake_get(url, payload=None, timeout=15, headers=None):
         _time.sleep(0.05 if url.endswith("/orders") else 0.8)
