@@ -52,7 +52,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.32"
+VERSION = "1.154.33"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -1336,10 +1336,14 @@ class Store:
     the close. A ":memory:" store writes synchronously: a memory database belongs to one connection."""
     FLUSH_SECONDS = 10.0
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, persist: bool = True):
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.path = path  # (the rule taker keeps its orders' journal beside it: rules.RuleTaker.journal, 1.154.15)
+        # 1.154.33 (an outside review, R23): ``persist=False`` (`--calib`) reads the file and keeps every write in memory (the
+        # overlay): a report must not change the database a running bot uses — its Bot pruned the saved settings it could not
+        # read (control:env) and saved a web token of its own
+        self.persist = persist
         self.conn = sqlite3.connect(path)
         self.conn.execute("PRAGMA journal_mode=WAL")
         # 1.111.0: NORMAL, not FULL — with WAL a committed transaction survives a process crash either way; FULL also fsyncs the
@@ -1358,7 +1362,7 @@ class Store:
         self.write_error = ""  # the writer's last failure (it tries again every second; the records stay readable meanwhile)
         self.writer: threading.Thread | None = None
         self.writer_conn: sqlite3.Connection | None = None
-        if path != ":memory:":
+        if path != ":memory:" and persist:
             self.writer_conn = sqlite3.connect(path, check_same_thread=False)
             self.writer_conn.execute("PRAGMA synchronous=NORMAL")
             self.writer = threading.Thread(target=self.write_loop, name="store-writer", daemon=True)
@@ -1393,7 +1397,12 @@ class Store:
         overlay until committed (1.122.0: a delete or a move used to run on this thread after a flush whose failure it
         ignored, so a put still queued could write the deleted record back once the writer recovered — a cancelled order
         reappearing resting). Written here when the store has no writer (":memory:")."""
-        if self.writer is None:
+        if not self.persist:
+            with self.lock:  # in memory only: read back through the overlay, never written
+                self.version += 1
+                for key, text in rows:
+                    self.pending[key] = (self.version, text)
+        elif self.writer is None:
             with self.conn:
                 self._apply(self.conn, rows)
         else:
@@ -1508,6 +1517,14 @@ class Store:
             except Exception as error:
                 with self.lock:
                     self.write_error = f"{type(error).__name__}: {str(error)[:80]}"
+                    # 1.154.33 (an outside review, R14): the failed batches merged into one — the last row of each key, what _apply
+                    # writes of them anyway (they go in one transaction) — so a disk that stays full holds one row per key here, not
+                    # every write made meanwhile (each of them kept, the queue grew without end and each retry walked it all)
+                    merged: dict[str, str | None] = {}
+                    for _, batch_rows in self.queue[:len(batch)]:
+                        for key, text in batch_rows:
+                            merged[key] = text
+                    self.queue[:len(batch)] = [(through, list(merged.items()))]
                     self.lock.notify_all()
                 time.sleep(1.0)
                 continue
@@ -1854,8 +1871,11 @@ def _read_body(response: Any, timeout: float) -> bytes:
     """The whole body, in pieces: the socket timeout bounds each read, this bounds them all (an answer that trickles in
     for a minute held a thread of the feeds' pool that long: KOSPI from a 502-ing host took 33 s against a 12 s timeout)."""
     deadline, chunks, size = time.monotonic() + 2 * timeout + 1, [], 0
+    # 1.154.33 (an outside review, R22): read1, what has arrived — read(n) waits for n bytes (or the end), each receive within the
+    # socket timeout: a body under 64 KB trickling in a byte at a time was never measured against the deadline (8 s for a 3 s one)
+    read = getattr(response, "read1", None) or response.read
     while True:
-        chunk = response.read(65536)
+        chunk = read(65536)
         if not chunk:
             return b"".join(chunks)
         chunks.append(chunk)
@@ -5639,7 +5659,7 @@ PREDICT_KEYS = {title: key for key, title, _ in PREDICT_ITEMS}
 PREDICT_STALE_MS = 90_000       # a book older than this is shown as stale and never recommended
 PREDICT_PARALLEL = 16           # Predict requests in flight at once, on Predict's own thread pool (predict_blocking): the
                                 # hot round (a dozen markets, each answer about a second) goes out in one batch
-PREDICT_POOL_WORKERS = 40       # that pool: the orderbook feed's requests and the real-trading client's, apart from the quote
+PREDICT_POOL_WORKERS = 64       # that pool: the orderbook feed's requests and the real-trading client's, apart from the quote
                                 # feeds' pool, where a 502-ing scraper held threads for the 12-second timeout (a round took 60 s).
                                 # It must hold every request the asyncio gates above it can let through at once, or an order or a
                                 # cancel that got its client's priority slot still waits in this pool's FIFO queue behind reads
@@ -5647,7 +5667,10 @@ PREDICT_POOL_WORKERS = 40       # that pool: the orderbook feed's requests and t
                                 # trader's 4; the pre-open mode's two clients add 8 = 28). 1.150.0 (audit LIVE-POOL-THREADS): at least
                                 # PREDICT_PARALLEL (16) + live.PredictApi.PARALLEL (5, since 1.138.2) x 4 clients (the bot's own, and
                                 # the pre-open mode's api / cancel_api / bulk_api since 1.141.1) = 36, plus headroom — 32 left 4 short.
-                                # KEEPALIVE_PER_HOST is no cap here: it only bounds the idle connections kept.
+                                # KEEPALIVE_PER_HOST is no cap here: it only bounds the idle connections kept. 1.154.33 (an outside review,
+                                # CR-07): 64 — the pool has since gained the pre-open mode's snapshot client (1.154.11), its fresh-listing
+                                # client and the two on the borrowed key (1.154.21): the feed's 16 + the trader's 5 + seven pre-open clients
+                                # of 5 = 56 the gates can let through at once, 40 threads under it (the rule taker's are its own: first_pool)
 PREDICT_LADDER_PARALLEL = 8     # of those, at most this many may be ladder levels at once: a hot ladder's levels never
                                 # queue the daily cards' books behind them
 _PREDICT_POOL: ThreadPoolExecutor | None = None
@@ -10060,6 +10083,9 @@ class IndexUpDownMarket(UpDownMarket):
     STRIKE_WAIT_MS = 0                # a card waits this long after a window's start for Predict's start price before suggesting (a spot window: 60 s)
     LEAD_STALE_MS = 15_000            # a quote fetched longer ago than this leads nothing (the poll failed): the index alone
     LEAD_START_TOLERANCE_MS = 20_000  # the quote taken for the window's start must be from within this of the start moment
+    LEAD_START_BEFORE_MS = 120_000    # ...and its trade no further before it (1.154.33, R13: a feed returning a stale snapshot looks
+    #                                   like a stock that has not traded; one quiet for two minutes in session is priced on the index)
+    LEAD_TRADE_STALE_MS = 60_000      # a quote whose last trade is older than this leads nothing either, however recently it was read
     LEAD_MAX_GAP = 0.01               # an exchange price this far (ln) from the index is another instrument, a currency move: not used
 
     def __init__(self, store: "Store", spec: UpDownSpec, futures: Any = None, exchange: str = "", trading: Any = None,
@@ -10111,7 +10137,7 @@ class IndexUpDownMarket(UpDownMarket):
             return
         fetched = int(q.fetched_ms or now_ms)
         quoted = int(q.quoted_ms or fetched)
-        if fetched >= at and quoted - at <= self.LEAD_START_TOLERANCE_MS:
+        if fetched >= at and -self.LEAD_START_BEFORE_MS <= quoted - at <= self.LEAD_START_TOLERANCE_MS:
             self.store.put(key, {"price": str(q.last), "at": quoted, "read_ms": now_ms, "source": q.source})
         elif now_ms - at > self.LEAD_START_TOLERANCE_MS:
             self.store.put(key, {"missed": True, "read_ms": now_ms})
@@ -10130,6 +10156,11 @@ class IndexUpDownMarket(UpDownMarket):
             return None, 0.0, "没有窗口起点的交易所价"
         if now_ms - int(q.fetched_ms or 0) > self.LEAD_STALE_MS:
             return None, 0.0, f"交易所行情 {(now_ms - int(q.fetched_ms or 0)) // 1000} 秒没读到"
+        if q.quoted_ms and quiet_ms(int(q.quoted_ms), now_ms) > self.LEAD_TRADE_STALE_MS:
+            # 1.154.33 (an outside review, R13): read a moment ago is not traded a moment ago — the quote layer passes a last trade up
+            # to ten minutes old (a single stock may stand still on its daily card), and a feed serving a stale snapshot read
+            # "fresh" here every second: the window priced on a minutes-old trade, the index (what settles it) set aside
+            return None, 0.0, f"交易所最后一笔成交在 {quiet_ms(int(q.quoted_ms), now_ms) // 1000} 秒前，按指数"
         if not (q.last > 0 and start[0] > 0 and self.price):
             return None, 0.0, "交易所价或指数无效"
         price = line * q.last / start[0]
@@ -10225,8 +10256,14 @@ class IndexUpDownMarket(UpDownMarket):
         moved = price != self.price
         # 1.122.0: fresh as of its own event time, not of its arrival — a frame delivered minutes late (a stalled socket catching
         # up) used to make a stale card look current and price again on an old index
-        self.index_ms, self.price, self.priced_ms, self.times["price"] = at_ms, price, min(now_ms, at_ms), time.monotonic()
+        self.index_ms, self.price, self.priced_ms = at_ms, price, min(now_ms, at_ms)
+        if now_ms - at_ms <= self.PUSH_CURRENT_MS:
+            # 1.154.33 (an outside review, R19): only a current frame puts the REST read off — late ones arriving a second apart (a
+            # socket catching up, a lag at Binance's end) kept it off for as long as they came, the card held stale meanwhile
+            self.times["price"] = time.monotonic()
         return moved
+
+    PUSH_CURRENT_MS = 2_000  # a pushed index this far behind the clock at the most defers the REST read (push_index)
 
     def point(self, open_ms: int) -> str:
         """The boundary the 1-minute candle opening at ``open_ms`` ends at, as the card names its windows: Beijing time —
@@ -19263,16 +19300,16 @@ class Bot:
                        "sigma_annual", "tau_years", "sigma_sqrt_tau", "z_model", "price", "line", "need", "hold", "note",
                        "result_up", "final", "move_ln", "realized_z", "up_index", "up_lead", "lead_gap", "lead_used")
 
-    def window_csv(self) -> str:
+    def window_csv(self, rows: list[dict] | None = None) -> str:
         """Every sample as a CSV (a BOM for Excel; /samples, samples.csv): one row a sample, the result columns empty while
-        the market has none."""
+        the market has none. ``rows``: window_rows() already read (1.154.33, R21: /samples read and sorted them all twice)."""
         out = io.StringIO()
         out.write("\ufeff")
         writer = csv.writer(out)
         writer.writerow(self.WSAMPLE_COLUMNS)
         when = lambda ms: dt.datetime.fromtimestamp(int(ms) / 1000, BEIJING).strftime("%Y-%m-%d %H:%M:%S") if ms else ""
         num = lambda v: "" if v is None else f"{v:.6g}" if isinstance(v, float) else v
-        for r in self.window_rows():
+        for r in self.window_rows() if rows is None else rows:
             st = float(r.get("sigma") or 0) * math.sqrt(float(r.get("tau") or 0))
             writer.writerow([when(r.get("t")), r.get("card", ""), r.get("kind", ""), r.get("slug", ""), when(r.get("start")), when(r.get("end")),
                              r.get("left", ""), num(r.get("up")), num(r.get("mkt")), num(r.get("bid")), num(r.get("ask")), num(r.get("book_age")),
@@ -19287,13 +19324,17 @@ class Bot:
         return out.getvalue()
 
     async def cmd_samples(self, req: Request) -> Any:
-        """/samples: the samples' CSV as a Telegram document."""
+        """/samples: the samples' CSV as a Telegram document. 1.154.33 (an outside review, R21): the samples read once (they were
+        read and sorted twice, both on the event loop), and not while the rule taker goes first — the web export (samples.csv)
+        waits then too (WebServer.busy): seconds of the loop at hundreds of thousands of samples."""
+        if not self.rules_clear(WebServer.HEAVY_CLEAR_S):
+            return "规则吃单正在优先时段（抢单时刻前后、开场前 15 分钟和盘中），样本导出这段时间不做——导出一次要占住机器人几秒；过一会儿再发 /samples"
         rows = self.window_rows()
         if not rows:
             return "还没有样本：15 分钟涨跌 / 加密日涨跌的市场定价后，每个市场在固定的剩余时间各记一条（/calib 里有说明）。"
         day = dt.datetime.fromtimestamp(self.market.now_ms() / 1000, BEIJING).strftime("%Y%m%d")
         done = sum(r.get("result") is not None for r in rows)
-        return Document(f"model-samples-{day}.csv", self.window_csv().encode("utf-8"),
+        return Document(f"model-samples-{day}.csv", self.window_csv(rows).encode("utf-8"),
                         f"模型样本 {len(rows)} 条（已有结果 {done} 条），{len({r.get('slug') for r in rows})} 个市场；列的含义见 README")
 
     def journal_filter_words(self, words: list[str]) -> tuple[dict[str, str], str]:
@@ -21688,6 +21729,13 @@ class Bot:
                     # nothing to follow on this side (an empty book, bids all under SIM_MAKER_MIN_BID): a floor order — a dollar's
                     # worth at SIM_MAKER_FLOOR_CENTS, for a seller dumping into the empty side (1.105.0: the 11-05 宇树 10:45 window
                     # showed "暂无挂单" and both sides with nothing to follow); it follows a 买1 that appears (sim_requote_reason)
+                    if limit is not None and c.sim_maker_floor > limit + 1e-9:
+                        # 1.154.33 (an outside review, R11): after hours a floor order too only at or under the price limit — it went
+                        # out past it, and every step withdrew it (sim_requote_reason: "盘后只挂 …") and placed it again. Refused, not
+                        # cut to the limit: its price is the setting's (a cut one would be re-placed as "托底单价格已改为…")
+                        dear = max(dear if dear is not None else -1.0, c.sim_maker_floor)
+                        sides_seen[side] = {"why": f"盘后只挂 {cents(limit)} 以下的，托底单价 {cents(c.sim_maker_floor)} 高于它"}
+                        continue
                     edge = fair - c.sim_maker_floor
                     cands.append(BookEdge(name, True, c.sim_maker_floor, edge, 0.0, edge, floor=True))
                     sides_seen[side] = {"cand": cands[-1]}
@@ -27708,6 +27756,9 @@ class Bot:
                 _FIRST_POOL.shutdown(wait=False)
             if self.reference_pool:
                 self.reference_pool.shutdown(wait=False, cancel_futures=True)
+            for pool in (self.__dict__.get("diag_pool"), self.__dict__.get("speed_pool")):  # 1.154.33 (CR-11): made by /diag and /speed when first asked
+                if pool is not None:
+                    pool.shutdown(wait=False, cancel_futures=True)
             if self.web:
                 await self.web.stop()
             LOG.info("Stopped safely (exit %s)", exit_code)
@@ -27799,7 +27850,7 @@ def main() -> int:
         if args.diag:
             return asyncio.run(run_diagnostics(config))
         if args.calib:
-            store = Store(config.db_path)
+            store = Store(config.db_path, persist=False)  # (1.154.33, R23: a report reads, it does not write)
             print(Bot(config, store, Binance(config), None).calibration_text())  # type: ignore[arg-type]
             return 0
         if args.live_check or args.approve:

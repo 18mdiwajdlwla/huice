@@ -767,6 +767,28 @@ async def _ledger_growth(folder):
     off_db = str(Path(folder) / "off.preopen.sqlite3")
     clock3 = types.SimpleNamespace(ms=later)
     off = _pnl_bot(clock3, off_db, False, asyncio.Event())
+    # 1.154.33 (an outside review, R09): U's order in doubt (its answer lost, never found by its hash) is past its signed expiry
+    # with nobody to look for it while the mode is off — the apply now also starts the wind-down that does. A stand-in here,
+    # resting until it is stopped: this part is about the archive pass (test_preopen's
+    # test_a_mode_off_start_reads_the_orders_that_expired_while_it_was_down follows a real one to the end)
+    started = []
+
+    class Winding:
+        def __init__(self, owner):
+            self.owner, self.settings, self.alive, self.stop, self.error, self.winding = owner, owner.config.preopen, True, asyncio.Event(), "", ""
+            self.ledger = types.SimpleNamespace(close=lambda: None)
+            started.append(self)
+
+        def wind_down(self, reason):
+            self.winding = reason
+
+        async def run(self):
+            try:
+                await self.stop.wait()
+            finally:
+                self.alive = False
+    off.preopen_factory = Winding
+    assert off.preopen_left() == (1, 0), off.preopen_left()  # U's order in doubt (it was (0, 0))
     passes, real_file = [], _p.archive_file
     _p.archive_file = lambda path, now_ms: (passes.append(path), real_file(path, now_ms))[1]
     try:
@@ -774,7 +796,10 @@ async def _ledger_growth(folder):
         await off.preopen_apply()  # (a settings apply a moment later: not again within the hour)
     finally:
         _p.archive_file = real_file
-    assert off.preopen is None and passes == [off_db], passes
+    assert passes == [off_db] and [x.winding for x in started] == ["预挂模式关着，但上次还有挂单没撤完"], (passes, [x.winding for x in started])
+    off.stopping.set()  # (as the process stops: the stand-in's end asks for no apply — U, still in doubt on file, would start it again)
+    await off.preopen_stop("test")
+    assert off.preopen is None
     assert {x["slug"] for x in _p.read_rows(off_db)} == kept and set(_tables(off_db)[1]) == old
     assert off.preopen_review() == ref["review"] and off.preopen_filled() == ref["fills"] and off.preopen_unverified() == ref["unverified"]
     nowhere = str(Path(folder) / "none.preopen.sqlite3")

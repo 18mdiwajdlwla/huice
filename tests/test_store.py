@@ -63,6 +63,30 @@ assert other.execute("SELECT count(*) FROM records WHERE k IN ('sim:f', 'sim:g')
     and json.loads(other.execute("SELECT v FROM records WHERE k='sim:g#1'").fetchone()[0]) == {"g": 1} \
     and json.loads(other.execute("SELECT v FROM records WHERE k='sim:h'").fetchone()[0]) == {"h": 2}
 s.writer_conn = real
+# 1.154.33 (an outside review, R14): a writer that keeps failing holds one row per key, not every write made meanwhile — the failed
+# batches are merged (the last row of each key, what one transaction of them writes anyway); and what it writes once it can is
+# the same: a put then a delete gone, a move in place, the latest value of a key written many times
+s.writer_conn = Broken(); s.writer_conn.fails = 10 ** 9
+for round_ in range(6):
+    s.put_many((f"sim:many{i}", {"r": round_, "i": i}) for i in range(300))
+    time.sleep(0.05)
+s.put("sim:gone", 1); s.delete_keys(["sim:gone"]); s.put("sim:mv", {"m": 1}); s.replace(["sim:mv"], [("sim:mv#1", {"m": 1})])
+deadline = time.monotonic() + 5.0
+while time.monotonic() < deadline:  # (the writer merges at its next failure, a second at the most)
+    with s.lock:
+        rows = sum(len(r) for _, r in s.queue)
+        merged = len(s.queue) == 1
+    if merged:
+        break
+    time.sleep(0.05)
+assert merged and rows <= 300 + 3, (len(s.queue), rows)
+assert s.get("sim:many7") == {"r": 5, "i": 7} and s.get("sim:gone") is None and s.get("sim:mv") is None and s.get("sim:mv#1") == {"m": 1}
+s.writer_conn.fails = 0
+assert s.flush(8.0) and s.write_error == "" and not s.queue and not s.pending
+assert json.loads(other.execute("SELECT v FROM records WHERE k='sim:many7'").fetchone()[0]) == {"r": 5, "i": 7}
+assert other.execute("SELECT count(*) FROM records WHERE k IN ('sim:gone', 'sim:mv')").fetchone()[0] == 0 \
+    and json.loads(other.execute("SELECT v FROM records WHERE k='sim:mv#1'").fetchone()[0]) == {"m": 1}
+s.writer_conn = real
 # a big batch is one transaction; a record under a queued write is in the keys and the items
 s.put_many((f"sim:big{i}", {"i": i}) for i in range(2000))
 assert s.count("sim:big") == 2000 and len(s.items("sim:big1")) == 1111 and s.flush() \

@@ -104,7 +104,12 @@ assert L.order_fill({"amount": "100", "amountFilled": "250"}, 100) == (100.0, ""
 assert L.order_price({"averagePrice": "0.58"}) == 0.58 and L.order_price({"avgPrice": str(58 * 10 ** 16)}) == 0.58 and L.order_price({}) is None
 assert L.order_price({"averagePrice": "0"}) is None and L.order_hash_of({"order": {"hash": "0xAB"}}) == "0xab" and L.order_hash_of({"hash": "0xCD"}) == "0xcd"
 assert L.PredictApi.rows({"success": True, "data": [{"id": 1}, 3]}) == [{"id": 1}] and L.PredictApi.rows({"data": {"items": [{"a": 1}]}}) == [{"a": 1}]
-assert L.PredictApi.rows([{"b": 2}]) == [{"b": 2}] and L.PredictApi.rows({"data": {}}) == []
+assert L.PredictApi.rows([{"b": 2}]) == [{"b": 2}] and L.PredictApi.rows({"success": True, "data": [], "cursor": None}) == []
+# 1.154.33 (an outside review, R08): an empty answer (an empty body) is an error, not an empty list (one read as a whole list at that);
+# an answer that says something without a list stays an empty list (Predict's way of saying an empty one has not been seen)
+try: L.PredictApi.rows({}); assert False
+except m.RemoteError as e: assert "空的" in str(e), e
+assert L.PredictApi.rows({"data": {}}) == [] and L.PredictApi.rows({"success": True, "data": None}) == [] and L.PredictApi.rows({"success": True}) == []
 outs = [{"name": "Up", "index_set": 1, "token": "1"}, {"name": "Down", "index_set": 2, "token": "2"}]
 assert L.outcome_for_side("close", "up", outs) == (outs[0], "") and L.outcome_for_side("close", "down", outs) == (outs[1], "")
 flipped = [{"name": "No", "index_set": 1, "token": "9"}, {"name": "Yes", "index_set": 2, "token": "8"}]
@@ -2445,11 +2450,20 @@ async def cancel_reads():
         await step(bot, NOW + 5_000, mkt(NOW + 5_000))
         t = next(t for k, t in bot.sim_trades().items() if k.startswith(tid))
         assert ("remove", [oid]) in fake.calls and t["live"]["state"] == "done" and t["shares"] == 20, (case, t["shares"], t["live"]["events"])
-        # 1.122.0: the unfilled 80 stay reserved until the order's own record is read after the cancel (fills_pending): read ("lagging")
-        # it is released; not readable ("unknown") it stays, until a read or FILLS_PENDING_MAX_MS
-        pending = 80 * 0.55 if case == "unknown" else 0.0
-        assert t["status"] == "filled" and t["unfilled"] == 80 and abs(bot.live_reserved(t) - 20 * 0.55 - pending) < 1e-9, (case, t["status"], bot.live_reserved(t))
-        assert bool(t["live"].get("fills_pending")) == (case == "unknown") and m.sim_open_order(t) == (case == "unknown"), (case, t["live"].get("fills_pending"))
+        # 1.122.0: the unfilled 80 stay reserved until the order's own record is read after the cancel (fills_pending). 1.154.33 (an
+        # outside review, R02): until a read that is Predict's last word on the order — a lagging record still saying OPEN ("lagging")
+        # is not: what it shows is taken, the rest stays reserved and the record is read again; not readable ("unknown") it stays
+        # too — until a final read or FILLS_PENDING_MAX_MS
+        assert t["status"] == "filled" and t["unfilled"] == 80 and abs(bot.live_reserved(t) - 20 * 0.55 - 80 * 0.55) < 1e-9, (case, t["status"], bot.live_reserved(t))
+        assert t["live"].get("fills_pending") and m.sim_open_order(t), (case, t["live"].get("fills_pending"))
+        if case == "lagging":
+            assert any("按哈希读到的订单记录仍是 OPEN" in e["what"] for e in t["live"]["events"]), t["live"]["events"]
+            del fake.order  # Predict's record catches up (CANCELLED, 20 filled): read again at the step after the wait, and released
+            await step(bot, NOW + 10_000, mkt(NOW + 10_000))
+            await bot.live_fills_wait()
+            t = next(t for t in bot.sim_trades().values() if (t.get("live") or {}).get("order_id") == oid)
+            assert not t["live"].get("fills_pending") and t["shares"] == 20 and abs(bot.live_reserved(t) - 20 * 0.55) < 1e-9, (t["live"], bot.live_reserved(t))
+            assert not m.sim_open_order(t), "the last word read: released"
         if case == "unknown":
             t["live"]["fills_pending"] = time.time() * 1000 - m.FILLS_PENDING_MAX_MS - 1
             assert abs(bot.live_reserved(t) - 20 * 0.55) < 1e-9 and not m.sim_open_order(t), "too old to hold: released"
