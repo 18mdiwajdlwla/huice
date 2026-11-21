@@ -52,7 +52,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.33"
+VERSION = "1.154.34"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -16102,9 +16102,19 @@ function poDiag(r,span,fold){  // under a pre-open line of 按市场 (1.151.0): 
   if((d.hours||[]).length)kids.push($("div","sub","按开始时间（北京时间，几天里同一小时合在一起）"),table(["开始",...cols],d.hours.map(line)));
   if((d.lead||[]).length)kids.push($("div","sub","按成交时距开场（第一次看到成交的时刻，1.151.0 起才记）"),table(["成交",...cols],d.lead.map(line)));
   kids.push($("div","sub","按方向（一场的涨、跌是两张单）"),table(["方向","挂出","有成交","成交份数","成交额","已结算","盈亏"],(d.sides||[]).map(x=>[x.name,x.records,x.filled_windows||"—",num(x.filled),usd(x.volume),poWl(x),x.settled?poPn(x.pnl):"—"])));
-  if((d.levels||[]).length>1)kids.push($("div","sub","按价格档"),table(["价格","记录","有成交","成交份数","已结算","盈亏"],d.levels.map(x=>[x.name,x.records,x.filled_windows||"—",num(x.filled),poWl(x),x.settled?poPn(x.pnl):"—"])));
-  kids.push(hint("怎么看：只成交一边时成交那边赢不到一半、偏离低于 −2σ，就是被知道方向的人挑着吃（逆向选择），不是运气；亏损挤在某几个开始时间，或者越早成交越亏，多半是那几个钟点标的休市、刚开盘或有固定的消息。两边都成交的场次两边对冲，每场稳赚 1 − 两边价格。"));
+  if((d.levels||[]).length)kids.push($("div","sub","按价格档：预期（按五五开）对实际"),poLevels(d.levels));  // 1.154.34: the EV columns
+  kids.push(hint("怎么看：只成交一边时成交那边赢不到一半、偏离低于 −2σ，就是被知道方向的人挑着吃（逆向选择），不是运气；亏损挤在某几个开始时间，或者越早成交越亏，多半是那几个钟点标的休市、刚开盘或有固定的消息。两边都成交的场次两边对冲，每场稳赚 1 − 两边价格。",
+    PO_LEVEL_HINT));
   return kids}
+const PO_LEVEL_HINT="按价格档：预期 = (50¢ − 买价) × 已结算的成交份数，按五五开算，47¢ 一份预期赚 3¢；实际 − 预期就是结果给的或拿走的，偏离在 ±2σ 以内可以是运气。只成交一边时，成交那边赢的占比要高过买价（47¢ 要赢过 47%）才赚钱，明显低于保本线就是被挑着吃；两边都成交的那几场是对冲，赚的是 1 − 两边价格。";
+function poLevels(rows){  // 按价格档位 (1.154.34; the user: "47 抽 3 个点，期望值盈利跟实际盈利对比"): each level's settled fills against a coin toss (preopen.ev_line) — worth 50¢ − the price a share at the order, what they made, and where the gap came from
+  const span=(...xs)=>{const s=$("span","");s.append(...xs);return s},zt=z=>z==null?"":"（"+(z>=0?"+":"−")+Math.abs(z).toFixed(1)+"σ）";
+  const per=v=>(v>=0?"+":"−")+Math.abs(v*100).toFixed(1)+"¢",pc=(a,b)=>b?Math.round(a*100/b)+"%":"—";
+  return table(["档位","有成交 / 场次","已结算","已结算份数","每份：预期 → 实际","预期","实际","实际 − 预期（偏离）","两边都成交","只成交一边：那边赢"],
+    rows.map(r=>{const sh=r.settled_shares||0,b=r.both||{},o=r.one||{};
+      return [r.name,num(r.filled_windows||0)+" / "+num(r.windows),r.settled||"—",sh?num(sh):"—",sh?per(0.5-r.price)+" → "+per(r.pnl/sh):"—",sh?money(r.ev):"—",sh?poPn(r.pnl):"—",
+        sh?span(poPn(r.pnl-r.ev),zt(r.z)):"—",b.windows?span(b.windows+" 场 ",poPn(b.pnl)):"—",
+        o.windows?o.won+"/"+o.windows+"（"+pc(o.won,o.windows)+"，保本 "+(r.price*100).toFixed(0)+"%）":"—"]}))}
 function dayDetail(rows){  // under the daily summary (1.115.0): the opened day's records (the filter's; journal.json?rows=1&day=…), by card with each card's figures first
   const el=document.getElementById("d-detail"),r=dayOpen&&rows?rows.find(x=>x.day===dayOpen):null;if(!r){el.replaceChildren();el.hidden=true;return}
   const fold=$("button","lnk","收起");fold.type="button";fold.addEventListener("click",()=>{dayOpen="";summary()});
@@ -16163,8 +16173,12 @@ function preopenSection(po){  // 开盘前预挂 (1.128.0): the mode's own ledge
   p("场次",t.windows+"（记录 "+t.records+"，挂着 "+t.resting+" 场、预留 "+usd(po.resting_usd)+"，没成交撤掉 "+t.withdrawn+"）");
   p("有成交",t.filled_windows+" 场 · "+num(t.filled)+" 份 · "+usd(t.volume)+(t.pending?" · 待结算 "+t.pending+" 场":""));
   p("已结算",t.settled?[t.settled+" 场（赢 "+t.wins+" 输 "+t.losses+(t.ties?" 平 "+t.ties:"")+"）盈亏 ",poPn(t.pnl)," · 平均每场 ",poPn(t.pnl/t.settled)]:"还没有结算的场次");
+  const e=po.ev;  // 1.154.34: the settled fills against a coin toss (preopen.ev_line), and where the gap came from
+  if(e&&e.settled_shares){const b=e.both||{},o=e.one||{};
+    p("预期对实际",["按五五开预期 ",poPn(e.ev),"，实际 ",poPn(t.pnl),"，差 ",poPn(t.pnl-e.ev),e.z!=null?"（偏离 "+(e.z>=0?"+":"−")+Math.abs(e.z).toFixed(1)+"σ）":""]);
+    p("差在哪",(b.windows?"两边都成交 "+b.windows+" 场 "+money(b.pnl)+" · ":"")+(o.windows?"只成交一边 "+o.windows+" 场 "+money(o.pnl)+"，成交那边赢 "+o.won+" 场（"+Math.round(o.won*100/o.windows)+"%）":"没有只成交一边的场次"))}
   el.append(d,...bigTable("按日期",poTable(po.days||[]),(po.days||[]).length),$("div","sub","按标的"),poTable(po.cards||[]));
-  if((po.levels||[]).length>1)el.append($("div","sub","按价格档位（每档一条记录）"),poTable(po.levels));
+  if((po.levels||[]).length)el.append($("div","sub","按价格档位：预期（按五五开）对实际（每档一条记录）"),poLevels(po.levels),hint(PO_LEVEL_HINT));
   el.append(...bigTable("按开始时间",poTable(po.hours||[]),(po.hours||[]).length));
   if((po.weekly||[]).length)el.append($("div","sub","周末 vs 工作日（按场次开始时间；周末 = 北京时间周六 00:00 到周一 08:00，和“周末也挂”的开关同一区间）"),poTable(po.weekly));
   el.append($("div","sub","按方向（一场的涨、跌是两张单）"),table(["方向","挂出","有成交","成交份数","成交额","已结算","盈亏"],(po.sides||[]).map(r=>[r.name,r.records,r.filled_windows||"—",num(r.filled),usd(r.volume),poWl(r),r.settled?poPn(r.pnl):"—"])));

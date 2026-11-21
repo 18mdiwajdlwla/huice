@@ -660,6 +660,25 @@ async def browser_check(bot, data):
         assert "涨（盘前不买）｜盘中 ≤60¢" in rtxt2 and "跌（已关）" in rtxt2 and "其中盘中买的" not in rtxt2, rtxt2
         assert "盘口变化→推送到达 中位 246 ms、到达→发出 2098 ms、发出→应答 358 ms" in rtxt2, rtxt2
         assert await page.get_attribute("#h-rules", "data-k") == "ruletaker", "its own fold key: 统计与风险's 规则 keeps rules"
+        # 1.154.34: 开盘前预挂 by price level — each level's settled fills against a coin toss (preopen.ev_line): 47¢ worth 3¢ a share
+        import preopen as P
+        bj = lambda h: int(dt.datetime(2026, 10, 5, h, tzinfo=m.BEIJING).timestamp() * 1000)
+
+        def pre(start, up, down, result, level=0, price=0.47, shares=30):
+            payout = {"up": 1.0, "down": 0.0}[result]
+            return {"slug": f"btc-updown-15m-{start // 1000}" + (f"#{level}" if level else ""), "key": "BTC-15M", "name": "BTC 15分涨跌 x", "start_ms": start,
+                    "phase": "closed", "accounted": True, "result": result, "pnl": (payout - price) * up + ((1 - payout) - price) * down,
+                    "price": str(price), "shares": str(shares), "level": level, "attempt": 0,
+                    "orders": {side: {"state": "final", "filled": float(f)} for side, f in (("up", up), ("down", down))}}
+        po = P.review([pre(bj(10), 30, 0, "up"), pre(bj(10), 0, 80, "up", 1, 0.43, 80), pre(bj(11), 0, 30, "up"), pre(bj(12), 30, 30, "down")], NOW)
+        await page.evaluate("po=>preopenSection(po)", po)
+        ptxt = await page.text_content("#a-preopen")
+        for want in ("预期对实际", "按五五开预期 +$9.20，实际 −$30.80，差 −$40.00（偏离 −1.4σ）", "两边都成交 2 场 −$16.70 · 只成交一边 1 场 −$14.10，成交那边赢 0 场（0%）",
+                     "按价格档位：预期（按五五开）对实际", "每份：预期 → 实际", "+3.0¢ → +3.0¢", "+$3.60", "1/2（50%，保本 47%）",
+                     "+7.0¢ → −43.0¢", "+$5.60", "−$34.40", "−$40.00（−1.0σ）", "0/1（0%，保本 43%）", "47¢ 一份预期赚 3¢"):
+            assert want in ptxt, (want, ptxt)
+        heads = await page.locator("#a-preopen .tbl").nth(2).locator("th").all_inner_texts()
+        assert heads == ["档位", "有成交 / 场次", "已结算", "已结算份数", "每份：预期 → 实际", "预期", "实际", "实际 − 预期（偏离）", "两边都成交", "只成交一边：那边赢"], heads
         # 1.113.0: the daily summary is one line per day until that line is clicked (its kind / way lines then show; a second
         # click folds them); 今日按市场 has a refresh button and says when the data was read
         days = page.locator("#summary tr.dayrow")
@@ -722,7 +741,10 @@ async def browser_check(bot, data):
                 "lead": [{"name": "开场前 6 小时以上", "windows": 2, "settled": 2, "pnl": -9.4, "one": 2, "won": 0}],
                 "sides": [{"name": "涨", "records": 3, "filled_windows": 0, "filled": 0.0, "volume": 0.0, "settled": 0, "wins": 0, "losses": 0, "ties": 0, "pnl": 0.0},
                           {"name": "跌", "records": 3, "filled_windows": 2, "filled": 20.0, "volume": 9.4, "settled": 2, "wins": 0, "losses": 2, "ties": 0, "pnl": -9.4}],
-                "levels": [], "notes": ["亏损集中在 06:00（北京时间）开始的场次"]}
+                "levels": [{"name": "47¢", "price": 0.47, "records": 3, "windows": 3, "resting": 0, "filled_windows": 2, "filled": 20.0, "volume": 9.4, "pending": 0,
+                            "settled": 2, "wins": 0, "losses": 2, "ties": 0, "pnl": -9.4, "pending_cost": 0.0, "withdrawn": 1, "settled_shares": 20.0, "ev": 0.6,
+                            "sigma": 7.0711, "z": -1.41, "both": {"windows": 0, "pnl": 0.0}, "one": {"windows": 2, "won": 0, "pnl": -9.4}}],  # 1.154.34: with its 预期对实际
+                "notes": ["亏损集中在 06:00（北京时间）开始的场次"]}
         po_row = {"name": "BTC 15分涨跌 · 开盘前预挂", "preopen": True, "records": 3, "markets": 3, "filled": 10.0, "volume": 4.9, "settled": 1, "wins": 1,
                   "losses": 0, "ties": 0, "pnl": 5.1, "open": 0, "open_cost": 0.0, "resting": 2, "marked": 0, "unrealized": 0.0, "expected": 0.1, "hit": 1.0, "avg_fair": 0.5,
                   "luck": {"bets": 4, "ev": 0.1, "pnl": 5.1, "sigma": 2.5, "z": 2.0, "verdict": "样本不足"}, "diag": diag}
@@ -737,7 +759,8 @@ async def browser_check(bot, data):
         await page.wait_for_selector("#s-detail ul.notes")
         assert (await po_line.inner_text()).startswith("▾ ") and "BTC 15分涨跌 · 开盘前预挂 · 今天：钱亏在哪" in await page.inner_text("#s-detail h3")
         text = await page.inner_text("#s-detail")
-        for want in ("亏损集中在 06:00（北京时间）开始的场次", "成交那边赢 0 场（0%，五五开该一半，偏离 −1.4σ）", "按开始时间", "开场前 6 小时以上", "按方向"):
+        for want in ("亏损集中在 06:00（北京时间）开始的场次", "成交那边赢 0 场（0%，五五开该一半，偏离 −1.4σ）", "按开始时间", "开场前 6 小时以上", "按方向",
+                     "按价格档：预期（按五五开）对实际", "+3.0¢ → −47.0¢", "+$0.60", "−$10.00（−1.4σ）", "0/2（0%，保本 47%）"):  # 1.154.34
             assert want in text, (want, text)
         assert await page.locator("#s-detail tr.rec").count() == 0, "the model trader's records panel is not a pre-open line's"
         await po_line.locator("td").first.click()

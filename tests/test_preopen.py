@@ -2381,6 +2381,44 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(p.review([], NOW)["total"]["records"], 0)
             await self.finish(ctl)
 
+    def test_each_level_against_a_coin_toss(self):
+        """1.154.34 (the user: "复盘可以看预挂，哪个档位赚的多吗……比如 47 抽 3 个点，期望值盈利跟实际盈利对比"): the review's levels
+        and the mode's whole, and a card's levels over a range (card_diag), with what their settled fills were worth at the
+        order — 0.5 − the price a share, 47¢: 3¢ — beside what they made, the gap in the σ of the unhedged shares (a window
+        one toss: its levels and re-quotes netted), and where it came from: the hedged windows, the one-sided ones' wins."""
+        BJ = m.BEIJING
+        at = lambda h: int(dt.datetime(2026, 11, 5, h, tzinfo=BJ).timestamp() * 1000)
+
+        def rec(start, up, down, result, level=0, price=0.47, shares=30, accounted=True, attempt=0):
+            payout = {"up": 1.0, "down": 0.0}[result] if result else None
+            pnl = (payout - price) * up + ((1 - payout) - price) * down if payout is not None and accounted else 0.0
+            return {"slug": f"btc-updown-15m-{start // 1000}" + (f"#{level}" if level else "") + (f"@{attempt}" if attempt else ""), "key": "BTC-15M",
+                    "name": "BTC 15分涨跌 x", "start_ms": start, "phase": "closed" if accounted else "closing", "accounted": accounted,
+                    "result": result if accounted else "", "pnl": pnl, "price": str(price), "shares": str(shares), "level": level, "attempt": attempt,
+                    "orders": {side: {"state": "final", "filled": float(f)} for side, f in (("up", up), ("down", down))}}
+        rows = [rec(at(10), 30, 0, "up"), rec(at(10), 0, 80, "up", level=1, price=0.43, shares=80),  # A: Up won at 47¢, Down lost at 43¢
+                rec(at(11), 0, 30, "up"),            # B: one side, lost
+                rec(at(12), 30, 30, "down"),         # C: both sides — hedged, 1 − 2 × 47¢ a pair
+                rec(at(13), 10, 0, "", accounted=False),  # D: filled, no result yet — worth nothing to the comparison
+                rec(at(14), 0, 0, "", attempt=1)]    # E: withdrawn unfilled
+        r = p.review(rows, NOW)
+        top, deep = r["levels"]
+        self.assertEqual((top["name"], top["price"], top["size"], deep["name"]), ("47¢×30", 0.47, 30.0, "43¢×80"))
+        self.assertEqual((top["settled"], top["settled_shares"], top["ev"], top["pnl"]), (3, 120.0, 3.6, 3.6))  # 3¢ a share of 120
+        self.assertEqual((top["sigma"], top["z"]), (round(450 ** 0.5, 4), 0.0))  # A and B 30 unhedged shares each; C none
+        self.assertEqual((top["both"], top["one"]), ({"windows": 1, "pnl": 1.8}, {"windows": 2, "won": 1, "pnl": 1.8}))
+        self.assertEqual((deep["settled_shares"], deep["ev"], deep["pnl"], deep["sigma"], deep["z"]), (80.0, 5.6, -34.4, 40.0, -1.0))
+        self.assertEqual((deep["both"]["windows"], deep["one"]), (0, {"windows": 1, "won": 0, "pnl": -34.4}))
+        # the whole: A is one toss (Up 30 at one level, Down 80 at the other: 50 unhedged) — and a window filled on both sides
+        e = r["ev"]
+        self.assertEqual((e["settled_shares"], e["ev"], e["sigma"], e["z"]), (200.0, 9.2, round(850 ** 0.5, 4), round((-30.8 - 9.2) / 850 ** 0.5, 2)))
+        self.assertEqual((e["both"], e["one"]), ({"windows": 2, "pnl": -16.7}, {"windows": 1, "won": 0, "pnl": -14.1}))
+        self.assertAlmostEqual(r["total"]["pnl"], -30.8, places=6)
+        # a card's levels over a range: by price, the same figures
+        d = p.cards_between(rows, "2026-11-05", "2026-11-05")[0]["diag"]
+        self.assertEqual([(x["name"], x["settled_shares"], x["ev"], x["pnl"], x["z"]) for x in d["levels"]], [("47¢", 120.0, 3.6, 3.6, 0.0), ("43¢", 80.0, 5.6, -34.4, -1.0)])
+        self.assertEqual(p.ev_line([]), {"settled_shares": 0.0, "ev": 0.0, "sigma": 0.0, "z": None, "both": {"windows": 0, "pnl": 0.0}, "one": {"windows": 0, "won": 0, "pnl": 0.0}})
+
     async def test_review_findings_only_an_operators_stop_withdraws_and_attempts_are_not_reused(self):
         """1.128.3: the account not verified yet at a start (or the stop itself) withdraws nothing — an operator's stop does;
         the attempt after a superseded record is not reused when the re-quote left no record; Predict's deferred refusal
