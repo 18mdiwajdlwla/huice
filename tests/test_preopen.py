@@ -2325,6 +2325,9 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             bot = L.LiveBot.__new__(L.LiveBot)
             bot.preopen, bot.config, bot.market = ctl, ctl.owner.config, ctl.owner.market
             self.assertEqual(bot.preopen_review()["total"]["records"], 4)
+            lv = bot.preopen_levels("2026-11-06", "2026-11-07")  # 1.154.35: 预挂按价格档位 on 按市场's days, read as preopen_cards reads them
+            self.assertEqual(([x["name"] for x in lv["levels"]], lv["pnl"], lv["settled"]), (["49¢×50", "49¢×10"], 5.1, 1))
+            self.assertIsNone(m.Bot.preopen_levels(bot, "2026-11-06", "2026-11-07"), "a bot without the mode: no block")
             # 1.154.26: within one build of the review page (review_scope) the review is made once — the daily summary and the
             # analysis both ask — and each record's figures once (quote_of: four walks of every record a build); the same
             # figures as made afresh, and nothing kept beyond the build
@@ -2380,6 +2383,67 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(bot.preopen_review())
             self.assertEqual(p.review([], NOW)["total"]["records"], 0)
             await self.finish(ctl)
+
+    def test_each_level_against_a_coin_toss(self):
+        """1.154.34 (the user: "复盘可以看预挂，哪个档位赚的多吗……比如 47 抽 3 个点，期望值盈利跟实际盈利对比"): the review's levels
+        and the mode's whole, and a card's levels over a range (card_diag), with what their settled fills were worth at the
+        order — 0.5 − the price a share, 47¢: 3¢ — beside what they made, the gap in the σ of the unhedged shares (a window
+        one toss: its levels and re-quotes netted), and where it came from: the hedged windows, the one-sided ones' wins."""
+        BJ = m.BEIJING
+        at = lambda h: int(dt.datetime(2026, 11, 5, h, tzinfo=BJ).timestamp() * 1000)
+
+        def rec(start, up, down, result, level=0, price=0.47, shares=30, accounted=True, attempt=0):
+            payout = {"up": 1.0, "down": 0.0}[result] if result else None
+            pnl = (payout - price) * up + ((1 - payout) - price) * down if payout is not None and accounted else 0.0
+            return {"slug": f"btc-updown-15m-{start // 1000}" + (f"#{level}" if level else "") + (f"@{attempt}" if attempt else ""), "key": "BTC-15M",
+                    "name": "BTC 15分涨跌 x", "start_ms": start, "phase": "closed" if accounted else "closing", "accounted": accounted,
+                    "result": result if accounted else "", "pnl": pnl, "price": str(price), "shares": str(shares), "level": level, "attempt": attempt,
+                    "orders": {side: {"state": "final", "filled": float(f)} for side, f in (("up", up), ("down", down))}}
+        rows = [rec(at(10), 30, 0, "up"), rec(at(10), 0, 80, "up", level=1, price=0.43, shares=80),  # A: Up won at 47¢, Down lost at 43¢
+                rec(at(11), 0, 30, "up"),            # B: one side, lost
+                rec(at(12), 30, 30, "down"),         # C: both sides — hedged, 1 − 2 × 47¢ a pair
+                rec(at(13), 10, 0, "", accounted=False),  # D: filled, no result yet — worth nothing to the comparison
+                rec(at(14), 0, 0, "", attempt=1)]    # E: withdrawn unfilled
+        r = p.review(rows, NOW)
+        top, deep = r["levels"]
+        self.assertEqual((top["name"], top["price"], top["size"], deep["name"]), ("47¢×30", 0.47, 30.0, "43¢×80"))
+        self.assertEqual((top["settled"], top["settled_shares"], top["ev"], top["pnl"]), (3, 120.0, 3.6, 3.6))  # 3¢ a share of 120
+        self.assertEqual((top["sigma"], top["z"]), (round(450 ** 0.5, 4), 0.0))  # A and B 30 unhedged shares each; C none
+        self.assertEqual((top["both"], top["one"]), ({"windows": 1, "pnl": 1.8}, {"windows": 2, "won": 1, "pnl": 1.8}))
+        self.assertEqual((deep["settled_shares"], deep["ev"], deep["pnl"], deep["sigma"], deep["z"]), (80.0, 5.6, -34.4, 40.0, -1.0))
+        self.assertEqual((deep["both"]["windows"], deep["one"]), (0, {"windows": 1, "won": 0, "pnl": -34.4}))
+        # the whole: A is one toss (Up 30 at one level, Down 80 at the other: 50 unhedged) — and a window filled on both sides
+        e = r["ev"]
+        self.assertEqual((e["settled_shares"], e["ev"], e["sigma"], e["z"]), (200.0, 9.2, round(850 ** 0.5, 4), round((-30.8 - 9.2) / 850 ** 0.5, 2)))
+        self.assertEqual((e["both"], e["one"]), ({"windows": 2, "pnl": -16.7}, {"windows": 1, "won": 0, "pnl": -14.1}))
+        self.assertAlmostEqual(r["total"]["pnl"], -30.8, places=6)
+        # a card's levels over a range: by price, the same figures
+        d = p.cards_between(rows, "2026-11-05", "2026-11-05")[0]["diag"]
+        self.assertEqual([(x["name"], x["settled_shares"], x["ev"], x["pnl"], x["z"]) for x in d["levels"]], [("47¢", 120.0, 3.6, 3.6, 0.0), ("43¢", 80.0, 5.6, -34.4, -1.0)])
+        self.assertEqual(p.ev_line([]), {"settled_shares": 0.0, "ev": 0.0, "sigma": 0.0, "z": None, "both": {"windows": 0, "pnl": 0.0}, "one": {"windows": 0, "won": 0, "pnl": 0.0}})
+        # 1.154.35 ("这个也可以用时间选择"): over a range of days (levels_between, under 按市场 and on its days) — only the windows
+        # starting on them; the archived records (finished quotes that filled nothing) counted in by their kept counts, a level's
+        # records and windows on each date, never a fill
+        at4 = lambda h: int(dt.datetime(2026, 11, 4, h, tzinfo=BJ).timestamp() * 1000)
+        older = [rec(at4(h), 0, 0, "") for h in range(3)] + [rec(at4(5), 30, 0, "down")]  # 11-04: three 47¢×30 quotes that filled nothing, one that lost
+        day5 = p.levels_between(rows + older, "2026-11-05", "2026-11-05")
+        self.assertEqual((day5["levels"], day5["ev"], day5["pnl"], day5["settled"]), (r["levels"], r["ev"], r["total"]["pnl"], r["total"]["settled"]))
+        wide = p.levels_between(rows + older, "2026-11-04", "2026-11-05")
+        self.assertEqual([(x["name"], x["records"], x["windows"], x["withdrawn"], x["settled_shares"], x["ev"], x["pnl"]) for x in wide["levels"]],
+                         [("47¢×30", 9, 9, 4, 150.0, 4.5, -10.5), ("43¢×80", 1, 1, 0, 80.0, 5.6, -34.4)])
+        self.assertEqual(p.levels_between(rows, "2026-11-06", "2026-11-30"), {"levels": [], "ev": p.ev_line([]), "pnl": 0, "settled": 0})
+        with tempfile.TemporaryDirectory() as folder:
+            led = p.Ledger(str(Path(folder) / "x.preopen.sqlite3"))
+            for row in rows + older:
+                led.save(row)
+            later = int(dt.datetime(2026, 11, 9, tzinfo=BJ).timestamp() * 1000)
+            self.assertEqual(led.archive_old(later), 3)  # the three of 11-04 (E, the card's latest window, stays whatever its age)
+            working = list(led.rows.values())
+            share = p.archive_share(led, working)
+            self.assertTrue(share.fits(later))
+            self.assertEqual(p.levels_between(working, "2026-11-04", "2026-11-05", share), wide)
+            self.assertEqual(p.levels_between(working, "2026-11-04", "2026-11-04", share)["levels"][0]["records"], 4)
+            led.close()
 
     async def test_review_findings_only_an_operators_stop_withdraws_and_attempts_are_not_reused(self):
         """1.128.3: the account not verified yet at a start (or the stop itself) withdraws nothing — an operator's stop does;

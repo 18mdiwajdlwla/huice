@@ -2790,7 +2790,10 @@ async def preopen_fills_not_adopted():
     assert P.cards_today([pair], NOW + 86_400_000) == [], "tomorrow: not today's"
     a = bot.sim_analysis(list(bot.sim_trades().values()), {})
     assert any(r.get("preopen") and r["name"] == "恒生指数 · 开盘前预挂" for r in a["cards_today"]), a["cards_today"]
-    assert not any(r.get("preopen") for r in bot.sim_analysis(list(bot.sim_trades().values()), {}, {"card": "恒生指数"})["cards_today"]), "the filter bar: the model's records alone"
+    lv = a["preopen_levels_today"]  # 1.154.35: 预挂按价格档位 under 按市场 — today's (preopen.levels_between)
+    assert [(x["pnl"], round(x["ev"], 6)) for x in lv["levels"]] == [(5.1, 0.1)] and lv["pnl"] == 5.1, lv
+    flt_a = bot.sim_analysis(list(bot.sim_trades().values()), {}, {"card": "恒生指数"})
+    assert not any(r.get("preopen") for r in flt_a["cards_today"]) and "preopen_levels_today" not in flt_a, "the filter bar: the model's records alone"
     print("PREOPEN_NOT_ADOPTED_OK")
 
 

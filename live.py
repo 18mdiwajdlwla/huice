@@ -7431,12 +7431,28 @@ class LiveBot(core.Bot):
         controller's ledger, or the file while the mode is off; the archived records (finished quotes that filled nothing)
         counted in by their kept counts (preopen_review's ArchiveShare, brought up to date) when those can stand for them —
         else only the records and windows of the older days come out short, never a fill or a P&L."""
-        from preopen import archive_share, cards_between, read_rows
+        from preopen import cards_between
+        rows, share = self.preopen_range("按市场")
+        return cards_between(rows, first, last, share) if rows is not None else []
+
+    def preopen_levels(self, first: str, last: str) -> dict | None:
+        """The review page's 预挂按价格档位 over the Beijing dates ``first``..``last`` (preopen.levels_between, 1.154.35) — under
+        按市场, on its days: as preopen_cards reads them. None when the mode has no record at all (the block is not shown)."""
+        from preopen import levels_between
+        rows, share = self.preopen_range("按价格档位")
+        return levels_between(rows, first, last, share) if rows else None
+
+    def preopen_range(self, what: str) -> tuple[list[dict] | None, Any]:
+        """(the pre-open mode's records, the archive's share standing for its archived ones) for a table over a range of days
+        (preopen_cards, preopen_levels): the controller's ledger, or the file while the mode is off; the share is
+        preopen_review's ArchiveShare brought up to date, None when it cannot stand for the archive (then only the records
+        and windows of the older days come out short, never a fill or a P&L). (None, None) when the records cannot be read."""
+        from preopen import archive_share, read_rows
         try:
             rows = list(self.preopen.ledger.rows.values()) if self.preopen is not None else read_rows(self.config.preopen.db)
         except Exception as error:
-            LOG.warning("预挂按市场读取失败：%s", core.clean_error(error) or type(error).__name__)
-            return []
+            LOG.warning("预挂%s读取失败：%s", what, core.clean_error(error) or type(error).__name__)
+            return None, None
         share = None
         try:
             share = self.preopen_share = archive_share(self.preopen.ledger if self.preopen is not None else self.config.preopen.db, rows,
@@ -7445,8 +7461,8 @@ class LiveBot(core.Bot):
                 share = None
         except Exception as error:
             self.preopen_share = share = None
-            LOG.warning("预挂按市场的归档统计没用上（较早日子的记录数会少算）：%s", core.clean_error(error) or type(error).__name__)
-        return cards_between(rows, first, last, share)
+            LOG.warning("预挂%s的归档统计没用上（较早日子的记录数会少算）：%s", what, core.clean_error(error) or type(error).__name__)
+        return rows, share
 
     def window_use(self, key: str, busy: set | None = None) -> str:
         """...and the rule taker (1.154.29): a card whose index a rule's windows are judged by in their course (rules.live_guard —
@@ -7473,10 +7489,13 @@ class LiveBot(core.Bot):
     def sim_analysis(self, trades: list[dict], marks: Any, flt: Any = None) -> dict:
         out = super().sim_analysis(trades, marks, flt)
         if not flt:  # the filter bar picks the model trader's records; the pre-open mode's rows stand beside them unfiltered
-            from preopen import cards_today
+            from preopen import cards_today, levels_between
             rows = self.preopen_rows()
             if rows:
                 out["cards_today"] = [*out.get("cards_today", []), *cards_today(rows, self.market.now_ms())]  # 1.131.5: the 49¢ pairs in 今日按市场
+                # 1.154.35: 预挂按价格档位 under 按市场, today's (none of today's windows is archived yet: no share needed)
+                today = dt.datetime.fromtimestamp(self.market.now_ms() / 1000, core.BEIJING).date().isoformat()
+                out["preopen_levels_today"] = levels_between(rows, today, today)
         return out
 
     def preopen_filled(self, days: int = 30) -> dict[tuple[str, int], float]:

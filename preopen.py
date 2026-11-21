@@ -953,6 +953,32 @@ def cards_between(rows: Iterable[dict], first: str, last: str, old: ArchiveShare
     return sorted(out, key=lambda x: (-x["records"], x["name"]))
 
 
+def levels_between(rows: Iterable[dict], first: str, last: str, old: ArchiveShare | None = None) -> dict:
+    """The review page's 预挂按价格档位 over the Beijing dates ``first``..``last`` (ISO; by the window's start) — under 按市场
+    and on its days (1.154.35; the user, of 1.154.34's table: "这个也可以用时间选择，给这个查看方式往上调"): each level's line
+    as review() makes it (review_summary with its ev_line, the highest bid first) over the windows of those days, and the
+    whole's ev_line and settled P&L. ``old``: the archived records (ArchiveShare: finished quotes that filled nothing, moved
+    out two days on) counted in by their kept counts — a level's records and windows on each date (ldate), never a fill."""
+    qs = [q for q in (quote_of(p) for p in rows if any(o.get("state") not in NEVER_PLACED for o in (p.get("orders") or {}).values()))
+          if first <= q["date"] <= last]
+    levels: dict[tuple[float, float], list[dict]] = {}
+    for q in qs:
+        levels.setdefault((q["price"], q["shares"]), []).append(q)
+    archived = sorted(key for key in old.lines["ldate"] if first <= key[1] <= last) if old is not None else []
+    for k, _ in archived:
+        levels.setdefault(k, [])
+    out = []
+    for k in sorted(levels, reverse=True):  # the highest bid first
+        group = levels[k]
+        r = review_summary(group[0]["level_name"] if group else level_name(*k), group)
+        for key in archived:
+            if key[0] == k:
+                r = old.counted(r, "ldate", key, [q for q in group if q["date"] == key[1]])
+        out.append({**r, "price": k[0], "size": k[1], **ev_line(group)})
+    total = review_summary("全部", qs)
+    return {"levels": out, "ev": ev_line(qs), "pnl": total["pnl"], "settled": total["settled"]}
+
+
 LEAD_BUCKETS = ((0.0, "撤单后才读到（成交时刻不详）"), (1.0, "开场前 1 分钟内"), (10.0, "开场前 1–10 分钟"), (60.0, "开场前 10–60 分钟"),
                 (360.0, "开场前 1–6 小时"), (math.inf, "开场前 6 小时以上"))  # card_diag: how long before the start the first fill was seen, the earliest first
 LOSS_FOCUS_SHARE = 0.6  # card_diag: two start hours carrying this much of a card's losses are named as where it lost
@@ -1017,7 +1043,7 @@ def card_diag(qs: list[dict], luck: dict | None = None) -> dict:
     levels: dict[float, list[dict]] = {}
     for q in qs:
         levels.setdefault(q["price"], []).append(q)
-    level_lines = [{**review_summary(f"{price * 100:g}¢", levels[price]), "price": price} for price in sorted(levels, reverse=True)]
+    level_lines = [{**review_summary(f"{price * 100:g}¢", levels[price]), "price": price, **ev_line(levels[price])} for price in sorted(levels, reverse=True)]  # (ev_line: 1.154.34)
     notes = diag_notes(ws, one, hours, leads, luck)
     return {"windows": len(ws), "one": one, "both": both, "hours": hours, "lead": leads,
             "sides": [review_side(name, side, qs) for side, name in (("up", "涨"), ("down", "跌"))],
@@ -1370,6 +1396,39 @@ def review_side(name: str, side: str, qs: list[dict]) -> dict:
             "pnl": round(sum(pnls), 4)}
 
 
+def ev_line(qs: list[dict]) -> dict:
+    """What the settled fills of ``qs`` (quote_of) were worth at the order against what they made — the review page's
+    预期对实际 by price level (1.154.34; the user: "47 抽 3 个点，期望值盈利跟实际盈利对比"). The mode prices a window a coin
+    toss, so a share bought at ``price`` is worth 0.5 − price at the order (47¢: 3¢), as ev_bets and cards_between count it;
+    the P&L beside it is review_summary's (the records' own). A window (its re-quotes, and levels when ``qs`` holds several)
+    is one toss: its fills netted per side, (Σup − Σdown)² / 4 its variance, as ev_bets — the gap in that σ (``z``). And
+    where the gap comes from: ``both`` — the windows both sides of which filled (hedged: a pair makes 1 − the two prices
+    whatever the result); ``one`` — those only one side of which filled, the result up or down: how many the filled side
+    won. At a price p it must win more than p of them to make money (47¢: 47%); far fewer is a bid taken by whoever knew
+    the direction (card_diag)."""
+    windows: dict[str, dict] = {}
+    for q in qs:
+        if not q["settled"]:
+            continue
+        w = windows.setdefault(q["window"], {"up": 0.0, "down": 0.0, "ev": 0.0, "pnl": 0.0, "result": ""})
+        w["up"] += q["filled_up"]
+        w["down"] += q["filled_down"]
+        w["ev"] += (0.5 - q["price"]) * q["filled"]
+        w["pnl"] += q["pnl"] or 0.0
+        w["result"] = w["result"] or q["result"]
+    ws = list(windows.values())
+    ev, pnl = sum(w["ev"] for w in ws), sum(w["pnl"] for w in ws)
+    var = sum((w["up"] - w["down"]) ** 2 * 0.25 for w in ws)
+    sigma = math.sqrt(var) if var > 1e-12 else 0.0
+    both = [w for w in ws if w["up"] > 0 and w["down"] > 0]
+    one = [w for w in ws if (w["up"] > 0) != (w["down"] > 0) and w["result"] in {"up", "down"}]
+    return {"settled_shares": round(sum(w["up"] + w["down"] for w in ws), 4), "ev": round(ev, 4),
+            "sigma": round(sigma, 4), "z": round((pnl - ev) / sigma, 2) if sigma > 0 else None,
+            "both": {"windows": len(both), "pnl": round(sum(w["pnl"] for w in both), 4)},
+            "one": {"windows": len(one), "won": sum(1 for w in one if (w["result"] == "up") == (w["up"] > 0)),
+                    "pnl": round(sum(w["pnl"] for w in one), 4)}}
+
+
 def ev_bets(rows: list[dict]) -> list[dict]:
     """The mode's settled fills as bets for the review page's 模型 EV 对实际盈亏 (core.sim_ev_timeline, 1.140.0): each accounted
     pair (one window) is one bet at the pair's price over its filled sides — EV = (0.5 − price) × the shares filled, P&L the
@@ -1463,13 +1522,17 @@ def review(rows: Iterable[dict], now_ms: int, old: ArchiveShare | None = None) -
     shown = ("start_ms", "name", "key", "filled_up", "filled_down", "price", "volume", "result", "pnl", "status", "lead_min", "cancel_s", "attempt", "fill_lead_min")
     total = summary("全部", qs, "all", "")
     today = dt.datetime.fromtimestamp(now_ms / 1000, core.BEIJING).date().isoformat()  # the daily summary takes today's and earlier windows: tomorrow's resting pairs are no day yet
+
+    def level(k: tuple[float, float]) -> dict:  # 1.154.34: a level's line with its 预期对实际 (ev_line; the archive adds no fill to it)
+        return {**summary(levels[k][0]["level_name"] if levels[k] else level_name(*k), levels[k], "level", k), "price": k[0], "size": k[1], **ev_line(levels[k])}
     return {"total": total,
+            "ev": ev_line(qs),  # 1.154.34: the whole mode's 预期对实际 (a window's levels one toss)
             "daily": {"days": {date: summary_shape(summary(date, dates[date], "date", date)) for date in dates if date <= today},
                       "total": summary_shape(summary("全部", [q for q in qs if q["date"] <= today], "all", ""))},  # the daily summary's share (core.merge_preopen_summary)
             "resting_usd": round(sum(q["price"] * q["shares"] * sum(q["sent"].values()) for q in qs if q["active"]), 4),
             "days": [summary(day, days[day], "day", day) for day in sorted(days, key=latest, reverse=True)],
             "cards": [summary(card, cards[card], "card", card) for card in sorted(cards, key=lambda c: (-size(c), c))],
-            "levels": [summary(levels[k][0]["level_name"] if levels[k] else level_name(*k), levels[k], "level", k) for k in sorted(levels, reverse=True)],  # the highest bid first
+            "levels": [level(k) for k in sorted(levels, reverse=True)],  # the highest bid first
             "hours": [summary(f"{card} {hour:02d} 时开始".strip(), hours[(card, hour)], "hour", (card if many else only, hour)) for card, hour in sorted(hours)],
             "sides": [side_line(name, side) for side, name in (("up", "涨"), ("down", "跌"))],
             # 1.139.2: the weekend's windows against the weekdays' — the weekend as PREOPEN_WEEKEND draws it (on_weekend)
@@ -1478,15 +1541,16 @@ def review(rows: Iterable[dict], now_ms: int, old: ArchiveShare | None = None) -
             "recent": [{k: q[k] for k in shown} for q in recent]}
 
 
-REVIEW_KINDS = ("all", "date", "day", "card", "level", "hour", "week", "cdate")  # the review's tables (and 按市场's card by date, 1.151.0), as ArchiveShare keeps the archive's lines of each
+REVIEW_KINDS = ("all", "date", "day", "card", "level", "hour", "week", "cdate", "ldate")  # the review's tables (and 按市场's card by date, 1.151.0; a level by date, 1.154.35), as ArchiveShare keeps the archive's lines of each
 
 
 def review_lines(q: dict) -> tuple:
     """The lines of the review's tables a quote is counted on, as (kind, key) — one of each of REVIEW_KINDS: the total, its
     window's date (the daily summary) and day, its card, its level, its card's start hour, the weekend or the week, its card on
-    its date (按市场 over a range of days, 1.151.0)."""
+    its date (按市场 over a range of days, 1.151.0), its level on its date (预挂按价格档位 over those days, 1.154.35)."""
     return (("all", ""), ("date", q["date"]), ("day", q["day"]), ("card", q["card"]), ("level", (q["price"], q["shares"])),
-            ("hour", (q["card"], q["hour"])), ("week", on_weekend(q["start_ms"])), ("cdate", (q["card"], q["date"])))
+            ("hour", (q["card"], q["hour"])), ("week", on_weekend(q["start_ms"])), ("cdate", (q["card"], q["date"])),
+            ("ldate", ((q["price"], q["shares"]), q["date"])))
 
 
 class ArchiveLine:
