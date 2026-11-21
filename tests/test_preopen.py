@@ -2325,6 +2325,9 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             bot = L.LiveBot.__new__(L.LiveBot)
             bot.preopen, bot.config, bot.market = ctl, ctl.owner.config, ctl.owner.market
             self.assertEqual(bot.preopen_review()["total"]["records"], 4)
+            lv = bot.preopen_levels("2026-11-06", "2026-11-07")  # 1.154.35: 预挂按价格档位 on 按市场's days, read as preopen_cards reads them
+            self.assertEqual(([x["name"] for x in lv["levels"]], lv["pnl"], lv["settled"]), (["49¢×50", "49¢×10"], 5.1, 1))
+            self.assertIsNone(m.Bot.preopen_levels(bot, "2026-11-06", "2026-11-07"), "a bot without the mode: no block")
             # 1.154.26: within one build of the review page (review_scope) the review is made once — the daily summary and the
             # analysis both ask — and each record's figures once (quote_of: four walks of every record a build); the same
             # figures as made afresh, and nothing kept beyond the build
@@ -2418,6 +2421,29 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         d = p.cards_between(rows, "2026-11-05", "2026-11-05")[0]["diag"]
         self.assertEqual([(x["name"], x["settled_shares"], x["ev"], x["pnl"], x["z"]) for x in d["levels"]], [("47¢", 120.0, 3.6, 3.6, 0.0), ("43¢", 80.0, 5.6, -34.4, -1.0)])
         self.assertEqual(p.ev_line([]), {"settled_shares": 0.0, "ev": 0.0, "sigma": 0.0, "z": None, "both": {"windows": 0, "pnl": 0.0}, "one": {"windows": 0, "won": 0, "pnl": 0.0}})
+        # 1.154.35 ("这个也可以用时间选择"): over a range of days (levels_between, under 按市场 and on its days) — only the windows
+        # starting on them; the archived records (finished quotes that filled nothing) counted in by their kept counts, a level's
+        # records and windows on each date, never a fill
+        at4 = lambda h: int(dt.datetime(2026, 11, 4, h, tzinfo=BJ).timestamp() * 1000)
+        older = [rec(at4(h), 0, 0, "") for h in range(3)] + [rec(at4(5), 30, 0, "down")]  # 11-04: three 47¢×30 quotes that filled nothing, one that lost
+        day5 = p.levels_between(rows + older, "2026-11-05", "2026-11-05")
+        self.assertEqual((day5["levels"], day5["ev"], day5["pnl"], day5["settled"]), (r["levels"], r["ev"], r["total"]["pnl"], r["total"]["settled"]))
+        wide = p.levels_between(rows + older, "2026-11-04", "2026-11-05")
+        self.assertEqual([(x["name"], x["records"], x["windows"], x["withdrawn"], x["settled_shares"], x["ev"], x["pnl"]) for x in wide["levels"]],
+                         [("47¢×30", 9, 9, 4, 150.0, 4.5, -10.5), ("43¢×80", 1, 1, 0, 80.0, 5.6, -34.4)])
+        self.assertEqual(p.levels_between(rows, "2026-11-06", "2026-11-30"), {"levels": [], "ev": p.ev_line([]), "pnl": 0, "settled": 0})
+        with tempfile.TemporaryDirectory() as folder:
+            led = p.Ledger(str(Path(folder) / "x.preopen.sqlite3"))
+            for row in rows + older:
+                led.save(row)
+            later = int(dt.datetime(2026, 11, 9, tzinfo=BJ).timestamp() * 1000)
+            self.assertEqual(led.archive_old(later), 3)  # the three of 11-04 (E, the card's latest window, stays whatever its age)
+            working = list(led.rows.values())
+            share = p.archive_share(led, working)
+            self.assertTrue(share.fits(later))
+            self.assertEqual(p.levels_between(working, "2026-11-04", "2026-11-05", share), wide)
+            self.assertEqual(p.levels_between(working, "2026-11-04", "2026-11-04", share)["levels"][0]["records"], 4)
+            led.close()
 
     async def test_review_findings_only_an_operators_stop_withdraws_and_attempts_are_not_reused(self):
         """1.128.3: the account not verified yet at a start (or the stop itself) withdraws nothing — an operator's stop does;

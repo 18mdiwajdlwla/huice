@@ -52,7 +52,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.34"
+VERSION = "1.154.35"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -15813,7 +15813,7 @@ details.hint{margin:4px 0 8px}details.hint>summary{display:inline-flex;align-ite
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><details class="menu" id="exports"><summary class="btn">导出 ▾</summary><div class="mlist"><a id="csv" href="journal.csv" download="交易日记.csv">交易日记 CSV</a><a id="scsv" href="summary.csv" download="复盘汇总.csv">复盘汇总 CSV</a><a id="mcsv" href="samples.csv" download="模型样本.csv">模型样本 CSV</a><a id="json" href="journal.json?full=1" download="交易日记.json">交易日记 JSON</a></div></details></div>
 <div class="tiles" id="tiles"></div>
 <section class="box" id="sumbox"><div class="hd" id="sumhd"><h2>每日汇总</h2><span class="sum" id="sumsum"></span><button type="button" class="lnk" id="foldsum">收起</button></div>
-<div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>按市场 · <span id="scrng">今天</span> <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbar" id="cbar"><button type="button" class="tq on" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><button type="button" class="tq" data-r="all">全部</button><details class="cust" id="ccust"><summary>自定义</summary><span class="tcust"><input type="date" id="cfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="cto" aria-label="结束日期"><button type="button" id="cgo">查看</button></span></details></div><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><details class="hint"><summary>说明</summary><p>选的日子（北京时间）里下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；开盘前预挂（两边挂）单独成行，名字后带“· 开盘前预挂”，按场次开始的日期算，下单时预期按五五开算。<b>偏离</b> = 实际盈亏比下单时预期差了几个 σ（σ 按下单时的概率算）：±2σ 以内可能只是运气，低于 −2σ 就不像运气了，是这个市场有问题。点一行看明细：原策略是这段时间的每一笔；开盘前预挂是钱亏在哪——只成交一边时那边赢几成、按开始时间、按成交时距开场、按方向和价格档。</p><p>按下单日期（北京时间）统计，开盘前预挂的场次按场次开始的日期计入当天，点开那一天有单独的“开盘前预挂”一行；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></details></div></section>
+<div class="body" id="sumbody"><div class="note fline" id="sumfilt" hidden></div><div class="tbl" id="summary"></div><div class="sec" id="d-detail" hidden></div><h3>按市场 · <span id="scrng">今天</span> <button type="button" class="lnk" id="scref" title="立即重读（列表、每日汇总、复盘分析一起；页面每 60 秒也会自动刷新）">刷新</button><span id="scat"></span></h3><div class="tbar" id="cbar"><button type="button" class="tq on" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><button type="button" class="tq" data-r="all">全部</button><details class="cust" id="ccust"><summary>自定义</summary><span class="tcust"><input type="date" id="cfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="cto" aria-label="结束日期"><button type="button" id="cgo">查看</button></span></details></div><div class="tbl" id="s-cards"></div><div class="sec" id="s-detail" hidden></div><details class="hint"><summary>说明</summary><p>选的日子（北京时间）里下单的记录按卡片汇总，15 分钟涨跌的各个窗口合在一张卡片下；开盘前预挂（两边挂）单独成行，名字后带“· 开盘前预挂”，按场次开始的日期算，下单时预期按五五开算。<b>偏离</b> = 实际盈亏比下单时预期差了几个 σ（σ 按下单时的概率算）：±2σ 以内可能只是运气，低于 −2σ 就不像运气了，是这个市场有问题。点一行看明细：原策略是这段时间的每一笔；开盘前预挂是钱亏在哪——只成交一边时那边赢几成、按开始时间、按成交时距开场、按方向和价格档。</p><p>按下单日期（北京时间）统计，开盘前预挂的场次按场次开始的日期计入当天，点开那一天有单独的“开盘前预挂”一行；盈亏是这些记录里已结算的，持仓中的另计（挂单 = 还在挂着的记录）；浮动盈亏 = 持仓按现在盘口中间价估（双边都有报价的才算）；每天下面按市场类型和挂/吃拆开。</p></details><div id="plbox" hidden><h3>预挂按价格档位 · <span id="plrng">今天</span> <span class="small mut" style="font-weight:normal">（日期跟着上面“按市场”选的）</span></h3><div id="p-levels"></div></div></div></section>
 <section class="box" id="tallybox"><div class="hd" id="tallyhd"><h2>市场涨跌统计</h2><span class="sum" id="tallysum"></span><button type="button" class="lnk" id="foldtally">收起</button></div>
 <div class="body" id="tallybody"><div class="tbar"><select id="tcard" aria-label="市场"></select><button type="button" class="tq" data-r="today">今天</button><button type="button" class="tq" data-r="yesterday">昨天</button><button type="button" class="tq" data-r="7d">近 7 天</button><button type="button" class="tq" data-r="30d">近 30 天</button><details class="cust" id="tcustd"><summary>自定义</summary><span class="tcust"><input type="date" id="tfrom" aria-label="开始日期"><span class="mut">到</span><input type="date" id="tto" aria-label="结束日期"><button type="button" id="tgo">查看</button></span></details></div>
 <div id="tally"></div>
@@ -16039,13 +16039,21 @@ let cardRng="today",cardFrom="",cardTo="";const cardsCache={},cardsBusy=new Set(
 function cardsRange(){return cardRng?["range="+cardRng]:["from="+cardFrom,"to="+(cardTo||cardFrom)]}
 function cardsView(S){  // 按市场: today's rows come with the summary's analysis; other days are read from the server (journal.json?cards=1&…), again after each refresh
   const cel=document.getElementById("s-cards"),lab=document.getElementById("scrng");
-  if(cardRng==="today"){lab.textContent="今天";const ct=(S.a||{}).cards_today||[];cel.replaceChildren(ct.length?cardsTable(ct):$("p","small mut","今天还没有记录"));cardDetail(ct,"今天");return}
+  if(cardRng==="today"){lab.textContent="今天";const ct=(S.a||{}).cards_today||[];cel.replaceChildren(ct.length?cardsTable(ct):$("p","small mut","今天还没有记录"));cardDetail(ct,"今天");
+    levelsView((S.a||{}).preopen_levels_today,"今天");return}
   const fk=filterKey(),q=["cards=1",...cardsRange()].join("&")+(fk?"&"+fk:""),c=cardsCache[q];if(!c||c.at!==okAt)loadCards(q);
-  if(!c||!c.data){cel.replaceChildren($("p","small mut",c&&c.error?"读取失败："+c.error:"读取中…"));cardDetail([],"");return}
+  if(!c||!c.data){cel.replaceChildren($("p","small mut",c&&c.error?"读取失败："+c.error:"读取中…"));cardDetail([],"");levelsView(null,"",c&&c.error?"读取失败："+c.error:"读取中…");return}
   const j=c.data,fi=document.getElementById("cfrom"),ti=document.getElementById("cto");lab.textContent=j.label;
   if(document.activeElement!==fi&&document.activeElement!==ti){fi.value=j.from;ti.value=j.to}fi.max=ti.max=j.today;
   const kids=[];if(c.error)kids.push($("p","small bad","刷新失败："+c.error+"，下面是上一次读到的"));
-  kids.push((j.rows||[]).length?cardsTable(j.rows):$("p","small mut","这段时间没有记录"));cel.replaceChildren(...kids);cardDetail(j.rows||[],j.label)}
+  kids.push((j.rows||[]).length?cardsTable(j.rows):$("p","small mut","这段时间没有记录"));cel.replaceChildren(...kids);cardDetail(j.rows||[],j.label);levelsView(j.preopen_levels,j.label)}
+function levelsView(pl,label,wait){  // 预挂按价格档位 (1.154.35; the user: "这个也可以用时间选择，给这个查看方式往上调"): under 按市场, on its days — each price level's settled fills against a coin toss (preopen.levels_between)
+  const box=document.getElementById("plbox"),el=document.getElementById("p-levels");
+  if(wait){if(!box.hidden)el.replaceChildren($("p","small mut",wait));return}  // (the days' figures on their way: the block keeps its place)
+  if(!pl){box.hidden=true;el.replaceChildren();return}  // no pre-open mode (or the filter bar on: the mode's records are not the filter's)
+  box.hidden=false;document.getElementById("plrng").textContent=label;
+  const d=$("dl");poEvRows(pl.ev,pl.pnl).forEach(([k,v])=>{const dd=$("dd","");if(Array.isArray(v))dd.append(...v);else dd.textContent=v;d.append($("dt","",k),dd)});
+  el.replaceChildren(...(d.children.length?[d]:[]),(pl.levels||[]).length?poLevels(pl.levels):$("p","small mut","这段时间预挂没有记录"),hint(PO_LEVEL_HINT))}
 async function loadCards(q){const at=okAt;if(cardsBusy.has(q))return;cardsBusy.add(q);
   try{const k=ctlKey();const r=await fetch(base+"/journal.json?"+q,{cache:"no-store",headers:k?{"X-Control-Key":k}:{}});if(!r.ok)throw await oops(r);cardsCache[q]={at,data:await r.json()}}
   catch(e){cardsCache[q]={at,error:e.message||"读取失败",data:(cardsCache[q]||{}).data}}  // a failed re-read keeps what was shown
@@ -16106,6 +16114,10 @@ function poDiag(r,span,fold){  // under a pre-open line of 按市场 (1.151.0): 
   kids.push(hint("怎么看：只成交一边时成交那边赢不到一半、偏离低于 −2σ，就是被知道方向的人挑着吃（逆向选择），不是运气；亏损挤在某几个开始时间，或者越早成交越亏，多半是那几个钟点标的休市、刚开盘或有固定的消息。两边都成交的场次两边对冲，每场稳赚 1 − 两边价格。",
     PO_LEVEL_HINT));
   return kids}
+function poEvRows(e,pnl){  // 预期对实际 and 差在哪 (1.154.34): the settled fills against a coin toss (preopen.ev_line) beside their P&L, and where the gap came from — [label, content] pairs
+  if(!e||!e.settled_shares)return[];const b=e.both||{},o=e.one||{};
+  return [["预期对实际",["按五五开预期 ",poPn(e.ev),"，实际 ",poPn(pnl),"，差 ",poPn(pnl-e.ev),e.z!=null?"（偏离 "+(e.z>=0?"+":"−")+Math.abs(e.z).toFixed(1)+"σ）":""]],
+    ["差在哪",(b.windows?"两边都成交 "+b.windows+" 场 "+money(b.pnl)+" · ":"")+(o.windows?"只成交一边 "+o.windows+" 场 "+money(o.pnl)+"，成交那边赢 "+o.won+" 场（"+Math.round(o.won*100/o.windows)+"%）":"没有只成交一边的场次")]]}
 const PO_LEVEL_HINT="按价格档：预期 = (50¢ − 买价) × 已结算的成交份数，按五五开算，47¢ 一份预期赚 3¢；实际 − 预期就是结果给的或拿走的，偏离在 ±2σ 以内可以是运气。只成交一边时，成交那边赢的占比要高过买价（47¢ 要赢过 47%）才赚钱，明显低于保本线就是被挑着吃；两边都成交的那几场是对冲，赚的是 1 − 两边价格。";
 function poLevels(rows){  // 按价格档位 (1.154.34; the user: "47 抽 3 个点，期望值盈利跟实际盈利对比"): each level's settled fills against a coin toss (preopen.ev_line) — worth 50¢ − the price a share at the order, what they made, and where the gap came from
   const span=(...xs)=>{const s=$("span","");s.append(...xs);return s},zt=z=>z==null?"":"（"+(z>=0?"+":"−")+Math.abs(z).toFixed(1)+"σ）";
@@ -16173,12 +16185,9 @@ function preopenSection(po){  // 开盘前预挂 (1.128.0): the mode's own ledge
   p("场次",t.windows+"（记录 "+t.records+"，挂着 "+t.resting+" 场、预留 "+usd(po.resting_usd)+"，没成交撤掉 "+t.withdrawn+"）");
   p("有成交",t.filled_windows+" 场 · "+num(t.filled)+" 份 · "+usd(t.volume)+(t.pending?" · 待结算 "+t.pending+" 场":""));
   p("已结算",t.settled?[t.settled+" 场（赢 "+t.wins+" 输 "+t.losses+(t.ties?" 平 "+t.ties:"")+"）盈亏 ",poPn(t.pnl)," · 平均每场 ",poPn(t.pnl/t.settled)]:"还没有结算的场次");
-  const e=po.ev;  // 1.154.34: the settled fills against a coin toss (preopen.ev_line), and where the gap came from
-  if(e&&e.settled_shares){const b=e.both||{},o=e.one||{};
-    p("预期对实际",["按五五开预期 ",poPn(e.ev),"，实际 ",poPn(t.pnl),"，差 ",poPn(t.pnl-e.ev),e.z!=null?"（偏离 "+(e.z>=0?"+":"−")+Math.abs(e.z).toFixed(1)+"σ）":""]);
-    p("差在哪",(b.windows?"两边都成交 "+b.windows+" 场 "+money(b.pnl)+" · ":"")+(o.windows?"只成交一边 "+o.windows+" 场 "+money(o.pnl)+"，成交那边赢 "+o.won+" 场（"+Math.round(o.won*100/o.windows)+"%）":"没有只成交一边的场次"))}
+  poEvRows(po.ev,t.pnl).forEach(([k,v])=>p(k,v));  // 1.154.34: the settled fills against a coin toss, and where the gap came from
   el.append(d,...bigTable("按日期",poTable(po.days||[]),(po.days||[]).length),$("div","sub","按标的"),poTable(po.cards||[]));
-  if((po.levels||[]).length)el.append($("div","sub","按价格档位：预期（按五五开）对实际（每档一条记录）"),poLevels(po.levels),hint(PO_LEVEL_HINT));
+  if((po.levels||[]).length)el.append($("p","small mut","按价格档位的预期对实际在上面“按市场”下方，跟着那里选的日期（全部日子选“全部”）。"));  // 1.154.35: moved up
   el.append(...bigTable("按开始时间",poTable(po.hours||[]),(po.hours||[]).length));
   if((po.weekly||[]).length)el.append($("div","sub","周末 vs 工作日（按场次开始时间；周末 = 北京时间周六 00:00 到周一 08:00，和“周末也挂”的开关同一区间）"),poTable(po.weekly));
   el.append($("div","sub","按方向（一场的涨、跌是两张单）"),table(["方向","挂出","有成交","成交份数","成交额","已结算","盈亏"],(po.sides||[]).map(r=>[r.name,r.records,r.filled_windows||"—",num(r.filled),usd(r.volume),poWl(r),r.settled?poPn(r.pnl):"—"])));
@@ -24145,6 +24154,10 @@ class Bot:
         """The pre-open mode's 按市场 rows over the Beijing dates ``first``..``last`` (LiveBot.preopen_cards); none here."""
         return []
 
+    def preopen_levels(self, first: str, last: str) -> dict | None:
+        """The pre-open mode's 预挂按价格档位 over those dates (LiveBot.preopen_levels, 1.154.35); None here: the block is not shown."""
+        return None
+
     def journal_cards(self, flt: Mapping | None = None, frm: str = "", to: str = "", rng: str = "") -> dict:
         """journal.json?cards=1&range=today | yesterday | 7d | 30d | all (or &from=<date>&to=<date>) — the review page's 按市场
         over a range of days (1.151.0; 今日按市场 was today's alone): the model trader's records in ``flt`` opened on those
@@ -24163,11 +24176,13 @@ class Bot:
             except Exception as error:  # the rows still come; open trades just cannot be marked
                 LOG.warning("journal: markets unavailable: %s", clean_error(error) or type(error).__name__)
         rows = sim_by_card(trades, self.sim_marks(markets, now_ms))
+        levels = None
         if not flt:  # the filter bar picks the model trader's records; the pre-open mode's rows stand beside them unfiltered (as in sim_analysis)
             rows += self.preopen_cards(d0.isoformat(), d1.isoformat())
+            levels = self.preopen_levels(d0.isoformat(), d1.isoformat())  # 1.154.35: 预挂按价格档位 under 按市场, on its days
         return {"version": VERSION, "server_ms": now_ms, "generated_at": stamp(now_ms) + "（北京时间）", "filter": flt,
                 "from": d0.isoformat(), "to": d1.isoformat(), "today": today.isoformat(), "range": rng if rng in JOURNAL_RANGES or rng == "all" else "",
-                "label": journal_days_label(d0, d1, today) if rng != "all" else f"全部（{d0:%m-%d} 起）", "rows": rows}
+                "label": journal_days_label(d0, d1, today) if rng != "all" else f"全部（{d0:%m-%d} 起）", "rows": rows, "preopen_levels": levels}
 
     def sim_ev(self, trades: list[dict] | None = None, preopen: bool = True) -> dict:
         """模型 EV 对实际盈亏 (sim_ev_timeline, 1.140.0) over ``trades`` (every record when None) and, when ``preopen``, the

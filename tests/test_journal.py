@@ -670,15 +670,14 @@ async def browser_check(bot, data):
                     "phase": "closed", "accounted": True, "result": result, "pnl": (payout - price) * up + ((1 - payout) - price) * down,
                     "price": str(price), "shares": str(shares), "level": level, "attempt": 0,
                     "orders": {side: {"state": "final", "filled": float(f)} for side, f in (("up", up), ("down", down))}}
-        po = P.review([pre(bj(10), 30, 0, "up"), pre(bj(10), 0, 80, "up", 1, 0.43, 80), pre(bj(11), 0, 30, "up"), pre(bj(12), 30, 30, "down")], NOW)
+        po_rows = [pre(bj(10), 30, 0, "up"), pre(bj(10), 0, 80, "up", 1, 0.43, 80), pre(bj(11), 0, 30, "up"), pre(bj(12), 30, 30, "down")]
+        po = P.review(po_rows, NOW)
         await page.evaluate("po=>preopenSection(po)", po)
         ptxt = await page.text_content("#a-preopen")
         for want in ("预期对实际", "按五五开预期 +$9.20，实际 −$30.80，差 −$40.00（偏离 −1.4σ）", "两边都成交 2 场 −$16.70 · 只成交一边 1 场 −$14.10，成交那边赢 0 场（0%）",
-                     "按价格档位：预期（按五五开）对实际", "每份：预期 → 实际", "+3.0¢ → +3.0¢", "+$3.60", "1/2（50%，保本 47%）",
-                     "+7.0¢ → −43.0¢", "+$5.60", "−$34.40", "−$40.00（−1.0σ）", "0/1（0%，保本 43%）", "47¢ 一份预期赚 3¢"):
+                     "按价格档位的预期对实际在上面“按市场”下方"):  # 1.154.35: the level table moved up, on 按市场's days (below)
             assert want in ptxt, (want, ptxt)
-        heads = await page.locator("#a-preopen .tbl").nth(2).locator("th").all_inner_texts()
-        assert heads == ["档位", "有成交 / 场次", "已结算", "已结算份数", "每份：预期 → 实际", "预期", "实际", "实际 − 预期（偏离）", "两边都成交", "只成交一边：那边赢"], heads
+        assert "每份：预期 → 实际" not in ptxt
         # 1.113.0: the daily summary is one line per day until that line is clicked (its kind / way lines then show; a second
         # click folds them); 今日按市场 has a refresh button and says when the data was read
         days = page.locator("#summary tr.dayrow")
@@ -820,16 +819,34 @@ async def browser_check(bot, data):
         assert await page.locator("#cbar .tq.on").count() == 0 and "上证指数" not in await page.inner_text("#s-cards")
         po_range = {**po_row, "name": "黄金 15分涨跌 · 开盘前预挂", "luck": {**po_row["luck"], "z": -3.29, "bets": 30}}
         bot.preopen_cards = lambda first, last: [po_range] if first <= "2026-10-04" <= last else []
+        # 1.154.35: 预挂按价格档位 under 按市场, on its days (preopen.levels_between) — hidden without the mode (the paper bot's today)
+        assert await page.is_hidden("#plbox")
+        bot.preopen_levels = lambda first, last: P.levels_between(po_rows, first, last)
         await page.click("#cbar [data-r='30d']")
         await page.wait_for_selector("#s-cards tr.dayrow:has-text('黄金 15分涨跌')")
+        await page.wait_for_selector("#plbox:not([hidden])")
+        ltxt = await page.inner_text("#plbox")
+        for want in ("预挂按价格档位 · 09-06 至 10-05（30 天）", "日期跟着上面“按市场”选的", "按五五开预期 +$9.20，实际 −$30.80，差 −$40.00（偏离 −1.4σ）",
+                     "47¢×30", "+3.0¢ → +3.0¢", "+$3.60", "1/2（50%，保本 47%）", "43¢×80", "+7.0¢ → −43.0¢", "+$5.60", "−$34.40", "−$40.00（−1.0σ）", "0/1（0%，保本 43%）"):
+            assert want in ltxt, (want, ltxt)
+        heads = await page.locator("#plbox .tbl th").all_inner_texts()
+        assert heads == ["档位", "有成交 / 场次", "已结算", "已结算份数", "每份：预期 → 实际", "预期", "实际", "实际 − 预期（偏离）", "两边都成交", "只成交一边：那边赢"], heads
+        assert await page.evaluate("!!(document.getElementById('s-cards').compareDocumentPosition(document.getElementById('plbox'))&Node.DOCUMENT_POSITION_FOLLOWING)")
+        assert await page.evaluate("!!(document.getElementById('plbox').compareDocumentPosition(document.getElementById('anabody'))&Node.DOCUMENT_POSITION_FOLLOWING)"), "above 复盘分析"
         gold = page.locator("#s-cards tr.dayrow", has_text="黄金 15分涨跌")
         assert "−3.3σ 不像运气" in await gold.inner_text() and await gold.locator("b.bad").count() >= 1
         await gold.locator("td").first.click()
         await page.wait_for_selector("#s-detail ul.notes")
         assert "黄金 15分涨跌 · 开盘前预挂 · 09-06 至 10-05（30 天）：钱亏在哪" in await page.inner_text("#s-detail h3")
+        await page.evaluate("document.getElementById('ccust').open=true")  # days without a window of the mode: the block says so
+        await page.fill("#cfrom", "2026-10-01")  # (dates not read before: 昨天's answer is the server's from earlier, cached)
+        await page.fill("#cto", "2026-10-03")
+        await page.click("#cgo")
+        await page.wait_for_selector("#plrng:has-text('10-01')")
+        assert "这段时间预挂没有记录" in await page.inner_text("#plbox") and await page.locator("#plbox .tbl").count() == 0
         await page.click("#cbar [data-r=today]")
-        assert await page.inner_text("#scrng") == "今天" and await page.is_hidden("#s-detail")
-        del bot.preopen_cards
+        assert await page.inner_text("#scrng") == "今天" and await page.is_hidden("#s-detail") and await page.is_hidden("#plbox")
+        del bot.preopen_cards, bot.preopen_levels
         assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "no sideways scroll with the range bar"
         assert not errors, errors
         # three rows at first (the resting order and the last two finished ones), every one on request, by day

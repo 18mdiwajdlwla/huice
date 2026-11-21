@@ -953,6 +953,32 @@ def cards_between(rows: Iterable[dict], first: str, last: str, old: ArchiveShare
     return sorted(out, key=lambda x: (-x["records"], x["name"]))
 
 
+def levels_between(rows: Iterable[dict], first: str, last: str, old: ArchiveShare | None = None) -> dict:
+    """The review page's 预挂按价格档位 over the Beijing dates ``first``..``last`` (ISO; by the window's start) — under 按市场
+    and on its days (1.154.35; the user, of 1.154.34's table: "这个也可以用时间选择，给这个查看方式往上调"): each level's line
+    as review() makes it (review_summary with its ev_line, the highest bid first) over the windows of those days, and the
+    whole's ev_line and settled P&L. ``old``: the archived records (ArchiveShare: finished quotes that filled nothing, moved
+    out two days on) counted in by their kept counts — a level's records and windows on each date (ldate), never a fill."""
+    qs = [q for q in (quote_of(p) for p in rows if any(o.get("state") not in NEVER_PLACED for o in (p.get("orders") or {}).values()))
+          if first <= q["date"] <= last]
+    levels: dict[tuple[float, float], list[dict]] = {}
+    for q in qs:
+        levels.setdefault((q["price"], q["shares"]), []).append(q)
+    archived = sorted(key for key in old.lines["ldate"] if first <= key[1] <= last) if old is not None else []
+    for k, _ in archived:
+        levels.setdefault(k, [])
+    out = []
+    for k in sorted(levels, reverse=True):  # the highest bid first
+        group = levels[k]
+        r = review_summary(group[0]["level_name"] if group else level_name(*k), group)
+        for key in archived:
+            if key[0] == k:
+                r = old.counted(r, "ldate", key, [q for q in group if q["date"] == key[1]])
+        out.append({**r, "price": k[0], "size": k[1], **ev_line(group)})
+    total = review_summary("全部", qs)
+    return {"levels": out, "ev": ev_line(qs), "pnl": total["pnl"], "settled": total["settled"]}
+
+
 LEAD_BUCKETS = ((0.0, "撤单后才读到（成交时刻不详）"), (1.0, "开场前 1 分钟内"), (10.0, "开场前 1–10 分钟"), (60.0, "开场前 10–60 分钟"),
                 (360.0, "开场前 1–6 小时"), (math.inf, "开场前 6 小时以上"))  # card_diag: how long before the start the first fill was seen, the earliest first
 LOSS_FOCUS_SHARE = 0.6  # card_diag: two start hours carrying this much of a card's losses are named as where it lost
@@ -1515,15 +1541,16 @@ def review(rows: Iterable[dict], now_ms: int, old: ArchiveShare | None = None) -
             "recent": [{k: q[k] for k in shown} for q in recent]}
 
 
-REVIEW_KINDS = ("all", "date", "day", "card", "level", "hour", "week", "cdate")  # the review's tables (and 按市场's card by date, 1.151.0), as ArchiveShare keeps the archive's lines of each
+REVIEW_KINDS = ("all", "date", "day", "card", "level", "hour", "week", "cdate", "ldate")  # the review's tables (and 按市场's card by date, 1.151.0; a level by date, 1.154.35), as ArchiveShare keeps the archive's lines of each
 
 
 def review_lines(q: dict) -> tuple:
     """The lines of the review's tables a quote is counted on, as (kind, key) — one of each of REVIEW_KINDS: the total, its
     window's date (the daily summary) and day, its card, its level, its card's start hour, the weekend or the week, its card on
-    its date (按市场 over a range of days, 1.151.0)."""
+    its date (按市场 over a range of days, 1.151.0), its level on its date (预挂按价格档位 over those days, 1.154.35)."""
     return (("all", ""), ("date", q["date"]), ("day", q["day"]), ("card", q["card"]), ("level", (q["price"], q["shares"])),
-            ("hour", (q["card"], q["hour"])), ("week", on_weekend(q["start_ms"])), ("cdate", (q["card"], q["date"])))
+            ("hour", (q["card"], q["hour"])), ("week", on_weekend(q["start_ms"])), ("cdate", (q["card"], q["date"])),
+            ("ldate", ((q["price"], q["shares"]), q["date"])))
 
 
 class ArchiveLine:

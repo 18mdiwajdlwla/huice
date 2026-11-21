@@ -1273,7 +1273,7 @@ async def _review_by_counts(folder):
         assert w not in share.known and (share.lines["all"][""].records, share.lines["all"][""].windows) == (9, 5)
         share.learn(led.conn, w)
         friday, saturday = (share.lines["date"][_p.quote_of(x)["date"]] for x in (own[0], others[0]))
-        assert friday in share.known[w] and saturday not in share.known[w] and len(share.known[w]) == 9, "the lines of its own four records: the total, a date, a day, a card, two levels, an hour, the week, the card on its date (1.151.0)"
+        assert friday in share.known[w] and saturday not in share.known[w] and len(share.known[w]) == 11, "the lines of its own four records: the total, a date, a day, a card, two levels, an hour, the week, the card on its date (1.151.0), the two levels on their date (1.154.35)"
 
         def both():
             """(the review by the archive's counts, the review of every record) of this ledger, as JSON"""
