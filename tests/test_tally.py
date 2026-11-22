@@ -129,6 +129,36 @@ def unit_checks():
     assert few["one"]["verdict"] == f"样本太少（不到 {m.TALLY_MIN_FILLS} 场），先别下结论" and few["levels"] == [{"price": 0.49, "n": 1, "won": 1, "expected": 0.5}]
     assert m.tally_fills(rows, [])["windows"] == 0 and m.tally_fills(rows, [])["price"] is None and m.tally_fills([], [])["one"]["z"] is None
     assert len(ledger(FILLS)) == len(FILLS)
+    # 1.154.38: 预挂按前面连涨 / 连跌的场数 — the filled windows by the run right before each (tally_follow's chain: a missing candle or
+    # a gap breaks it), what a share made against the coin toss, with or against the run, the doubling rule's windows (3+) against the rest
+    res = "uuuddxuuuuux"
+    run_rows = [{"s": i * 5, "e": i * 5 + 5, "r": r} for i, r in enumerate(res)]
+    fl = lambda i, up, down, price=0.47, result="": {"s": i * 5, "up": up, "down": down, "price": price, "result": result}
+    st = m.tally_streaks(run_rows, [fl(1, 10, 0), fl(3, 10, 0), fl(5, 0, 10, result="u"), fl(6, 0, 10, 0.43), fl(9, 0, 10), fl(10, 10, 0), fl(10, 0, 10),
+                                    fl(11, 10, 0), fl(99, 10, 0)])  # (11: no result yet; 99: not the range's)
+    g = st["groups"]
+    assert [(x["windows"], x["shares"], x["ev"], x["pnl"], x["z"]) for x in g] == [(1, 10.0, 0.7, -4.3, -1.0), (1, 10.0, 0.3, 5.3, 1.0), (1, 10.0, 0.3, -4.7, -1.0),
+                                                                                   (2, 20.0, 0.6, -9.4, -1.41), (1, 20.0, 0.6, 0.6, None)], g
+    assert [(x["one"], x["with"], x["against"], x["both"]) for x in g] == [
+        ({"n": 1, "won": 0, "price": 0.43}, {"n": 0, "won": 0}, {"n": 0, "won": 0}, {"n": 0, "pnl": 0.0}),     # after a missing candle: no run
+        ({"n": 1, "won": 1, "price": 0.47}, {"n": 1, "won": 1}, {"n": 0, "won": 0}, {"n": 0, "pnl": 0.0}),     # after an up, filled up, won
+        ({"n": 1, "won": 0, "price": 0.47}, {"n": 1, "won": 0}, {"n": 0, "won": 0}, {"n": 0, "pnl": 0.0}),     # after two downs, down filled, Predict said up
+        ({"n": 2, "won": 0, "price": 0.47}, {"n": 1, "won": 0}, {"n": 1, "won": 0}, {"n": 0, "pnl": 0.0}),     # after three ups: one with, one against
+        ({"n": 0, "won": 0, "price": None}, {"n": 0, "won": 0}, {"n": 0, "won": 0}, {"n": 1, "pnl": 0.6})], g  # after four: both sides, hedged
+    assert (st["double"]["windows"], st["double"]["pnl"], st["double"]["z"], st["rest"]["windows"], st["rest"]["pnl"], st["rest"]["z"]) == (3, -8.8, -1.41, 3, -3.7, -0.58), st
+    assert (st["rate_double"], st["rate_rest"], st["z"], st["pending"], st["at"]) == (-0.22, -0.1233, -0.29, 1, 3), st
+    assert st["verdict"] == f"样本太少（不到 {m.TALLY_MIN_FILLS} 场），先别下结论" and st["rest"]["one"]["price"] == 0.4567
+    # forty runs of four ups (a missing candle between): the fourth window filled up and won, the first filled down and lost — doubling
+    # after three would pay; the other way round, it would lose more
+    blocks = [{"s": i * 5, "e": i * 5 + 5, "r": "x" if i % 5 == 4 else "u"} for i in range(200)]
+    good = m.tally_streaks(blocks, [fl(i, 10, 0) if i % 5 == 3 else fl(i, 0, 10) for i in range(200) if i % 5 in (0, 3)])
+    assert (good["double"]["windows"], good["rest"]["windows"], good["rate_double"], good["rate_rest"]) == (40, 40, 0.53, -0.47) and good["z"] > 3, good
+    assert good["verdict"] == "连 3 场以上的场次每份赚得比其余多（明显，超过 3σ）：翻倍有数据支持", good["verdict"]
+    bad = m.tally_streaks(blocks, [fl(i, 0, 10) if i % 5 == 3 else fl(i, 10, 0) for i in range(200) if i % 5 in (0, 3)])
+    assert bad["verdict"] == "连 3 场以上的场次每份赚得比其余少（明显，超过 3σ）：翻倍会亏得更多" and bad["double"]["against"] == {"n": 40, "won": 0}, bad
+    even = m.tally_streaks(blocks, [fl(i, 10, 0) for i in range(200) if i % 5 in (0, 3)])
+    assert even["z"] == 0.0 and even["verdict"] == "连 3 场以上和其余每份赚得差不多：翻倍只是把仓位放大，没有额外的优势", even
+    assert m.tally_streaks(run_rows, [])["double"]["windows"] == 0 and m.tally_streaks([], [])["z"] is None
 
 
 async def run():
@@ -188,6 +218,9 @@ async def run():
     bot.preopen_rows = lambda: rows
     p = bot.tally_payload("BTC-5M", "2026-11-08", "2026-11-08")
     assert (p["fills"]["windows"], p["fills"]["one"]["won"], p["fills"]["one"]["decided"], p["fills"]["one"]["z"]) == (50, 10, 45, -3.73), p["fills"]
+    # 1.154.38: 预挂按前面连涨 / 连跌 from the same rows and fills
+    assert p["streak_fills"] == m.tally_streaks(day_rows(), bot.tally_fill_rows(m.tally_card("BTC-5M"), {r["s"] for r in day_rows()})), p["streak_fills"]
+    assert p["streak_fills"]["double"]["windows"] + p["streak_fills"]["rest"]["windows"] == 50 - 1, p["streak_fills"]  # (the one without a result is pending)
     assert p["fills"]["both"] == {"n": 4, "uneven": 3, "heavy_won": 2} and p["fills"]["unknown"] == 1 and p["checks"]["n"] == 2  # no result kept: nothing official
     assert bot.tally_fill_rows(m.tally_card("ETH-5M"), {DAY0 + k * 300_000 for k in range(120)}) == []  # another card's windows: none of these
     kept = ledger([(13, 10, 0, 0.49, "up"), (14, 0, 0, 0.49, ""), (15, 0, 10, 0.49, "split")])  # the result the ledger keeps reaches the stat; an unfilled record is none
@@ -287,7 +320,10 @@ async def browser_check(bot):
             for want in ("跟随还是反转", "上一场涨之后，下一场涨 5/60（8%）· 上一场跌之后，下一场跌 4/57（7%）", "同向 9 次、反向 108 次；这段涨占 50%，如果每场互不相干，同向该有 58.5 次，实际偏离 −9.2σ → 偏反转（明显，超过 3σ）：涨跌容易交替",
                          "连涨 4 场以上", "预挂成交的那一边", "只成交一边、分出结果的 45 场里，成交那边赢 10 场；随机成交该赢 22.5 场，实际偏离 −3.7σ → 有逆向选择（明显，超过 3σ）",
                          "这些成交均价 48.9¢：成交那边赢的占比要高过 48.9% 才赚钱", "45 场还没有官方结果，按 K 线算", "另有 1 场结果还没定，没算进去",
-                         "两边都成交的 4 场两边对冲，不算输赢（其中两边不一样多的 3 场，多的那边赢 2 场）", "按价格档"):  # 1.144.0
+                         "两边都成交的 4 场两边对冲，不算输赢（其中两边不一样多的 3 场，多的那边赢 2 场）", "按价格档",  # 1.144.0
+                         "预挂按前面连涨 / 连跌的场数", "连 3 场以上合计", "其余合计", "顺着方向赢", "逆着方向赢",
+                         "连 1 场\t48\t530\t+1.1¢ → −25.9¢", "9/44（20%） 保本49%", "0/35（0%）", "样本太少（不到 20 场），先别下结论",  # (no fill after a run of 3+ on this day)
+                         "“连 3 场以上合计”就是翻倍规则会翻倍的那些场", "“顺着方向”= 前面连涨时成交在涨那边"):  # 1.154.38
                 assert want in text, (want, text)
             assert await page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "no sideways scroll with the new tables"
             # 1.143.1: a dot tapped says its window; only the mismatches on request; a range of days: a row a day, the dots of the day picked
