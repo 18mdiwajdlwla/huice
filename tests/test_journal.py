@@ -660,6 +660,19 @@ async def browser_check(bot, data):
         assert "涨（盘前不买）｜盘中 ≤60¢" in rtxt2 and "跌（已关）" in rtxt2 and "其中盘中买的" not in rtxt2, rtxt2
         assert "盘口变化→推送到达 中位 246 ms、到达→发出 2098 ms、发出→应答 358 ms" in rtxt2, rtxt2
         assert await page.get_attribute("#h-rules", "data-k") == "ruletaker", "its own fold key: 统计与风险's 规则 keeps rules"
+        # 1.154.36: the control key is asked for in the page, as a password (prompt() has no password mode: a phone showed it as typed)
+        assert "prompt(msg" not in m.JOURNAL_PAGE and "prompt(msg" not in m.WEB_PAGE
+        await page.evaluate("()=>{window.kd=keyDialog('需要控制口令\\n这是实盘账户的交易记录')}")
+        await page.locator(".kdlg .kbox").wait_for()
+        assert await page.get_attribute(".kdlg input.kin", "type") == "password" and await page.get_attribute(".kdlg input.kin", "autocomplete") == "current-password"
+        assert "这是实盘账户的交易记录" in await page.inner_text(".kdlg p")
+        await page.fill(".kdlg input.kin", "secret-456")
+        await page.press(".kdlg input.kin", "Enter")  # (the form: Enter submits, as on a phone's keyboard)
+        assert await page.evaluate("window.kd") == "secret-456" and await page.locator(".kdlg").count() == 0
+        await page.evaluate("()=>{window.kd=keyDialog('x')}")
+        await page.locator(".kdlg .kbox").wait_for()
+        await page.keyboard.press("Escape")
+        assert await page.evaluate("window.kd") is None and await page.locator(".kdlg").count() == 0
         # 1.154.34: 开盘前预挂 by price level — each level's settled fills against a coin toss (preopen.ev_line): 47¢ worth 3¢ a share
         import preopen as P
         bj = lambda h: int(dt.datetime(2026, 10, 5, h, tzinfo=m.BEIJING).timestamp() * 1000)
