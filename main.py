@@ -52,7 +52,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.37"
+VERSION = "1.154.38"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -9657,6 +9657,98 @@ def tally_fills(rows: list[dict], fills: list[dict]) -> dict:
             "levels": [{**lv, "expected": round(lv["expected"], 1)} for _, lv in sorted(levels.items(), reverse=True)]}
 
 
+TALLY_RUN_NAMES = ("前面没有连续", "连 1 场", "连 2 场", "连 3 场", "连 4 场以上")  # (前面没有连续: the one before tied, had no candle or was not adjacent — said under the table)
+TALLY_RUN_DOUBLE = 3  # 预挂按前面连涨 / 连跌: the run the user's doubling rule starts at ("连续涨 3 把，下一把预挂的就翻倍")
+
+
+def tally_streaks(rows: list[dict], fills: list[dict]) -> dict:
+    """预挂按前面连涨 / 连跌的场数 (1.154.38; the user: "连续涨 3 把，下一把预挂的就翻倍……连续涨跌的次数越多就赚的越多"): the
+    pre-open mode's filled windows of the card in the range (``fills`` as tally_fills takes them), by the run of ups or downs
+    right before each — as tally_follow counts it: adjacent windows both up or down, a tie, a missing candle or a closed
+    market between breaks it (0), 1, 2, 3, 4+ — each group's shares, what they were worth at the order against a coin toss
+    ((0.5 − price) a share, preopen.ev_line's way), what they made (Predict's result where the ledger holds it, else the
+    candles'), the gap in the σ of the unhedged shares, the one-sided windows' wins against their mean price (the share a
+    side must win to pay) — those filled on the run's side (with it) and on the other (against it) apart — and the hedged.
+    Then the doubling rule's windows (a run of TALLY_RUN_DOUBLE or more before) against the rest, a share each: doubling pays
+    only if a share there makes more than elsewhere; within 2σ of the rest it is the same bet at twice the size."""
+    by_start = {r["s"]: r for r in rows}
+    before: dict[int, tuple[str, int]] = {}  # a window's start -> (the run's side, its length, 4 = 4+), ("", 0) for none
+    prev, run = None, 0
+    for r in rows:
+        linked = prev is not None and prev["r"] in ("u", "d") and r["s"] == prev["e"]
+        before[r["s"]] = (prev["r"], min(run, 4)) if linked else ("", 0)
+        run = (run + 1 if linked and r["r"] == prev["r"] else 1) if r["r"] in ("u", "d") else 0
+        prev = r
+    windows: dict[int, dict] = {}
+    for f in fills:
+        if f["s"] not in by_start or f["up"] + f["down"] <= 0:
+            continue
+        w = windows.setdefault(f["s"], {"up": 0.0, "down": 0.0, "parts": [], "result": ""})
+        w["up"] += f["up"]
+        w["down"] += f["down"]
+        w["parts"].append(f)
+        w["result"] = w["result"] or (f["result"] if f["result"] in ("u", "d", "s") else "")
+
+    def group(name: str) -> dict:
+        return {"name": name, "windows": 0, "shares": 0.0, "ev": 0.0, "pnl": 0.0, "var": 0.0, "both": {"n": 0, "pnl": 0.0},
+                "one": {"n": 0, "won": 0, "cost": 0.0, "shares": 0.0}, "with": {"n": 0, "won": 0}, "against": {"n": 0, "won": 0}}
+    groups = [group(name) for name in TALLY_RUN_NAMES]
+    double, rest = group(f"连 {TALLY_RUN_DOUBLE} 场以上合计"), group("其余合计")
+    pending = 0
+    for s, w in windows.items():
+        o = w["result"] or by_start[s]["r"]
+        if o not in ("u", "d", "s"):
+            pending += 1  # neither Predict nor the candles say yet
+            continue
+        side_run, length = before[s]
+        payout = {"u": 1.0, "d": 0.0, "s": 0.5}[o]
+        pnl = sum((payout - f["price"]) * f["up"] + ((1 - payout) - f["price"]) * f["down"] for f in w["parts"])
+        ev = sum((0.5 - f["price"]) * (f["up"] + f["down"]) for f in w["parts"])
+        cost = sum(f["price"] * (f["up"] + f["down"]) for f in w["parts"])
+        for g in (groups[length], double if length >= TALLY_RUN_DOUBLE else rest):
+            g["windows"] += 1
+            g["shares"] += w["up"] + w["down"]
+            g["ev"] += ev
+            g["pnl"] += pnl
+            g["var"] += (w["up"] - w["down"]) ** 2 * 0.25  # the unhedged part, one coin toss (ev_line)
+            if w["up"] > 0 and w["down"] > 0:
+                g["both"]["n"] += 1
+                g["both"]["pnl"] += pnl
+            elif o in ("u", "d"):
+                side = "u" if w["up"] > 0 else "d"
+                g["one"]["n"] += 1
+                g["one"]["won"] += int(o == side)
+                g["one"]["cost"] += cost
+                g["one"]["shares"] += w["up"] + w["down"]
+                if side_run:
+                    part = g["with" if side == side_run else "against"]
+                    part["n"] += 1
+                    part["won"] += int(o == side)
+
+    def shown(g: dict) -> dict:
+        sigma = math.sqrt(g["var"]) if g["var"] > 1e-12 else 0.0
+        one = g["one"]
+        return {"name": g["name"], "windows": g["windows"], "shares": round(g["shares"], 4), "ev": round(g["ev"], 4), "pnl": round(g["pnl"], 4),
+                "sigma": round(sigma, 4), "z": round((g["pnl"] - g["ev"]) / sigma, 2) if sigma > 0 else None,
+                "both": {"n": g["both"]["n"], "pnl": round(g["both"]["pnl"], 4)},
+                "one": {"n": one["n"], "won": one["won"], "price": round(one["cost"] / one["shares"], 4) if one["shares"] > 0 else None},
+                "with": g["with"], "against": g["against"]}
+    # the doubling rule's windows against the rest, a share each: under the coin toss each group's P&L a share has the variance of
+    # its unhedged shares over its shares squared — the two apart, z of the difference
+    rate = lambda g: g["pnl"] / g["shares"] if g["shares"] > 0 else None
+    z = None
+    if double["shares"] > 0 and rest["shares"] > 0:
+        spread = math.sqrt(double["var"] / double["shares"] ** 2 + rest["var"] / rest["shares"] ** 2)
+        z = round((rate(double) - rate(rest)) / spread, 2) if spread > 0 else None
+    verdict = tally_reading(z, min(double["windows"], rest["windows"]), TALLY_MIN_FILLS, "场",
+                            (f"连 {TALLY_RUN_DOUBLE} 场以上的场次每份赚得比其余多", "翻倍有数据支持"),
+                            (f"连 {TALLY_RUN_DOUBLE} 场以上的场次每份赚得比其余少", "翻倍会亏得更多"),
+                            f"连 {TALLY_RUN_DOUBLE} 场以上和其余每份赚得差不多：翻倍只是把仓位放大，没有额外的优势")
+    return {"groups": [shown(g) for g in groups], "double": shown(double), "rest": shown(rest), "z": z, "verdict": verdict,
+            "rate_double": round(rate(double), 4) if rate(double) is not None else None, "rate_rest": round(rate(rest), 4) if rate(rest) is not None else None,
+            "pending": pending, "at": TALLY_RUN_DOUBLE}
+
+
 def updown_odds(price: float, line: float, sigma: float, years: float, drift: float = -0.5,
                 tick: float = 0.01) -> tuple[float, float, float, float]:
     """(up, flat, down, z) for a close `years` from now against `line`: log-normal with annual σ, its log mean moved by
@@ -16530,6 +16622,21 @@ function tallyFills(j){  // 预挂成交的那一边 (1.144.0): how often the si
   if((f.levels||[]).length>1)out.push($("div","sub","按价格档（每档的挂单各算各的，只算只成交一边的）"),
     table(["档位","次数","那边赢","赢占比","随机该赢"],f.levels.map(l=>[(l.price*100).toFixed(1).replace(/\.0$/,"")+"¢",l.n,l.won,tallyPc(l.won,l.n),tallyPc(l.expected,l.n)])));
   return out}
+function tallyStreaks(j){  // 预挂按前面连涨 / 连跌的场数 (1.154.38): the pre-open mode's filled windows by the run right before each — does a share make more after a run (the doubling rule's question)?
+  const t=j.streak_fills,out=[$("div","sub","预挂按前面连涨 / 连跌的场数（本卡这段时间；连续 = 相邻两场都分出涨跌，平、没数据、休市会断开）")];
+  if(!t||!(t.double.windows+t.rest.windows)){out.push($("p","small mut","这段时间本卡的预挂没有已出结果的成交"));return out}
+  const per=v=>(v>=0?"+":"−")+Math.abs(v*100).toFixed(1)+"¢",cell=(...xs)=>{const sp=$("span","");sp.append(...xs);return sp};
+  const win=x=>x.n?x.won+"/"+x.n+"（"+tallyPc(x.won,x.n)+"）":"—";
+  const row=g=>{const sh=g.shares,o=g.one;return [g.name,g.windows||"—",sh?num(sh):"—",sh?per(g.ev/sh)+" → "+per(g.pnl/sh):"—",
+    sh?cell(pn(g.pnl-g.ev),g.z!=null?"（"+tallyZ(g.z)+"）":""):"—",o.n?win(o)+(o.price!=null?" 保本"+Math.round(o.price*100)+"%":""):"—",win(g.with),win(g.against),
+    g.both.n?cell(g.both.n+" 场 ",pn(g.both.pnl)):"—"]};
+  out.push(table(["前面","有成交","成交份数","每份：预期→实际","实际−预期（偏离）","只成交一边赢","顺着方向赢","逆着方向赢","两边都成交"],
+    [...t.groups.filter(g=>g.windows).map(row),row(t.double),row(t.rest)]));
+  out.push($("p","small",(t.rate_double!=null&&t.rate_rest!=null?"连 "+t.at+" 场以上每份 "+per(t.rate_double)+"，其余每份 "+per(t.rate_rest)+(t.z!=null?"，相差 "+tallyZ(t.z):"")+" → ":"")+t.verdict));
+  out.push($("p","small mut","“前面没有连续”= 上一场平、没数据或不相连；“连 "+t.at+" 场以上合计”就是翻倍规则会翻倍的那些场。“顺着方向”= 前面连涨时成交在涨那边、连跌时成交在跌那边，“逆着”反过来；保本 = 这组成交的均价。"
+    +"连 "+t.at+" 场以上后翻倍，只有“连 "+t.at+" 场以上”每份明显比“其余”多（超过 2σ）才值得做；只是持平的话，翻倍只放大风险。"
+    +(t.pending?"另有 "+t.pending+" 场结果还没定，没算进去。":"")));
+  return out}
 function tallyRender(j){const el=document.getElementById("tally"),c=j.counts||{};el.replaceChildren();tallyLast=j;
   const multi=j.from!==j.to,days=j.days||[];if(multi&&!days.some(d=>d.d===tallyDay))tallyDay=days.length?days[days.length-1].d:"";
   const dec=(c.up||0)+(c.down||0),rate=dec?Math.round(c.up*100/dec)+"%":"—";
@@ -16551,7 +16658,7 @@ function tallyRender(j){const el=document.getElementById("tally"),c=j.counts||{}
   const lg=$("p","small mut tlegend","");[["u","涨"],["d","跌"],["f","平"],["x","没数据"]].forEach(([k,w])=>lg.append($("span","tdot "+k),w));if(j.tie)lg.append($("span","tdot u n"),tallyNear(j));lg.append($("span","tdot u bad"),"和官方结果不一致");el.append(lg);
   if((j.hours||[]).length>1)el.append($("div","sub",j.from!==j.to?"按小时（北京时间，几天里同一小时合在一起）":"按小时（北京时间）"),
     table(["开始","涨","跌","平","没数据","涨占比"],j.hours.map(h=>{const n=h.up+h.down;return [String(h.h).padStart(2,"0")+":00",h.up,h.down,h.flat||"—",h.missing||"—",n?Math.round(h.up*100/n)+"%":"—"]})));
-  el.append(...tallyFollow(j),...tallyFills(j));  // 1.144.0
+  el.append(...tallyFollow(j),...tallyFills(j),...tallyStreaks(j));  // 1.144.0; 1.154.38: 预挂按前面连涨 / 连跌
   el.append($("p","small mut","数据：币安"+(j.source||"").replace("币安","")+"；"+(j.tie?"开始和结束完全一样才记平；"+tallyNear(j)+" 的照涨跌算，画浅色":"只有完全相同才记平")));
   document.getElementById("tallysum").textContent=j.name+" 涨 "+c.up+" · 跌 "+c.down+(c.flat?" · 平 "+c.flat:"")}
 async function tallyLoad(tries){const my=++tallySeq,el=document.getElementById("tally");if(!tries)el.replaceChildren($("p","small mut","读取中…"));
@@ -24320,6 +24427,7 @@ class Bot:
             return {**base, "ready": False, "message": f"正在读币安 1 分钟 K 线（{len(waiting)} 段，每段 1000 分钟）…"}
         rows = tally_rows(windows, closes, tally_tie(card))
         summary = tally_summary(rows, self.tally_official(card, {w[0] for w in windows}))
+        fill_rows = self.tally_fill_rows(card, {w[0] for w in windows})  # (read once: 预挂成交的那一边 and 按前面连涨 / 连跌 both take them)
         at = lambda ms: dt.datetime.fromtimestamp(ms / 1000, BEIJING)
         if not rows:
             label = f"{d0:%m-%d}" + (f" 到 {d1:%m-%d}" if d1 != d0 else "") + " 还没有结束的场次"
@@ -24330,7 +24438,8 @@ class Bot:
         return {**base, "ready": True, "range": label, "windows": rows, **summary, "errors": errors[:3], "tie": tally_tie(card),
                 "source": "币安现货 1 分钟 K 线" if source == "spot" else "币安合约指数 1 分钟 K 线",
                 "follow": tally_follow(rows),                                                    # 1.144.0: 跟随还是反转
-                "fills": tally_fills(rows, self.tally_fill_rows(card, {w[0] for w in windows}))}  # 1.144.0: 预挂成交的那一边
+                "fills": tally_fills(rows, fill_rows),                                           # 1.144.0: 预挂成交的那一边
+                "streak_fills": tally_streaks(rows, fill_rows)}                                  # 1.154.38: 预挂按前面连涨 / 连跌的场数
 
     def tally_fetch(self, source: str, symbol: str, chunks: list[int]) -> None:
         """The candle chunks read in the background, three at a time (tally_gate): one not read yet, one still filling; one
