@@ -2504,7 +2504,8 @@ class Controller:
             return False  # signed to expire otherwise than the card's expiry says now (1.152.0: BTC 5-minute's own)
         price, shares = pair_quote(pair)
         index = int(pair.get("level") or 0)
-        level = self.settings.levels[index] if index < len(self.settings.levels) else None
+        ladder = self.settings.levels_for(str(pair.get("key") or ""))  # (1.154.37: BTC 5-minute's own, where set)
+        level = ladder[index] if index < len(ladder) else None
         if level is None or float(level[0]) != price or float(level[1]) != shares:
             return False  # not what the settings say at this level (a price or size changed, a level dropped): withdrawn, quoted again as they say
         amounts = live.limit_amounts(True, live.to_wei(level[0]), live.to_wei(level[1]))
@@ -2647,11 +2648,12 @@ class Controller:
         """Whether a card's next listing is expected any second (poll_wait: the fast poll): the pass probes the listings alone."""
         return self.poll_wait() == FAST_POLL_S
 
-    def wanted_levels(self, slug: str, start: int, strikes: dict, st: dict) -> list[tuple[str, int, D, D]]:
+    def wanted_levels(self, slug: str, start: int, strikes: dict, st: dict, card: str = "") -> list[tuple[str, int, D, D]]:
         """The levels of a window to quote now: (record key, level, price, shares) — not queued, not quoted, not past the
-        failures cap, not waiting on a withdrawal's reconciliation (counted as pending), the deeper ones only near the start."""
+        failures cap, not waiting on a withdrawal's reconciliation (counted as pending), the deeper ones only near the start.
+        ``card``: the window's card, whose ladder it is (levels_for — BTC 5-minute's own, 1.154.37)."""
         wanted = []
-        for level, (price, shares) in enumerate(self.settings.levels):
+        for level, (price, shares) in enumerate(self.settings.levels_for(card)):
             if level and start - self.now() > self.settings.deep_ahead_minutes * 60_000:
                 break  # the deeper levels wait for the window to come near (PREOPEN_DEEP_AHEAD_MINUTES); the first keeps its queue position
             key = slug if level == 0 else f"{slug}#{level}"  # sorts after the first level's key, before the next's
@@ -2699,7 +2701,7 @@ class Controller:
                 slug = window_slug(rolling, start)
                 if self.now() - self.skipped_at.get(slug, 0) < SKIP_RETRY_MS:
                     continue  # judged no candidate a moment ago: not read again every poll
-                wanted = self.wanted_levels(slug, start, strikes, st)
+                wanted = self.wanted_levels(slug, start, strikes, st, rolling.key)
                 if not wanted:
                     continue
                 st["asked"] += 1
@@ -2740,7 +2742,7 @@ class Controller:
             slug = window_slug(rolling, start)
             if self.now() - self.skipped_at.get(slug, 0) < SKIP_RETRY_MS:
                 continue
-            wanted = self.wanted_levels(slug, start, strikes, st)
+            wanted = self.wanted_levels(slug, start, strikes, st, rolling.key)
             if not wanted:
                 continue
             if st["reads"] >= DISCOVER_READS:
@@ -2841,7 +2843,8 @@ class Controller:
             return ""
         if self.hold() or (self.card_holds.get(str(c.get("key") or "")) and int(c.get("start_ms") or 0) - self.now() <= CARD_HOLD_NEAR_MS):
             return "held"
-        price, shares = D(str(c.get("price") or self.settings.price)), D(str(c.get("shares") or self.settings.shares))  # the level's (PREOPEN_LEVELS)
+        first = self.settings.levels_for(str(c.get("key") or ""))[0]  # (a candidate with no level's figures: its card's first level — 1.154.37)
+        price, shares = D(str(c.get("price") or first[0])), D(str(c.get("shares") or first[1]))  # the level's (PREOPEN_LEVELS)
         side_usd, pair_usd = float(price * shares), 2 * float(price * shares)
         if why := self.budget_problem(pair_usd, side_usd):
             self.error = why
@@ -3798,7 +3801,7 @@ class Controller:
             if start > self.listed_by_card.get(rolling.key, 0):
                 continue
             slug = window_slug(rolling, start)
-            for level, (price, shares) in enumerate(self.settings.levels):
+            for level, (price, shares) in enumerate(self.settings.levels_for(rolling.key)):
                 if level and start - now > self.settings.deep_ahead_minutes * 60_000:
                     break
                 key = slug if level == 0 else f"{slug}#{level}"
@@ -3855,6 +3858,8 @@ class Controller:
                 + (f"BTC 5 分钟自己的时间：开场前 {b5.cancel_seconds} 秒撤单、{b5.expiry_seconds} 秒签名到期，不足 {b5.entry_seconds} 秒不再新挂，"
                    + ("挂 24 小时内已发布的全部场次" if b5.ahead_minutes >= 1440 else f"只挂 {b5.ahead_minutes} 分钟内开始的场次") + "\n"
                    if "BTC-5M" in self.settings.markets and (b5 := self.settings.timing("BTC-5M")) is not self.settings else "") +  # 1.152.0
+                (f"BTC 5 分钟自己的档位：两边各 {'、'.join(f'{core.cents(float(lp))}×{float(ls):g} 份' for lp, ls in self.settings.btc5_levels)}\n"
+                 if "BTC-5M" in self.settings.markets and self.settings.btc5_levels else "") +  # 1.154.37
                 f"已记录 {len(self.ledger.windows)} 场、{total} 条（{resting} 条挂着，{cleared} 条已结清）"
                 + (f"，另有 {self.ledger.archived_count} 条已归档（结束超过 {ARCHIVE_AFTER_MS // core.DAY_MS} 天、已撤且没成交的；复盘页照常统计）" if self.ledger.archived_count else "") + "，"
                 f"队列 {self.queue.qsize() + len(self.parked)} 场" + (f"（{len(self.parked)} 场在等，见暂不新挂）" if self.parked else "") + f"；{listed}"

@@ -52,7 +52,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.36"
+VERSION = "1.154.37"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -540,6 +540,9 @@ class PreopenSettings:
     btc5_expiry_seconds: int = 0   # PREOPEN_BTC5_EXPIRY_SECONDS
     btc5_entry_seconds: int = 0    # PREOPEN_BTC5_ENTRY_SECONDS
     btc5_ahead_minutes: int = 0    # PREOPEN_BTC5_AHEAD_MINUTES
+    # 1.154.37: BTC 5-minute's own ladder (PREOPEN_BTC5_LEVELS): (price, shares) a side per level, its first level included; () = the
+    # general one above (levels_for) — the user: "单独 BTC 5 分钟的预挂，可以设置挂多少份额的吗"
+    btc5_levels: tuple = ()
 
     @property
     def side_usd(self) -> float:
@@ -552,6 +555,11 @@ class PreopenSettings:
             return self
         return dataclasses.replace(self, cancel_seconds=self.btc5_cancel_seconds or self.cancel_seconds, expiry_seconds=self.btc5_expiry_seconds or self.expiry_seconds,
                                    entry_seconds=self.btc5_entry_seconds or self.entry_seconds, ahead_minutes=self.btc5_ahead_minutes or self.ahead_minutes)
+
+    def levels_for(self, key: str) -> tuple:
+        """The levels a card's windows are quoted at (1.154.37): BTC 5-minute's own ladder where set (PREOPEN_BTC5_LEVELS, the first
+        level included), every other card's — and BTC 5-minute's without one — the general ladder (the first level, PREOPEN_LEVELS)."""
+        return self.btc5_levels if key == "BTC-5M" and self.btc5_levels else self.levels
 
     @property
     def pair_usd(self) -> float:
@@ -587,12 +595,23 @@ class PreopenSettings:
         price = D(cents) / 100
         exclusive = str(e.get("PREOPEN_EXCLUSIVE", "off")).strip().lower() == "on"
         weekend = str(e.get("PREOPEN_WEEKEND", "on")).strip().lower() != "off"
-        levels = [(cents, shares)]
-        for part in [x.strip() for x in str(e.get("PREOPEN_LEVELS", "")).replace("，", ",").split(",") if x.strip()]:
-            found = re.fullmatch(r"(\d+)\s*[xX×*:：]\s*(\d+)", part)
-            if not found:
-                raise ValueError("PREOPEN_LEVELS 的格式是 价格x份数，逗号分隔，如 48x20,47x40（第一档是 PREOPEN_PRICE_CENTS × PREOPEN_SHARES）")
-            levels.append((int(found.group(1)), int(found.group(2))))
+        def ladder(name: str, example: str) -> list[tuple[int, int]]:  # "价格x份数, …" as (cents, shares) (PREOPEN_LEVELS; PREOPEN_BTC5_LEVELS, 1.154.37)
+            out = []
+            for part in [x.strip() for x in str(e.get(name, "")).replace("，", ",").split(",") if x.strip()]:
+                found = re.fullmatch(r"(\d+)\s*[xX×*:：]\s*(\d+)", part)
+                if not found:
+                    raise ValueError(f"{name} 的格式是 价格x份数，逗号分隔，如 {example}")
+                out.append((int(found.group(1)), int(found.group(2))))
+            return out
+
+        def bad_ladder(rungs: list[tuple[int, int]]) -> bool:  # too many, a price or size out of range, a side under Predict's minimum, prices not falling
+            return (len(rungs) > PREOPEN_MAX_LEVELS or any(not 1 <= c <= 50 or not 1 <= s <= 500 or c * s / 100 < PREOPEN_MIN_SIDE_USD for c, s in rungs)
+                    or any(rungs[i][0] <= rungs[i + 1][0] for i in range(len(rungs) - 1)))
+        levels = [(cents, shares), *ladder("PREOPEN_LEVELS", "48x20,47x40（第一档是 PREOPEN_PRICE_CENTS × PREOPEN_SHARES）")]
+        btc5 = ladder("PREOPEN_BTC5_LEVELS", "47x10,43x40（第一档在前；空 = 跟所有卡一样）")
+        if btc5 and bad_ladder(btc5):
+            raise ValueError(f"PREOPEN_BTC5_LEVELS（BTC 5 分钟自己的价格档位，含第一档）至多 {PREOPEN_MAX_LEVELS} 档，每档价格 1～50¢、份数 1～500、"
+                             f"每边不少于 ${PREOPEN_MIN_SIDE_USD:g}，价格逐档递减；空 = 跟所有卡一样")
         deep = int(e.get("PREOPEN_DEEP_AHEAD_MINUTES", "0") or 0) or ahead
         limit_gap = float(e.get("PREOPEN_LIMIT_GAP_PCT", "2") or 0)
         if not 0 <= limit_gap <= 20:
@@ -600,8 +619,7 @@ class PreopenSettings:
         open_quiet = int(e.get("PREOPEN_OPEN_QUIET_MINUTES", "15") or 0)
         if not 0 <= open_quiet <= 120:
             raise ValueError("PREOPEN_OPEN_QUIET_MINUTES 0～120（开盘后第一场固定不挂，这里只能再加长；0 按 15 算）")
-        if (len(levels) > PREOPEN_MAX_LEVELS or any(not 1 <= c <= 50 or not 1 <= s <= 500 or c * s / 100 < PREOPEN_MIN_SIDE_USD for c, s in levels)
-                or any(levels[i][0] <= levels[i + 1][0] for i in range(len(levels) - 1)) or not 3 <= deep <= ahead):
+        if bad_ladder(levels) or not 3 <= deep <= ahead:
             raise ValueError(f"PREOPEN_LEVELS 连第一档至多 {PREOPEN_MAX_LEVELS} 档，每档价格 1～50¢、份数 1～500、每边不少于 ${PREOPEN_MIN_SIDE_USD:g}，价格要比第一档低、逐档递减；"
                              "PREOPEN_DEEP_AHEAD_MINUTES 3～PREOPEN_AHEAD_MINUTES（0 = 和第一档一样）")
         if (not 1 <= poll <= 60 or not 0 <= cap <= 1_000_000 or not 1 <= cents <= 50 or not 1 <= shares <= 500
@@ -620,7 +638,8 @@ class PreopenSettings:
         return cls(enabled, poll=poll, cancel_seconds=cancel, expiry_seconds=expiry, entry_seconds=entry, ahead_minutes=ahead, max_open_usd=cap,
                    price=price, shares=D(shares), markets=markets, exclusive=exclusive, weekend=weekend, db=cls.db_of(e),
                    levels=tuple((D(c) / 100, D(s)) for c, s in levels), deep_ahead_minutes=deep, limit_gap_pct=limit_gap, open_quiet_minutes=open_quiet,
-                   btc5_cancel_seconds=b5[0], btc5_expiry_seconds=b5[1], btc5_entry_seconds=b5[2], btc5_ahead_minutes=b5[3])
+                   btc5_cancel_seconds=b5[0], btc5_expiry_seconds=b5[1], btc5_entry_seconds=b5[2], btc5_ahead_minutes=b5[3],
+                   btc5_levels=tuple((D(c) / 100, D(s)) for c, s in btc5))
 
     @classmethod
     def from_config(cls, config: "Config", force: bool = False) -> "PreopenSettings":
@@ -852,6 +871,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_BTC5_AHEAD_MINUTES", "BTC 5 分钟：只挂几分钟内开始的场次", "只管 BTC 5 分钟卡；0 = 跟上面所有卡的一样。1440 = 挂满：Predict 发布的场次全部挂上，"
      "新场次一发布就挂（0.5 秒内），排在 49¢ 买单队伍最前面；24 小时最多 288 场，每场两边各 49¢ × 每次份数，预挂资金上限不够时最晚发布的几场挂不上（预挂状态写“已发布未挂”）。"
      "3～1440：调小就只挂快开场的几场，少占资金、少读接口，但新场次要等进了范围才挂，排在先挂的人后面"),
+    ("PREOPEN_BTC5_LEVELS", "BTC 5 分钟：自己的价格档位", "只管 BTC 5 分钟卡（1.154.37）；价格x份数、逗号分隔、第一档在前、价格逐档递减，最多 8 档，如 47x10,43x40："
+     "BTC 5 分钟每场每边就挂这几档（第一档也按这里的价格和份数）；空 = 跟上面所有卡的一样（预挂价格 × 每次份数，加更深的价格档位）。改了只撤、重挂 BTC 5 分钟的单"),
     ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "0～1000000，0 = 不限（默认）：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金，成交时才扣款；余额够一场双边就挂）；设了上限时每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放，/preopen 会算出把已发布的全部挂上需要多少"),
     # 1.153.0: 规则吃单 (rules.py) — the gold / oil windows the backtest found mispriced (README「规则吃单」)
     ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段，开场前吃：Predict 撮合开启后到开场前 15 秒，盘口一出现规则价以内的指定方向就立即买"
@@ -12638,6 +12659,8 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_BTC5_ENTRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["0", "90", "120", "180", "300"], "unit": "秒", "zero": "跟所有卡一样"},
     "PREOPEN_BTC5_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "30", "60", "120", "240", "1440"], "unit": "分钟", "zero": "跟所有卡一样",
                                    "captions": {"1440": "挂满：一发布就挂"}},  # 1.152.2: every listed window, each placed the moment it is listed
+    "PREOPEN_BTC5_LEVELS": {"kind": "text", "group": "预挂", "presets": ["", "47x10", "47x10,43x40", "47x20,43x80,40x80", "47x30,43x160,40x160,37x160"], "unit": "",
+                            "empty": "跟所有卡一样"},  # 1.154.37
     "PREOPEN_MAX_OPEN_USD": {"kind": "number", "group": "预挂", "presets": ["0", "1000", "5000", "7000", "20000"], "unit": "$", "zero": "不限"},
     "RULE_TAKER": {"kind": "choice", "group": "规则", "options": [["off", "off 关"], ["paper", "paper 只记录不下单"], ["on", "on 真实吃单（需要 LIVE=on）"]]},
     "RULE_GOLD_SHUT_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "55", "58", "60", "65"], "unit": "¢", "zero": "不做"},
@@ -25830,6 +25853,7 @@ class Bot:
                   "PREOPEN_EXPIRY_SECONDS": str(c.preopen.expiry_seconds), "PREOPEN_ENTRY_SECONDS": str(c.preopen.entry_seconds),
                   "PREOPEN_BTC5_CANCEL_SECONDS": str(c.preopen.btc5_cancel_seconds), "PREOPEN_BTC5_EXPIRY_SECONDS": str(c.preopen.btc5_expiry_seconds),
                   "PREOPEN_BTC5_ENTRY_SECONDS": str(c.preopen.btc5_entry_seconds), "PREOPEN_BTC5_AHEAD_MINUTES": str(c.preopen.btc5_ahead_minutes),
+                  "PREOPEN_BTC5_LEVELS": ",".join(f"{float(p) * 100:g}x{float(s):g}" for p, s in c.preopen.btc5_levels),
                   "PREOPEN_MAX_OPEN_USD": plain(c.preopen.max_open_usd), "PREOPEN_EXCLUSIVE": flag(c.preopen.exclusive),
                   "RULE_TAKER": c.rules.mode, "RULE_MAX_DAY_USD": plain(c.rules.max_day_usd), **{name: str(c.rules.price(key)) for key, name in RULE_SETTING_KEYS.items()},
                   **{switch: flag(c.rules.on(mk)) for mk, (switch, _) in RULE_MARKET_KEYS.items()},
