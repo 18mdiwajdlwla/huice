@@ -52,7 +52,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.35"
+VERSION = "1.154.37"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -540,6 +540,9 @@ class PreopenSettings:
     btc5_expiry_seconds: int = 0   # PREOPEN_BTC5_EXPIRY_SECONDS
     btc5_entry_seconds: int = 0    # PREOPEN_BTC5_ENTRY_SECONDS
     btc5_ahead_minutes: int = 0    # PREOPEN_BTC5_AHEAD_MINUTES
+    # 1.154.37: BTC 5-minute's own ladder (PREOPEN_BTC5_LEVELS): (price, shares) a side per level, its first level included; () = the
+    # general one above (levels_for) — the user: "单独 BTC 5 分钟的预挂，可以设置挂多少份额的吗"
+    btc5_levels: tuple = ()
 
     @property
     def side_usd(self) -> float:
@@ -552,6 +555,11 @@ class PreopenSettings:
             return self
         return dataclasses.replace(self, cancel_seconds=self.btc5_cancel_seconds or self.cancel_seconds, expiry_seconds=self.btc5_expiry_seconds or self.expiry_seconds,
                                    entry_seconds=self.btc5_entry_seconds or self.entry_seconds, ahead_minutes=self.btc5_ahead_minutes or self.ahead_minutes)
+
+    def levels_for(self, key: str) -> tuple:
+        """The levels a card's windows are quoted at (1.154.37): BTC 5-minute's own ladder where set (PREOPEN_BTC5_LEVELS, the first
+        level included), every other card's — and BTC 5-minute's without one — the general ladder (the first level, PREOPEN_LEVELS)."""
+        return self.btc5_levels if key == "BTC-5M" and self.btc5_levels else self.levels
 
     @property
     def pair_usd(self) -> float:
@@ -587,12 +595,23 @@ class PreopenSettings:
         price = D(cents) / 100
         exclusive = str(e.get("PREOPEN_EXCLUSIVE", "off")).strip().lower() == "on"
         weekend = str(e.get("PREOPEN_WEEKEND", "on")).strip().lower() != "off"
-        levels = [(cents, shares)]
-        for part in [x.strip() for x in str(e.get("PREOPEN_LEVELS", "")).replace("，", ",").split(",") if x.strip()]:
-            found = re.fullmatch(r"(\d+)\s*[xX×*:：]\s*(\d+)", part)
-            if not found:
-                raise ValueError("PREOPEN_LEVELS 的格式是 价格x份数，逗号分隔，如 48x20,47x40（第一档是 PREOPEN_PRICE_CENTS × PREOPEN_SHARES）")
-            levels.append((int(found.group(1)), int(found.group(2))))
+        def ladder(name: str, example: str) -> list[tuple[int, int]]:  # "价格x份数, …" as (cents, shares) (PREOPEN_LEVELS; PREOPEN_BTC5_LEVELS, 1.154.37)
+            out = []
+            for part in [x.strip() for x in str(e.get(name, "")).replace("，", ",").split(",") if x.strip()]:
+                found = re.fullmatch(r"(\d+)\s*[xX×*:：]\s*(\d+)", part)
+                if not found:
+                    raise ValueError(f"{name} 的格式是 价格x份数，逗号分隔，如 {example}")
+                out.append((int(found.group(1)), int(found.group(2))))
+            return out
+
+        def bad_ladder(rungs: list[tuple[int, int]]) -> bool:  # too many, a price or size out of range, a side under Predict's minimum, prices not falling
+            return (len(rungs) > PREOPEN_MAX_LEVELS or any(not 1 <= c <= 50 or not 1 <= s <= 500 or c * s / 100 < PREOPEN_MIN_SIDE_USD for c, s in rungs)
+                    or any(rungs[i][0] <= rungs[i + 1][0] for i in range(len(rungs) - 1)))
+        levels = [(cents, shares), *ladder("PREOPEN_LEVELS", "48x20,47x40（第一档是 PREOPEN_PRICE_CENTS × PREOPEN_SHARES）")]
+        btc5 = ladder("PREOPEN_BTC5_LEVELS", "47x10,43x40（第一档在前；空 = 跟所有卡一样）")
+        if btc5 and bad_ladder(btc5):
+            raise ValueError(f"PREOPEN_BTC5_LEVELS（BTC 5 分钟自己的价格档位，含第一档）至多 {PREOPEN_MAX_LEVELS} 档，每档价格 1～50¢、份数 1～500、"
+                             f"每边不少于 ${PREOPEN_MIN_SIDE_USD:g}，价格逐档递减；空 = 跟所有卡一样")
         deep = int(e.get("PREOPEN_DEEP_AHEAD_MINUTES", "0") or 0) or ahead
         limit_gap = float(e.get("PREOPEN_LIMIT_GAP_PCT", "2") or 0)
         if not 0 <= limit_gap <= 20:
@@ -600,8 +619,7 @@ class PreopenSettings:
         open_quiet = int(e.get("PREOPEN_OPEN_QUIET_MINUTES", "15") or 0)
         if not 0 <= open_quiet <= 120:
             raise ValueError("PREOPEN_OPEN_QUIET_MINUTES 0～120（开盘后第一场固定不挂，这里只能再加长；0 按 15 算）")
-        if (len(levels) > PREOPEN_MAX_LEVELS or any(not 1 <= c <= 50 or not 1 <= s <= 500 or c * s / 100 < PREOPEN_MIN_SIDE_USD for c, s in levels)
-                or any(levels[i][0] <= levels[i + 1][0] for i in range(len(levels) - 1)) or not 3 <= deep <= ahead):
+        if bad_ladder(levels) or not 3 <= deep <= ahead:
             raise ValueError(f"PREOPEN_LEVELS 连第一档至多 {PREOPEN_MAX_LEVELS} 档，每档价格 1～50¢、份数 1～500、每边不少于 ${PREOPEN_MIN_SIDE_USD:g}，价格要比第一档低、逐档递减；"
                              "PREOPEN_DEEP_AHEAD_MINUTES 3～PREOPEN_AHEAD_MINUTES（0 = 和第一档一样）")
         if (not 1 <= poll <= 60 or not 0 <= cap <= 1_000_000 or not 1 <= cents <= 50 or not 1 <= shares <= 500
@@ -620,7 +638,8 @@ class PreopenSettings:
         return cls(enabled, poll=poll, cancel_seconds=cancel, expiry_seconds=expiry, entry_seconds=entry, ahead_minutes=ahead, max_open_usd=cap,
                    price=price, shares=D(shares), markets=markets, exclusive=exclusive, weekend=weekend, db=cls.db_of(e),
                    levels=tuple((D(c) / 100, D(s)) for c, s in levels), deep_ahead_minutes=deep, limit_gap_pct=limit_gap, open_quiet_minutes=open_quiet,
-                   btc5_cancel_seconds=b5[0], btc5_expiry_seconds=b5[1], btc5_entry_seconds=b5[2], btc5_ahead_minutes=b5[3])
+                   btc5_cancel_seconds=b5[0], btc5_expiry_seconds=b5[1], btc5_entry_seconds=b5[2], btc5_ahead_minutes=b5[3],
+                   btc5_levels=tuple((D(c) / 100, D(s)) for c, s in btc5))
 
     @classmethod
     def from_config(cls, config: "Config", force: bool = False) -> "PreopenSettings":
@@ -852,6 +871,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_BTC5_AHEAD_MINUTES", "BTC 5 分钟：只挂几分钟内开始的场次", "只管 BTC 5 分钟卡；0 = 跟上面所有卡的一样。1440 = 挂满：Predict 发布的场次全部挂上，"
      "新场次一发布就挂（0.5 秒内），排在 49¢ 买单队伍最前面；24 小时最多 288 场，每场两边各 49¢ × 每次份数，预挂资金上限不够时最晚发布的几场挂不上（预挂状态写“已发布未挂”）。"
      "3～1440：调小就只挂快开场的几场，少占资金、少读接口，但新场次要等进了范围才挂，排在先挂的人后面"),
+    ("PREOPEN_BTC5_LEVELS", "BTC 5 分钟：自己的价格档位", "只管 BTC 5 分钟卡（1.154.37）；价格x份数、逗号分隔、第一档在前、价格逐档递减，最多 8 档，如 47x10,43x40："
+     "BTC 5 分钟每场每边就挂这几档（第一档也按这里的价格和份数）；空 = 跟上面所有卡的一样（预挂价格 × 每次份数，加更深的价格档位）。改了只撤、重挂 BTC 5 分钟的单"),
     ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "0～1000000，0 = 不限（默认）：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金，成交时才扣款；余额够一场双边就挂）；设了上限时每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放，/preopen 会算出把已发布的全部挂上需要多少"),
     # 1.153.0: 规则吃单 (rules.py) — the gold / oil windows the backtest found mispriced (README「规则吃单」)
     ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段，开场前吃：Predict 撮合开启后到开场前 15 秒，盘口一出现规则价以内的指定方向就立即买"
@@ -12638,6 +12659,8 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_BTC5_ENTRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["0", "90", "120", "180", "300"], "unit": "秒", "zero": "跟所有卡一样"},
     "PREOPEN_BTC5_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "30", "60", "120", "240", "1440"], "unit": "分钟", "zero": "跟所有卡一样",
                                    "captions": {"1440": "挂满：一发布就挂"}},  # 1.152.2: every listed window, each placed the moment it is listed
+    "PREOPEN_BTC5_LEVELS": {"kind": "text", "group": "预挂", "presets": ["", "47x10", "47x10,43x40", "47x20,43x80,40x80", "47x30,43x160,40x160,37x160"], "unit": "",
+                            "empty": "跟所有卡一样"},  # 1.154.37
     "PREOPEN_MAX_OPEN_USD": {"kind": "number", "group": "预挂", "presets": ["0", "1000", "5000", "7000", "20000"], "unit": "$", "zero": "不限"},
     "RULE_TAKER": {"kind": "choice", "group": "规则", "options": [["off", "off 关"], ["paper", "paper 只记录不下单"], ["on", "on 真实吃单（需要 LIVE=on）"]]},
     "RULE_GOLD_SHUT_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "55", "58", "60", "65"], "unit": "¢", "zero": "不做"},
@@ -14983,6 +15006,7 @@ button.tog{font-family:inherit;padding:4px 11px}.tog.on{border-color:var(--best)
 @media(max-width:560px){.wrap{padding:10px 16px 24px}header{padding:2px 0 4px}h1{font-size:19px}.grid{gap:10px}.card{padding:10px 12px 8px;gap:6px}.card.hot{padding:9px 11px 7px}body.olddata .card.hot{padding:10px 12px 8px}
 h2{margin:12px 2px 6px}.legend{margin-bottom:4px}.edge{min-height:40px}.pb{padding-top:6px}.odds{margin-top:0}.tag,.cd{padding:1px 7px}.quote a.open{padding:3px 10px}.skel{height:150px}}
 #fsent{height:1px;margin-top:-1px}
+.kdlg{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;padding:16px}.kbox{background:var(--card);color:var(--text);border-radius:14px;padding:16px;width:min(380px,100%);box-shadow:0 8px 30px rgba(0,0,0,.25);display:flex;flex-direction:column;gap:12px}.kbox p{margin:0;white-space:pre-line;font-size:14px;line-height:1.5}.kbox input.kin{font:inherit;font-size:16px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--text);width:100%}.kbox .krow{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.kbox label{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px}.kbox .kbtns{display:flex;gap:8px;margin-left:auto}.kbox button{font:inherit;font-size:14px;padding:8px 18px;border-radius:10px;border:1px solid var(--line);background:var(--chip);color:var(--text);cursor:pointer}.kbox button[type=submit]{background:var(--best);border-color:var(--best);color:var(--on-accent);font-weight:600}
 </style></head><body><div class="wrap">
 <header><div class="ttl"><h1>收盘涨跌概率</h1><div class="meta" id="meta">加载中…</div></div><div class="hr"><label class="tog"><input type="checkbox" id="showbook" checked>显示 Predict 盘口</label><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button><button type="button" class="tog" id="edit" title="调整卡片和栏目顺序、隐藏卡片或栏目、改高亮门槛">✎ 自定义</button><a class="tog" id="ctl" href="#" title="交易控制台：真实交易、订单、参数">⚙ 控制台</a><a class="tog" id="jrn" href="#" title="模拟交易复盘：每笔证据、导出">📒 复盘</a></div></header>
 <div class="legend" id="legend"></div>
@@ -15256,13 +15280,21 @@ function takerLine(t){  // 距吃单: how far the trader itself (its own bar, ca
 // (no prompt, no 5 s re-polls; a click on the title reads again) instead of asking after every value typed
 let whyData=null,whyAt=0,whyBusy=false,whyErr="",whyKeyBad=false,whyNoKey=false;
 function whyKey(){try{return sessionStorage.getItem("ctlkey")||""}catch(e){return ""}}
-function whyAsk(msg){const k=prompt(msg+"\\n下单情况里有实盘账户的挂单和持仓，需要控制口令（环境变量 WEB_CONTROL_KEY）：","");
+function keyDialog(msg){  // the control key asked for in the page (1.154.36): prompt() has no password mode — on a phone it showed the key as it was typed
+  return new Promise(done=>{const el=t=>document.createElement(t),back=el("div"),box=el("form"),p=el("p"),inp=el("input"),row=el("div"),show=el("label"),eye=el("input"),btns=el("div"),ok=el("button"),no=el("button");
+    back.className="kdlg";box.className="kbox";box.setAttribute("role","dialog");box.setAttribute("aria-modal","true");box.setAttribute("aria-label","控制口令");
+    p.textContent=msg;inp.type="password";inp.className="kin";inp.autocomplete="current-password";inp.placeholder="控制口令";inp.setAttribute("aria-label","控制口令");
+    eye.type="checkbox";eye.addEventListener("change",()=>{inp.type=eye.checked?"text":"password";inp.focus()});show.append(eye,"显示");
+    ok.type="submit";ok.textContent="确定";no.type="button";no.textContent="取消";row.className="krow";btns.className="kbtns";btns.append(no,ok);row.append(show,btns);
+    const end=v=>{back.remove();done(v)};box.addEventListener("submit",e=>{e.preventDefault();end(inp.value)});no.addEventListener("click",()=>end(null));
+    back.addEventListener("keydown",e=>{if(e.key==="Escape")end(null)});box.append(p,inp,row);back.append(box);document.body.append(back);setTimeout(()=>inp.focus(),0)})}
+async function whyAsk(msg){const k=await keyDialog(msg+"\\n下单情况里有实盘账户的挂单和持仓，需要控制口令（环境变量 WEB_CONTROL_KEY）：");
   if(k===null||!k.trim()){whyKeyBad=true;return false}try{sessionStorage.setItem("ctlkey",k.trim())}catch(e){}whyKeyBad=false;return true}
 async function loadWhy(force){
   if(whyBusy||(!force&&(whyKeyBad||Date.now()-whyAt<5000)))return;whyBusy=true;let again=false;
   try{const key=whyKey(),r=await fetch(location.pathname.replace(/\\/$/,"")+"/why.json",{cache:"no-store",headers:key?{"X-Control-Key":key}:{}});
     if(r.status===403||r.status===429){let j={};try{j=await r.json()}catch(e){}
-      whyNoKey=r.status===403&&!!j.nokey;if(whyNoKey)whyKeyBad=true;else if(r.status===403&&whyAsk(j.message||"需要控制口令"))again=true;
+      whyNoKey=r.status===403&&!!j.nokey;if(whyNoKey)whyKeyBad=true;else if(r.status===403&&await whyAsk(j.message||"需要控制口令"))again=true;
       throw new Error(j.message||("HTTP "+r.status))}
     if(!r.ok)throw new Error("HTTP "+r.status);whyData=await r.json();whyAt=Date.now();whyErr=""}
   catch(e){whyErr="读取失败："+(e.message||"网络错误")+(whyKeyBad&&!whyNoKey?"（点标题重新输入口令）":"")}
@@ -15808,6 +15840,7 @@ footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:v
 .evchart{width:100%;height:auto;display:block;margin:6px 0 2px;background:var(--chip);border-radius:10px}.evchart .grid{stroke:var(--line2)}.evchart .zero{stroke:var(--faint);stroke-dasharray:3 3}.evchart text{font-size:10px;fill:var(--faint)}.evchart .band{fill:var(--best-soft);opacity:.35}.evchart .ev{fill:none;stroke:var(--muted);stroke-width:1.5;stroke-dasharray:5 4}.evchart .pnl{fill:none;stroke:var(--best);stroke-width:2}.evchart circle.pnl{fill:var(--best)}.evchart circle.ev{fill:var(--muted)}
 .ulist{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:2px 12px}.ulist .urow{padding:8px 0;border-bottom:1px solid var(--line2);font-size:13px;line-height:1.5}.ulist .urow:last-child{border-bottom:0}.ulist .urow>a,.ulist .urow>span{overflow-wrap:anywhere}.ulist .urow .small{margin-top:2px}
 details.hint{margin:4px 0 8px}details.hint>summary{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--muted);cursor:pointer;list-style:none;user-select:none;padding:2px 0}details.hint>summary::-webkit-details-marker{display:none}details.hint>summary:before{content:"ⓘ"}details.hint>summary:after{content:"▸";font-size:10px}details.hint[open]>summary:after{content:"▾"}details.hint[open]>summary{color:var(--text)}details.hint>p{margin:3px 0 0;font-size:12.5px;color:var(--muted);line-height:1.6}details.fold{border-top:1px solid var(--line2)}details.fold>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:8px;padding:10px 0;user-select:none}details.fold>summary::-webkit-details-marker{display:none}details.fold>summary:before{content:"▸";color:var(--muted);font-size:11px;width:10px;flex:0 0 auto}details.fold[open]>summary:before{content:"▾"}details.fold>summary h3{margin:0;font-size:13.5px;color:var(--text)}details.fold[open]{padding-bottom:10px}details.fold.sub{border-top:0}details.fold.sub>summary{padding:6px 0 4px;font-size:12px;color:var(--muted);font-weight:600}details.fold.sub[open]{padding-bottom:4px}details.cust{display:contents}details.cust>summary{list-style:none;display:inline-flex;align-items:center;cursor:pointer;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}details.cust>summary::-webkit-details-marker{display:none}details.cust>summary:after{content:" ▾";font-size:10px}details.cust[open]>summary{border-color:var(--best);color:var(--best)}details.cust .tcust{flex-basis:100%}details.menu{display:inline-block;position:relative}details.menu>summary{list-style:none}details.menu>summary::-webkit-details-marker{display:none}details.menu .mlist{position:absolute;z-index:8;top:calc(100% + 4px);left:0;display:flex;flex-direction:column;gap:2px;min-width:160px;padding:6px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow2)}details.menu .mlist a{padding:7px 10px;border-radius:8px;color:var(--text);text-decoration:none;font-size:13px}details.menu .mlist a:hover{background:var(--chip)}.tbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:2px 0 10px}.tbar .tq.on{border-color:var(--best);color:var(--best);background:var(--best-bg)}ul.notes{margin:4px 0 10px;padding-left:20px;font-size:13px;line-height:1.55}ul.notes li{margin:2px 0}.tbar select,.tbar input,.tbar button{font:inherit;font-size:12.5px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text)}.tbar button{cursor:pointer}.tcust{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}.tsum{font-size:13px;margin:2px 0 4px}.tcu{color:var(--up)}.tcd{color:var(--down)}.tdots{display:flex;flex-direction:column;gap:3px;margin:10px 0 6px}.trow{display:flex;align-items:flex-start;gap:8px;font-size:11px;color:var(--muted)}.trow .tl{width:70px;flex:none;font-variant-numeric:tabular-nums;line-height:13px}.trow .tcells{display:flex;flex-wrap:wrap;gap:3px}.tdot{width:12px;height:12px;border-radius:50%;display:inline-block;flex:none;vertical-align:-2px;box-sizing:border-box}.tdot.u{background:var(--up)}.tdot.d{background:var(--down)}.tdot.f{background:var(--faint)}.tdot.n{opacity:.42}.tdot.x{border:1.5px solid var(--line)}.tdot.bad{box-shadow:0 0 0 2px var(--warn)}.tlegend .tdot{margin:0 4px 0 8px}.tdots .tdot{cursor:pointer}.tdots.only .tdot:not(.bad){opacity:.15}.tdot.sel{outline:2px solid var(--text);outline-offset:1px}.tdet{font-size:12.5px;background:var(--chip);border-radius:10px;padding:7px 10px;margin:4px 0}.tdays tr.pick{cursor:pointer}.tdays tr.on td{background:var(--best-bg)}
+.kdlg{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;padding:16px}.kbox{background:var(--card);color:var(--text);border-radius:14px;padding:16px;width:min(380px,100%);box-shadow:0 8px 30px rgba(0,0,0,.25);display:flex;flex-direction:column;gap:12px}.kbox p{margin:0;white-space:pre-line;font-size:14px;line-height:1.5}.kbox input.kin{font:inherit;font-size:16px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--text);width:100%}.kbox .krow{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.kbox label{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px}.kbox .kbtns{display:flex;gap:8px;margin-left:auto}.kbox button{font:inherit;font-size:14px;padding:8px 18px;border-radius:10px;border:1px solid var(--line);background:var(--chip);color:var(--text);cursor:pointer}.kbox button[type=submit]{background:var(--best);border-color:var(--best);color:var(--on-accent);font-weight:600}
 </style></head><body><div class="wrap">
 <header><div class="ttl"><h1 id="title">交易复盘</h1><div class="meta" id="meta">加载中…</div></div><button type="button" class="tog" id="theme" title="切换主题">◐ 自动</button></header>
 <div class="btns"><a class="btn" id="back" href="#">← 概率页</a><a class="btn" id="ctl" href="#">⚙ 控制台</a><details class="menu" id="exports"><summary class="btn">导出 ▾</summary><div class="mlist"><a id="csv" href="journal.csv" download="交易日记.csv">交易日记 CSV</a><a id="scsv" href="summary.csv" download="复盘汇总.csv">复盘汇总 CSV</a><a id="mcsv" href="samples.csv" download="模型样本.csv">模型样本 CSV</a><a id="json" href="journal.json?full=1" download="交易日记.json">交易日记 JSON</a></div></details></div>
@@ -16392,7 +16425,15 @@ let okAt=0,dead=false;
 function two(n){return String(n).padStart(2,"0")}
 function clock(ms){const d=new Date(ms);return two(d.getHours())+":"+two(d.getMinutes())+":"+two(d.getSeconds())}
 function ctlKey(){try{return sessionStorage.getItem("ctlkey")||""}catch(e){return ""}}
-function askKey(msg){const k=prompt(msg+"\n这是实盘账户的交易记录，需要控制口令（环境变量 WEB_CONTROL_KEY）：","");if(k===null||!k.trim()){load.keyBad=true;return false}
+function keyDialog(msg){  // the control key asked for in the page (1.154.36): prompt() has no password mode — on a phone it showed the key as it was typed
+  return new Promise(done=>{const el=t=>document.createElement(t),back=el("div"),box=el("form"),p=el("p"),inp=el("input"),row=el("div"),show=el("label"),eye=el("input"),btns=el("div"),ok=el("button"),no=el("button");
+    back.className="kdlg";box.className="kbox";box.setAttribute("role","dialog");box.setAttribute("aria-modal","true");box.setAttribute("aria-label","控制口令");
+    p.textContent=msg;inp.type="password";inp.className="kin";inp.autocomplete="current-password";inp.placeholder="控制口令";inp.setAttribute("aria-label","控制口令");
+    eye.type="checkbox";eye.addEventListener("change",()=>{inp.type=eye.checked?"text":"password";inp.focus()});show.append(eye,"显示");
+    ok.type="submit";ok.textContent="确定";no.type="button";no.textContent="取消";row.className="krow";btns.className="kbtns";btns.append(no,ok);row.append(show,btns);
+    const end=v=>{back.remove();done(v)};box.addEventListener("submit",e=>{e.preventDefault();end(inp.value)});no.addEventListener("click",()=>end(null));
+    back.addEventListener("keydown",e=>{if(e.key==="Escape")end(null)});box.append(p,inp,row);back.append(box);document.body.append(back);setTimeout(()=>inp.focus(),0)})}
+async function askKey(msg){const k=await keyDialog(msg+"\n这是实盘账户的交易记录，需要控制口令（环境变量 WEB_CONTROL_KEY）：");if(k===null||!k.trim()){load.keyBad=true;return false}
   try{sessionStorage.setItem("ctlkey",k.trim())}catch(e){}load.keyBad=false;return true}
 async function load(){  // the list: light rows, the open trades and the last few hundred finished ones (all of them once asked for)
   if(dead||load.busy||load.keyBad)return;load.busy=true;let again=false;
@@ -16400,7 +16441,7 @@ async function load(){  // the list: light rows, the open trades and the last fe
   const wantAll=allLoaded||!!load.more;
   try{const key=ctlKey();const r=await fetch(base+"/journal.json"+(wantAll?"?all=1":""),{cache:"no-store",headers:key?{"X-Control-Key":key}:{},signal:ctl.signal});
     if(r.status===403||r.status===429){let j={};try{j=await r.json()}catch(e){}  // 1.150.0: "nokey" (a real account, WEB_CONTROL_KEY unset): nothing to type, the message once
-      if(r.status===403&&j.nokey)load.keyBad=true;else if(r.status===403&&askKey(j.message||"需要控制口令"))again=true;throw new Error(j.message||("HTTP "+r.status))}
+      if(r.status===403&&j.nokey)load.keyBad=true;else if(r.status===403&&await askKey(j.message||"需要控制口令"))again=true;throw new Error(j.message||("HTTP "+r.status))}
     if(!r.ok)throw await oops(r);const j=await r.json();  // (1.154.26: a 503 says why — the rule taker goes first, nothing is built now: oops)
     if(openId&&!wantAll&&j.more>0&&!j.trades.some(t=>t.id===openId)){allLoaded=true;again=true}  // a link to an older trade: the whole list
     else{if(load.more){allLoaded=true;load.more=false}data=j;okAt=Date.now();if(filterKey())loadAna();  // the filter's tables refreshed with the list
@@ -25812,6 +25853,7 @@ class Bot:
                   "PREOPEN_EXPIRY_SECONDS": str(c.preopen.expiry_seconds), "PREOPEN_ENTRY_SECONDS": str(c.preopen.entry_seconds),
                   "PREOPEN_BTC5_CANCEL_SECONDS": str(c.preopen.btc5_cancel_seconds), "PREOPEN_BTC5_EXPIRY_SECONDS": str(c.preopen.btc5_expiry_seconds),
                   "PREOPEN_BTC5_ENTRY_SECONDS": str(c.preopen.btc5_entry_seconds), "PREOPEN_BTC5_AHEAD_MINUTES": str(c.preopen.btc5_ahead_minutes),
+                  "PREOPEN_BTC5_LEVELS": ",".join(f"{float(p) * 100:g}x{float(s):g}" for p, s in c.preopen.btc5_levels),
                   "PREOPEN_MAX_OPEN_USD": plain(c.preopen.max_open_usd), "PREOPEN_EXCLUSIVE": flag(c.preopen.exclusive),
                   "RULE_TAKER": c.rules.mode, "RULE_MAX_DAY_USD": plain(c.rules.max_day_usd), **{name: str(c.rules.price(key)) for key, name in RULE_SETTING_KEYS.items()},
                   **{switch: flag(c.rules.on(mk)) for mk, (switch, _) in RULE_MARKET_KEYS.items()},

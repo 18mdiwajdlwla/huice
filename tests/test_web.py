@@ -228,6 +228,18 @@ async def browser_check(async_playwright, chrome, port, token):
         await page.add_init_script("if(!localStorage.getItem('levelsDefault')){localStorage.setItem('hideSec','[\"sim\"]');localStorage.setItem('levelsDefault','1')}")  # 价格阶梯 on, as below; one-shot so a reload keeps what the test changes
         await page.goto(url)
         await page.wait_for_selector(".card .odds")
+        # 1.154.36: the control key is asked for in the page (keyDialog), as a password — prompt() showed it as typed on a phone
+        await page.evaluate("()=>{window.kd=keyDialog('需要控制口令')}")
+        await page.locator(".kdlg .kbox").wait_for()
+        assert await page.get_attribute(".kdlg input.kin", "type") == "password" and "需要控制口令" in await page.inner_text(".kdlg")
+        await page.fill(".kdlg input.kin", "secret-123")
+        await page.check(".kdlg label input[type=checkbox]")
+        assert await page.get_attribute(".kdlg input.kin", "type") == "text", "显示: the key as typed, on request"
+        await page.click(".kdlg button[type=submit]")
+        assert await page.evaluate("window.kd") == "secret-123" and await page.locator(".kdlg").count() == 0
+        await page.evaluate("()=>{window.kd=keyDialog('x')}")
+        await page.click(".kdlg button:has-text('取消')")
+        assert await page.evaluate("window.kd") is None and await page.locator(".kdlg").count() == 0
         text = await page.inner_text(".wrap")
         assert "上证指数" in text and "10-08 下周四" in text and "涨35.0¢" in text and "概率暂缺：等待行情" in text, text
         # the full close time sits on the countdown's tooltip (and in the details), not as another line
