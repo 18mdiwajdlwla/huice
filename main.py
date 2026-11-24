@@ -28,6 +28,7 @@ import hmac
 import ipaddress
 import logging
 import math
+import operator
 import os
 import re
 import secrets
@@ -52,7 +53,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.38"
+VERSION = "1.154.39"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -13191,7 +13192,7 @@ class TradeIndex:
     new tuple where a list changes. The rest is read live, by the looks that take the records as they are now."""
 
     __slots__ = ("records", "market", "driver", "lent", "where", "counting", "seq", "tick", "open", "ordered", "orders", "by_order",
-                 "by_hash", "order_tick", "numbers", "swaps", "dead", "keys_tick", "settled", "settled_tick")
+                 "by_hash", "order_tick", "numbers", "swaps", "dead", "keys_tick", "settled", "settled_tick", "stat_rows", "stat_touched", "stat_queue")
 
     def __init__(self, records: dict[str, dict]):
         self.records = records
@@ -13212,6 +13213,9 @@ class TradeIndex:
         self.keys_tick = 0                         # counts the keys added and removed: a view taken before no longer holds the cache's keys (TradeMap.kept)
         self.settled: set[str] = set()             # the tids of the real records settled (the day's P&L comes from them: LiveBot.live_pnl_rows)
         self.settled_tick = 0                      # counts the saves of such a record (its result, its time, a revision), and those that made one or ended one
+        self.stat_rows: dict[str, tuple] | None = None  # tid -> its record's figures for the page's totals (sim_stat_row), once asked for: Bot.sim_stat_rows, 1.154.39
+        self.stat_touched: set[str] = set()        # ...the tids saved, moved in or removed since those were last brought up to date
+        self.stat_queue: list[str] = []            # ...and the tids whose figures are still to be checked against their records, this round
         market: dict[str, list[str]] = {}
         driver: dict[str, list[str]] = {}
         for tid, t in records.items():
@@ -13273,6 +13277,8 @@ class TradeIndex:
 
     def note(self, tid: str, t: dict) -> None:
         """The record now kept under ``tid`` (new there, another one, or the same one changed), into every list."""
+        if self.stat_rows is not None:
+            self.stat_touched.add(tid)
         if tid not in self.seq:  # a new key: the cache has it at its end
             self.seq[tid] = self.tick
             self.tick += 1
@@ -13345,6 +13351,8 @@ class TradeIndex:
 
     def remove(self, tid: str) -> None:
         self.records.pop(tid, None)
+        if self.stat_rows is not None:
+            self.stat_touched.add(tid)
         if tid not in self.seq:
             return
         del self.seq[tid]
@@ -14903,6 +14911,62 @@ def sim_stats(trades: list[dict]) -> dict:
             "expired": sum(t["status"] == "expired" for t in trades),
             "cancelled": sum(t["status"] == "cancelled" for t in trades),
             "markout": markout_stats(trades)}
+
+
+# sim_stat_row's fields...
+SIM_STAT_OPENED, SIM_STAT_KIND, SIM_STAT_MAKER, SIM_STAT_STATUS, SIM_STAT_HELD, SIM_STAT_PARTIAL, SIM_STAT_MARKS, SIM_STAT_DONE = range(8)
+# ...and those of its last one, a settled record's terms
+(SIM_DONE_COST, SIM_DONE_BACK, SIM_DONE_WIN, SIM_DONE_LOSS, SIM_DONE_TIE, SIM_DONE_EXPECTED, SIM_DONE_EXPECTED_FILL,
+ SIM_DONE_CONFIRM) = range(8)
+
+
+def sim_stat_row(t: dict) -> tuple:
+    """One record's terms of sim_stats, each worked out as sim_stats (and markout_stats) works it out — once a saved
+    record, not once a sum (1.154.39: Bot.sim_stat_rows keeps them, sim_stats_of adds them up): when it was opened, its
+    kind and its maker flag (sim_report orders and groups by those), its status; what a position or a part-filled order
+    cost (None for any other record); whether it counts as part-filled; its markout marks, one (move, fair move) a horizon
+    of MARKOUT_HORIZONS and None where there is no mark (None for a record with none at all); a settled record's terms
+    (None for any other): cost, payout, won, lost, tied, the expectation at the order and at the fills, how it was
+    settled (confirmed / mismatch / local)."""
+    status = t["status"]
+    held = done = marks = None
+    if status == "settled":
+        payout = t["payout"]
+        done = (t["price"] * t["shares"], payout * t["shares"], payout == 1, payout == 0, 0 < payout < 1, t["edge"] * t["shares"],
+                sim_fill_expectation(t), t.get("confirm") if t.get("confirm") in {"confirmed", "mismatch"} else "local")
+    elif status in {"filled", "resting"} and float(t.get("shares") or 0) > 0:
+        held = t["price"] * t["shares"]
+    partial = status not in {"expired", "cancelled"} and bool(t.get("maker")) and 0 < float(t.get("shares") or 0) < float(t.get("order") or 0) - 1e-9
+    if isinstance(t.get("markout"), dict):
+        found = tuple((float(x["move"]), float(x.get("fair_move") or 0)) if isinstance(x := t["markout"].get(label), dict) and x.get("mid") is not None else None
+                      for _, label in MARKOUT_HORIZONS)
+        marks = found if any(x is not None for x in found) else None
+    return (t.get("opened", 0), t["kind"], t["maker"], status, held, partial, marks, done)
+
+
+def sim_stats_of(rows: list[tuple]) -> dict:
+    """sim_stats of the records whose sim_stat_row these are, in their order: the same figures to the last digit — each
+    total one sum() over the same terms in the same order — without reading a record again. (Why the terms are kept and
+    not the totals: sum() carries a correction term, and a total brought up to date record by record, or added up in
+    parts, does not come to the same digits.)"""
+    done = [d for c in rows if (d := c[SIM_STAT_DONE]) is not None]
+    of_done = list(zip(*done)) if done else [()] * 8
+    cost, back = sum(of_done[SIM_DONE_COST]), sum(of_done[SIM_DONE_BACK])
+    status = collections.Counter([c[SIM_STAT_STATUS] for c in rows])
+    marked = [x for c in rows if (x := c[SIM_STAT_MARKS]) is not None]
+    markout = {}
+    for i, (_, label) in enumerate(MARKOUT_HORIZONS):
+        marks = [y for x in marked if (y := x[i]) is not None]
+        if marks:
+            markout[label] = {"n": len(marks), "avg": sum([y[0] for y in marks]) / len(marks), "fair": sum([y[1] for y in marks]) / len(marks)}
+    return {"trades": len(rows), "settled": len(done), "wins": of_done[SIM_DONE_WIN].count(True), "losses": of_done[SIM_DONE_LOSS].count(True),
+            "ties": of_done[SIM_DONE_TIE].count(True), "cost": cost, "payout": back, "pnl": back - cost, "roi": (back - cost) / cost if cost else 0.0,
+            "expected": sum(of_done[SIM_DONE_EXPECTED]), "expected_fill": sum(of_done[SIM_DONE_EXPECTED_FILL]),
+            "confirmed": of_done[SIM_DONE_CONFIRM].count("confirmed"), "mismatch": of_done[SIM_DONE_CONFIRM].count("mismatch"),
+            "local": of_done[SIM_DONE_CONFIRM].count("local"),
+            "open": status["filled"], "open_cost": sum([h for c in rows if (h := c[SIM_STAT_HELD]) is not None]), "resting": status["resting"],
+            "partial": [c[SIM_STAT_PARTIAL] for c in rows].count(True), "expired": status["expired"], "cancelled": status["cancelled"],
+            "markout": markout}
 
 
 def sim_status(trade: dict) -> str:
@@ -18327,6 +18391,8 @@ class Bot:
         self.sim_index_checked = 0.0  # when the index was last checked against the records (sim_index_check)
         self.sim_index_checks = 0     # ...how many times
         self.sim_index_drift: dict = {}  # ...and what the last check that found something found: {"at", "n", "tids"}
+        self.sim_stat_builds = 0      # how many times the records' figures for the page's totals were all worked out (sim_stat_rows: once a reading of the records)
+        self.sim_stat_stale: dict = {}  # ...and what its check last found changed and not saved: {"at", "n", "tids"}
         self.notice_cache: dict[str, dict] | None = None  # in-memory view of the notice: records
         self.notice_gen = -1
         self.pred_pruned = 0.0  # when old prediction snapshots were last pruned
@@ -24015,24 +24081,36 @@ class Bot:
         if public and kept is not None and kept[0] == settings and time.monotonic() < kept[1]:
             return kept[2]
         began = time.perf_counter()
-        trades = sorted(self.sim_trades().items(), key=lambda kv: kv[1].get("opened", 0))
         private = public and (bool(getattr(self.config, "live_key", "")) or self.sim_has_real())  # real trades in the records: an account's activity, key or no key
-        rows = [{"id": tid, "opened": stamp(t["opened"], seconds=False), "item": t["item"], "label": t["label"],
-                 "maker": t["maker"], "price": t["price"], "shares": t["shares"], "order": t.get("order", t["shares"]),
-                 "edge": t["edge"], "status": t["status"], "text": sim_status(t), "state": sim_state(t),
-                 "pnl": (t["payout"] - t["price"]) * t["shares"] if t["status"] == "settled" else None,
-                 "note": t.get("note", ""), "url": self.sim_url(t)}
-                for tid, t in reversed(trades[-recent:])]
-        values = [t for _, t in trades]
         ways, kinds = sim_scope(self.config)
-        report = {"edge": self.config.sim_edge, "shares": self.config.sim_shares, "ways": ways, "scope": kinds, "total": sim_stats(values),
-                  "kinds": [{"name": name, **sim_stats([t for t in values if t["kind"] == kind])}
-                            for kind, name in SIM_KINDS.items() if any(t["kind"] == kind for t in values)],
-                  "modes": [{"name": name, **sim_stats([t for t in values if t["maker"] == maker])}
-                            for name, maker in (("挂单", True), ("吃单", False)) if any(t["maker"] == maker for t in values)],
-                  "groups": [] if private else sim_groups(values), "sources": [] if private else sim_sources(values),
-                  "blocks": [] if private else self.sim_blocks(),  # the public page: the totals only, never a position's name or cost
-                  "group_cap": self.config.sim_group_usd, "rows": [] if private else rows, "private": private}
+        head = {"edge": self.config.sim_edge, "shares": self.config.sim_shares, "ways": ways, "scope": kinds}
+        if private and not TRADE_AUDIT:
+            # 1.154.39: the totals alone, and those from each record's kept figures (sim_stat_rows) — the same sums over the
+            # same terms in the same order as below, without the walk of every record that held the loop 0.25–0.4 s at each
+            # build with 16,000 kept (11-24 /diag: 18 such holds in ten minutes, one each time the kept report ran out)
+            report = {**head, **self.sim_report_totals(), "groups": [], "sources": [], "blocks": [],
+                      "group_cap": self.config.sim_group_usd, "rows": [], "private": private}
+        else:
+            trades = sorted(self.sim_trades().items(), key=lambda kv: kv[1].get("opened", 0))
+            rows = [{"id": tid, "opened": stamp(t["opened"], seconds=False), "item": t["item"], "label": t["label"],
+                     "maker": t["maker"], "price": t["price"], "shares": t["shares"], "order": t.get("order", t["shares"]),
+                     "edge": t["edge"], "status": t["status"], "text": sim_status(t), "state": sim_state(t),
+                     "pnl": (t["payout"] - t["price"]) * t["shares"] if t["status"] == "settled" else None,
+                     "note": t.get("note", ""), "url": self.sim_url(t)}
+                    for tid, t in reversed(trades[-recent:])]
+            values = [t for _, t in trades]
+            report = {**head, "total": sim_stats(values),
+                      "kinds": [{"name": name, **sim_stats([t for t in values if t["kind"] == kind])}
+                                for kind, name in SIM_KINDS.items() if any(t["kind"] == kind for t in values)],
+                      "modes": [{"name": name, **sim_stats([t for t in values if t["maker"] == maker])}
+                                for name, maker in (("挂单", True), ("吃单", False)) if any(t["maker"] == maker for t in values)],
+                      "groups": [] if private else sim_groups(values), "sources": [] if private else sim_sources(values),
+                      "blocks": [] if private else self.sim_blocks(),  # the public page: the totals only, never a position's name or cost
+                      "group_cap": self.config.sim_group_usd, "rows": [] if private else rows, "private": private}
+            if private:  # (the tests, TRADE_AUDIT: the kept figures' answer against this walk, at every such report)
+                quick = self.sim_report_totals()
+                trade_audit("sim_report_totals", json.dumps(quick, sort_keys=False) == json.dumps({k: report[k] for k in quick}, sort_keys=False),
+                            {k: (quick[k], report[k]) for k in quick if quick[k] != report[k]})
         self.sim_report_cache = {key: report}
         took = time.perf_counter() - began
         if public and took >= self.SIM_REPORT_KEEP_MIN_S:
@@ -24042,6 +24120,64 @@ class Bot:
     SIM_REPORT_KEEP_FACTOR = 100.0  # the page's report: kept this many times the seconds its build took (sim_report)...
     SIM_REPORT_KEEP_MAX_S = 120.0   # ...two minutes at the most...
     SIM_REPORT_KEEP_MIN_S = 0.02    # ...and not at all when it took less than this
+    SIM_STAT_AUDIT = 256            # sim_stat_rows: at each call the kept figures of this many records are worked out again, in turn
+
+    def sim_stat_rows(self) -> list[tuple]:
+        """Every kept record's figures for the totals (sim_stat_row), in sim_report's order: by when the record was opened,
+        the cache's order among equals. 1.154.39: worked out once a saved record, not once a report — they are kept beside
+        the records (TradeIndex.stat_rows), and every save, move and removal marks its tid there (stat_touched).
+
+        The records still open are worked out again at every call: the step changes those in place before it saves them
+        (fills, markouts, a settlement: trade_open), and the walk this stands for read every record as it stood. Of the
+        rest — records nothing changes any more — SIM_STAT_AUDIT are checked each call, in turn: a figure found stale (a
+        record changed in place and never saved, which nothing should leave so) is put right and said. Figures that do not
+        match the records key for key (a record put or removed past the index: never in this code) are all worked out
+        again."""
+        index = self.sim_kept()
+        records, rows = index.records, index.stat_rows
+        if rows is not None:
+            for tid in index.stat_touched.union(index.open):
+                if (t := records.get(tid)) is None:
+                    rows.pop(tid, None)
+                else:
+                    rows[tid] = sim_stat_row(t)
+            index.stat_touched.clear()
+            if rows.keys() != records.keys():
+                trade_audit("sim_stat_rows", False, f"{len(rows)} kept figures for {len(records)} records")
+                rows = None
+        if rows is None:
+            rows = {tid: sim_stat_row(t) for tid, t in records.items()}
+            index.stat_rows, index.stat_touched, index.stat_queue = rows, set(), []
+            self.sim_stat_builds += 1
+        else:
+            queue = index.stat_queue
+            if not queue:
+                queue.extend(records)
+            stale = []
+            for _ in range(min(self.SIM_STAT_AUDIT, len(queue))):
+                tid = queue.pop()
+                if (t := records.get(tid)) is not None and rows[tid] != (row := sim_stat_row(t)):
+                    rows[tid] = row
+                    stale.append(tid)
+            if stale:
+                self.sim_stat_stale = {"at": self.market.now_ms(), "n": len(stale), "tids": stale[:5]}
+                self.log_limited("sim_stat", f"模拟交易合计自检：{len(stale)} 条记录改了但没保存（如 {stale[0]}），已按记录现状重算")
+        ordered = [rows[tid] for tid in records]
+        ordered.sort(key=operator.itemgetter(SIM_STAT_OPENED))  # (a stable sort: sorted(records.items(), key=opened), as sim_report walks them)
+        return ordered
+
+    def sim_report_totals(self) -> dict:
+        """sim_report's total, kinds and modes, from the kept figures (sim_stat_rows)."""
+        figures = self.sim_stat_rows()
+        of_kind: dict[str, list[tuple]] = {}
+        for c in figures:
+            if (part := of_kind.get(c[SIM_STAT_KIND])) is None:
+                part = of_kind[c[SIM_STAT_KIND]] = []
+            part.append(c)
+        return {"total": sim_stats_of(figures),
+                "kinds": [{"name": name, **sim_stats_of(part)} for kind, name in SIM_KINDS.items() if (part := of_kind.get(kind))],
+                "modes": [{"name": name, **sim_stats_of(part)} for name, maker in (("挂单", True), ("吃单", False))
+                          if (part := [c for c in figures if c[SIM_STAT_MAKER] == maker])]}
 
     def sim_text(self) -> str:
         r = self.sim_report(recent=10)
@@ -26729,7 +26865,8 @@ class Bot:
                     size = self.sim_step_info
                     detail += ("（决策内：" + "、".join(f"{k} {v / 1000:.1f}s" for k, v in self.sim_step_ms.items())
                                + (f"；{size['markets']} 个市场、{size['records']} 条记录" + (f"（其中 {size['open']} 条还没结束，每步只看这些）" if size.get("open", -1) >= 0 else "") if size else "")
-                               + (f"；记录索引自检 {drift['n']} 条没跟上（{stamp(drift['at'], seconds=False)}，如 {drift['tids'][0]}），已更正" if (drift := getattr(self, "sim_index_drift", None)) else "") + "）")
+                               + (f"；记录索引自检 {drift['n']} 条没跟上（{stamp(drift['at'], seconds=False)}，如 {drift['tids'][0]}），已更正" if (drift := getattr(self, "sim_index_drift", None)) else "")
+                               + (f"；合计自检 {stale['n']} 条改了没保存（{stamp(stale['at'], seconds=False)}，如 {stale['tids'][0]}），已重算" if (stale := getattr(self, "sim_stat_stale", None)) else "") + "）")
                 sync = getattr(self, "live_sync_detail", None)
                 if name == "模拟交易" and sync:  # 1.137.2: what the sync's seconds went to
                     detail += (f"（同步内：挂单列表" + (f"按市场读 {sync['markets']} 个市场 {sync['list_s']:.1f}s" if sync.get("markets")
