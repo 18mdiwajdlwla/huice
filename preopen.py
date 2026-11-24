@@ -182,8 +182,12 @@ class Ledger:
         self.struck: dict[str, dict] = {}  # the records that counted against their window's MAX_ATTEMPTS when last saved (strikes)
         self.ids: dict[str, int] = {}  # order id -> how many records' orders carry it (known: Controller.unmanaged_rows)
         self.hashes: dict[str, int] = {}  # ...and their hashes (hash, api_hash), lower case
-        self.marks: dict[str, tuple[tuple, tuple, str]] = {}  # record -> (the ids, the hashes, the window) it was counted with
+        self.marks: dict[str, tuple] = {}  # record -> (the ids, the hashes, the window, the market id, the tokens, the name) it was counted with
         self.windows: dict[str, int] = {}  # window -> its records here (the status's 已记录 N 场)
+        self.markets: dict[str, int] = {}  # market id -> how many records are of it (market_names, 1.154.39)...
+        self.tokens: dict[str, int] = {}  # ...outcome token -> how many records' orders name it...
+        self.market_name: dict[str, str] = {}  # ...and the name each goes by: the record's last counted (a window's records share one)
+        self.token_name: dict[str, str] = {}
         self.seq: dict[str, int] = {}  # a record's place in ``rows`` (its order of entry): what the walks' own order was
         self.seq_next = 0
         # 1.154.22 — the model trader's positions check asks, once a minute, which outcomes hold a fill of this mode's not read for
@@ -222,8 +226,13 @@ class Ledger:
         else:
             self.working[slug] = row  # (the same key keeps its place; the row may be a new object: a test's, a reload's)
         orders = (row.get("orders") or {}).values()
+        # (1.154.39: ...and its market and its orders' outcome tokens, by the record's name — market_names: what
+        # LiveBot.live_known_markets walked every record's orders for, a quarter second a minute while a manual order rested)
+        mid = str(row.get("market_id") or "")
         mark = (tuple(str(o["id"]) for o in orders if o.get("id")),
-                tuple(str(o[k]).lower() for o in orders for k in ("hash", "api_hash") if o.get(k)), window_of(row))
+                tuple(str(o[k]).lower() for o in orders for k in ("hash", "api_hash") if o.get(k)), window_of(row), mid,
+                tuple(t for o in orders if (t := order_token(o))),
+                str(row.get("name") or row.get("slug") or mid))
         if self.marks.get(slug) != mark:
             self.unmark(slug)
             for i in mark[0]:
@@ -231,6 +240,12 @@ class Ledger:
             for h in mark[1]:
                 self.hashes[h] = self.hashes.get(h, 0) + 1
             self.windows[mark[2]] = self.windows.get(mark[2], 0) + 1
+            if mid:
+                self.markets[mid] = self.markets.get(mid, 0) + 1
+                self.market_name[mid] = mark[5]
+            for t in mark[4]:
+                self.tokens[t] = self.tokens.get(t, 0) + 1
+                self.token_name[t] = mark[5]
             self.marks[slug] = mark
         key = record_key(row)
         if self.tries_key.get(slug, key) != key:
@@ -322,6 +337,23 @@ class Ledger:
                     held.pop(k, None)
                 else:
                     held[k] -= 1
+        for held, names, keys in ((self.markets, self.market_name, (mark[3],) if mark[3] else ()), (self.tokens, self.token_name, mark[4])):
+            for k in keys:
+                if held.get(k, 0) <= 1:  # its last record: the market (the token) is none of this ledger's any more
+                    held.pop(k, None)
+                    names.pop(k, None)
+                else:
+                    held[k] -= 1
+
+    def market_names(self) -> tuple[dict[str, str], dict[str, str]]:
+        """(market id -> name, outcome token -> name) over every record, as each was when last saved — a record's market and
+        its orders' tokens are set before its first save and never change: what a walk of ``rows`` and their orders gives
+        (LiveBot.live_known_markets: the orphan sweep asked for it every minute while an unrecorded order rested — a manual
+        one, on a market that is none of the bot's — and the walk of 40,000 records' orders held the event loop 0.3 s each
+        time, 11-24). The dicts are the index's own: read, never changed."""
+        if not self.in_step():
+            self.reindex()
+        return self.market_name, self.token_name
 
     def known(self) -> tuple[dict[str, int], dict[str, int]]:
         """The ids and the hashes (lower case) of every record's orders, as they were when each record was last saved: an
@@ -344,6 +376,7 @@ class Ledger:
         self.by_hash, self.working, self.scored, self.scored_day, self.seq, self.seq_next, self.unordered = {}, {}, {}, {}, {}, 0, False
         self.tries, self.tries_key, self.struck = {}, {}, {}
         self.ids, self.hashes, self.marks, self.windows = {}, {}, {}, {}
+        self.markets, self.tokens, self.market_name, self.token_name = {}, {}, {}, {}
         self.unsure, self.filled = {}, {}
         for slug, row in self.rows.items():
             self.index(slug, row)
@@ -1207,6 +1240,16 @@ def record_key(pair: dict) -> str:
     """A record's key without its attempt (a superseded record's key carries the attempt after '@'): the window's slug,
     with '#<level>' for a deeper price level (1.129.0)."""
     return str(pair.get("slug") or "").split("@")[0]
+
+
+def order_token(order: dict) -> str:
+    """The outcome token a record's order was signed for ("" for one without a signed body, or one whose body is not the
+    shape the placement writes): what Ledger.index counts a record's tokens by — at every save, so nothing here may fail
+    on a record's shape."""
+    signed = order.get("body")
+    for key in ("data", "order"):
+        signed = signed.get(key) if isinstance(signed, dict) else None
+    return str(signed.get("tokenId") or "") if isinstance(signed, dict) else ""
 
 
 def window_of(pair: dict) -> str:

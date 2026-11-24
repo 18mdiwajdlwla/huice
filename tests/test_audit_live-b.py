@@ -529,6 +529,57 @@ async def live_orphan_known():
 
 
 asyncio.run(live_orphan_known())
+
+
+async def live_orphan_by_the_ledgers_index():
+    """1.154.39: the pre-open mode's markets and tokens come from its ledger's own index (preopen.Ledger.market_names), not
+    from a walk of every record's orders at each sweep — 0.3 s of the event loop a minute for as long as a manual order
+    rested on the account (11-24). The sweep judges as before: an unrecorded order on a window the mode quoted — named by
+    its market id, or by its outcome token alone — is withdrawn after the grace; one on a market nobody here touched is a
+    manual order, reported and left; and a window whose records are gone is none of the bot's any more."""
+    import types
+    import preopen as P
+    bot = make_bot()
+    await bot.live_prepare()
+    fake = bot.live.api
+    led = P.Ledger(":memory:")
+    pair = {"slug": "btc-updown-15m-1795000000", "key": "BTC-15M", "name": "BTC 15分涨跌 10:00–10:15", "market_id": "7001", "start_ms": NOW + 3600_000,
+            "phase": "active", "price": "0.49", "shares": "10",
+            "orders": {side: {"state": "open", "filled": 0.0, "id": f"p{i}", "hash": f"0xpre{i}", "index_set": i + 1,
+                              "body": {"data": {"order": {"tokenId": f"7001{i}", "makerAmount": "1", "takerAmount": "2"}}}} for i, side in enumerate(("up", "down"))}}
+    led.save(pair)
+    bot.preopen = types.SimpleNamespace(ledger=led, unmanaged_rows=lambda rows: rows)  # (none of the orders below is one of the mode's own)
+    walks = []
+    real = P.Ledger.market_names
+    led.market_names = lambda: walks.append(1) or real(led)
+    assert bot.live_known_markets() == ({"7001": "BTC 15分涨跌 10:00–10:15"}, {"70010": "BTC 15分涨跌 10:00–10:15", "70011": "BTC 15分涨跌 10:00–10:15"}) and walks == [1]
+    order = lambda oid, **more: {"id": oid, "status": "OPEN", "amount": "10", "amountFilled": "0", **more}
+    rows = [order("by-id", market={"id": "7001"}, order={"hash": "0xa", "tokenId": "other"}),   # on the window's market
+            order("by-token", order={"hash": "0xb", "tokenId": "70011"}),                          # named by its outcome token alone
+            order("manual", market={"id": "9999"}, order={"hash": "0xc", "tokenId": "99990"})]    # somebody's own order elsewhere
+    fake.open.update({r["id"]: r for r in rows})
+    notes = []
+    bot.live_notify = lambda text, key="": notes.append(text)
+    bot.live_note_unknown(rows, NOW - bot.LIVE_ORPHAN_GRACE_MS - 1)
+    assert [bool(bot.live_market_of(r)) for r in rows] == [True, True, False]
+    await bot.live_orphan_sweep(NOW)
+    removed = sorted(i for k, ids in fake.calls if k == "remove" for i in ids)
+    assert removed == ["by-id", "by-token"] and [u["id"] for u in bot.live_unknown_open] == ["manual"] and "manual" in fake.open, (fake.calls, bot.live_unknown_open)
+    assert notes and "撤掉 2 张" in notes[-1] and "BTC 15分涨跌 10:00–10:15" in notes[-1], notes
+    # the manual one is judged again at every sweep (by the index: nothing is walked), and left
+    before = len(walks)
+    await bot.live_orphan_sweep(NOW + bot.LIVE_ORPHAN_EVERY_MS)
+    assert len(walks) == before + 1 and [u["id"] for u in bot.live_unknown_open] == ["manual"] and removed == sorted(i for k, ids in fake.calls if k == "remove" for i in ids)
+    # the window's record gone (never sent: deleted): its market is none of the bot's — an order there is somebody's own
+    led.delete(pair["slug"])
+    assert bot.live_known_markets() == ({}, {}) and not bot.live_market_of(rows[0])
+    led.close()
+    print("LIVE_ORPHAN_LEDGER_INDEX_OK")
+
+
+asyncio.run(live_orphan_by_the_ledgers_index())
+
+
 async def live_recheck_error():
     """LIVE-RECHECK-ERROR: a hash read that keeps raising (success=false, a 4xx other than 404) no longer holds an unknown
     record past its signed expiry. Before expiry + margin an error is no evidence (still unknown, still reserved); after it

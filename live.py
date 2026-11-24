@@ -3787,15 +3787,23 @@ class LiveBot(core.Bot):
             if want.get("token"):
                 tokens[str(want["token"])] = name or mid
         ledger = getattr(getattr(self, "preopen", None), "ledger", None)
-        for pair in (getattr(ledger, "rows", None) or {}).values():
-            mid = str(pair.get("market_id") or "")
-            name = str(pair.get("name") or pair.get("slug") or mid)
-            if mid:
-                ids[mid] = name
-            for o in (pair.get("orders") or {}).values():
-                token = str((((o.get("body") or {}).get("data") or {}).get("order") or {}).get("tokenId") or "")
-                if token:
-                    tokens[token] = name
+        if callable(named := getattr(ledger, "market_names", None)):
+            # 1.154.39: from the ledger's own index (preopen.Ledger.market_names: kept as its records are saved) — the walk below
+            # went through every record's orders, 40,000 of them, each time the orphan sweep had an unrecorded order to judge:
+            # once a minute for as long as a manual order rested on the account (11-24: 9 stalls of 0.3 s in ten minutes)
+            led_ids, led_tokens = named()
+            ids.update(led_ids)
+            tokens.update(led_tokens)
+        else:  # (a stand-in for the ledger without the index: its records walked, as before)
+            for pair in (getattr(ledger, "rows", None) or {}).values():
+                mid = str(pair.get("market_id") or "")
+                name = str(pair.get("name") or pair.get("slug") or mid)
+                if mid:
+                    ids[mid] = name
+                for o in (pair.get("orders") or {}).values():
+                    token = str((((o.get("body") or {}).get("data") or {}).get("order") or {}).get("tokenId") or "")
+                    if token:
+                        tokens[token] = name
         # 1.154.33 (an outside review, CR-09): ...and the rule taker's windows with a real order. An order of its own whose record it lost
         # rested on a market neither list above names: taken for somebody's manual order, never swept (a record's market id is all
         # its order names here: it keeps no token)

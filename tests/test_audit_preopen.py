@@ -1257,6 +1257,12 @@ async def _review_by_counts(folder):
         assert text.startswith("没有订单号为") and not led.pause() and bot.preopen.manual_pause is False, text
         ids, _ = bot.live_known_markets()
         assert gone["market_id"] not in ids and filled["market_id"] in ids
+        # 1.154.39: ...from the ledger's own index (Ledger.market_names) — the same answer as the walk of every record's orders it
+        # replaces, which a stand-in for the ledger without that index still gets
+        by_index = bot.live_known_markets()
+        bot.preopen = types.SimpleNamespace(ledger=types.SimpleNamespace(rows=led.rows), manual_pause=False)
+        assert bot.live_known_markets() == by_index and by_index[0], "the index and the walk name the same markets"  # (tokens: tests/test_preopen.py)
+        bot.preopen = types.SimpleNamespace(ledger=led, manual_pause=False)
         assert look() == (want(list(led.rows.values())), 0)  # (the mode on again, on the same file: the kept counts go on)
         led.close()
 

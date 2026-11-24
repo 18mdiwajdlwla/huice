@@ -2442,6 +2442,69 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(p.review([], NOW)["total"]["records"], 0)
             await self.finish(ctl)
 
+    def test_the_ledger_names_its_markets_and_tokens(self):
+        """1.154.39: the ledger keeps, as its records are saved, which markets and outcome tokens they are of (market_names) —
+        what LiveBot.live_known_markets walked every record's orders for each time the orphan sweep had an unrecorded order to
+        judge: once a minute for as long as a manual order rested on the account, 0.3 s of the event loop each (11-24). The
+        same answer as that walk through saves, a record stepping aside, deletions, the archive and records put in by hand."""
+        def row(slug, mid, name, tokens=("", ""), **more):
+            return {"slug": slug, "key": "BTC-15M", "name": name, "market_id": mid, "start_ms": NOW + 3600_000, "phase": "active", "price": "0.49", "shares": "10",
+                    "orders": {side: {"state": "open", "filled": 0.0, "id": f"{slug}-{side}", "hash": f"0x{slug}{side}", "index_set": i + 1,
+                                      **({"body": {"data": {"order": {"tokenId": token, "makerAmount": "1"}}}} if token else {})}
+                               for i, (side, token) in enumerate(zip(("up", "down"), tokens))}, **more}
+
+        def walked(led):  # (the walk as LiveBot.live_known_markets made it before)
+            ids, tokens = {}, {}
+            for pair in led.rows.values():
+                mid = str(pair.get("market_id") or "")
+                name = str(pair.get("name") or pair.get("slug") or mid)
+                if mid:
+                    ids[mid] = name
+                for o in (pair.get("orders") or {}).values():
+                    token = str((((o.get("body") or {}).get("data") or {}).get("order") or {}).get("tokenId") or "")
+                    if token:
+                        tokens[token] = name
+            return ids, tokens
+        w1, w2 = "btc-updown-15m-100", "btc-updown-15m-200"
+        led = p.Ledger(":memory:")
+        led.save(row(w1, "11", "BTC 10:00", ("t1", "t2")))
+        led.save_many([row(w1 + "#1", "11", "BTC 10:00", ("t1", "t2")), row(w2, 12, "BTC 10:15", ("t3", "t4")),
+                       row("btc-updown-15m-300", "", "no market", ("", "")), row("btc-updown-15m-400", "14", "", ("t7", ""))])
+        self.assertEqual(led.market_names(), walked(led))
+        self.assertEqual(led.market_names(), ({"11": "BTC 10:00", "12": "BTC 10:15", "14": "btc-updown-15m-400"},
+                                              {"t1": "BTC 10:00", "t2": "BTC 10:00", "t3": "BTC 10:15", "t4": "BTC 10:15", "t7": "btc-updown-15m-400"}))
+        self.assertEqual((led.markets, led.tokens["t1"]), ({"11": 2, "12": 1, "14": 1}, 2))
+        led.save(led.rows[w1])  # saved again as it is, then with its id changed: counted once all the same
+        led.rows[w1]["orders"]["up"]["id"] = "other"
+        led.save(led.rows[w1])
+        self.assertEqual((led.markets["11"], led.tokens["t1"], led.market_names()), (2, 2, walked(led)))
+        led.rename(w1, w1 + "@0")  # the record steps aside (its window quoted again): still that market's
+        self.assertEqual((led.markets["11"], led.market_names()), (2, walked(led)))
+        led.delete(w1 + "#1")
+        self.assertEqual((led.markets["11"], led.tokens["t2"], led.market_names()), (1, 1, walked(led)))
+        led.delete(w1 + "@0")  # its last record: the market and its tokens are none of the ledger's any more
+        self.assertEqual(led.market_names(), walked(led))
+        self.assertEqual((sorted(led.market_names()[0]), sorted(led.market_names()[1])), (["12", "14"], ["t3", "t4", "t7"]))
+        led.rows[w2]["name"] = "BTC 10:15 改名"  # a name changed and saved: the one it goes by now
+        led.save(led.rows[w2])
+        self.assertEqual((led.market_names()[0]["12"], led.market_names()[1]["t3"], led.markets["12"]), ("BTC 10:15 改名", "BTC 10:15 改名", 1))
+        led.rows["by-hand"] = row("by-hand", "15", "put in by hand", ("t8", "t9"))  # (a test's doing: the indexes are made again)
+        self.assertEqual(led.market_names(), walked(led))
+        self.assertIn("15", led.market_names()[0])
+        led.close()
+        # the archive: a finished quote that filled nothing leaves the working records two days on — and its market with it (unless
+        # another record of that market stays: the card's latest window always does)
+        led = p.Ledger(":memory:")
+        old = NOW - 5 * 86_400_000
+        done = lambda slug, mid, start, tokens: {**row(slug, mid, slug, tokens), "start_ms": start, "phase": "closed", "accounted": True, "pnl": 0.0,
+                                                  "orders": {s: {**o, "state": "final"} for s, o in row(slug, mid, slug, tokens)["orders"].items()}}
+        led.save_many([done("btc-updown-15m-1", "21", old, ("a1", "a2")), done("btc-updown-15m-2", "22", old + 900_000, ("b1", "b2")),
+                       done("btc-updown-15m-3", "23", NOW - 60_000, ("c1", "c2"))])
+        self.assertEqual(led.archive_old(NOW), 2)
+        self.assertEqual(led.market_names(), walked(led))
+        self.assertEqual(led.market_names(), ({"23": "btc-updown-15m-3"}, {"c1": "btc-updown-15m-3", "c2": "btc-updown-15m-3"}))
+        led.close()
+
     def test_each_level_against_a_coin_toss(self):
         """1.154.34 (the user: "复盘可以看预挂，哪个档位赚的多吗……比如 47 抽 3 个点，期望值盈利跟实际盈利对比"): the review's levels
         and the mode's whole, and a card's levels over a range (card_diag), with what their settled fills were worth at the
