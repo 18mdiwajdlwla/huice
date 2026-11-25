@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.44"
+VERSION = "1.154.45"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -1110,6 +1110,9 @@ class Config:
     rule_key_lend: bool = True         # RULE_KEY_LEND: on = while the rule taker is idle its own key (RULE_API_KEY) also carries the orderbook feed's
     #                                    reads and the pre-open mode's overflow — never from five minutes before the rule taker needs it
     #                                    (preopen.KeyLending, 1.154.21); off = that key is the rule taker's alone
+    live_read_lend: bool = True        # LIVE_READ_LEND: on = ...and the model trader's own reads (its orders' fills, the open list, the positions) once
+    #                                    they have waited two seconds on the bot's key for a token — used up by its orders and cancels
+    #                                    (live.ReadRelief, 1.154.45); off = those reads wait on the bot's key, as before
     rule_api_key: str = ""             # RULE_API_KEY: a Predict API key for the rule taker alone (its reads, orders and push) — its own budget and its own
     #                                    429 cooldown: the bot's key's cooldowns no longer blind it (1.154.12); unset: PREDICT_API_KEY
     predict_book_api_key: str = ""     # PREDICT_BOOK_API_KEY: a Predict API key for the orderbook feed alone (its REST reads and push) — its own budget,
@@ -1337,6 +1340,7 @@ class Config:
             predict_rate_per_min=float(bounded_int(e, "PREDICT_RATE_PER_MIN", 220, 0, 100_000)),
             preopen_api_key=str(e.get("PREOPEN_API_KEY", "")).strip(),
             rule_key_lend=not off(e.get("RULE_KEY_LEND", "on")),
+            live_read_lend=not off(e.get("LIVE_READ_LEND", "on")),
             predict_book_api_key=str(e.get("PREDICT_BOOK_API_KEY", "")).strip(),
             rule_api_key=str(e.get("RULE_API_KEY", "")).strip(),
             live_max_open_usd=parse_bounded(e, "LIVE_MAX_OPEN_USD", "500", 1, 100_000_000),
