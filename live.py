@@ -1117,6 +1117,9 @@ class PredictApi:
 TOKEN_WAIT: contextvars.ContextVar = contextvars.ContextVar("predict_token_wait", default=None)  # seconds the read under way waits for its key's token (PredictApi.call; relieved sets it)
 
 
+READ_URGENT: contextvars.ContextVar = contextvars.ContextVar("predict_read_urgent", default=False)  # the read under way is one an order waits on (relieved: ReadRelief.URGENT_S)
+
+
 class NoToken(core.RemoteError):
     """A read given up before it was sent: its key had no token for it within the time it was given (PredictApi.call under
     TOKEN_WAIT) — the orders and cancels ahead of it took them. Nothing went out."""
@@ -1145,7 +1148,7 @@ async def relieved(api: Any, path: str, via: Any = None, signed: bool = True) ->
             return await ask(api), None
         if signed:
             await api.ensure_auth()  # (outside the wait below: a sign-in is not given up for a token)
-        token = TOKEN_WAIT.set(relief.WAIT_S)
+        token = TOKEN_WAIT.set(relief.URGENT_S if READ_URGENT.get() else relief.WAIT_S)
         try:
             return await ask(api), None
         except NoToken:
@@ -1209,6 +1212,11 @@ class ReadRelief:
       bucket's depth alone left the reads that had chosen to wait starving as before. With two seconds' wait (the clients
       and the pacer as they are, Predict's answers stood in for, 20 times faster): 19 a minute borrowed at 0.79 re-quotes
       a second, 72 at 1.3 and 101 at 1.5 — a cancelled order's fills read within 3–7 s, a sync round 2–4 s;
+    - 1.154.46: a read an order waits on — a cancelled order's fills: its unfilled shares stay held until it is back —
+      waits there URGENT_S, not WAIT_S (READ_URGENT, live_cancel_fills_read). The first /diag with this in production
+      (11-25 19:31): 同步 4.6 s a round, its list and its reads by hash two seconds each on a key at its pace, and every
+      cancelled order's fills as late. With these gone to the lent key at once the sync's own reads find the bot's key
+      that much freer: the fills read back within half a second where it took two, 9–13 reads a minute more borrowed;
     - only while the key is lent (KeyLending.why: not from five minutes before the rule taker needs it, nor after a
       refusal) and this client is signed in on it (warm: in a task beside, never on a read's way);
     - a list that has moved to the lent key stays there for its later pages;
@@ -1219,6 +1227,7 @@ class ReadRelief:
     On the lent key these are ordinary reads (a whole token), as the rule taker's own; the other borrowers are low ones and
     leave the reserve (PredictPacer.LOW_RESERVE), which is what these take."""
     WAIT_S = 2.0   # how long a read waits for a token on the bot's own key before it goes out on the lent one
+    URGENT_S = 0.3  # ...and one an order waits on (READ_URGENT: a cancelled order's fills — its unfilled shares are held until read)
     WARM_S = 60.0  # the sign-in on that key is tried this often at the most (as preopen.LEND_WARM_S)
     OFF_S = 600.0  # after a 401 / 403 on that key: this client borrows nothing for this long (as preopen.LEND_OFF_S)
 
@@ -2317,15 +2326,33 @@ class LiveBot(core.Bot):
         LOG.warning("真实交易：%s", text)
         self.live_errors = [*self.live_errors[-9:], f"{core.stamp(self.market.now_ms(), seconds=False)} {text}"]
 
+    def live_kept(self, key: str) -> Any:
+        """A record of the live: family (live:paused, live:killed) as the store has it, read once a write of that family
+        (Store.touched — as core.kept_read; a store that keeps no count, a test's stand-in, is read every time). 1.154.46:
+        the pause and the loss switch are asked at every gate of every candidate and every order (live_room,
+        live_send_block), each time a SELECT and a parse on the event loop — 11-25, ⏱️ 主循环: main.get ← live.live_paused
+        named for 33 of ten minutes' stalls, up to 256 ms (a read of the database file that had to wait for the disk).
+        They change when the owner pauses or the switch trips. A dict is handed out as a copy of its top (the callers
+        build their own from it)."""
+        touched = getattr(self.store, "touched", None)
+        if touched is None:
+            return self.store.get(key)
+        generation = touched.get("live", 0)
+        kept = self.__dict__.setdefault("live_kept_reads", {})
+        held = kept.get(key)
+        if held is None or held[0] is not self.store or held[1] != generation:
+            held = kept[key] = (self.store, generation, self.store.get(key))
+        return dict(held[2]) if isinstance(held[2], dict) else held[2]
+
     def live_paused(self) -> str:
-        record = self.store.get("live:paused")
+        record = self.live_kept("live:paused")
         if isinstance(record, dict):
             return str(record.get("why") or "手动暂停")
         return ""
 
     def live_kill_record(self) -> dict:
         """Today's kill-switch record: tripped (why) or resumed by the administrator; {} on any other day."""
-        record = self.store.get("live:killed")
+        record = self.live_kept("live:killed")
         if isinstance(record, dict) and record.get("day") == core.beijing_day(self.market.now_ms() / 1000):
             return record
         return {}
@@ -3909,6 +3936,12 @@ class LiveBot(core.Bot):
             ids = view["ids"] if view is not None else set(by_id)
             hashes = view["hashes"] if view is not None else set(by_hash)
             self.live_whole = (ids, hashes, full_at)
+            if not self.live_open_ids_at:
+                # 1.154.46: the first whole view since the start — until it, no attempt of a real order may be pruned (prunable), so
+                # the prune a start begins with removed none of them and the next came SIM_PRUNE_SECONDS later: an hour of
+                # re-quotes' attempts kept (3,800 at one a second) on every deploy, and more with each deploy inside the hour
+                # (11-25: three, and 17,476 records became 25,778). Looked for again at the next step
+                self.sim_pruned_at = -1e9
             self.live_open_ids, self.live_open_ids_at = ids, full_at
             if view is not None:
                 self.live_readopt(full_rows, view["by_id"], view["by_hash"], now_ms, full_at)
@@ -4313,16 +4346,46 @@ class LiveBot(core.Bot):
             st["requote_looked"] = True  # the slot's re-quote ran on the reservation: looked at again once the last read frees it
         self.sim_save([(tid, trade)])
 
+    LIVE_FILLS_CLOSE_STEP = 150  # the records whose awaited read has run out are closed this many a step at the most (thousands at once: a save that held the loop)
+
     def live_fills_reread(self, now_ms: int) -> None:
-        """The step's look for confirmed cancels whose fills are due to be read again (live_fills_again): each read beside the step,
-        one at a time an order. 1.154.33 (an outside review, R02)."""
+        """The step's look at the confirmed cancels whose fills are still awaited (fills_pending): each one due is read beside
+        the step, one read at a time an order (live_fills_again's waits; 1.154.33, an outside review, R02).
+
+        1.154.46 — and the two that nothing looked at. (a) One whose first read never ended — begun by a process since
+        replaced (every deploy), its task gone with it: it had no next read set, and only a read sets one. It is counted and
+        read now, by the same waits. (b) One whose mark has run out (FILLS_PENDING_MAX_MS: nothing is held on it any more,
+        nothing reads it again — what the account shows of it is the minute's positions check's to book, as before): the
+        mark stayed on the record for good, and a record carrying one is an open record (core.trade_open) — walked by
+        every look at what the account ties up. 11-25: the bot's key past its pace for hours, these reads queuing behind its
+        orders and lost at each of three deploys — "25778 条记录（其中 4207 条还没结束" where a week before 46 were, and
+        ⏱️ 主循环 at 4.0%, 176 stalls in ten minutes under live_exposure / live_reserved / fills_pending / side_held. With
+        4,000 such records on the production-sized copy live_exposure takes 6.7 ms where it took 0.02, and an order asks it
+        a dozen times on its way. The mark is taken off (``fills_unread``: when the cancel was — the record's own times
+        are left as they were: the positions check goes by them) and the record saved: no longer open."""
         reading = self.__dict__.setdefault("live_fills_reading", set())
+        due: list[tuple[str, dict]] = []
+        over: list[tuple[str, dict]] = []
         for tid, t in core.trades_open(self.sim_trades()):  # (a record with fills_pending is an open one)
             st = t.get("live")
-            if (not isinstance(st, dict) or not st.get("fills_reread_at") or st.get("state") != "done" or not core.fills_pending(st)
-                    or now_ms < int(st["fills_reread_at"]) or str(st.get("order_id") or "") in reading):
+            if not isinstance(st, dict) or not st.get("fills_pending") or st.get("state") != "done" or str(st.get("order_id") or "") in reading:
                 continue
+            if not core.fills_pending(st):
+                if len(over) < self.LIVE_FILLS_CLOSE_STEP:
+                    over.append((tid, t))
+            elif now_ms >= int(st.get("fills_reread_at") or 0):
+                due.append((tid, t))
+        for tid, t in due:
+            if not t["live"].get("fills_reread_at"):
+                self.live_fills_again(tid, t, str(t["live"].get("order_id") or ""), now_ms)  # (a): its read was lost — counted, and due again by the usual waits
             self.live_fills_later(tid, t, None)
+        for _, t in over:
+            st = t["live"]
+            st["fills_unread"] = int(st.pop("fills_pending") or 0)
+            st.pop("fills_reread_at", None)
+        if over:
+            self.sim_save(over)
+            self.live_fills_closed = getattr(self, "live_fills_closed", 0) + len(over)
 
     async def live_cancel_fills(self, tid: str, trade: dict, mk: Any) -> None:
         """What a removed order filled before its cancel (GET by its hash), onto its record — found by the order id, under
@@ -4336,15 +4399,22 @@ class LiveBot(core.Bot):
 
     async def live_cancel_fills_read(self, order_id: str, hash_: str, mk: Any) -> None:
         final: Any = None
-        for attempt in range(3):  # 1.138.0: tried again — one failed read kept the reservation (and the slot's re-quote cut short) for minutes
-            try:
-                final = await self.live.api.order(order_id, hash_)
-                break
-            except Exception as error:
-                if attempt == 2:
-                    self.live_note_error(f"撤单后读成交失败（#{order_id}）：{core.clean_error(error) or type(error).__name__}")
+        # 1.154.46: this read is one the slot's next order waits on (the cancelled order's unfilled shares stay held until it is
+        # back: fills_pending) — on a key at its pace it does not wait two seconds for a token there before it is borrowed for
+        # (ReadRelief.URGENT_S). The reads that do wait — the sync's — then find the bot's key that much freer
+        urgent = READ_URGENT.set(True)
+        try:
+            for attempt in range(3):  # 1.138.0: tried again — one failed read kept the reservation (and the slot's re-quote cut short) for minutes
+                try:
+                    final = await self.live.api.order(order_id, hash_)
                     break
-                await asyncio.sleep(max(1.0 + attempt, float(getattr(error, "retry_after", 0) or 0)))
+                except Exception as error:
+                    if attempt == 2:
+                        self.live_note_error(f"撤单后读成交失败（#{order_id}）：{core.clean_error(error) or type(error).__name__}")
+                        break
+                    await asyncio.sleep(max(1.0 + attempt, float(getattr(error, "retry_after", 0) or 0)))
+        finally:
+            READ_URGENT.reset(urgent)
         trades = self.sim_trades()
         cur = core.trade_of_order(trades, order_id)  # (1.154.40: by the orders' index, not a walk of every record)
         if cur is None:

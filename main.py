@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.45"
+VERSION = "1.154.46"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -27316,6 +27316,8 @@ class Bot:
                     size = self.sim_step_info
                     detail += ("（决策内：" + "、".join(f"{k} {v / 1000:.1f}s" for k, v in self.sim_step_ms.items())
                                + (f"；{size['markets']} 个市场、{size['records']} 条记录" + (f"（其中 {size['open']} 条还没结束，每步只看这些）" if size.get("open", -1) >= 0 else "") if size else "")
+                               # 1.154.46: the confirmed cancels whose fills read never came back, taken out of the open ones (LiveBot.live_fills_reread)
+                               + (f"；撤单后成交一直没读回、标记已过期的 {closed:,} 条已结案" if (closed := getattr(self, "live_fills_closed", 0)) else "")
                                + (f"；记录表每次取用都整表复制（SIM_VIEW_COPY=on）" if TRADE_VIEWS_COPY else
                                   f"；记录表取用 {LAZY_VIEWS['made']:,} 次、其中 {LAZY_VIEWS['copied']:,} 次要整表复制" if LAZY_VIEWS["made"] else "")  # 1.154.41
                                + (f"；记录索引自检 {drift['n']} 条没跟上（{stamp(drift['at'], seconds=False)}，如 {drift['tids'][0]}），已更正" if (drift := getattr(self, "sim_index_drift", None)) else "")
