@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.48"
+VERSION = "1.154.49"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -14082,6 +14082,18 @@ def trades_open(trades: Mapping) -> Iterable[tuple[str, dict]]:
     return rows
 
 
+def requote_kind(why: Any) -> str:
+    """A withdrawal's reason without its figures — what /diag counts the re-quotes by (LiveBot.live_requote_lines, 1.154.49):
+    "买1 移到 54.0¢，改跟" and "买1 移到 61.0¢，改跟" are one kind, "净优势降到 3.2¢，低于撤单线 5.0¢" another. Its first two
+    clauses, the amounts and what stands in brackets taken out; "其他" for a reason that says nothing."""
+    text = str(why or "").replace("买1", "买\x01").replace("卖1", "卖\x01")  # (the 1 of 买1 is no amount)
+    text = re.sub(r"（[^（）]*）|\([^()]*\)", "", text)
+    text = re.sub(r"(?<![A-Za-z\d])[-+−]?\$?\d[\d,.]*\s*(?:¢|份|%|U|秒|分钟|小时|天)?", "", text)  # (not the digits of a name: A50, KR200)
+    parts = [" ".join(part.split()) for part in re.split(r"[，,；;：:。]", text)]
+    kind = "，".join([part for part in parts if part][:2]).replace("\x01", "1")
+    return kind[:24] or "其他"
+
+
 def trade_mark(trade: Mapping) -> Any:
     """A record as it stands, to tell afterwards whether a look changed it (the step's and the express lane's walks of the
     open records, the real trader's reads of its orders: saved only when changed). 1.154.40: its pickle — until now its
@@ -27398,6 +27410,10 @@ class Bot:
                     if note := self.predict.graphql_note():
                         detail += "｜" + note
                 lines.append(f"  {mark} {name}：{what}｜上次用时 {state['ms'] / 1000:.1f}s｜共 {state['runs']} 轮{busy}{detail}{err}")
+                requotes = getattr(self, "live_requote_lines", None)
+                if name == "模拟交易" and requotes:  # 1.154.49: the re-quotes of the last minutes, by reason and by slot — what the keys' budget goes on
+                    with contextlib.suppress(Exception):  # (a note: never the reason /diag has no trader line)
+                        lines.extend("    " + row for row in requotes())
                 takers = getattr(self, "live_taker_lines", None)
                 if name == "模拟交易" and takers:  # 1.154.31: the real taker orders by market — which fill, which never do, and why
                     with contextlib.suppress(Exception):  # (a note: never the reason /diag has no trader line)

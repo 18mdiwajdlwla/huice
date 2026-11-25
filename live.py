@@ -2274,6 +2274,10 @@ class LiveBot(core.Bot):
         self.live_market_filter: bool | None = None  # whether Predict's open-order list honours marketId (1.139.0): None until a read shows it either way
         self.live_whole: tuple[set, set, int] = (set(), set(), 0)  # the last whole view of the account's open orders: ids, hashes, when read (live_counts_miss)
         self.live_requote_looked: set[str] = set()  # order ids of confirmed cancels whose slot live_requote_freed has looked at (live_cancel_fills, 1.138.0)
+        # 1.154.49: (monotonic, the slot's name, the kind of its withdrawal) of each order placed right after a confirmed cancel
+        # (live_requote_freed) — /diag's 重挂明细 (live_requote_lines): which slots re-quote, and why
+        self.live_requotes: collections.deque = collections.deque(maxlen=8192)
+        self.live_requotes_since = time.monotonic()
         self.live_track_reads: dict[str, int] = {}  # record id -> when its order was last read by its hash in the sync (the rotation, 1.137.2)
         self.live_sync_detail: dict = {}  # the last sync's parts, for /diag: the list's pages and seconds, the hash reads, the ones left for later
         self.live_rate_samples: collections.deque = collections.deque(maxlen=130)  # (monotonic, the model trader's requests so far), each step
@@ -3272,6 +3276,8 @@ class LiveBot(core.Bot):
                         st["requote_cancel_done_at"] = int(old[1]["live"].get("cancel_done_at") or 0)
                         st["events"].append({"at": at_ms, "what": f"上一张单（{core.cents(float(old[1].get('price') or 0))}）的撤单已获确认，随即重挂"})
                         fresh.append((tid, t))
+                        self.live_requotes.append((time.monotonic(), f"{t.get('item') or t.get('key') or ''} {t.get('label') or ''}".strip(),
+                                                   core.requote_kind((old[1].get("withdrawn") or {}).get("why"))))  # 1.154.49 (/diag)
                 if fresh:
                     self.sim_requote_count += len(fresh)
                     self.sim_requote_live += len(fresh)
@@ -3675,6 +3681,41 @@ class LiveBot(core.Bot):
 
     TAKER_LINES_HOURS = 24   # /diag's taker lines cover the real taker orders this far back...
     TAKER_LINES_MARKETS = 8  # ...of this many markets at the most (the most orders first)
+
+    REQUOTE_LINES_S = 600.0  # /diag's re-quote lines cover this long back...
+    REQUOTE_LINES_KINDS = 5  # ...the reasons with the most re-quotes, this many of them (the rest together)
+    REQUOTE_LINES_SLOTS = 8  # ...and the slots with the most
+
+    def live_requote_lines(self) -> list[str]:
+        """/diag (1.154.49): the orders placed right after a confirmed cancel in the last REQUOTE_LINES_S — how many and how
+        fast, by the reason of the withdrawal they followed (core.requote_kind) and by slot (a card's market and side), the
+        most first. 11-25: 撤单后随即重挂 at 0.79 a second on 11-18, then 1.05, 1.3, 1.5 — each one a cancel, the cancelled
+        order's fills read and a new order on the bot's key, 270 requests a minute at 1.5 a second, more than the key has;
+        the trader's reads and the feed's then take the rule taker's idle key whole and the pre-open mode is left with its
+        own. Nothing said which slots re-quote, or why (a 买1 followed, an edge under the exit line, a setting): the line
+        counted them and no more. [] with none in that time."""
+        now = time.monotonic()
+        cut = now - self.REQUOTE_LINES_S
+        rows = [(name, kind) for at, name, kind in list(self.live_requotes) if at >= cut]
+        if not rows:
+            return []
+        span = max(1.0, min(self.REQUOTE_LINES_S, now - self.live_requotes_since))
+        kinds, slots = collections.Counter(kind for _, kind in rows), collections.Counter(name for name, _ in rows)
+        by_slot: dict[str, collections.Counter] = {}
+        for name, kind in rows:
+            by_slot.setdefault(name, collections.Counter())[kind] += 1
+        total = len(rows)
+        minutes = f"{span / 60:.0f} 分钟" if span >= 60 else f"{span:.0f} 秒"
+        top = kinds.most_common(self.REQUOTE_LINES_KINDS)
+        rest = total - sum(n for _, n in top)
+        out = [f"重挂明细（真实订单，近 {minutes} {total} 单 ≈ 每秒 {total / span:.2f} 单，{len(slots)} 个档位；每单在主 Key 上是撤单、读成交、新单 3 个请求）：",
+               "· 按原因：" + "｜".join(f"{kind} {n} 单（{n * 100 // total}%）" for kind, n in top) + (f"｜其余 {rest} 单" if rest else "")]
+        for name, n in slots.most_common(self.REQUOTE_LINES_SLOTS):
+            why = "｜".join(f"{kind} {k}" for kind, k in by_slot[name].most_common(2))
+            out.append(f"· {name or '（没有名字）'}：{n} 单（{why}）")
+        if len(slots) > self.REQUOTE_LINES_SLOTS:
+            out.append(f"· 另有 {len(slots) - self.REQUOTE_LINES_SLOTS} 个档位共 {total - sum(n for _, n in slots.most_common(self.REQUOTE_LINES_SLOTS))} 单")
+        return out
 
     def live_taker_lines(self, now_ms: int) -> list[str]:
         """/diag (1.154.31 — the user: "宇树 海力士 长鑫一直吃不到单…检查下原因", with nothing to go by but the feeds' health): the real
