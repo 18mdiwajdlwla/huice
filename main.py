@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.43"
+VERSION = "1.154.44"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -5970,15 +5970,23 @@ GC_WATCH = GcWatch()
 
 
 @contextlib.contextmanager
-def gc_held() -> Any:
+def gc_held(aside: bool = False) -> Any:
     """No automatic collection while a start reads its records (1.154.43; GcWatch.hold). Reading tens of thousands of them
     makes a million long-lived objects in a few seconds, and the collector, counting allocations, walked the heap again
     and again as it grew — a heap with no garbage in it: more than half of the 3.8–4.2 s the model trader's 16,000 records
     took to read, a quarter of the pre-open ledger's 2.1–2.5 s, all on the event loop with the bot not yet (or just)
-    trading. The reference counts free what is let go meanwhile, as ever."""
+    trading. The reference counts free what is let go meanwhile, as ever.
+
+    ``aside`` (1.154.44): what was read is set aside (GcWatch.set_aside) before the collector is let on again, not after.
+    Everything made with the collector off is still "young" to it, and it runs at the first chance once it is back on: set
+    aside a line later, the records had just been walked once — the one walk 1.154.43 meant to spare (11-25 17:52,
+    production, 7 minutes into a start: "小回收…最长 292 ms"; on the production-sized copies 167 + 37 ms after the ledger's
+    read and 326 ms after the trader's, Python 3.12). Not when the read failed: nothing of it is kept."""
     GC_WATCH.hold()
     try:
         yield
+        if aside:
+            GC_WATCH.set_aside()
     finally:
         GC_WATCH.release()
 
@@ -21489,13 +21497,12 @@ class Bot:
         cache, to be read, never changed, by the caller)."""
         generation = self.store.touched.get("sim", 0)
         if self.sim_cache is None or self.sim_gen != generation:
-            with gc_held():  # 1.154.43: the collector off while the records are read (gc_held), and what was read set aside at once
+            with gc_held(aside=True):  # 1.154.43: the collector off while the records are read; 1.154.44: and what was read set aside before it is on again
                 self.sim_cache = {k.removeprefix("sim:"): sim_upgrade(v) for k, v in self.store.items("sim:")
                                   if isinstance(v, dict) and "status" in v}
                 self.sim_gen = generation
                 self.sim_built = getattr(self, "sim_built", 0) + 1  # (the view read afresh: its records are new objects)
                 self.__dict__["sim_index"] = TradeIndex(self.__dict__["_sim_cache"])
-            GC_WATCH.set_aside()
         index = self.__dict__.get("sim_index")
         if index is None:
             index = self.__dict__["sim_index"] = TradeIndex(self.__dict__["_sim_cache"])

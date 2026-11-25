@@ -167,16 +167,7 @@ class Ledger:
         self.conn.execute("CREATE TABLE IF NOT EXISTS pairs (slug TEXT PRIMARY KEY, body TEXT NOT NULL)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, body TEXT NOT NULL)")
         self.conn.commit()
-        # 1.154.43: read PARSE_CHUNK records at a call of the decoder (core.parse_rows: their keys the same strings — 55 a record,
-        # 45,000 records: a quarter of what they took in memory were copies of the same few words), with the collector off
-        # while they are read and indexed (core.gc_held) and what was read set aside at once (below): 2.1–2.5 s of the event
-        # loop at every start (and at every setting changed on the control page) for 45,000 records, a quarter of it the
-        # collector walking a heap that only grew
-        self.rows: dict[str, dict] = {}
-        with core.gc_held():
-            cursor = self.conn.execute("SELECT slug,body FROM pairs")
-            while part := cursor.fetchmany(core.PARSE_CHUNK):
-                self.rows.update(zip([slug for slug, _ in part], core.parse_rows([body for _, body in part])))
+        self.rows: dict[str, dict] = {}  # (read below, once what indexes them is there)
         self.by_hash: dict[str, str] = {}  # order hash -> its record's key (holder); "" for a hash two records hold
         # 1.154.20 — what the loops walk instead of every record (11-17: 39,116 of them, 26,956 accounted and only history; the day's
         # P&L alone was summed over all of them a dozen times a second — withdrawing(), asked by every placement's gates and by the
@@ -206,10 +197,19 @@ class Ledger:
         self.unsure: dict[str, dict] = {}  # the records with an order sent whose fills were not known for certain when last saved
         self.filled: dict[str, dict] = {}  # the records an order of which had filled something when last saved, or has since (note_filled)
         self.unordered = False  # a record put back among the working ones out of its place (never by this code: a test's): sorted again at the next walk
-        with core.gc_held():
+        # 1.154.43: read PARSE_CHUNK records at a call of the decoder (core.parse_rows: their keys the same strings — 55 a record,
+        # 45,000 records: a quarter of what they took in memory were copies of the same few words), with the collector off
+        # while they are read and indexed (core.gc_held) and what was read set aside (long-lived, none of it garbage: out of
+        # the collector's way from now): 2.1–2.5 s of the event loop at every start (and at every setting changed on the
+        # control page) for 45,000 records, a quarter of it the collector walking a heap that only grew. 1.154.44: the read
+        # and the indexing under one hold, and set aside before the collector is on again (``aside``) — it was let on between
+        # the two, and again before the setting aside: each time it walked what had just been read (167 + 37 ms at that size)
+        with core.gc_held(aside=True):
+            cursor = self.conn.execute("SELECT slug,body FROM pairs")
+            while part := cursor.fetchmany(core.PARSE_CHUNK):
+                self.rows.update(zip([slug for slug, _ in part], core.parse_rows([body for _, body in part])))
             for slug, row in self.rows.items():
                 self.index(slug, row)
-        core.GC_WATCH.set_aside()  # (1.154.43: what was just read is long-lived, none of it garbage: out of the collector's way from now)
         self.archived_count = self.archive_count()  # (the status says how many)
 
     def index(self, slug: str, row: dict) -> None:
