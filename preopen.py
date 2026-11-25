@@ -115,6 +115,7 @@ FULL_SCAN_MS = 60_000  # a full scan (up to MISS_STOP unlisted per card) this of
 ARCHIVE_AFTER_MS = 2 * core.DAY_MS  # a finished quote that filled nothing leaves the working records this long after its window's end (archivable, Ledger.archive_old)
 ARCHIVE_EVERY_MS = 3_600_000        # ...looked for at a start and then this often (Controller.archive; LiveBot.preopen_tidy while the mode is off)
 ARCHIVE_CHUNK = 2_000               # ...this many a transaction: the first pass over an old ledger moves tens of thousands, and the file must not double for it
+ADOPT_CHUNK = 1000  # the records a start saves in one transaction (Controller.adopt, 1.154.42): a commit a thousand, not one each
 
 
 def final_order(row: dict) -> bool:
@@ -439,6 +440,15 @@ class Ledger:
         self.rows[row["slug"]] = row
         self.index(row["slug"], row)
 
+    def hold(self, row: dict) -> None:
+        """A record among the working ones — and in every index — before its first save (1.154.42, Controller.place_pair): the
+        pair's gates find it by its orders' hashes (before_send: holder) and its money is counted (risk) from here, and the
+        save that follows, in the same turn of the loop, writes it as the gates left it. Until 1.154.42 it was saved to get it
+        here and saved again a few lines on: two commits (synchronous=FULL: two waits for the disk, on the event loop) before
+        either order could go out. Nothing of it is on disk until that save; nothing of it is sent before."""
+        self.rows[row["slug"]] = row
+        self.index(row["slug"], row)
+
     def save_many(self, rows: list[dict]) -> None:
         """Several records in one transaction (1.141.0: a batch withdrawal touches thousands — one commit, not one each)."""
         if not rows:
@@ -469,6 +479,24 @@ class Ledger:
         self.unindex(slug, row)
         self.rows[new_slug] = row
         self.index(new_slug, row)
+
+    def rename_many(self, moves: list[tuple[str, str]]) -> None:
+        """Several records stepping aside in one transaction (1.154.42): a window quoted again renames each of its levels'
+        records — seven commits back to back for seven levels (rename), a disk wait each on the event loop. The records
+        end where one rename after another leaves them: each out of its place, in at the end, in the order given."""
+        if not moves:
+            return
+        moved = [(slug, new_slug, self.rows[slug]) for slug, new_slug in moves]
+        with self.conn:  # (on disk first, as each is written under its new key: a write that fails leaves the records where they were)
+            self.conn.executemany("DELETE FROM pairs WHERE slug=?", [(slug,) for slug, _, _ in moved])
+            self.conn.executemany("INSERT INTO pairs VALUES (?,?) ON CONFLICT(slug) DO UPDATE SET body=excluded.body",
+                                  [(new_slug, json.dumps({**row, "slug": new_slug}, ensure_ascii=False)) for _, new_slug, row in moved])
+        for slug, new_slug, row in moved:
+            self.rows.pop(slug)
+            row["slug"] = new_slug
+            self.unindex(slug, row)
+            self.rows[new_slug] = row
+            self.index(new_slug, row)
 
     def archive_old(self, now_ms: int) -> int:
         """The records that are history only (archivable: accounted, closed, every order ended in the ordinary way, nothing
@@ -2514,16 +2542,20 @@ class Controller:
             self.listed_ids = {str(r.get("id")) for r in rows}
             self.account_rows = rows
             by_hash = {digest: r for r in rows if (digest := live.order_hash_of(r))}
-            for pair in self.ledger.rows.values():
-                changed = False
-                for order in pair["orders"].values():
-                    row = by_hash.get(order.get("api_hash") or order["hash"])
-                    if row is not None:
-                        before = order["filled"]
-                        self.apply_fill(order, row, pair)
-                        changed |= order["filled"] != before
-                if changed:
-                    self.ledger.save(pair)
+            filled: list[dict] = []  # 1.154.42: the pairs a fill was read for, saved in one transaction below — a commit each before (a disk wait each, under the lock, on the event loop)
+            try:
+                for pair in self.ledger.rows.values():
+                    changed = False
+                    for order in pair["orders"].values():
+                        row = by_hash.get(order.get("api_hash") or order["hash"])
+                        if row is not None:
+                            before = order["filled"]
+                            self.apply_fill(order, row, pair)
+                            changed |= order["filled"] != before
+                    if changed:
+                        filled.append(pair)
+            finally:  # (a row that cannot be read stops the walk, as before: the fills applied before it are saved all the same)
+                self.ledger.save_many(filled)
             self.account_at = fetched
 
     def resumable(self, pair: dict) -> bool:
@@ -2562,26 +2594,38 @@ class Controller:
     def adopt(self) -> None:
         """The records found at the start: an active pair as the settings say is taken over (resumable); any other pair not
         at its end is withdrawn and reconciled (interrupted attempts included — a recovered record never gets a new salt)."""
-        for pair in list(self.ledger.rows.values()):
-            if not pair.get("price") or not pair.get("shares"):  # a record from before 1.128.0: its size and price, read off its orders, kept on it
-                price, shares = pair_quote(pair)
-                if price and shares:
-                    pair.update(price=str(price), shares=str(int(shares) if shares == int(shares) else shares))
-                    self.ledger.save(pair)
-            if pair["phase"] == "active" and self.resumable(pair):
-                cancel_ms = pair["start_ms"] - self.settings.timing(str(pair.get("key") or "")).cancel_seconds * 1000
-                if pair.get("cancel_ms") != cancel_ms:
-                    # 1.154.20: saved only when its cancel time changes (the setting did). A restart with the same settings took
-                    # over 12,000 resting pairs with a committed write each (synchronous=FULL: an fsync a pair, on the event loop)
-                    # that changed nothing — the whole bot stood still for that long at every start, a deploy included
-                    pair["cancel_ms"] = cancel_ms
-                    self.ledger.save(pair)
-                self.resumed += 1
-                if pair.get("key"):  # the listing horizon as the records know it: the status's 发布到, and the discovery's "beyond the listing", from the start
-                    self.listed_by_card[pair["key"]] = max(self.listed_by_card.get(pair["key"], 0), int(pair["start_ms"]))
-            elif pair["phase"] != "closed" and not pair.get("accounted"):
-                pair.update(phase="closing", retry_ms=0, **({"reason": "设置不同，撤掉后重新报价", "free": True} if pair["phase"] == "active" else {}))
-                self.ledger.save(pair)
+        # 1.154.42: what the start changes is saved a transaction a thousand records (save_many), not a commit a record. 1.154.20
+        # spared the restart with the settings as they were; a start with another cancel time, or another price or size at a
+        # level, still saved every resting pair by itself — 12,000 commits in one stretch of the event loop, each a wait for
+        # the disk (synchronous=FULL): 3.6 s on a fast disk, half a minute and more at 2 ms a commit, the whole bot standing
+        # still (a changed setting on the control page is such a start). The records, and what the file holds once this has
+        # returned, are the same; one saved here twice (an old one given its price, then its cancel time) is written once.
+        changed: dict[str, dict] = {}
+        try:
+            for pair in list(self.ledger.rows.values()):
+                if not pair.get("price") or not pair.get("shares"):  # a record from before 1.128.0: its size and price, read off its orders, kept on it
+                    price, shares = pair_quote(pair)
+                    if price and shares:
+                        pair.update(price=str(price), shares=str(int(shares) if shares == int(shares) else shares))
+                        changed[pair["slug"]] = pair
+                if pair["phase"] == "active" and self.resumable(pair):
+                    cancel_ms = pair["start_ms"] - self.settings.timing(str(pair.get("key") or "")).cancel_seconds * 1000
+                    if pair.get("cancel_ms") != cancel_ms:
+                        # 1.154.20: saved only when its cancel time changes (the setting did). A restart with the same settings took
+                        # over 12,000 resting pairs with a committed write each (synchronous=FULL: an fsync a pair, on the event loop)
+                        # that changed nothing — the whole bot stood still for that long at every start, a deploy included
+                        pair["cancel_ms"] = cancel_ms
+                        changed[pair["slug"]] = pair
+                    self.resumed += 1
+                    if pair.get("key"):  # the listing horizon as the records know it: the status's 发布到, and the discovery's "beyond the listing", from the start
+                        self.listed_by_card[pair["key"]] = max(self.listed_by_card.get(pair["key"], 0), int(pair["start_ms"]))
+                elif pair["phase"] != "closed" and not pair.get("accounted"):
+                    pair.update(phase="closing", retry_ms=0, **({"reason": "设置不同，撤掉后重新报价", "free": True} if pair["phase"] == "active" else {}))
+                    changed[pair["slug"]] = pair
+        finally:  # (a record that cannot be judged stops the start, as before: what was changed before it is saved all the same)
+            rows = list(changed.values())
+            for at in range(0, len(rows), ADOPT_CHUNK):
+                self.ledger.save_many(rows[at:at + ADOPT_CHUNK])
 
     def supersedable(self, pair: dict, strikes: int | None = None) -> bool:
         """A pair withdrawn before its window — a stop, a pause, a settings change, an external cancel — with the start
@@ -2826,10 +2870,12 @@ class Controller:
             self.skipped[slug] = candidate_problem(market, self.now(), self.owner.config, self.settings)
             self.skipped_at[slug] = self.now()
             return
+        # the withdrawn pairs' records step aside: their levels are quoted again (place_pair: a new salt) — the record and the
+        # attempt: one key each. 1.154.42: a window's levels in one transaction (Ledger.rename_many), not a commit a level
+        aside = [(key, f"{key}@{int(self.ledger.rows[key].get('attempt') or 0)}") for key, _, _, _ in wanted if key in self.ledger.rows]
+        self.ledger.rename_many(aside)
+        self.requoted += len(aside)
         for key, level, price, shares in wanted:
-            if key in self.ledger.rows:  # the withdrawn pair's record steps aside: the level is quoted again (place_pair: a new salt)
-                self.ledger.rename(key, f"{key}@{int(self.ledger.rows[key].get('attempt') or 0)}")  # the record and the attempt: one key each
-                self.requoted += 1
             self.queued.add(key)
             st["found"] += 1
             item = {**c, "slug": key, "window": slug, "level": level, "price": str(price), "shares": str(shares),
@@ -2867,12 +2913,13 @@ class Controller:
                 status, trading = str(market.get("status") or "").upper(), str(market.get("tradingStatus") or "").upper()
                 if status != "REGISTERED" or trading not in {"OPEN", "MATCHING_NOT_ENABLED"}:
                     await self.cancel_many(pairs, f"市场状态 {status or '?'} / {trading or '?'}")
-                else:
-                    # 1.154.27: one transaction a market, not one a level. The ledger writes on the event loop and waits for the
-                    # disk each time (synchronous=FULL: a record of real orders); seven levels a window were seven such waits back
-                    # to back — 11-18 23:34: six times in ten minutes they held the loop for more than a tenth of a second, once
-                    # for 1,054 ms (a disk that answers in 150 ms now and then, times seven)
-                    self.ledger.save_many(pairs)
+                # 1.154.42: nothing is saved for the read itself. What it leaves on a record is meta_ms — when the market was last
+                # read: pacing, as checked_ms is (monitor_pair, Audit PRE-MONITOR-SAVES) — in the same dicts the ledger holds, so
+                # the next round is paced from memory; after a restart an older figure makes the window due a little sooner.
+                # 1.154.27 made it one transaction a market (seven a window before); it was still a commit — a wait for the disk
+                # (synchronous=FULL), on the event loop — for each of the eight markets read every five seconds: 1.6 a second,
+                # 138,000 a day, more than half of every commit this mode made. A market first seen OPEN is saved by note_open,
+                # one no longer open for orders by cancel_many: both as before.
         for error in await asyncio.gather(*(one(ps) for ps in batch.values()), return_exceptions=True):
             if isinstance(error, BaseException):
                 raise error
@@ -2949,18 +2996,24 @@ class Controller:
                     "phase": "active", "orders": orders, "created_ms": self.now(), "tries": 0, "retry_ms": 0,
                     "open_seen_ms": self.now() if str(market.get("tradingStatus") or "").upper() == "OPEN" else 0,
                     "seen_ms": int(c.get("read_ms") or 0)}  # when the discovery read it listed (the 发现→挂上 of the status)
-            self.ledger.save(pair)  # both hashes durable before either POST
+            # 1.154.42: among the records from here (Ledger.hold: the gates below find it by its hashes, its money is reserved),
+            # written once those gates have judged it — one commit before the orders go out where there were two (the pair
+            # as prepared, then again as placing a few lines on: each a wait for the disk, on the event loop, in front of both
+            # requests). No other task runs between here and that save: nothing awaits
+            self.ledger.hold(pair)
         sides: list[str] = []
-        for side in ("up", "down"):
-            if why := self.before_send(pair["orders"][side]["body"]):
-                pair["orders"][side].update(state="not_sent", error=why)
-                pair["phase"] = "closing"
-                sides = []  # a pair refused in part sends nothing: the side that passed stays prepared (never sent)
-                break
-            sides.append(side)
-        for side in sides:
-            pair["orders"][side]["state"] = "placing"
-        self.ledger.save(pair)
+        try:
+            for side in ("up", "down"):
+                if why := self.before_send(pair["orders"][side]["body"]):
+                    pair["orders"][side].update(state="not_sent", error=why)
+                    pair["phase"] = "closing"
+                    sides = []  # a pair refused in part sends nothing: the side that passed stays prepared (never sent)
+                    break
+                sides.append(side)
+            for side in sides:
+                pair["orders"][side]["state"] = "placing"
+        finally:
+            self.ledger.save(pair)  # both hashes durable before either POST (and whatever a gate that failed left: a record held is a record saved)
 
         async def send(side: str) -> None:
             order = pair["orders"][side]
@@ -2991,12 +3044,13 @@ class Controller:
                     order.update(state="unknown", error=text)
                 pair["phase"] = "closing"
             drop_signature(order)  # 1.154.33 (an outside review, R24): through() is through — the request is never sent again (not before: a refusal on the borrowed key sends this same body on the mode's own)
+            # 1.154.42: the moment the pair was placed goes with the save of its last answer — it had a commit of its own right
+            # after (the fifth of a pair's; three now)
+            if all(pair["orders"][s]["state"] != "placing" for s in sides) and any(o["state"] == "open" for o in pair["orders"].values()):
+                pair["placed_ms"] = self.now()
             self.ledger.save(pair)
         if sides:
             await asyncio.gather(*(send(side) for side in sides))  # 1.131.0: side by side — the second side no longer waits a round trip
-            if any(o["state"] == "open" for o in pair["orders"].values()):
-                pair["placed_ms"] = self.now()
-                self.ledger.save(pair)
         if all(o["state"] in {"prepared", "not_sent"} or o.get("limited") for o in pair["orders"].values()):
             # nothing of the pair was ever placed (a gate or the rate limiter refused the first request): no record, so a
             # later poll places the window afresh — hold() keeps it back while the reason lasts
