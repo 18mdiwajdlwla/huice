@@ -26,6 +26,7 @@ import inspect
 import json
 import hmac
 import ipaddress
+import itertools
 import logging
 import math
 import operator
@@ -55,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.42"
+VERSION = "1.154.43"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -1350,6 +1351,37 @@ class Config:
         )
 
 
+PARSE_CHUNK = 256  # the records parsed in one call (parse_rows)
+JSON_STARTS = {"{": dict, "[": list, '"': str, "t": bool, "f": bool, "n": type(None)}  # what a JSON text is by its first character (a number's: below)
+
+
+def parse_rows(texts: list[str]) -> list:
+    """Each JSON text parsed — what json.loads gives for each alone — in one call of the decoder for all of them, so that
+    the keys of their objects are the same strings (1.154.43). The decoder shares a key within one call and no further:
+    read a row a call, every record kept in memory had strings of its own for its keys — some 250 of them a model
+    trader's record, 55 a pre-open one — the same few hundred words 61,000 times over: 250 MB of the 900 the records took
+    after a start, in a store of 16,000 and a ledger of 45,000 (a record made while running has the code's own strings
+    for its keys: the same data weighed a third more after each deploy than before it). Nothing else is shared: every
+    value is its record's own, as before.
+
+    The texts are parsed as the elements of one array, and taken only when that gives one value a text, each of the kind
+    its text begins as; anything else — a text that does not parse, or not alone — and each is parsed by itself, the one
+    at fault raising as it always did."""
+    if len(texts) > 1:
+        try:
+            rows = json.loads("[" + ",".join(texts) + "]")
+        except (ValueError, RecursionError):
+            rows = None
+        if rows is not None and len(rows) == len(texts):
+            for text, row in zip(texts, rows):
+                first, kind = text[:1], type(row)
+                if JSON_STARTS.get(first) is not kind and not (kind in (int, float) and first and first in "-0123456789NI"):
+                    break
+            else:
+                return rows
+    return [json.loads(text) for text in texts]
+
+
 class Store:
     """Small persistent JSON records in SQLite. Reads, and the structural writes (replace, delete_*), use the event-loop
     thread's connection; the records written (put, put_many) are queued for a writer thread, which commits them in
@@ -1470,6 +1502,12 @@ class Store:
         return prefix, (prefix[:-1] + chr(ord(prefix[-1]) + 1)) if prefix else "\U0010ffff"
 
     def items(self, prefix: str) -> list[tuple[str, Any]]:
+        if self.path != ":memory:":
+            # 1.154.43: a database on disk is read as each() reads it — the rows a chunk at a time, parsed as they come
+            # (parse_rows: their keys shared), never every row's text held until the last is parsed (a family of 16,000
+            # records: 220 MB of text beside the records, most of it still the process's after the read). The same rows
+            # in the same order: the table by its keys, the queued records in their places
+            return list(self.each(prefix))
         overlay = self._overlay(prefix)  # before the table read (keys)
         rows = dict(self.conn.execute("SELECT k, v FROM records WHERE k >= ? AND k < ?", self._bounds(prefix)))
         for k, text in overlay.items():
@@ -1477,7 +1515,11 @@ class Store:
                 rows.pop(k, None)
             else:
                 rows[k] = text
-        return [(k, json.loads(rows[k])) for k in sorted(rows)]
+        keys, out = sorted(rows), []  # (1.154.43: parsed PARSE_CHUNK at a call, as on disk)
+        for at in range(0, len(keys), PARSE_CHUNK):
+            part = keys[at:at + PARSE_CHUNK]
+            out.extend(zip(part, parse_rows([rows.pop(k) for k in part])))
+        return out
 
     def each(self, prefix: str) -> Any:
         """The records under ``prefix`` one at a time, in the keys' order — what items() gives, never all of them parsed at
@@ -1486,22 +1528,35 @@ class Store:
         of a record, not the table's; a queued delete skipped); the table as the pass's read finds it — a database on disk
         shows it as it stood at the pass's first row (and so shows every read made on this thread until the pass is over:
         flush() first where that matters), one in memory as it stands at each row."""
+        texts = self._each_text(prefix)
+        if self.path == ":memory:":  # (shown as it stands at each row: a row at a time, as before)
+            for k, text in texts:
+                yield k, json.loads(text)
+            return
+        # 1.154.43: PARSE_CHUNK rows at a call of the decoder (parse_rows: their keys shared, and a pass over hundreds of
+        # thousands of samples a quarter faster). A database on disk is read as it stood at the pass's first row anyway, so
+        # the rows read ahead are the ones the pass would have come to
+        while part := list(itertools.islice(texts, PARSE_CHUNK)):
+            yield from zip([k for k, _ in part], parse_rows([text for _, text in part]))
+
+    def _each_text(self, prefix: str) -> Any:
+        """each()'s rows before they are parsed: (key, JSON), the queued records in their places, a queued delete skipped."""
         overlay = self._overlay(prefix)  # before the table read (keys)
         queued, i = sorted(overlay), 0
         for k, text in self.conn.execute("SELECT k, v FROM records WHERE k >= ? AND k < ? ORDER BY k", self._bounds(prefix)):
             while i < len(queued) and queued[i] < k:  # queued, not in the table (yet): in its place among the keys
                 if overlay[queued[i]] is not None:
-                    yield queued[i], json.loads(overlay[queued[i]])
+                    yield queued[i], overlay[queued[i]]
                 i += 1
             if i < len(queued) and queued[i] == k:
                 if overlay[k] is not None:
-                    yield k, json.loads(overlay[k])
+                    yield k, overlay[k]
                 i += 1
             else:
-                yield k, json.loads(text)
+                yield k, text
         for k in queued[i:]:
             if overlay[k] is not None:
-                yield k, json.loads(overlay[k])
+                yield k, overlay[k]
 
     def count(self, prefix: str) -> int:
         return len(self.keys(prefix))
@@ -5815,6 +5870,7 @@ class GcWatch:
         self.threshold: tuple | None = None  # the collector's thresholds as they were found (FULL_EVERY in force since the first settle)
         self.settles = 0   # ...how many there were
         self.thawed: float | None = None  # monotonic: when everything was last walked (the first settle, then each thaw); None before any
+        self.early = 0     # the times a start's own reads were set aside before any settle (set_aside)
 
     def start(self) -> None:
         if not self.watching:
@@ -5829,12 +5885,22 @@ class GcWatch:
         if self.holders:
             self.holders = 0
             gc.enable()
-        if self.settles:
+        if self.settles or self.early:
             gc.unfreeze()  # (as it was found: the tests)
-            self.settled, self.settles, self.thawed = (0.0, 0.0, 0), 0, None
+            self.settled, self.settles, self.thawed, self.early = (0.0, 0.0, 0), 0, None, 0
         if self.threshold is not None:
             gc.set_threshold(*self.threshold)
             self.threshold = None
+
+    def set_aside(self) -> None:
+        """What a start has just read — the kept records: tens of thousands, every one long-lived, none of it garbage — set
+        aside from the collector at once (gc.freeze, with no collection before it), where it waited for the first settle
+        (1.154.43). That settle, SETTLE_FIRST_S into the start, began with a collection of everything alive: the million
+        objects of the records walked once more, 0.7–1.0 s of the event loop with the bot already trading. It now walks what
+        was made since. Only while the watch runs (the bot's own run: a bot a test builds leaves the collector as it was)."""
+        if self.watching:
+            gc.freeze()
+            self.early += 1
 
     def settle(self, thaw: bool = False) -> float:
         """What is alive now set aside from the collector (gc.freeze), after one collection of what has been made since the
@@ -5901,6 +5967,20 @@ class GcWatch:
 
 
 GC_WATCH = GcWatch()
+
+
+@contextlib.contextmanager
+def gc_held() -> Any:
+    """No automatic collection while a start reads its records (1.154.43; GcWatch.hold). Reading tens of thousands of them
+    makes a million long-lived objects in a few seconds, and the collector, counting allocations, walked the heap again
+    and again as it grew — a heap with no garbage in it: more than half of the 3.8–4.2 s the model trader's 16,000 records
+    took to read, a quarter of the pre-open ledger's 2.1–2.5 s, all on the event loop with the bot not yet (or just)
+    trading. The reference counts free what is let go meanwhile, as ever."""
+    GC_WATCH.hold()
+    try:
+        yield
+    finally:
+        GC_WATCH.release()
 
 
 class LoopWatch:
@@ -21409,10 +21489,13 @@ class Bot:
         cache, to be read, never changed, by the caller)."""
         generation = self.store.touched.get("sim", 0)
         if self.sim_cache is None or self.sim_gen != generation:
-            self.sim_cache = {k.removeprefix("sim:"): sim_upgrade(v) for k, v in self.store.items("sim:")
-                              if isinstance(v, dict) and "status" in v}
-            self.sim_gen = generation
-            self.sim_built = getattr(self, "sim_built", 0) + 1  # (the view read afresh: its records are new objects)
+            with gc_held():  # 1.154.43: the collector off while the records are read (gc_held), and what was read set aside at once
+                self.sim_cache = {k.removeprefix("sim:"): sim_upgrade(v) for k, v in self.store.items("sim:")
+                                  if isinstance(v, dict) and "status" in v}
+                self.sim_gen = generation
+                self.sim_built = getattr(self, "sim_built", 0) + 1  # (the view read afresh: its records are new objects)
+                self.__dict__["sim_index"] = TradeIndex(self.__dict__["_sim_cache"])
+            GC_WATCH.set_aside()
         index = self.__dict__.get("sim_index")
         if index is None:
             index = self.__dict__["sim_index"] = TradeIndex(self.__dict__["_sim_cache"])

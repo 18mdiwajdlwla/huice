@@ -7715,6 +7715,7 @@ class LiveBot(core.Bot):
         return self.preopen.status()
 
     async def run(self) -> int:
+        core.GC_WATCH.start()  # (1.154.43: before the pre-open ledger is read — its records are set aside from the collector as they come: GcWatch.set_aside)
         await self.preopen_apply()  # PREOPEN_15M as the environment and the control page's saved values say at the start
         self.rules_start()
         try:
