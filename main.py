@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.45"
+VERSION = "1.154.47"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -6227,6 +6227,10 @@ def predict_rest_kind(url: str) -> str:
     return "市场列表" if tail == "markets" else "其他"
 
 
+class LentBack(RemoteError):
+    """A read that waited for its token on a lent key, and the key is no longer lent (PredictFeed.fetch_with): never sent there."""
+
+
 PREDICT_PACERS: dict[str, PredictPacer] = {}
 PREDICT_RATE = {"per_min": 220.0}  # PREDICT_RATE_PER_MIN, set by Config (Bot.apply_config): every key's pace
 
@@ -6830,14 +6834,27 @@ class PredictFeed:
         """The rule taker's own key, for this read (1.154.21): while that taker is idle (preopen.KeyLending) and its key has a
         token to spare this instant — the feed's reads go out there, and the bot's key is left to the model trader (its order
         reads and its sync never queue behind a round of books; and a key shared with anyone else stays further from its
-        limit: 11-17, ninety 429s on it in 2.3 hours, the trader silent twenty seconds each). "" otherwise: the feed's own."""
+        limit: 11-17, ninety 429s on it in 2.3 hours, the trader silent twenty seconds each). "" otherwise: the feed's own.
+
+        1.154.47 — ...and with no token to spare there this instant, there all the same when the feed's own key has none
+        either: the read waits on the lent key. A read of the feed's is a low one (it leaves two tokens behind), and on the
+        bot's key, at its pace on the trader's orders and cancels, the bucket never holds the three it needs: 11-25,
+        "Predict 盘口：上一轮失败…用时 300.0s…TimeoutError", 盘口 1 read a minute — a round that needed one read hung until it was
+        given up, and with it the market lists and details the round reads (the next day's markets among them). The lent
+        key was no way out either: it went there only if three tokens stood in that bucket at the moment it asked, and the
+        pre-open mode's overflow, asking all the time, took each as it came (预挂借用 208 / 111 次 a minute, 盘口借用 none).
+        Waiting there, it is woken when the bucket holds its three and takes one — ahead of that overflow, which takes
+        what the feed leaves (1.154.21 meant the feed's reads to go there, and the overflow to be the overflow); behind
+        the rule taker's own requests and the trader's reads there, which need one token, as ever."""
         lending = self.lend
         if lending is None or self.api_key() != self.config.predict_api_key:
             return ""  # nothing to borrow; or the feed has a key of its own (PREDICT_BOOK_API_KEY): the bot's key carries none of its reads anyway
         try:
             lent = lending.key()
-            if not lent or lent == self.api_key() or lending.why() or not predict_pacer(lent).spare(low=True):
+            if not lent or lent == self.api_key() or lending.why():
                 return ""
+            if not predict_pacer(lent).spare(low=True) and predict_pacer(self.api_key()).spare(low=True):
+                return ""  # none to spare there this instant, one on the feed's own key: there, at once
         except Exception:  # (a lender that cannot answer lends nothing)
             return ""
         self.lent_at.append(time.monotonic())
@@ -6882,6 +6899,8 @@ class PredictFeed:
         if lent:
             try:
                 return await self.fetch_with(url, payload, lent)
+            except LentBack:
+                pass  # (1.154.47: the key was taken back while this read waited for its token there: on the feed's own)
             except RemoteError as error:
                 if not self.lent_refusal(error, lent):
                     raise
@@ -6910,6 +6929,12 @@ class PredictFeed:
             # the key's budget, shared with the trading clients (1.154.0) unless the feed has its own (1.154.5); behind their reads
             # (1.154.9) — but for a read that goes ahead (fetch: /diag's probe), which takes its token as an order does
             await predict_pacer(key).take(write=ahead, low=not ahead)
+            if key != self.api_key() and (lending := self.lend) is not None and lending.why():
+                # 1.154.47: a read may now wait for its token on the lent key (lent_key) — and the key is not lent any more
+                # by the time it has one (the rule taker needs it within minutes, or it answered a borrower with its limit):
+                # nothing goes out there; the token is put back
+                predict_pacer(key).tokens += 1.0
+                raise LentBack("那把 Key 已收回")
         async with self.gate:
             # 1.150.0: a cooldown that began while this request waited for its slot (another read's 429) is honoured here too,
             # as live.py's send() does since 1.138.0: nothing queued behind the PREDICT_PARALLEL in flight goes out into it.
@@ -27316,6 +27341,8 @@ class Bot:
                     size = self.sim_step_info
                     detail += ("（决策内：" + "、".join(f"{k} {v / 1000:.1f}s" for k, v in self.sim_step_ms.items())
                                + (f"；{size['markets']} 个市场、{size['records']} 条记录" + (f"（其中 {size['open']} 条还没结束，每步只看这些）" if size.get("open", -1) >= 0 else "") if size else "")
+                               # 1.154.46: the confirmed cancels whose fills read never came back, taken out of the open ones (LiveBot.live_fills_reread)
+                               + (f"；撤单后成交一直没读回、标记已过期的 {closed:,} 条已结案" if (closed := getattr(self, "live_fills_closed", 0)) else "")
                                + (f"；记录表每次取用都整表复制（SIM_VIEW_COPY=on）" if TRADE_VIEWS_COPY else
                                   f"；记录表取用 {LAZY_VIEWS['made']:,} 次、其中 {LAZY_VIEWS['copied']:,} 次要整表复制" if LAZY_VIEWS["made"] else "")  # 1.154.41
                                + (f"；记录索引自检 {drift['n']} 条没跟上（{stamp(drift['at'], seconds=False)}，如 {drift['tids'][0]}），已更正" if (drift := getattr(self, "sim_index_drift", None)) else "")

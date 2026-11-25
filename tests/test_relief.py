@@ -184,6 +184,42 @@ class ReliefTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await api.market("5", priority=True))["id"], 5)
         self.assertEqual([(key, path) for key, _, path, _ in self.wire.sent], [("rule-key", "/markets/5"), ("main-key", "/markets/5")])
 
+    async def test_a_read_an_order_waits_on_is_borrowed_for_sooner(self):
+        """1.154.46: a cancelled order's fills (its unfilled shares stay held until they are read) wait URGENT_S for a token
+        on the bot's key, not WAIT_S — the sync's reads, the patient ones, as before."""
+        bot = make_bot()
+        api, relief = bot.live.api, bot.live_relief
+        self.signed(bot)
+        relief.WAIT_S, relief.URGENT_S = 0.4, 0.03
+        self.assertTrue(L.ReadRelief.URGENT_S < L.ReadRelief.WAIT_S and L.READ_URGENT.get() is False)
+        bucket("main-key", -3.0), bucket("rule-key", 8.0)
+        began = time.monotonic()
+        await api.order("77", HASH)
+        self.assertGreaterEqual(time.monotonic() - began, 0.4)
+        bucket("main-key", -3.0), bucket("rule-key", 8.0)
+        began = time.monotonic()
+        await bot.live_cancel_fills_read("77", HASH, None)  # (no record of that order here: read, nothing to book)
+        took = time.monotonic() - began
+        self.assertTrue(0.03 <= took < 0.3, took)
+        self.assertEqual((self.wire.keys(), L.READ_URGENT.get(), relief.lent_last()), (["rule-key", "rule-key"], False, 2))
+        # a token on the bot's key: there, at once, urgent or not; and a read that fails leaves the mark off as well
+        self.wire.sent.clear()
+        bucket("main-key", 2.0), bucket("rule-key", 8.0)
+        await bot.live_cancel_fills_read("77", HASH, None)
+        self.assertEqual(self.wire.keys(), ["main-key"])
+        bucket("main-key", 5.0)
+        self.wire.fail["main-key"] = [m.RemoteError("HTTP 500: upstream")] * 3
+        sleep = asyncio.sleep
+
+        async def quick(seconds, *a, **kw):  # (the read's own retries, 1 s and 2 s apart: not waited for here)
+            return await sleep(0)
+        asyncio.sleep = quick
+        try:
+            await bot.live_cancel_fills_read("77", HASH, None)
+        finally:
+            asyncio.sleep = sleep
+        self.assertIs(L.READ_URGENT.get(), False)
+
     async def test_the_wait_for_a_token_is_given_up_before_anything_is_sent(self):
         api = L.PredictApi("https://x", "kp", None)
         bucket("kp", -3.0)
