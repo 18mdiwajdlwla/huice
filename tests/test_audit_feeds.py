@@ -821,7 +821,7 @@ async def feed_fetched_ms() -> None:
         assert why({k: v for k, v in deep.items() if k != "live"}, unsent, T + 300) == "买1 被顶到 33.0¢，改挂 34.0¢"  # paper: unchanged
         # a sweep order (SIM_MAKER_DEEP_ONLY) the same: "the bid under the threshold" may be the order itself. The front at
         # 50¢ (no edge there at a fair price of 55¢), our 100 at 20¢, the others' 19¢
-        sbot = m.Bot(m.Config.from_env({**PAPER, "SIM_MAKER_DEEP_ONLY": "on", "SIM_MAKER_FOLLOW_SETTLE_SECONDS": "0"}),
+        sbot = m.Bot(m.Config.from_env({**PAPER, "SIM_MAKER_DEEP_ONLY": "on", "SIM_MAKER_FOLLOW_SETTLE_SECONDS": "0", "SIM_MAKER_SWEEP_SETTLE_SECONDS": "0"}),
                      m.Store(":memory:"), FM(), None)
         sweep = deep_order(sbot, 0.20, T, sweep=True)
         under = [["0.50", "300"], ["0.20", "100"], ["0.19", "500"]]

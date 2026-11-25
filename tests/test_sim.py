@@ -22,7 +22,8 @@ KOSPI_SLUG = "kospi-composite-index-up-or-down-on-october-5-2026"
 CLOSE = BJ(10, 5, 16, 10)
 LEGACY = {"SIM_MAKER_MIN_BID": "0", "SIM_MAKER_EXIT_CENTS": "0", "SIM_MAKER_SESSION": "off", "SIM_MAKER_POINTS": "off",
           "SIM_MAKER_SPREAD_CENTS": "10", "SIM_TAKER_MAX_SHARES": "0", "SIM_TAKER_SWEEP_SHARES": "0", "SIM_MAKER_DEEPER": "off",
-          "SIM_MAKER_FOLLOW_SETTLE_SECONDS": "0", "SIM_MAKER_FLOOR_SHARES": "0"}  # the resting-order rules off and the old 10¢ spread rule on: orders rest as placed; re-quotes at once
+          "SIM_MAKER_FOLLOW_SETTLE_SECONDS": "0", "SIM_MAKER_SWEEP_SETTLE_SECONDS": "0",  # (1.154.50: a sweep order's own settle too)
+          "SIM_MAKER_FLOOR_SHARES": "0"}  # the resting-order rules off and the old 10¢ spread rule on: orders rest as placed; re-quotes at once
 FEE = 0.02  # Predict: 2% × min(p, 1 − p) when the market states no rate
 
 # --- settings ----------------------------------------------------------------------------------------------------------
@@ -855,7 +856,7 @@ async def maker_rules():
     # --- no spread limit by default (SIM_MAKER_SPREAD_CENTS=0): the 10-08 ask "价差大也挂，比如两边都是 5，公平价 40" — bids 5¢ on
     # both sides (涨 5¢×300; 跌 5¢ = a 95¢ ask ×200), fair 40¢: the 跌 bid is joined at 5¢ with 55¢ of edge; the deep-bid mode
     # then puts it a cent in front, on this and any book, when the edge there clears its bar
-    both5 = lambda **env: m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEPER": "off", "SIM_MAKER_FOLLOW_SETTLE_SECONDS": "0", "SIM_MAKER_FLOOR_SHARES": "0", "SIM_WAYS": "maker", **env}), m.Store(":memory:"), FM(NOW), None)
+    both5 = lambda **env: m.Bot(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "SIM_MAKER_DEEPER": "off", "SIM_MAKER_FOLLOW_SETTLE_SECONDS": "0", "SIM_MAKER_SWEEP_SETTLE_SECONDS": "0", "SIM_MAKER_FLOOR_SHARES": "0", "SIM_WAYS": "maker", **env}), m.Store(":memory:"), FM(NOW), None)
     ubot = both5()
     ubot.predict.market_meta["101"] = (active, time.monotonic())
     five = m.dataclasses.replace(hsi(0.40, [("0.05", "300")], [("0.95", "200")], NOW), in_session=True)
