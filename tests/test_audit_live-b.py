@@ -216,12 +216,10 @@ async def live_double_rekey():
     bot = make_bot(SIM_WAYS="maker")
     await bot.live_prepare(); await bot.live_prefetch(NOW)
     release = asyncio.Event()
-    async def slow_to_thread(fn, *a, **k):  # the store flush the placement waits for (a busy writer)
+    async def slow_wait(fn, *a, **k):  # the wait for the placement's record to be written (a busy writer); 1.154.40: core.store_wait, was asyncio.to_thread
         await release.wait()
         return fn(*a, **k)
-    real_asyncio = L.asyncio
-    L.asyncio = types.SimpleNamespace(**{n: getattr(asyncio, n) for n in dir(asyncio) if not n.startswith("__")})
-    L.asyncio.to_thread = slow_to_thread
+    real_wait, m.store_wait = m.store_wait, slow_wait
     try:
         bot.market.now = NOW
         T["world"]["markets"] = [hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW)]
@@ -241,7 +239,7 @@ async def live_double_rekey():
         await confirm
         await express
     finally:
-        L.asyncio = real_asyncio
+        m.store_wait = real_wait
     keys = sorted(k for k in bot.store.keys("sim:") if k.startswith(f"sim:{tid}"))
     assert f"sim:{tid}#2" not in keys and f"sim:{tid}#2" not in [f"sim:{k}" for k in bot.sim_trades()], keys
     one = bot.store.get(f"sim:{tid}#1")

@@ -276,20 +276,34 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             return await plain_market(mid)
         api.market = market_read
         await ctl.refresh_active()
-        self.assertEqual((len(reads), writes), (1, [7]), "one read of the market, one write for its seven records")
+        # 1.154.42: ...and none at all for the read itself — when a market was last read (meta_ms) is pacing, kept on the records in
+        # memory as checked_ms is; it was a commit a market, eight every five seconds: more than half of all this mode wrote
+        self.assertEqual((len(reads), writes), (1, []), "one read of the market, nothing written for it")
         self.assertTrue(all(pair["meta_ms"] == clock.ms for pair in pairs))
         stored = {slug: json.loads(body) for slug, body in ctl.ledger.conn.execute("SELECT slug, body FROM pairs")}
-        self.assertEqual({stored[pair["slug"]]["meta_ms"] for pair in pairs}, {clock.ms})
-        # matching seen open: noted on every level's record — one write again, then the reread's
+        self.assertEqual({stored[pair["slug"]].get("meta_ms", 0) for pair in pairs}, {0}, "the stamp is memory's; the file has the records as last saved")
+        await ctl.refresh_active()
+        self.assertEqual(len(reads), 1, "read a moment ago: not due again — paced from the records in memory")
+        # matching seen open: noted on every level's record — one write
         api.markets["123"]["tradingStatus"] = "OPEN"
         del writes[:]
         clock.ms += p.REFRESH_MS
         await ctl.refresh_active()
-        self.assertEqual((writes, {pair.get("open_seen_ms") for pair in pairs}), ([7, 7], {clock.ms}))
+        self.assertEqual((writes, {pair.get("open_seen_ms") for pair in pairs}), ([7], {clock.ms}))
+        stored = {slug: json.loads(body) for slug, body in ctl.ledger.conn.execute("SELECT slug, body FROM pairs")}
+        self.assertEqual({(stored[pair["slug"]]["open_seen_ms"], stored[pair["slug"]]["meta_ms"]) for pair in pairs}, {(clock.ms, clock.ms)}, "(what that write carries: the records as they stand)")
         del writes[:]
         clock.ms += p.REFRESH_MS
         await ctl.refresh_active()
-        self.assertEqual(writes, [0, 7], "seen open already: nothing to note (an empty write is none)")
+        self.assertEqual(writes, [0], "seen open already: nothing to note (an empty write is none)")
+        # a market no longer open for orders has its pairs withdrawn, and saved, as before
+        api.markets["123"]["status"] = "RESOLVED"
+        del writes[:]
+        clock.ms += p.REFRESH_MS
+        await ctl.refresh_active()
+        self.assertTrue(writes and all(pair["phase"] != "active" for pair in pairs), writes)
+        stored = {slug: json.loads(body) for slug, body in ctl.ledger.conn.execute("SELECT slug, body FROM pairs")}
+        self.assertTrue(all(stored[pair["slug"]]["phase"] != "active" for pair in pairs))
         # ...and the cancellation loop's pass over the closing pairs whose try has come: their next tries booked in one write
         ctl2, api2, clock2 = controller()
         closing = await self.book_of(ctl2, api2, 7, phase="closing")
@@ -1435,13 +1449,248 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((ctl2.resumed, saves), (40, []))
             await self.finish(ctl2)
             ctl3, _, _ = controller(PREOPEN_CANCEL_SECONDS="30", **db)
-            saves3 = []
-            real_save3 = ctl3.ledger.save
+            saves3, many3 = [], []
+            real_save3, real_many3 = ctl3.ledger.save, ctl3.ledger.save_many
             ctl3.ledger.save = lambda row: (saves3.append(row["slug"]), real_save3(row))[1]
+            ctl3.ledger.save_many = lambda rows: (many3.append([row["slug"] for row in rows]), real_many3(rows))[1]
             ctl3.adopt()
-            self.assertEqual((ctl3.resumed, len(saves3)), (40, 40))
+            # 1.154.42: ...in one transaction (a commit each before: 12,000 in one stretch of the event loop at production's size)
+            self.assertEqual((ctl3.resumed, saves3, [len(rows) for rows in many3]), (40, [], [40]))
+            self.assertEqual(many3[0], [pair["slug"] for pair in pairs], "in the records' order")
             self.assertTrue(all(x["cancel_ms"] == x["start_ms"] - 30_000 for x in ctl3.ledger.rows.values()))
+            stored = {slug: json.loads(body) for slug, body in ctl3.ledger.conn.execute("SELECT slug, body FROM pairs")}
+            self.assertEqual(stored, ctl3.ledger.rows, "the file has every record as the start left it")
             await self.finish(ctl3)
+
+    def count_writes(self, ctl):
+        """Every write of the controller's ledger from now, in order: its kind (and how many records, for the ones that take several)."""
+        writes = []
+        for name in ("save", "save_many", "delete", "rename", "rename_many"):
+            def counted(*args, name=name, plain=getattr(ctl.ledger, name)):
+                writes.append((name, len(args[0])) if name.endswith("_many") else name)
+                return plain(*args)
+            setattr(ctl.ledger, name, counted)
+        return writes
+
+    def on_file(self, ledger):
+        return {slug: json.loads(body) for slug, body in ledger.conn.execute("SELECT slug, body FROM pairs")}
+
+    async def test_a_pair_is_written_once_before_its_orders_go_out(self):
+        """1.154.42 — a pair placed was five commits of the ledger, each a wait for the disk on the event loop (synchronous=FULL):
+        as prepared, again as placing a few lines on (both in front of the two requests), one with each answer, one more for
+        the moment it was placed. Three now: once before the orders — among the records at once (Ledger.hold: the gates find
+        it by its hashes), written as the gates left it — and one with each answer, the last carrying the moment. What the
+        file holds when an order's bytes leave, and when all is done, is what it held before."""
+        ctl, api, clock = controller()
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        writes, seen = self.count_writes(ctl), []
+
+        async def at_send():
+            seen.append((list(writes), self.on_file(ctl.ledger)))
+            clock.ms += 5  # (each answer takes a moment)
+        api.before = at_send
+        self.assertEqual(await ctl.place_pair(c), "")
+        pair = ctl.ledger.rows[c["slug"]]
+        self.assertEqual(writes, ["save", "save", "save"], "one write before the orders, one with each answer")
+        before, file = seen[0]
+        self.assertEqual((before, list(file)), (["save"], [c["slug"]]), "the first order leaves with the pair on file — written once")
+        self.assertEqual({side: (o["state"], o["hash"], bool(o["body"]["data"]["order"]["signature"])) for side, o in file[c["slug"]]["orders"].items()},
+                         {side: ("placing", o["hash"], True) for side, o in pair["orders"].items()}, "both hashes durable before either POST, the orders marked as going out")
+        self.assertEqual((file[c["slug"]]["phase"], "placed_ms" in file[c["slug"]]), ("active", False))
+        self.assertEqual(({o["state"] for o in pair["orders"].values()}, pair["placed_ms"]), ({"open"}, clock.ms), "the moment it was placed: its last answer's")
+        self.assertEqual(self.on_file(ctl.ledger), {c["slug"]: pair}, "on file as in memory, the moment included")
+        self.assertEqual(len(api.sent), 2)
+        await self.finish(ctl)
+        # a side that stays unconfirmed: no moment of placement is claimed before the other's answer says the pair has an order out
+        for case in ("unknown", "rejected"):
+            ctl, api, clock = controller()
+            c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+            writes = self.count_writes(ctl)
+            if case == "unknown":
+                api.fail_side = 2
+            else:
+                api.reject_side = 2
+            await ctl.place_pair(c)
+            pair = ctl.ledger.rows[c["slug"]]
+            self.assertEqual(writes[:3], ["save", "save", "save"], case)
+            self.assertEqual(pair.get("placed_ms"), clock.ms, "one side is open: placed")
+            self.assertEqual(self.on_file(ctl.ledger)[c["slug"]], pair)
+            await self.finish(ctl)
+        # a gate that refuses the pair before any request: saved once as the gate left it (one side not sent, the other never
+        # tried), then gone — nothing of it was ever sent; it was written twice before that
+        ctl, api, clock = controller()
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        writes, last = self.count_writes(ctl), []
+        gone = ctl.ledger.delete
+        ctl.ledger.delete = lambda slug: (last.append(self.on_file(ctl.ledger)), gone(slug))[1]
+        plain_gate, ctl.before_send = ctl.before_send, lambda body: "测试：闸门不放行"
+        self.assertEqual(await ctl.place_pair(c), "")
+        self.assertEqual((writes, api.sent, c["slug"] in ctl.ledger.rows, ctl.error), (["save", "delete"], [], False, "测试：闸门不放行"))
+        self.assertEqual(({side: o["state"] for side, o in last[0][c["slug"]]["orders"].items()}, last[0][c["slug"]]["phase"]), ({"up": "not_sent", "down": "prepared"}, "closing"))
+        self.assertEqual(self.on_file(ctl.ledger), {})
+        # ...and a gate that fails: the pair is on file as it was held (prepared: never sent), as its first write left it before
+        ctl.before_send = plain_gate
+        del writes[:]
+
+        def broken(body):
+            raise RuntimeError("the gate itself failed")
+        ctl.before_send = broken
+        with self.assertRaises(RuntimeError):
+            await ctl.place_pair(c)
+        self.assertEqual((writes, api.sent), (["save"], []))
+        self.assertEqual({o["state"] for o in self.on_file(ctl.ledger)[c["slug"]]["orders"].values()}, {"prepared"})
+        self.assertIs(ctl.ledger.holder(next(iter(ctl.ledger.rows[c["slug"]]["orders"].values()))["hash"]), ctl.ledger.rows[c["slug"]])
+        await self.finish(ctl)
+
+    async def test_a_start_with_other_settings_saves_its_pairs_a_thousand_a_transaction(self):
+        """1.154.42 — a start with another cancel time, or another price or size at a level, saved every resting pair by itself:
+        12,000 commits in one stretch of the event loop at production's size, each a wait for the disk — 3.6 s on a fast disk,
+        half a minute and more at 2 ms a commit, the whole bot standing still (a setting changed on the control page is such
+        a start). A transaction a thousand records now; the records, and the file, as before."""
+        with tempfile.TemporaryDirectory() as folder:
+            db = {"STATE_DB": str(Path(folder) / "state.sqlite3")}
+            ctl, api, clock = controller(**db)
+            pairs = await self.book_of(ctl, api, 2300)
+            old = ctl.ledger.rows[pairs[7]["slug"]]  # a record from before 1.128.0: its price and size are read off its orders at a start
+            del old["price"], old["shares"]
+            ctl.ledger.save(old)
+            ctl.ledger.close()
+            # another cancel time: every pair is taken over with it
+            ctl2, _, _ = controller(PREOPEN_CANCEL_SECONDS="30", **db)
+            writes = self.count_writes(ctl2)
+            ctl2.adopt()
+            self.assertEqual((ctl2.resumed, writes), (2300, [("save_many", 1000), ("save_many", 1000), ("save_many", 300)]))
+            self.assertTrue(all(x["cancel_ms"] == x["start_ms"] - 30_000 and x["phase"] == "active" for x in ctl2.ledger.rows.values()))
+            self.assertEqual((ctl2.ledger.rows[pairs[7]["slug"]]["price"], ctl2.ledger.rows[pairs[7]["slug"]]["shares"]), ("0.49", "50"), "(written once, with both changes)")
+            self.assertEqual(self.on_file(ctl2.ledger), ctl2.ledger.rows, "the file has every record as the start left it")
+            self.assertEqual(list(ctl2.ledger.rows), [pair["slug"] for pair in pairs], "the records in their order, as before")
+            del writes[:]
+            ctl2.adopt()
+            self.assertEqual(writes, [], "the settings as they are: nothing to write (1.154.20)")
+            ctl2.ledger.close()
+            # another size: none is what the settings say — every pair withdrawn to be quoted again, saved the same way
+            ctl3, _, _ = controller(PREOPEN_CANCEL_SECONDS="30", PREOPEN_SHARES="20", **db)
+            writes = self.count_writes(ctl3)
+            ctl3.adopt()
+            self.assertEqual((ctl3.resumed, writes), (0, [("save_many", 1000), ("save_many", 1000), ("save_many", 300)]))
+            self.assertEqual({(x["phase"], x["reason"], x["free"], x["retry_ms"]) for x in ctl3.ledger.rows.values()}, {("closing", "设置不同，撤掉后重新报价", True, 0)})
+            self.assertEqual(self.on_file(ctl3.ledger), ctl3.ledger.rows)
+            self.assertEqual(len(ctl3.ledger.pending()), 2300)
+            ctl3.ledger.close()
+            # a record that cannot be judged stops the start, as before — and what was changed before it is on file all the same
+            ctl4, _, _ = controller(PREOPEN_CANCEL_SECONDS="45", **db)
+            for x in ctl4.ledger.rows.values():
+                x.update(phase="active")
+                x.pop("reason", None)
+            ctl4.ledger.save_many(list(ctl4.ledger.rows.values()))
+            del ctl4.ledger.rows[pairs[1500]["slug"]]["start_ms"]
+            writes = self.count_writes(ctl4)
+            with self.assertRaises(KeyError):
+                ctl4.adopt()
+            self.assertEqual(writes, [("save_many", 1000), ("save_many", 500)])
+            file = self.on_file(ctl4.ledger)
+            self.assertTrue(all(file[pair["slug"]]["cancel_ms"] == pair["start_ms"] - 45_000 for pair in pairs[:1500]))
+            self.assertTrue(all(file[pair["slug"]]["cancel_ms"] == pair["start_ms"] - 30_000 for pair in pairs[1501:]))
+            ctl4.ledger.close()
+
+    async def test_a_snapshots_fills_are_one_write(self):
+        """1.154.42: the fills an account snapshot shows were saved a commit a pair, under the account's lock, on the event loop."""
+        ctl, api, clock = controller()
+        pairs = await self.book_of(ctl, api, 30)
+        for row in api.rows.values():  # (the account's list names each order's money)
+            row["order"].update(makerAmount=str(L.to_wei(24.5)), side=0)
+        for k in (3, 4, 11, 29):  # four pairs' Up orders partly filled since
+            api.rows[pairs[k]["orders"]["up"]["hash"]]["amountFilled"] = "20"
+        writes = self.count_writes(ctl)
+        await ctl.account()
+        self.assertEqual(writes, [("save_many", 4)])
+        self.assertEqual([pair["orders"]["up"]["filled"] > 0 for pair in pairs].count(True), 4)
+        self.assertEqual(self.on_file(ctl.ledger), ctl.ledger.rows, "each fill on file with its pair")
+        del writes[:]
+        await ctl.account()
+        self.assertEqual(writes, [("save_many", 0)], "nothing new: an empty write is none")
+        # a row that cannot be read stops the snapshot, as before — the fills applied before it are saved
+        api.rows[pairs[5]["orders"]["up"]["hash"]]["amountFilled"] = "30"
+        api.rows[pairs[20]["orders"]["up"]["hash"]]["amountFilled"] = "30"
+        plain = ctl.apply_fill
+
+        def apply(order, row, pair):
+            if pair is pairs[12]:
+                raise m.RemoteError("这一行读不懂")
+            return plain(order, row, pair)
+        ctl.apply_fill = apply
+        del writes[:]
+        with self.assertRaises(m.RemoteError):
+            await ctl.account()
+        self.assertEqual(writes, [("save_many", 1)])
+        file = self.on_file(ctl.ledger)
+        self.assertTrue(file[pairs[5]["slug"]]["orders"]["up"]["filled"] > pairs[4]["orders"]["up"]["filled"] > 0 and file[pairs[20]["slug"]]["orders"]["up"]["filled"] == 0)
+        await self.finish(ctl)
+
+    async def test_records_step_aside_together(self):
+        """1.154.42: a window quoted again renames each of its levels' records (the record and the attempt: one key each) — a
+        commit a level, seven back to back. One transaction now (Ledger.rename_many), the records where one rename after
+        another leaves them; and a record held (Ledger.hold) is among the records, in every index, with nothing written."""
+        def filled(path=":memory:"):
+            ledger = p.Ledger(path)
+            for n in range(12):
+                ledger.save({"slug": f"w{n // 4}#{n % 4}", "key": "BTC-15M", "window": f"w{n // 4}", "level": n % 4, "attempt": n % 3, "phase": "closed", "accounted": bool(n % 2),
+                             "start_ms": NOW + n, "market_id": str(700 + n // 4), "name": f"w{n // 4}", "pnl": 0.0,
+                             "orders": {side: {"hash": f"0x{n}{side}", "id": f"{n}{side[0]}", "state": "final", "filled": 0.0, "index_set": 1 + (side == "up"),
+                                               "body": {"data": {"order": {"tokenId": f"{n}{side}"}}}} for side in ("up", "down")}})
+            return ledger
+        indexes = lambda ledger: {name: copy.deepcopy(getattr(ledger, name)) for name in ("by_hash", "tries", "tries_key", "ids", "hashes", "windows", "markets", "tokens", "market_name",
+                                                                                               "token_name", "scored_day")} | {
+            "working": list(ledger.working), "struck": list(ledger.struck), "unsure": list(ledger.unsure), "filled": list(ledger.filled),
+            "order": [slug for slug, _ in sorted(ledger.seq.items(), key=lambda kv: kv[1])]}
+        one, many = filled(), filled()
+        moves = [(f"w1#{k}", f"w1#{k}@{one.rows[f'w1#{k}']['attempt']}") for k in (2, 0, 3)]
+        for slug, new in moves:
+            one.rename(slug, new)
+        before = many.conn.total_changes
+        many.rename_many(moves)
+        self.assertEqual(list(many.rows), list(one.rows))
+        self.assertEqual(many.rows, one.rows)
+        self.assertEqual(self.on_file(many), self.on_file(one))
+        self.assertEqual([slug for slug, in many.conn.execute("SELECT slug FROM pairs ORDER BY rowid")], [slug for slug, in one.conn.execute("SELECT slug FROM pairs ORDER BY rowid")])
+        self.assertEqual(indexes(many), indexes(one))
+        self.assertTrue(many.in_step() and all(many.rows[new]["slug"] == new for _, new in moves) and many.conn.total_changes - before == 6)
+        many.rename_many([])
+        # a write that fails leaves the records where they were (on disk first)
+        with self.assertRaises(KeyError):
+            many.rename_many([("w0#0", "w0#0@0"), ("no-such-record", "x")])
+        self.assertTrue("w0#0" in many.rows and "w0#0@0" not in many.rows and "w0#0" in self.on_file(many) and many.in_step())
+        # held: among the records and in the indexes, not on file until its save
+        row = {"slug": "held#0", "key": "BTC-15M", "window": "held", "level": 0, "attempt": 0, "phase": "active", "start_ms": NOW + 99, "market_id": "799", "name": "held",
+               "orders": {"up": {"hash": "0xheldup", "id": "", "state": "prepared", "filled": 0.0, "index_set": 2, "body": {"data": {"order": {"tokenId": "hu"}}}}}}
+        many.hold(row)
+        self.assertIs(many.holder("0xheldup"), row)
+        self.assertTrue(many.rows["held#0"] is row and row in many.pending() and many.in_step() and "held#0" not in self.on_file(many) and "799" in many.market_names()[0])
+        twin = filled()
+        twin.rename_many(moves)
+        twin.save(copy.deepcopy(row))
+        many.save(row)
+        self.assertEqual((self.on_file(many), indexes(many)), (self.on_file(twin), indexes(twin)), "held and then saved: as saved at once")
+        for ledger in (one, many, twin):
+            ledger.close()
+        # ...and through the controller: a withdrawn window's seven levels step aside in one write when it is quoted again
+        ctl, api, clock = controller(PREOPEN_LEVELS="48x50,47x50,46x50,45x50,44x50,43x50")
+        c = p.candidate(market(), NOW, ctl.owner.config, ctl.settings)
+        wanted = [(c["slug"] + (f"#{n}" if n else ""), n, price, shares) for n, (price, shares) in enumerate(ctl.settings.levels_for("BTC-15M"))]
+        self.assertEqual(len(wanted), 7)
+        for key, level, price, shares in wanted:
+            ctl.ledger.save({**c, "slug": key, "window": c["slug"], "level": level, "attempt": 2, "price": str(price), "shares": str(shares), "phase": "closed", "accounted": True,
+                             "free": True, "orders": {}})
+        writes = self.count_writes(ctl)
+        st = {"found": 0}
+        ctl.enqueue({**market(), "_from": "category"}, c["slug"], wanted, {key: 3 for key, *_ in wanted}, st)
+        self.assertEqual((writes, ctl.requoted, st["found"], ctl.queue.qsize()), ([("rename_many", 7)], 7, 7, 7))
+        self.assertEqual(sorted(ctl.ledger.rows), sorted(f"{key}@2" for key, *_ in wanted))
+        self.assertEqual(self.on_file(ctl.ledger), ctl.ledger.rows)
+        del writes[:]
+        ctl.enqueue({**market(), "_from": "category"}, c["slug"], wanted, {key: 3 for key, *_ in wanted}, st)
+        self.assertEqual(writes, [("rename_many", 0)], "nothing in the way: nothing moved")
+        await self.finish(ctl)
 
     async def test_the_fresh_listings_client_is_kept_signed_in(self):
         """1.154.33 (an outside review, CR-10) — a fresh listing's orders go out on a client of their own (first_api, 1.154.21), and
