@@ -424,6 +424,72 @@ class KeyTests(unittest.IsolatedAsyncioTestCase):
         finally:
             m._http_get = real_get
 
+    async def test_the_feeds_read_waits_on_the_idle_key_when_its_own_has_no_token_either(self):
+        """1.154.47 — 11-25: Predict 盘口 "上一轮失败…用时 300.0s", 盘口 1 read a minute, 盘口借用 none. A read of the feed's is a low
+        one: on the bot's key, at its pace on the trader's orders, the bucket never holds the three it needs; and it went to
+        the idle key only if three stood there the moment it asked — the pre-open mode's overflow took each as it came. With
+        no token to spare on either, it now waits on the idle key."""
+        # (PREDICT_RATE_PER_MIN: a feed sets the keys' pace as it is made — a token every ten seconds, so a bucket set by hand stays as set)
+        feed = m.PredictFeed(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "PREDICT_RATE_PER_MIN": "6", **KEYS}))
+        why = [""]
+        feed.lend = types.SimpleNamespace(key=lambda: "rule-key", why=lambda: why[0], refused=lambda until, limited=True: None)
+        sent = []
+
+        def fake_get(url, payload=None, timeout=15, headers=None):
+            sent.append((headers or {}).get("x-api-key"))
+            return b"{}"
+        real_get, m._http_get = m._http_get, fake_get
+        url = m.PREDICT_REST + "/markets/1/orderbook"
+
+        async def asked(seconds: float = 0.05):
+            task = asyncio.ensure_future(feed.fetch(url))
+            await asyncio.sleep(seconds)
+            return task
+        try:
+            # neither key has a token to spare (a token every ten seconds here): the read is the idle key's to wait for
+            main, rule = bucket("main-key", 0.0), bucket("rule-key", 0.5)
+            task = await asked()
+            self.assertEqual((sent, task.done(), main.waited, feed.lent_last()), ([], False, 0.0, 1), "waiting — and not on the bot's key")
+            self.assertGreater(rule.waited, 0)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            # the bot's key with one to spare, the idle key without: the bot's key, at once (as before)
+            main, rule = bucket("main-key", 4.0), bucket("rule-key", 0.5)
+            was = rule.waited
+            self.assertEqual(await feed.fetch(url), {})
+            self.assertEqual((sent, rule.waited, main.waited, feed.lent_last()), (["main-key"], was, 0.0, 1))
+            # the rule taker needs its key: the feed's own, where it waits as it always did
+            sent.clear()
+            why[0] = "规则吃单正在用"
+            main, rule = bucket("main-key", 0.0), bucket("rule-key", 8.0)
+            task = await asked()
+            self.assertTrue(sent == [] and not task.done() and main.waited > 0 and rule.waited == was and feed.lent_last() == 1)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            why[0] = ""
+            # ...and it is answered there: the bot's key deep in debt to its orders (a hundred tokens a second here, three seconds'
+            # worth owed), the idle key empty — twenty reads of the feed's, every one through on the idle key well within a second
+            m.PREDICT_RATE["per_min"] = 6000.0
+            bucket("main-key", -300.0), bucket("rule-key", 0.0)
+            began = time.monotonic()
+            self.assertEqual(await asyncio.wait_for(asyncio.gather(*(feed.fetch(url) for _ in range(20))), 2.0), [{}] * 20)
+            self.assertTrue(sent == ["rule-key"] * 20 and time.monotonic() - began < 1.5 and feed.lent_last() == 21, (sent, time.monotonic() - began))
+            self.assertLess(m.predict_pacer("main-key").tokens, 0, "the bot's key gave none of them")
+            # the key taken back while a read waits for its token there (the rule taker needs it within minutes; or it answered a
+            # borrower with its limit): nothing goes out on it — the read is the feed's own key's, and the token is put back
+            sent.clear()
+            m.PREDICT_RATE["per_min"] = 600.0  # (ten tokens a second: the idle key holds its three in 0.2 s, the bot's key in 0.4)
+            bucket("main-key", -1.0), bucket("rule-key", 1.0)
+            task = await asked(0.02)
+            self.assertTrue(sent == [] and not task.done())
+            why[0] = "规则吃单 4 分钟后要用"
+            self.assertEqual(await asyncio.wait_for(task, 2.0), {})
+            self.assertEqual(sent, ["main-key"])
+            self.assertGreaterEqual(m.predict_pacer("rule-key").tokens, 2.9, "its token put back")
+            why[0] = ""
+        finally:
+            m._http_get = real_get
+
     async def test_diag_says_how_hard_each_key_is_pressed(self):
         cfg = m.Config.from_env({"TELEGRAM_BOT_TOKEN": "1:x", "LIVE": "on", "PREDICT_PRIVATE_KEY": "0x" + "a" * 64, **KEYS})
         bot = L.LiveBot(cfg, m.Store(":memory:"), types.SimpleNamespace(now_ms=lambda: T.NOW, config=None), None)
