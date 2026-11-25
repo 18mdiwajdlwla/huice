@@ -287,9 +287,31 @@ class KeyTests(unittest.IsolatedAsyncioTestCase):
         # the account snapshot: read on the idle key (behind what else is borrowed there) when the rule taker leaves it long enough
         ctl.account_pages = 242  # 121 s of pages, a minute's margin, and the five minutes
         need = p.LEND_BEFORE_MS + int(242 * p.LEND_PAGE_S * 1000) + 60_000
+        # 1.154.48 — but the first one of a start on the mode's own key, whatever the idle key holds: nothing is placed before it
+        self.assertEqual(ctl.snapshots_done, 0)
+        busy[0] = None
+        self.assertIs(ctl.snapshot_lane(), api)
+        self.assertIn("启动后的第一份", ctl.snapshot_where)
+        ctl.snapshots_done = 1
         for ms, there in ((need + 1, True), (need, False), (None, True)):
             busy[0] = ms
             self.assertIs(ctl.snapshot_lane(), lent if there else api, ms)
+        self.assertEqual(ctl.snapshot_where, "在借来的 Key 上读")
+        # ...and not while that key is the others' (11-25 20:49: 原策略借用 134 次、盘口借用 71 次 of its 220 a minute — the snapshot's
+        # 246 pages last of all there, 暂不新挂：账户快照过期): all its pacer let through in the last minute, less this mode's own there
+        rule, now = m.predict_pacer("rule-key"), time.monotonic()
+        allowed, mine = int(m.PREDICT_RATE["per_min"] * p.LEND_SNAPSHOT_OTHERS), ctl.lent_last()
+        kept_sent = list(rule.sent)
+        rule.sent.clear()
+        rule.sent.extend([now] * (mine + allowed + 1))  # this mode's own requests there, and one more of the others' than the share allows
+        self.assertEqual(ctl.lent_others(lent), allowed + 1)
+        self.assertIs(ctl.snapshot_lane(), api)
+        self.assertIn(f"别处用了 {allowed + 1} 次", ctl.snapshot_where)
+        rule.sent.pop()  # within the share: there again (what this mode itself sent there is not the others')
+        self.assertEqual(ctl.lent_others(lent), allowed)
+        self.assertIs(ctl.snapshot_lane(), lent)
+        rule.sent.clear(); rule.sent.extend(kept_sent)
+        self.assertIs(ctl.snapshot_lane(), lent)
         lent.rows.update(copy.deepcopy(api.rows))  # (one account behind both clients)
         before = ctl.lent_last()
         await ctl.account()
@@ -313,6 +335,29 @@ class KeyTests(unittest.IsolatedAsyncioTestCase):
             p.LEND_YIELD_MIN_S = kept_min
         self.assertEqual((seen_leave, lent.leave), ([p.LEND_SNAPSHOT_LEAVE, 0.0], p.LEND_SNAPSHOT_LEAVE))
         ctl.account_pages = 242
+
+        # 1.154.48: a read begun there that does not end within half the snapshot's own pace (its pages behind everyone else's on
+        # that key) is given up: the whole read on the mode's own key, and the next ones too for LEND_OFF_S
+        async def never(status="OPEN"):
+            await asyncio.sleep(3600)
+        lent.orders = never
+        kept_floor, p.LEND_SNAPSHOT_MIN_S, ctl.account_pages = p.LEND_SNAPSHOT_MIN_S, 0.05, 0
+        own_reads, at = len(api.sent), ctl.account_at
+        try:
+            began = time.monotonic()
+            await ctl.account()
+        finally:
+            p.LEND_SNAPSHOT_MIN_S = kept_floor
+        self.assertTrue(0.05 <= time.monotonic() - began < 2.0 and ctl.account_at and ctl.snapshots_done >= 3, (time.monotonic() - began, ctl.snapshots_done))
+        self.assertEqual(sorted(r["id"] for r in ctl.account_rows), sorted(r["id"] for r in api.rows.values() if r["status"] == "OPEN"), "read whole, on its own key")
+        self.assertIn("中途改回", ctl.snapshot_where)
+        ctl.account_pages = 242
+        lent.orders = real_orders
+        self.assertIs(ctl.snapshot_lane(), api)
+        self.assertIn("读得太慢", ctl.snapshot_where)
+        ctl.lent_snapshot_slow = time.monotonic() - p.LEND_OFF_S - 1
+        self.assertIs(ctl.snapshot_lane(), lent)
+        self.assertEqual(lent.leave, p.LEND_SNAPSHOT_LEAVE, "the mark back for the next read there")
 
         async def no_orders(status="OPEN"):
             raise m.RemoteError("HTTP 429: Too Many Requests")
