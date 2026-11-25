@@ -78,6 +78,14 @@ LEND_PAGE_S = 0.5             # ...and a snapshot read is begun on it only with 
 LEND_SNAPSHOT_LEAVE = 2.0     # ...its pages leaving this many tokens more than the placements and reads borrowed there (PredictApi.leave): those go first
 LEND_YIELD_MIN_S = 20.0       # ...but for half the read's own pace at the most (this at least): then beside them, so a backlog borrowing on and on never keeps it from finishing
 LEND_OFF_S = 600.0            # after that key refused a request (a 429, a 401 / 403) nothing more goes out on it for this long
+# 1.154.48 — that key is no longer this mode's alone to borrow: the model trader's reads go there when the bot's key keeps them
+# waiting (1.154.45) and the orderbook feed's wait there (1.154.47), both ahead of this mode's. 11-25 20:49: 原策略借用 134 次、
+# 盘口借用 71 次、预挂借用 1 次 of the key's 220 a minute — and the account snapshot, begun there because the key was "idle",
+# got its 246 pages at a few a minute behind them: 暂不新挂：账户快照过期（1205 秒前读到）, every new listing held
+LEND_SNAPSHOT_OTHERS = 0.25   # a snapshot is begun on that key only while the others' requests there in the last minute are under this share of its pace
+LEND_SNAPSHOT_MIN_S = 40.0    # ...and one begun there is given up once it has taken half the snapshot's own pace (ACCOUNT_PAGE_S a page; this at
+#                               least): read on this mode's own key instead — where its pages go ahead of the mode's other reads (snap_api) —
+#                               and no snapshot on that key for LEND_OFF_S
 LEND_WARM_S = 60.0            # the sign-in on that key is kept fresh this often while it may be borrowed
 FIRST_WARM_S = 60.0           # ...and the fresh listings' client's (first_keep_warm, 1.154.33)
 GIVE_WAY_MAX_S = 20.0     # 1.154.23: what waits for the rule taker's seconds (Controller.yielding) waits no longer than this
@@ -1980,6 +1988,8 @@ class Controller:
             self.lent_snap_api.leave = LEND_SNAPSHOT_LEAVE
         self.lent_made = self.lent_api  # (the tests put their own in: used whatever the api)
         self.lent_at: collections.deque = collections.deque(maxlen=4096)  # monotonic times of the requests that went out on the borrowed key (lent_last)
+        self.lent_snapshot_slow = -1e9  # monotonic: when a snapshot begun on the borrowed key was last given up as too slow there (snapshot_lane)
+        self.snapshot_where = ""        # where the last snapshot was read, and why there (the status)
         self.lent_warm: asyncio.Task | None = None  # the sign-in on that key, kept fresh while it may be borrowed (lent_keep_warm)
         self.lent_warmed = -1e9
         self.lent_warm_error = ""  # why this mode's sign-in on that key last failed (tried again LEND_WARM_S on; the orderbook feed needs none and borrows on)
@@ -2284,11 +2294,40 @@ class Controller:
     def snapshot_lane(self) -> Any:
         """The client the next account snapshot is read through (1.154.21): the borrowed key's while that key may be borrowed
         for as long as the read takes — its pages (LEND_PAGE_S each, as the last read counted them) done LEND_BEFORE_MS before
-        the rule taker needs the key — else this mode's own (snapshot_client)."""
+        the rule taker needs the key — else this mode's own (snapshot_client).
+
+        1.154.48 — and only while that key is not the others' meanwhile. Every placement waits on this read (a snapshot too
+        old holds them all: 暂不新挂), and on the borrowed key its pages go last of all — behind the rule taker's own
+        requests, the model trader's reads (a whole token each) and the orderbook feed's waiting ones. So: the first snapshot
+        of a start on this mode's own key (the page count is not known yet, and nothing is placed before it); none there
+        within LEND_OFF_S of one given up there as too slow (account); and none while the others' requests on that key in
+        the last minute — all it let through, less this mode's own — pass LEND_SNAPSHOT_OTHERS of its pace."""
+        own = self.snapshot_client()
         if self.borrow_why(int(self.account_pages * LEND_PAGE_S * 1000) + 60_000):
-            return self.snapshot_client()
+            self.snapshot_where = ""
+            return own
         lent = self.lent_snap_api if self.lent_api is self.lent_made and self.lent_snap_api is not None else self.lent_api
-        return lent if getattr(lent, "jwt", "signed") else self.snapshot_client()
+        if not getattr(lent, "jwt", "signed"):
+            self.snapshot_where = ""
+            return own
+        if not self.snapshots_done:
+            self.snapshot_where = "在预挂自己的 Key 上读（启动后的第一份）"
+            return own
+        if time.monotonic() - self.lent_snapshot_slow < LEND_OFF_S:
+            self.snapshot_where = "在预挂自己的 Key 上读（上次在借来的 Key 上读得太慢）"
+            return own
+        others, limit = self.lent_others(lent), core.PREDICT_RATE["per_min"] * LEND_SNAPSHOT_OTHERS
+        if core.PREDICT_PACING and limit > 0 and others > limit:
+            self.snapshot_where = f"在预挂自己的 Key 上读（借来的 Key 最近一分钟别处用了 {others} 次）"
+            return own
+        self.snapshot_where = "在借来的 Key 上读"
+        return lent
+
+    def lent_others(self, lent: Any) -> int:
+        """The requests the others made on the borrowed key in the last minute: all its pacer let through (core.PredictPacer:
+        the rule taker's own, the model trader's reads, the orderbook feed's, this mode's) less this mode's own there."""
+        key = str(getattr(lent, "api_key", "") or "")
+        return max(0, core.predict_pacer(key).last_minute() - self.lent_last()) if key else 0
 
     def first_snapshot_pending(self) -> bool:
         """Whether the first account snapshot since the start is still to come (1.154.8): every placement waits for it (hold), so
@@ -2491,6 +2530,18 @@ class Controller:
             if lent is not None and getattr(lent, "leave", 0.0):
                 yielding = asyncio.get_running_loop().call_later(max(LEND_YIELD_MIN_S, self.account_pages * ACCOUNT_PAGE_S / 2), lambda: setattr(lent, "leave", 0.0))
             try:
+                if lent is None:
+                    rows = await client.orders("OPEN")
+                else:
+                    # 1.154.48: on the borrowed key for half the snapshot's own pace at the most — its pages wait there behind
+                    # everyone else's, and a read that does not end leaves every placement held
+                    rows = await asyncio.wait_for(client.orders("OPEN"), max(LEND_SNAPSHOT_MIN_S, self.account_pages * ACCOUNT_PAGE_S / 2))
+            except asyncio.TimeoutError:
+                if lent is None:
+                    raise
+                self.lent_snapshot_slow = time.monotonic()
+                self.snapshot_where = "在预挂自己的 Key 上读（这次在借来的 Key 上读得太慢，中途改回）"
+                client = self.snapshot_client()  # too slow there: the whole read on the mode's own, and the next ones too for a while
                 rows = await client.orders("OPEN")
             except Exception as error:
                 if lent is None or not self.lent_refused(error):
@@ -3977,7 +4028,8 @@ class Controller:
                 + (f"\n请求约 {self.request_rate():.1f} 次/秒（最近一分钟）；" if self.request_rate() is not None else "\n")
                 + self.pace_line()
                 + f"账户快照每 {self.account_interval_s():.0f} 秒（{self.account_pages} 页挂单" + self.page_rows_note()
-                + (f"，上次读了 {self.account_read_s:.0f} 秒" if self.account_read_s >= 1 else "") + "）"
+                + (f"，上次读了 {self.account_read_s:.0f} 秒" if self.account_read_s >= 1 else "")
+                + (f"，{self.snapshot_where}" if self.snapshot_where else "") + "）"
                 + f"\n扫描：{self.scan_note or '还没扫过'}（发布探测每 {LISTING_PROBE_S:g} 秒，预计发布前后每 {FAST_POLL_S:g} 秒；"
                 + ("分类应答自带下单字段，发现即下单" if self.category_full else "分类应答不带下单字段，每场多读一次详情" if self.category_full is False else "还没读过发布")
                 + (f"；冲刺中：{'、'.join(sorted(k for k, t in self.awaiting.items() if 0 <= self.now() - t <= LISTING_LATE_MS))} 的下一场已进范围、等发布"
