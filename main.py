@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.50"
+VERSION = "1.154.51"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -9860,24 +9860,24 @@ TALLY_RUN_NAMES = ("前面没有连续", "连 1 场", "连 2 场", "连 3 场", 
 TALLY_RUN_DOUBLE = 3  # 预挂按前面连涨 / 连跌: the run the user's doubling rule starts at ("连续涨 3 把，下一把预挂的就翻倍")
 
 
-def tally_streaks(rows: list[dict], fills: list[dict]) -> dict:
-    """预挂按前面连涨 / 连跌的场数 (1.154.38; the user: "连续涨 3 把，下一把预挂的就翻倍……连续涨跌的次数越多就赚的越多"): the
-    pre-open mode's filled windows of the card in the range (``fills`` as tally_fills takes them), by the run of ups or downs
-    right before each — as tally_follow counts it: adjacent windows both up or down, a tie, a missing candle or a closed
-    market between breaks it (0), 1, 2, 3, 4+ — each group's shares, what they were worth at the order against a coin toss
-    ((0.5 − price) a share, preopen.ev_line's way), what they made (Predict's result where the ledger holds it, else the
-    candles'), the gap in the σ of the unhedged shares, the one-sided windows' wins against their mean price (the share a
-    side must win to pay) — those filled on the run's side (with it) and on the other (against it) apart — and the hedged.
-    Then the doubling rule's windows (a run of TALLY_RUN_DOUBLE or more before) against the rest, a share each: doubling pays
-    only if a share there makes more than elsewhere; within 2σ of the rest it is the same bet at twice the size."""
-    by_start = {r["s"]: r for r in rows}
-    before: dict[int, tuple[str, int]] = {}  # a window's start -> (the run's side, its length, 4 = 4+), ("", 0) for none
+def tally_runs(rows: list[dict]) -> dict[int, tuple[str, int]]:
+    """A window's start -> the run right before it: (the run's side u / d, its length, 4 = 4 or more), ("", 0) for none — as
+    tally_follow counts it: adjacent windows both up or down; a tie, a missing candle or a closed market between breaks it."""
+    before: dict[int, tuple[str, int]] = {}
     prev, run = None, 0
     for r in rows:
         linked = prev is not None and prev["r"] in ("u", "d") and r["s"] == prev["e"]
         before[r["s"]] = (prev["r"], min(run, 4)) if linked else ("", 0)
         run = (run + 1 if linked and r["r"] == prev["r"] else 1) if r["r"] in ("u", "d") else 0
         prev = r
+    return before
+
+
+def tally_window_fills(rows: list[dict], fills: list[dict]) -> dict[int, dict]:
+    """The pre-open mode's fills (``fills`` as tally_fills takes them) a window of ``rows``: start -> {up, down: the shares, parts:
+    its records, result: Predict's where a record keeps it, o: the outcome u / d / s — Predict's, else the candles' — or "" while
+    neither says; what the fills cost and were worth against a coin toss (ev), and once the outcome is known what they made (pnl)}."""
+    by_start = {r["s"]: r for r in rows}
     windows: dict[int, dict] = {}
     for f in fills:
         if f["s"] not in by_start or f["up"] + f["down"] <= 0:
@@ -9887,42 +9887,75 @@ def tally_streaks(rows: list[dict], fills: list[dict]) -> dict:
         w["down"] += f["down"]
         w["parts"].append(f)
         w["result"] = w["result"] or (f["result"] if f["result"] in ("u", "d", "s") else "")
-
-    def group(name: str) -> dict:
-        return {"name": name, "windows": 0, "shares": 0.0, "ev": 0.0, "pnl": 0.0, "var": 0.0, "both": {"n": 0, "pnl": 0.0},
-                "one": {"n": 0, "won": 0, "cost": 0.0, "shares": 0.0}, "with": {"n": 0, "won": 0}, "against": {"n": 0, "won": 0}}
-    groups = [group(name) for name in TALLY_RUN_NAMES]
-    double, rest = group(f"连 {TALLY_RUN_DOUBLE} 场以上合计"), group("其余合计")
-    pending = 0
     for s, w in windows.items():
         o = w["result"] or by_start[s]["r"]
-        if o not in ("u", "d", "s"):
+        w["o"] = o if o in ("u", "d", "s") else ""
+        w["cost"] = sum(f["price"] * (f["up"] + f["down"]) for f in w["parts"])
+        w["ev"] = sum((0.5 - f["price"]) * (f["up"] + f["down"]) for f in w["parts"])
+        payout = {"u": 1.0, "d": 0.0, "s": 0.5}.get(w["o"])
+        w["pnl"] = sum((payout - f["price"]) * f["up"] + ((1 - payout) - f["price"]) * f["down"] for f in w["parts"]) if payout is not None else None
+    return windows
+
+
+def tally_streak_group(name: str) -> dict:
+    return {"name": name, "windows": 0, "shares": 0.0, "ev": 0.0, "pnl": 0.0, "var": 0.0, "both": {"n": 0, "pnl": 0.0},
+            "one": {"n": 0, "won": 0, "cost": 0.0, "shares": 0.0}, "with": {"n": 0, "won": 0}, "against": {"n": 0, "won": 0}}
+
+
+def tally_streak_sums(rows: list[dict], fills: list[dict]) -> dict:
+    """tally_streaks' sums before they are shown — {groups: one a run length (TALLY_RUN_NAMES), double, rest, pending} — so that
+    several cards' can be added up (tally_streak_add: /tally over every card, 1.154.51)."""
+    before = tally_runs(rows)
+    groups = [tally_streak_group(name) for name in TALLY_RUN_NAMES]
+    double, rest = tally_streak_group(f"连 {TALLY_RUN_DOUBLE} 场以上合计"), tally_streak_group("其余合计")
+    pending = 0
+    for s, w in tally_window_fills(rows, fills).items():
+        o = w["o"]
+        if not o:
             pending += 1  # neither Predict nor the candles say yet
             continue
         side_run, length = before[s]
-        payout = {"u": 1.0, "d": 0.0, "s": 0.5}[o]
-        pnl = sum((payout - f["price"]) * f["up"] + ((1 - payout) - f["price"]) * f["down"] for f in w["parts"])
-        ev = sum((0.5 - f["price"]) * (f["up"] + f["down"]) for f in w["parts"])
-        cost = sum(f["price"] * (f["up"] + f["down"]) for f in w["parts"])
         for g in (groups[length], double if length >= TALLY_RUN_DOUBLE else rest):
             g["windows"] += 1
             g["shares"] += w["up"] + w["down"]
-            g["ev"] += ev
-            g["pnl"] += pnl
+            g["ev"] += w["ev"]
+            g["pnl"] += w["pnl"]
             g["var"] += (w["up"] - w["down"]) ** 2 * 0.25  # the unhedged part, one coin toss (ev_line)
             if w["up"] > 0 and w["down"] > 0:
                 g["both"]["n"] += 1
-                g["both"]["pnl"] += pnl
+                g["both"]["pnl"] += w["pnl"]
             elif o in ("u", "d"):
                 side = "u" if w["up"] > 0 else "d"
                 g["one"]["n"] += 1
                 g["one"]["won"] += int(o == side)
-                g["one"]["cost"] += cost
+                g["one"]["cost"] += w["cost"]
                 g["one"]["shares"] += w["up"] + w["down"]
                 if side_run:
                     part = g["with" if side == side_run else "against"]
                     part["n"] += 1
                     part["won"] += int(o == side)
+    return {"groups": groups, "double": double, "rest": rest, "pending": pending}
+
+
+def tally_streak_add(total: dict | None, more: dict) -> dict:
+    """``more`` (tally_streak_sums) added into ``total`` (None: a fresh one): the same groups, their sums together."""
+    if total is None:
+        total = {"groups": [tally_streak_group(name) for name in TALLY_RUN_NAMES], "double": tally_streak_group(f"连 {TALLY_RUN_DOUBLE} 场以上合计"),
+                 "rest": tally_streak_group("其余合计"), "pending": 0}
+    for into, g in (*zip(total["groups"], more["groups"]), (total["double"], more["double"]), (total["rest"], more["rest"])):
+        for key in ("windows", "shares", "ev", "pnl", "var"):
+            into[key] += g[key]
+        for part, keys in (("both", ("n", "pnl")), ("one", ("n", "won", "cost", "shares")), ("with", ("n", "won")), ("against", ("n", "won"))):
+            for key in keys:
+                into[part][key] += g[part][key]
+    total["pending"] += more["pending"]
+    return total
+
+
+def tally_streak_view(sums: dict) -> dict:
+    """tally_streak_sums (one card's, or several added up) as the page and /tally show it: each group's figures rounded, its gap
+    in σ, the doubling rule's windows against the rest a share, and the reading."""
+    groups, double, rest = sums["groups"], sums["double"], sums["rest"]
 
     def shown(g: dict) -> dict:
         sigma = math.sqrt(g["var"]) if g["var"] > 1e-12 else 0.0
@@ -9931,7 +9964,7 @@ def tally_streaks(rows: list[dict], fills: list[dict]) -> dict:
                 "sigma": round(sigma, 4), "z": round((g["pnl"] - g["ev"]) / sigma, 2) if sigma > 0 else None,
                 "both": {"n": g["both"]["n"], "pnl": round(g["both"]["pnl"], 4)},
                 "one": {"n": one["n"], "won": one["won"], "price": round(one["cost"] / one["shares"], 4) if one["shares"] > 0 else None},
-                "with": g["with"], "against": g["against"]}
+                "with": dict(g["with"]), "against": dict(g["against"])}
     # the doubling rule's windows against the rest, a share each: under the coin toss each group's P&L a share has the variance of
     # its unhedged shares over its shares squared — the two apart, z of the difference
     rate = lambda g: g["pnl"] / g["shares"] if g["shares"] > 0 else None
@@ -9945,7 +9978,22 @@ def tally_streaks(rows: list[dict], fills: list[dict]) -> dict:
                             f"连 {TALLY_RUN_DOUBLE} 场以上和其余每份赚得差不多：翻倍只是把仓位放大，没有额外的优势")
     return {"groups": [shown(g) for g in groups], "double": shown(double), "rest": shown(rest), "z": z, "verdict": verdict,
             "rate_double": round(rate(double), 4) if rate(double) is not None else None, "rate_rest": round(rate(rest), 4) if rate(rest) is not None else None,
-            "pending": pending, "at": TALLY_RUN_DOUBLE}
+            "pending": sums["pending"], "at": TALLY_RUN_DOUBLE}
+
+
+def tally_streaks(rows: list[dict], fills: list[dict]) -> dict:
+    """预挂按前面连涨 / 连跌的场数 (1.154.38; the user: "连续涨 3 把，下一把预挂的就翻倍……连续涨跌的次数越多就赚的越多"): the
+    pre-open mode's filled windows of the card in the range (``fills`` as tally_fills takes them), by the run of ups or downs
+    right before each — as tally_follow counts it: adjacent windows both up or down, a tie, a missing candle or a closed
+    market between breaks it (0), 1, 2, 3, 4+ — each group's shares, what they were worth at the order against a coin toss
+    ((0.5 − price) a share, preopen.ev_line's way), what they made (Predict's result where the ledger holds it, else the
+    candles'), the gap in the σ of the unhedged shares, the one-sided windows' wins against their mean price (the share a
+    side must win to pay) — those filled on the run's side (with it) and on the other (against it) apart — and the hedged.
+    Then the doubling rule's windows (a run of TALLY_RUN_DOUBLE or more before) against the rest, a share each: doubling pays
+    only if a share there makes more than elsewhere; within 2σ of the rest it is the same bet at twice the size.
+    1.154.51: in two steps — the sums (tally_streak_sums), then what is shown of them (tally_streak_view) — so that /tally can
+    add several cards' sums up before the reading; one card's figures are what they were."""
+    return tally_streak_view(tally_streak_sums(rows, fills))
 
 
 def updown_odds(price: float, line: float, sigma: float, years: float, drift: float = -0.5,
@@ -18378,10 +18426,13 @@ class Telegram:
             SEND_CHECK.set(None)  # once the first part is out, the rest of the message follows it
 
     async def send_document(self, chat: int, thread: int, doc: "Document") -> None:
-        """A file to a chat (sendDocument, multipart): the model samples' CSV (/samples)."""
+        """A file to a chat (sendDocument, multipart): the model samples' CSV (/samples), the exports (/export). 1.154.51: one
+        over DOCUMENT_GZIP_BYTES goes gzipped (<name>.gz, said in the caption) — Telegram takes 50 MB from a bot, and a CSV
+        of every record can be past that; compressed off the event loop."""
+        doc = await document_fit(doc)
         fields = {"chat_id": str(chat), **({"message_thread_id": str(thread)} if thread else {}),
                   **({"caption": doc.caption[:1024]} if doc.caption else {})}
-        data = await http_multipart(self.root + "sendDocument", fields, {"document": (doc.filename, doc.data, doc.mime)}, 60)
+        data = await http_multipart(self.root + "sendDocument", fields, {"document": (doc.filename, doc.data, doc.mime)}, DOCUMENT_TIMEOUT_S)
         if not isinstance(data, dict) or not data.get("ok"):
             msg = data.get("description", "未知错误") if isinstance(data, dict) else "响应格式异常"
             raise RemoteError(f"Telegram: {clean_error(msg)}")
@@ -18511,6 +18562,10 @@ COMMANDS: tuple[Command, ...] = (
             "不带筛选是全部记录；/journal 海力士 吃 = SK 海力士 15 分钟的吃单"),
     Command("summary", "导出复盘汇总 CSV（每日汇总、今日按市场、按净优势 / 公平价 / 时段、按设置版本、15 分钟表、撤单原因、被拦下的机会）", "海力士",
             "筛选词和 /journal 一样"),
+    Command("export", "导出复盘数据（CSV 文件）：不带参数列出能导出什么；全部 / 日记 / 汇总 / 样本 / 预挂 / 规则 / 涨跌", "全部",
+            "/export 预挂 7d = 近 7 天开场、有成交的预挂记录和预挂统计表；/export 涨跌 btc 5分 30d；/export 全部 = 每样都发来"),
+    Command("tally", "市场涨跌统计：每场涨跌、跟随还是反转、预挂成交的那一边、预挂按前面连涨 / 连跌几场（连 3 场后翻倍值不值），附明细文件", "BTC-5M 7d",
+            "不写卡 = 全部卡合计；15分 = 所有 15 分钟卡；范围：今天、昨天、7d、30d、14天、2026-11-20 2026-11-25（默认 7 天）"),
     Command("markout", "成交后市场走向（文字）：全部 / 挂单 / 吃单，15 分钟市场再按下单时离结束的分钟数和窗口开始的整点分组", "海力士 挂",
             "筛选词和 /journal 一样；1 / 5 / 30 分钟后盘口中间价 − 成交价、模型公平价的变化，持续为负 = 挂单被信息领先的对手吃掉"),
     Command("market", "看 Predict 对一张卡当前市场的说法：市场号、类别类型、结果名称、状态、起点价（startPrice）、详情里和价格有关的字段，以及卡片定价用的起点", "btc15分涨跌"),
@@ -18604,6 +18659,24 @@ class Document:
     data: bytes
     caption: str = ""
     mime: str = "text/csv"
+
+
+DOCUMENT_GZIP_BYTES = 20_000_000  # a file larger than this is sent gzipped (Telegram takes 50 MB from a bot; an upload has DOCUMENT_TIMEOUT_S)
+DOCUMENT_MAX_BYTES = 49_000_000   # ...and one still larger than this once compressed is not sent
+DOCUMENT_TIMEOUT_S = 120
+
+
+async def document_fit(doc: Document) -> Document:
+    """``doc`` as Telegram takes it: itself, or gzipped when it is large (the caption says so); RemoteError when even that is
+    past what a bot may send."""
+    if len(doc.data) <= DOCUMENT_GZIP_BYTES or doc.filename.endswith(".gz"):
+        fit = doc
+    else:
+        packed = await _blocking(gzip.compress, doc.data, 6)
+        fit = Document(doc.filename + ".gz", packed, (doc.caption + f"｜文件大（{len(doc.data) / 1e6:.0f} MB），已压缩成 .gz，解压后就是原文件")[:1024], "application/gzip")
+    if len(fit.data) > DOCUMENT_MAX_BYTES:
+        raise RemoteError(f"{doc.filename} 压缩后还有 {len(fit.data) / 1e6:.0f} MB，超过 Telegram 机器人能发的 50 MB；加筛选或范围分几次导出")
+    return fit
 
 
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -18906,6 +18979,7 @@ class Bot:
             "/cooldown": self.cmd_cooldown, "/mode": self.cmd_mode, "/setclose": self.cmd_setclose,
             "/setexchange": self.cmd_setexchange, "/prob": self.cmd_prob, "/web": self.cmd_web, "/diag": self.cmd_diag, "/speed": self.cmd_speed, "/calib": self.cmd_calib, "/samples": self.cmd_samples,
             "/journal": self.cmd_journal, "/summary": self.cmd_summary, "/markout": self.cmd_markout, "/market": self.cmd_market,
+            "/export": self.cmd_export, "/tally": self.cmd_tally,
             "/book": self.cmd_book, "/sim": self.cmd_sim, "/edge": self.cmd_edge, "/live": self.cmd_live, "/preopen": self.cmd_preopen, "/rules": self.cmd_rules,
         }
 
@@ -19178,10 +19252,21 @@ class Bot:
             LOG.exception("命令 %s 处理失败", req.command)
             reply = (f"❌ 命令执行失败：{clean_error(error) or type(error).__name__}\n"
                      "已写入日志；可发 /diag 检查数据源，或稍后重试。")
-        if isinstance(reply, Document):  # a file (the samples' CSV): sent as a document, queued like a text reply
-            await self.background("reply", functools.partial(self.telegram.send_document, req.chat, req.thread, reply))
-            return
-        await self.reply(req, reply, markup, html_mode)
+        await self.answer(req, reply, markup, html_mode)
+
+    async def answer(self, req: Request, reply: Any, markup: dict | None = None, html_mode: bool = False) -> None:
+        """A command's answer sent: a text, a file (Document: sent with sendDocument, queued like a text reply), or several of
+        them one after another (a list — /export's files and the line that says what they are, 1.154.51)."""
+        for part in reply if isinstance(reply, list) else [reply]:
+            if isinstance(part, Document):
+                try:
+                    part = await document_fit(part)  # (1.154.51: a large one gzipped here, off the loop; one too large even so is said)
+                except RemoteError as error:
+                    await self.reply(req, "❌ " + clean_error(error))
+                    continue
+                await self.background("reply", functools.partial(self.telegram.send_document, req.chat, req.thread, part))
+            elif part or not isinstance(reply, list):  # (a single answer goes as it always did; an empty part of several is none)
+                await self.reply(req, part, markup, html_mode)
 
     async def reply(self, req: Request, text: str, markup: dict | None = None, html_mode: bool = False) -> None:
         """Answer a command. While the background loops run the answer is queued like any other message, so a
@@ -20125,6 +20210,494 @@ class Bot:
         return Document(self.export_name("summary", flt), self.journal_summary_csv(flt).encode("utf-8"),
                         f"复盘汇总（{scope}）：每日汇总、今日按市场、按标的 / 净优势 / 公平价 / 时段、按设置版本、15 分钟表、"
                         "挂单效率与撤单原因、被拦下的机会；第一列是表名")
+
+    # --- 1.154.51: everything the review page holds, by Telegram (/export, /tally) --------------------------------------------------
+    EXPORT_BUSY = "规则吃单正在优先时段（抢单时刻前后、开场前 15 分钟和盘中），导出和统计这段时间不做——做一次要占住机器人几秒；过一会儿再发"
+    EXPORT_RANGES = {"今天": "today", "today": "today", "昨天": "yesterday", "yesterday": "yesterday", "7d": "7d", "7天": "7d", "一周": "7d",
+                     "30d": "30d", "30天": "30d", "一个月": "30d"}
+    EXPORT_ALL = ("全部", "所有", "all")
+    EXPORT_KINDS = {"日记": "journal", "journal": "journal", "汇总": "summary", "summary": "summary", "样本": "samples", "samples": "samples", "json": "json",
+                    "预挂": "preopen", "preopen": "preopen", "规则": "rules", "rules": "rules", "涨跌": "tally", "连涨": "tally", "tally": "tally",
+                    "全部": "all", "所有": "all", "all": "all"}
+    TALLY_WAIT_S = 90.0   # /tally: a card's candles are waited for this long at the most
+    TALLY_PACE_S = 0.5    # /tally over several cards: this long a chunk of candles just read before the next card's are asked for — Binance futures'
+    #                       index candles are 5 of the IP's 2,400 a minute a read: every card over a month is 750 reads
+    TALLY_HOLD_S = 900.0  # ...and while the rule taker goes first the next card waits, this long at the most (then the job ends, said)
+    TALLY_KEEP_AFTER = 120  # ...and when it is done no more than this many chunks of candles stay in memory (a chunk is 1,000 closes, some 90 KB:
+    #                         every card over a month would leave TALLY_KEEP_CHUNKS of them, 50 MB, for a page that looks at a card at a time)
+    TALLY_LINES = 15      # /tally over several cards: this many cards' own lines (the most filled windows first), the rest counted
+    PREOPEN_RECORD_COLUMNS = ("场次", "卡片", "场次名", "开场时间", "星期", "档位价", "每边份数", "第几次挂", "状态", "挂出涨", "挂出跌", "成交涨", "成交跌",
+                              "成交份数", "成交额", "结果", "盈亏", "涨边盈亏", "跌边盈亏", "按五五开预期", "挂出时距开场（分钟）",
+                              "首次成交距开场（分钟）", "撤单用时（秒）")
+    PREOPEN_SUMMARY_COLUMNS = ("表", "行", "挂出记录", "场次", "还挂着", "有成交记录", "成交份数", "成交额", "待结算记录", "待结算成本", "已结算记录", "赢", "输", "平",
+                               "盈亏", "已撤没成交", "档位价", "每边份数", "已结算份数", "按五五开预期", "偏离σ", "两边都成交场次", "两边都成交盈亏",
+                               "只成交一边场次", "只成交一边赢", "只成交一边盈亏")
+    RULES_COLUMNS = ("场次", "规则", "规则名", "场次名", "开场时间", "方向", "模式", "规则价（¢）", "成交份数", "成交均价", "成本", "其中盘中买的份数", "结果", "盈亏",
+                     "卖单出现时间", "卖单出现距开场（分钟）", "卖单最多份数", "多久被吃第一口（毫秒）", "多久被吃光（毫秒）", "开场前要了多少", "开场前买到多少")
+    TALLY_WINDOW_COLUMNS = ("卡片", "开始", "结束", "起点价", "终点价", "K线结果", "接近平", "Predict结果", "前面连续方向", "前面连续场数",
+                            "预挂成交涨", "预挂成交跌", "预挂成本", "按五五开预期", "预挂盈亏")
+    TALLY_GROUP_COLUMNS = ("卡片", "前面", "有成交场次", "成交份数", "按五五开预期", "实际盈亏", "σ", "偏离σ", "每份预期", "每份实际", "只成交一边场次",
+                           "只成交一边赢", "只成交一边均价（保本线）", "顺着方向场次", "顺着方向赢", "逆着方向场次", "逆着方向赢", "两边都成交场次", "两边都成交盈亏")
+
+    def export_days(self, words: list[str], default: str, max_days: int) -> tuple[dt.date, dt.date, list[str], bool, bool]:
+        """A command's range words: (the first Beijing day, the last, the words left, whether 全部 was among them, whether a range was) —
+        今天 / 昨天 / 7d / 30d, N天 or Nd (the last N days), 2026-11-20 (that day) or two such dates; none: ``default`` (a preset of
+        JOURNAL_RANGES). Never after today, ``max_days`` at the most (journal_days: the first day moved up)."""
+        today = dt.datetime.fromtimestamp(self.market.now_ms() / 1000, BEIJING).date()
+        rng, dates, rest, everything = "", [], [], False
+        for word in (w.strip() for w in words):
+            low = word.lower()
+            if low in self.EXPORT_RANGES:
+                rng, dates = self.EXPORT_RANGES[low], []
+            elif found := re.fullmatch(r"(\d{1,3})\s*(?:d|天)", low):
+                rng, dates = "", [(today - dt.timedelta(days=max(1, int(found.group(1))) - 1)).isoformat(), today.isoformat()]
+            elif DATE_RE.fullmatch(low):
+                rng = ""
+                dates = [*dates, parse_day(low)][-2:]
+            elif low in self.EXPORT_ALL:
+                everything = True
+            elif word:
+                rest.append(word)
+        given = bool(rng or dates)
+        d0, d1 = journal_days(min(dates) if dates else "", max(dates) if len(dates) > 1 else "", rng if given else default, today, max_days)
+        return d0, d1, rest, everything, given
+
+    @staticmethod
+    def export_csv(columns: tuple, rows: Iterable) -> bytes:
+        """A table as a CSV file's bytes: UTF-8 with a BOM (spreadsheet apps read the Chinese), the header first."""
+        out = io.StringIO()
+        writer = csv.writer(out)
+        writer.writerow(columns)
+        writer.writerows(rows)
+        return ("﻿" + out.getvalue()).encode("utf-8")
+
+    def export_stamp(self) -> str:
+        return dt.datetime.fromtimestamp(self.market.now_ms() / 1000, BEIJING).strftime("%Y%m%d")
+
+    def export_menu(self) -> str:
+        return ("📦 复盘数据导出（都是 CSV 文件，Excel 能直接打开；每个文件第一行是列名）\n"
+                "/export 全部 —— 下面几样一次都发来（涨跌统计是全部卡合计）\n"
+                "/export 日记 [筛选] —— 原策略每一笔：时间、市场、挂 / 吃、价格、公平价、净优势、结果、盈亏、撤单原因、数据来源、成交后市场走向（= /journal）\n"
+                "/export 汇总 [筛选] —— 复盘页的统计表：每日、按市场、按净优势 / 公平价 / 时段、按设置版本、挂单效率与撤单原因、被拦下的机会（= /summary）\n"
+                "/export 样本 —— 模型样本：每个市场在固定剩余时间记的公平价、盘口、σ 和结果（= /samples）\n"
+                "/export 预挂 [范围] [全部] —— 两个文件：①预挂记录，一条一行（卡、场次、档位、两边挂出和成交、结果、盈亏、提前多久挂上、多久成交）；"
+                "②预挂统计表（合计、按天、按卡、按档位含预期对实际、按开始小时、按方向、周末对工作日）。不写“全部”只出有成交的记录\n"
+                "/export 规则 —— 规则吃单每一场：卖单几点出现、多久被吃光、要了多少买到多少、结果、盈亏\n"
+                "/export json [筛选] —— 交易日记的完整记录（每笔的全部字段：下单时的盘口和行情快照、每次成交、撤单和改挂的经过），压缩的 JSON 文件；“全部”里不含它\n"
+                "/export 涨跌 [卡] [范围] —— 每一场的涨跌、前面连涨 / 连跌了几场，连同预挂在这一场的成交和盈亏（= /tally，聊天里直接看结论）\n"
+                "范围：今天、昨天、7d、30d、14天，或 2026-11-20 2026-11-25（预挂不写范围是全部日期，涨跌统计默认 7 天、最多 "
+                f"{TALLY_MAX_DAYS} 天）；筛选词同 /journal，如“海力士 挂”；卡写 BTC-5M、btc 5分、15分、btc 都行")
+
+    async def cmd_export(self, req: Request) -> Any:
+        """/export [what] […]: the review page's data as files, each kind by its word; none — what there is (export_menu)."""
+        words = [w.strip() for w in req.args if w.strip()]
+        kind = self.EXPORT_KINDS.get(words[0].lower()) if words else None
+        if kind is None:
+            return self.export_menu() if not words else f"没有“{words[0]}”这一种。\n\n" + self.export_menu()
+        sub = dataclasses.replace(req, args=words[1:])
+        if kind == "journal":
+            return await self.cmd_journal(sub)
+        if kind == "summary":
+            return await self.cmd_summary(sub)
+        if kind == "samples":
+            return await self.cmd_samples(sub)
+        if kind == "tally":
+            return await self.cmd_tally(sub)
+        if not self.rules_clear(WebServer.HEAVY_CLEAR_S):
+            return self.EXPORT_BUSY + " /export"
+        if kind == "preopen":
+            return await self.export_preopen(words[1:])
+        if kind == "rules":
+            return self.export_rules()
+        if kind == "json":
+            return await self.export_json(words[1:])
+        parts: list = []
+        nothing: list[str] = []
+        for name, made in (("日记", self.cmd_journal), ("汇总", self.cmd_summary), ("样本", self.cmd_samples)):
+            answer = await made(dataclasses.replace(req, args=[]))
+            (parts if isinstance(answer, Document) else nothing).append(answer if isinstance(answer, Document) else name)
+            await asyncio.sleep(0)  # (each is seconds of the loop: the trader's turn between two)
+        for name, answer in (("预挂", await self.export_preopen([])), ("规则", self.export_rules())):
+            docs = [x for x in (answer if isinstance(answer, list) else [answer]) if isinstance(x, Document)]
+            parts.extend(docs)
+            if not docs:
+                nothing.append(name)
+            await asyncio.sleep(0)
+        tally = await self.cmd_tally(dataclasses.replace(req, args=[]))
+        later = isinstance(tally, str) and tally.startswith("统计中")
+        parts.extend(x for x in (tally if isinstance(tally, list) else []) if isinstance(x, Document))
+        words_of = [tally] if isinstance(tally, str) and not later else [x for x in (tally if isinstance(tally, list) else []) if not isinstance(x, Document)]
+        said = (f"已发 {len(parts)} 个文件" + ("；涨跌统计（全部卡，近 7 天）还在读 K 线，算完随后发来" if later else "")
+                + (f"；没有数据的：{'、'.join(nothing)}" if nothing else "") + "。每个文件是什么、怎么单独要：/export")
+        return [*parts, said, *words_of]
+
+    EXPORT_JSON_BATCH = 200  # /export json: this many records are turned into text at a time (the trader's turn between two batches)
+
+    async def export_json(self, words: list[str]) -> Any:
+        """/export json [筛选词]: the journal's whole records (journal.json?full=1 — the review page's 交易日记 JSON), gzipped. The
+        text of every record at once is tens of megabytes: made EXPORT_JSON_BATCH records at a time here (a record may change
+        under a thread's hands), each batch compressed in a thread, so neither the text nor a long stall is ever held."""
+        flt, problem = self.journal_filter_words(words)
+        if problem:
+            return problem
+        payload = self.journal_payload(full=True, history=0)
+        mine = self.sim_trades()
+        trades = [t for t in payload.pop("trades") if not flt or journal_match(mine.get(t["id"]) or {}, flt)]
+        if not trades:
+            return f"没有符合的记录（筛选：{journal_filter_text(flt)}）" if flt else "还没有交易记录"
+        packer, out = zlib.compressobj(6, zlib.DEFLATED, 31), bytearray()  # (31: a gzip file)
+
+        async def feed(text: str) -> None:
+            out.extend(await _blocking(packer.compress, text.encode("utf-8")))
+        head = json.dumps({**payload, "filter": journal_filter_text(flt) if flt else ""}, ensure_ascii=False, default=str)
+        await feed(head[:-1] + ', "trades": [')
+        for i in range(0, len(trades), self.EXPORT_JSON_BATCH):
+            await feed(("," if i else "") + ",".join(json.dumps(t, ensure_ascii=False, default=str) for t in trades[i:i + self.EXPORT_JSON_BATCH]))
+        await feed("]}")
+        out.extend(packer.flush())
+        name = self.export_name("journal-full", flt).removesuffix(".csv") + ".json.gz"
+        scope = f"筛选：{journal_filter_text(flt)}" if flt else "全部"
+        return Document(name, bytes(out), f"交易日记完整记录 {len(trades)} 笔（{scope}）：gzip 压缩的 JSON，解压后 trades 里一笔一条，带下单时的快照和每次成交、撤单的经过",
+                        "application/gzip")
+
+    async def export_preopen(self, words: list[str]) -> Any:
+        """/export 预挂 [范围] [全部]: the pre-open mode's records, a row each (preopen_records_csv), and its review's tables
+        (preopen_summary_csv)."""
+        d0, d1, _, everything, given = self.export_days(words, "all", CARDS_MAX_DAYS)
+        day_ms = lambda d: int(dt.datetime(d.year, d.month, d.day, tzinfo=BEIJING).timestamp() * 1000)
+        lo, hi = (day_ms(d0), day_ms(d1 + dt.timedelta(days=1))) if given else (None, None)
+        rows = self.preopen_rows()
+        data, n, filled = await self.preopen_records_csv(rows, lo, hi, everything)
+        if not n:
+            return "预挂没有记录（开盘前预挂没开过，或这段时间没有" + ("挂单" if everything else "成交；加“全部”连没成交的也导出") + "）"
+        span = f"{d0:%m-%d} 至 {d1:%m-%d} 开场的" if given else "全部日期"
+        docs = [Document(f"preopen-records-{self.export_stamp()}.csv", data,
+                         f"预挂记录 {n} 条（{span}，{'含没成交的' if everything else '只有有成交的'}；其中有成交 {filled} 条）：一条记录 = 一场的一个档位的一次挂单，"
+                         "涨跌两边在同一行；更早的、没成交且已撤的旧记录已归档，不在这个文件里")]
+        review = self.preopen_review()
+        if review:
+            docs.append(Document(f"preopen-summary-{self.export_stamp()}.csv", self.preopen_summary_csv(review),
+                                 "预挂统计表（全部日期，归档的旧记录也计入）：合计、按天、按卡、按档位（按五五开的预期对实际）、按开始小时、按方向、周末对工作日；第一列是表名"))
+        return docs
+
+    EXPORT_SLICE = 2_000  # /export 预挂: this many records are looked at before the trader has its turn (tens of thousands: a second in one go)
+
+    async def preopen_records_csv(self, rows: list[dict], lo: int | None, hi: int | None, everything: bool) -> tuple[bytes, int, int]:
+        """The pre-open mode's records as a CSV, a row a record (a window's one level, one attempt; its two sides on the row),
+        the earliest window first: those of the windows starting in [lo, hi) (every one with None), those with a fill — every
+        record an order of which went out with ``everything``. (the file, its records, those with a fill.) EXPORT_SLICE
+        records at a time, the file itself written in a thread."""
+        from preopen import NEVER_PLACED, quote_of
+        when = lambda ms: dt.datetime.fromtimestamp(ms / 1000, BEIJING)
+        r4 = lambda v: "" if v is None else round(float(v), 4)
+        result = {"up": "涨", "down": "跌", "split": "50/50"}
+        out, filled = [], 0
+        for n, pair in enumerate(rows):
+            if n and n % self.EXPORT_SLICE == 0:
+                await asyncio.sleep(0)
+            start = int(pair.get("start_ms") or 0)
+            if lo is not None and not lo <= start < hi:
+                continue
+            orders = (pair.get("orders") or {}).values()
+            got = any(float(o.get("filled") or 0) > 0 for o in orders)
+            if not (got or (everything and any(o.get("state") not in NEVER_PLACED for o in orders))):
+                continue
+            q = quote_of(pair)
+            filled += int(got)
+            out.append((start, [q["window"], q["card"], q["name"], when(start).strftime("%Y-%m-%d %H:%M:%S"), WEEKDAYS[when(start).weekday()],
+                                r4(q["price"]), r4(q["shares"]), q["attempt"], q["status"], int(q["sent"]["up"]), int(q["sent"]["down"]),
+                                r4(q["filled_up"]), r4(q["filled_down"]), r4(q["filled"]), r4(q["volume"]), result.get(q["result"], ""), r4(q["pnl"]),
+                                r4(q["side_pnl"]["up"]) if q["filled_up"] > 0 else "", r4(q["side_pnl"]["down"]) if q["filled_down"] > 0 else "",
+                                r4((0.5 - q["price"]) * q["filled"]) if q["filled"] > 0 else "",
+                                "" if q["lead_min"] is None else round(q["lead_min"], 1), "" if q["fill_lead_min"] is None else round(q["fill_lead_min"], 1),
+                                "" if q["cancel_s"] is None else round(q["cancel_s"], 1)]))
+        out.sort(key=lambda x: x[0])
+        return await _blocking(self.export_csv, self.PREOPEN_RECORD_COLUMNS, [row for _, row in out]), len(out), filled
+
+    def preopen_summary_csv(self, review: dict) -> bytes:
+        """The review page's 开盘前预挂 tables (preopen.review) as one CSV, the table's name in the first column."""
+        col = {name: i for i, name in enumerate(self.PREOPEN_SUMMARY_COLUMNS)}
+        r4 = lambda v: "" if v is None else round(float(v), 4)
+        rows = []
+
+        def put(table: str, r: dict, ev: dict | None = None) -> None:
+            row: list = [""] * len(col)
+            row[0], row[1] = table, r.get("name", "")
+            for name, key in (("挂出记录", "records"), ("场次", "windows"), ("还挂着", "resting"), ("有成交记录", "filled_windows"), ("待结算记录", "pending"),
+                              ("已结算记录", "settled"), ("赢", "wins"), ("输", "losses"), ("平", "ties"), ("已撤没成交", "withdrawn")):
+                if key in r:
+                    row[col[name]] = r[key]
+            for name, key in (("成交份数", "filled"), ("成交额", "volume"), ("待结算成本", "pending_cost"), ("盈亏", "pnl"), ("档位价", "price"), ("每边份数", "size")):
+                if key in r:
+                    row[col[name]] = r4(r[key])
+            ev = ev if ev is not None else r if "settled_shares" in r else None
+            if ev:
+                both, one = ev.get("both") or {}, ev.get("one") or {}
+                for name, value in (("已结算份数", r4(ev.get("settled_shares"))), ("按五五开预期", r4(ev.get("ev"))), ("偏离σ", "" if ev.get("z") is None else ev["z"]),
+                                    ("两边都成交场次", both.get("windows", "")), ("两边都成交盈亏", r4(both.get("pnl"))),
+                                    ("只成交一边场次", one.get("windows", "")), ("只成交一边赢", one.get("won", "")), ("只成交一边盈亏", r4(one.get("pnl")))):
+                    row[col[name]] = value
+            rows.append(row)
+        put("合计", review["total"], review.get("ev"))
+        for table, key in (("按天", "days"), ("按卡", "cards"), ("按档位", "levels"), ("按开始小时", "hours"), ("按方向", "sides"), ("周末对工作日", "weekly")):
+            for r in review.get(key) or []:
+                put(table, r)
+        return self.export_csv(self.PREOPEN_SUMMARY_COLUMNS, rows)
+
+    def export_rules(self) -> Any:
+        """/export 规则: the rule taker's records, a row a window and rule (rules_csv)."""
+        recs = self.rules_records()
+        if not recs:
+            return "规则吃单没有记录（没开过，或真实交易模块没启动）"
+        data, n, bought = self.rules_csv(recs)
+        return Document(f"rules-records-{self.export_stamp()}.csv", data,
+                        f"规则吃单 {n} 场（其中买到的 {bought} 场）：一场一条规则一行，“只记录”和真实的分开；卖单出现、被吃光的时间按 Predict 盘口的时间戳（没有的按机器人看到的时刻）")
+
+    def rules_csv(self, recs: dict[str, dict]) -> tuple[bytes, int, int]:
+        """The rule taker's records as a CSV, the earliest window first: what was bought and what it made, and the window's race
+        (rules.races: when the offer showed, how long until it was taken from and gone, what this taker asked for and got).
+        (the file, its rows, those with a fill)."""
+        import rules
+        when = lambda ms: dt.datetime.fromtimestamp(int(ms) / 1000, BEIJING).strftime("%Y-%m-%d %H:%M:%S") if ms else ""
+        r4 = lambda v: "" if v is None else round(float(v), 4)
+        race = {(r["slug"], r["rule"], mode): r for mode in ("on", "paper") for r in rules.races(recs, mode, 0)}
+        result = {"up": "涨", "down": "跌", "split": "50/50"}
+        out, bought = [], 0
+        for rec in sorted(recs.values(), key=lambda r: (int(r.get("start_ms") or 0), str(r.get("rule") or ""))):
+            rule = rules.RULE_OF.get(rec.get("rule"))
+            shares = rules.filled(rec)
+            seen = race.get((rec.get("slug"), rec.get("rule"), rec.get("mode"))) or {}
+            bought += int(shares > rules.DUST)
+            out.append([rec.get("slug", ""), rec.get("rule", ""), rule.name if rule else "", rec.get("name", ""), when(rec.get("start_ms")),
+                        "涨" if rec.get("side") == "up" else "跌", "真实" if rec.get("mode") == "on" else "只记录", rec.get("cents", ""),
+                        r4(shares), r4(rules.avg_price(rec)) if shares > rules.DUST else "", r4(rules.cost(rec)) if shares > rules.DUST else "",
+                        r4(rules.course_part(rec)[0]) if shares > rules.DUST else "", result.get(str(rec.get("result") or ""), ""), r4(rec.get("pnl")),
+                        when(seen.get("offer_at")), "" if seen.get("lead_min") is None else seen["lead_min"], r4(seen.get("peak")) if seen else "",
+                        "" if seen.get("cut_ms") is None else seen["cut_ms"], "" if seen.get("gone_ms") is None else seen["gone_ms"],
+                        r4(seen.get("asked")) if seen else "", r4(seen.get("bought")) if seen else ""])
+        return self.export_csv(self.RULES_COLUMNS, out), len(out), bought
+
+    def tally_cards_named(self, words: list[str]) -> tuple[list, str]:
+        """The pre-open mode's cards a command's words name ((the cards, "") — or ([], why not)): none — every card; a card's key
+        or name (BTC-5M, btc 5分; spaces, dashes and case aside) — that one; else every card whose key or name holds the words
+        (15分: the 15-minute cards; btc: BTC's four) — a figure at the words' start never inside a longer one (5分 is not 15分)."""
+        cards = list(preopen_cards())
+        squash = lambda v: re.sub(r"[\s\-_]+", "", str(v)).casefold()
+        key = squash("".join(words)).replace("分钟", "分")
+        if not key:
+            return cards, ""
+        names = {c.key: (squash(c.key), squash(tally_name(c))) for c in cards}
+        exact = [c for c in cards if key in names[c.key]]
+        if exact:
+            return exact, ""
+        held = re.compile((r"(?<!\d)" if key[0].isdigit() else "") + re.escape(key))
+        hits = [c for c in cards if any(held.search(name) for name in names[c.key])]
+        if not hits:
+            return [], f"没有名字含“{' '.join(words)}”的卡。能统计的卡：" + "、".join(tally_name(c) for c in cards)
+        return hits, ""
+
+    async def tally_ready(self, key: str, frm: str, to: str, ledger: list | None = None, raw: dict | None = None) -> tuple[dict, int]:
+        """tally_payload once the candles it needs are read: asked again as the background reads end, TALLY_WAIT_S at the most
+        (then as it stands: "ready" false). (the payload, the reads waited for.)"""
+        deadline = time.monotonic() + self.TALLY_WAIT_S
+        reads: set = set()
+        while True:
+            payload = self.tally_payload(key, frm, to, ledger=ledger, raw=raw)
+            left = deadline - time.monotonic()
+            if payload.get("ready") or left <= 0:
+                return payload, len(reads)
+            tasks = [t for t in self.tally_tasks.values() if not t.done()]
+            reads.update(tasks)
+            if tasks:
+                await asyncio.wait(tasks, timeout=left)
+            else:
+                await asyncio.sleep(min(0.5, left))
+
+    async def cmd_tally(self, req: Request) -> Any:
+        """/tally [卡] [范围]: the review page's 市场涨跌统计 in the chat (1.154.51) — a card's windows up or down, 跟随还是反转, the
+        pre-open mode's filled side against chance and its fills by the run of ups or downs before each window (the doubling
+        rule's question), with the windows as a file; several cards (none named: every one) — their fills by the run added up,
+        and a line a card. The candles are read in the background: the answer follows when they are."""
+        if not self.rules_clear(WebServer.HEAVY_CLEAR_S):
+            return self.EXPORT_BUSY + " /tally"
+        try:
+            d0, d1, rest, _, _ = self.export_days(req.args, "7d", TALLY_MAX_DAYS)
+        except ValueError as error:
+            return "❌ " + clean_error(error)
+        cards, problem = self.tally_cards_named(rest)
+        if problem:
+            return problem
+        if not self.reference_tasks:  # a one-off run, a test: answered here
+            return await self.tally_report(cards, d0, d1)
+        job = getattr(self, "tally_job", None)
+        if job is not None and not job.done():
+            return "上一次 /tally 还在算，等它发来再要下一个"
+
+        async def later() -> None:
+            try:
+                parts: Any = await self.tally_report(cards, d0, d1)
+            except Exception as error:
+                LOG.exception("/tally 失败")
+                parts = f"❌ 统计失败：{clean_error(error) or type(error).__name__}"
+            await self.answer(req, parts)
+        self.tally_job = asyncio.create_task(later(), name="tally-report")
+        today = dt.datetime.fromtimestamp(self.market.now_ms() / 1000, BEIJING).date()
+        days = (d1 - d0).days + 1
+        wait = "几秒" if len(cards) == 1 else "一两分钟" if len(cards) * days <= 250 else f"大约 {max(3, round(len(cards) * days / 120))} 分钟"
+        return (f"统计中：{tally_name(cards[0]) if len(cards) == 1 else f'{len(cards)} 张卡'}，{journal_days_label(d0, d1, today)}——要读币安的 1 分钟 K 线，"
+                f"{wait}后发来")
+
+    async def tally_report(self, cards: list, d0: dt.date, d1: dt.date) -> list:
+        """/tally's answer: the text and the file (one card: a row a window; several: a row a card and run length)."""
+        frm, to = d0.isoformat(), d1.isoformat()
+        day_ms = lambda d: int(dt.datetime(d.year, d.month, d.day, tzinfo=BEIJING).timestamp() * 1000)
+        lo, hi = day_ms(d0) - 2 * DAY_MS, day_ms(d1) + 3 * DAY_MS  # the range's records, read once (days to spare: a daily card's window starts the day before its date)
+        ledger = [p for p in self.preopen_rows() if lo <= int(p.get("start_ms") or 0) < hi]
+        today = dt.datetime.fromtimestamp(self.market.now_ms() / 1000, BEIJING).date()
+        label = journal_days_label(d0, d1, today)
+        done: list[tuple[Any, dict, dict, dict]] = []  # (the card, its payload, its sums, the rows and fills they were made of)
+        unread: list[str] = []
+        held = 0.0
+        for card in cards:
+            while not self.rules_clear(WebServer.HEAVY_CLEAR_S) and held < self.TALLY_HOLD_S:  # the rule taker goes first: the next card waits
+                held += 5.0
+                await asyncio.sleep(5.0)
+            if held >= self.TALLY_HOLD_S:
+                unread.extend(tally_name(c) for c in cards[len(done) + len(unread):])
+                break
+            raw: dict = {}
+            payload, reads = await self.tally_ready(card.key, frm, to, ledger, raw)
+            if not payload.get("ready"):
+                unread.append(tally_name(card))
+                continue
+            done.append((card, payload, tally_streak_sums(raw["rows"], raw["fills"]), raw))
+            await asyncio.sleep(reads * self.TALLY_PACE_S if len(cards) > 1 else 0)  # (the trader's turn between two cards, and Binance's limit)
+        if len(cards) > 1:
+            while len(self.tally_cache) > self.TALLY_KEEP_AFTER:
+                self.tally_cache.pop(next(iter(self.tally_cache)))
+        if not done:
+            return [f"币安的 1 分钟 K 线没读到（{'、'.join(unread[:6])}），过一会儿再发 /tally"]
+        if len(cards) == 1:
+            card, payload, sums, raw = done[0]
+            return [self.tally_card_text(payload, tally_streak_view(sums), label),
+                    Document(f"tally-{card.key}-{d0:%Y%m%d}-{d1:%Y%m%d}.csv", self.tally_windows_csv(card, payload, raw),
+                             f"{payload['name']} {label}：一场一行——K 线的涨跌、Predict 的结果（机器人有记录的）、前面连涨 / 连跌几场、预挂在这一场的成交和盈亏")]
+        total = None
+        for _, _, sums, _ in done:
+            total = tally_streak_add(total, sums)
+        whole = tally_streak_view(total)
+        views = [(card, tally_streak_view(sums)) for card, _, sums, _ in done]
+        gaps = [tally_name(card) for card, payload, _, _ in done if payload.get("errors") or payload["counts"]["missing"]]
+        text = self.tally_cards_text(views, whole, label, unread, gaps)
+        rows = [self.tally_group_row("合计", g) for g in self.tally_view_groups(whole)]
+        for card, view in views:
+            rows.extend(self.tally_group_row(tally_name(card), g) for g in self.tally_view_groups(view))
+        return [text, Document(f"tally-streaks-{d0:%Y%m%d}-{d1:%Y%m%d}.csv", self.export_csv(self.TALLY_GROUP_COLUMNS, rows),
+                               f"预挂按前面连涨 / 连跌的场数，{len(done)} 张卡 {label}：合计和每张卡各 7 行（没有连续、连 1 / 2 / 3 / 4 场以上、连 3 场以上合计、其余合计）")]
+
+    @staticmethod
+    def tally_view_groups(view: dict) -> list[dict]:
+        return [*view["groups"], view["double"], view["rest"]]
+
+    @staticmethod
+    def tally_group_row(card: str, g: dict) -> list:
+        sh = g["shares"]
+        return [card, g["name"], g["windows"], g["shares"], g["ev"], g["pnl"], g["sigma"], "" if g["z"] is None else g["z"],
+                round(g["ev"] / sh, 4) if sh else "", round(g["pnl"] / sh, 4) if sh else "", g["one"]["n"], g["one"]["won"],
+                "" if g["one"]["price"] is None else g["one"]["price"], g["with"]["n"], g["with"]["won"], g["against"]["n"], g["against"]["won"],
+                g["both"]["n"], g["both"]["pnl"]]
+
+    @staticmethod
+    def tally_group_line(g: dict) -> str:
+        """A run length's filled windows as a line of /tally: what a share was worth against a coin toss and what it made."""
+        if not g["windows"]:
+            return f"· {g['name']}：没有成交"
+        per = lambda v: f"{'+' if v >= 0 else '−'}{abs(v) * 100:.1f}¢"
+        pc = lambda won, n: f"{won}/{n}（{round(won * 100 / n)}%）" if n else "—"
+        sh, one, both = g["shares"], g["one"], g["both"]
+        z = "" if g["z"] is None else f"，偏离 {'+' if g['z'] >= 0 else '−'}{abs(g['z']):.1f}σ"
+        return (f"· {g['name']}：{g['windows']} 场 {sh:,.0f} 份，每份预期 {per(g['ev'] / sh)} → 实际 {per(g['pnl'] / sh)}（{signed_usd(g['pnl'])}{z}）"
+                + (f"；只成交一边赢 {pc(one['won'], one['n'])}" + (f"，保本 {one['price'] * 100:.0f}%" if one["price"] is not None else "") if one["n"] else "")
+                + (f"；顺着 {pc(g['with']['won'], g['with']['n'])}、逆着 {pc(g['against']['won'], g['against']['n'])}" if g["with"]["n"] or g["against"]["n"] else "")
+                + (f"；两边都成交 {both['n']} 场 {signed_usd(both['pnl'])}" if both["n"] else ""))
+
+    @staticmethod
+    def tally_verdict_line(view: dict) -> str:
+        per = lambda v: f"{'+' if v >= 0 else '−'}{abs(v) * 100:.1f}¢"
+        rates = (f"（连 {view['at']} 场以上每份 {per(view['rate_double'])}，其余每份 {per(view['rate_rest'])}"
+                 + ("" if view["z"] is None else f"，相差 {'+' if view['z'] >= 0 else '−'}{abs(view['z']):.1f}σ") + "）"
+                 if view["rate_double"] is not None and view["rate_rest"] is not None else "")
+        return f"结论：{view['verdict']}{rates}" + (f"\n还有 {view['pending']} 场有成交但结果未定，没算进去" if view["pending"] else "")
+
+    TALLY_STREAK_HEAD = ("预挂按前面连涨 / 连跌的场数（每份 = 按五五开的预期 → 实际；连续 = 相邻两场都分出涨跌，平、没数据、休市会断开；"
+                         "顺着 = 成交在连续的那个方向上，逆着 = 另一边）：")
+
+    def tally_card_text(self, p: dict, view: dict, label: str) -> str:
+        """One card's 市场涨跌统计 as /tally's text: the counts and the longest runs, 跟随还是反转, 预挂成交的那一边, the fills by the
+        run before, the doubling rule's reading."""
+        c, st, f, x = p["counts"], p["streaks"], p["follow"], p["fills"]
+        z = lambda v: "" if v is None else f"，偏离 {'+' if v >= 0 else '−'}{abs(v):.1f}σ"
+        lines = [f"📊 {p['name']}｜{label}（{p['range']}）｜{p['source']}",
+                 f"场次 {c['total']}：涨 {c['up']}、跌 {c['down']}、平 {c['flat']}" + (f"、没数据 {c['missing']}" if c["missing"] else "")
+                 + (f"（涨跌里有 {c['near']} 场离起点很近，Predict 可能判成另一边）" if c["near"] else "")
+                 + f"｜最长连涨 {st['up']['n']} 场、最长连跌 {st['down']['n']} 场",
+                 f"跟随还是反转：{f['verdict']}（相邻两场都分出涨跌的 {f['pairs']} 对，同向 {f['same']} 对，随机该 {f['expected']:g} 对{z(f['z'])}）"]
+        if x["windows"]:
+            one = x["one"]
+            lines.append(f"预挂成交的那一边：有成交 {x['windows']} 场，只成交一边且分出涨跌的 {one['decided']} 场，成交那边赢 {one['won']} 场"
+                         f"（随机该 {one['expected']:g} 场{z(one['z'])}）——{one['verdict']}"
+                         + (f"；保本要赢 {x['price'] * 100:.0f}%" if x["price"] is not None else ""))
+            lines.append(self.TALLY_STREAK_HEAD)
+            lines.extend(self.tally_group_line(g) for g in self.tally_view_groups(view))
+            lines.append(self.tally_verdict_line(view))
+        else:
+            lines.append("这段时间预挂在这张卡上没有成交，“连涨 / 连跌后预挂”没有可统计的")
+        lines.extend(f"⚠️ {e}" for e in p.get("errors") or [])
+        return "\n".join(lines)
+
+    def tally_cards_text(self, views: list, total: dict, label: str, unread: list[str], gaps: list[str] = ()) -> str:
+        """Several cards' fills by the run before, added up, and a line a card (the doubling rule's windows against the rest)."""
+        per = lambda v: "—" if v is None else f"{'+' if v >= 0 else '−'}{abs(v) * 100:.1f}¢"
+        lines = [f"📊 预挂按前面连涨 / 连跌｜{len(views)} 张卡合计｜{label}", self.TALLY_STREAK_HEAD]
+        if not total["double"]["windows"] and not total["rest"]["windows"]:
+            return "\n".join([lines[0], "这段时间这些卡上预挂没有已出结果的成交，没有可统计的" + (f"（还有 {total['pending']} 场结果未定）" if total["pending"] else "")])
+        lines.extend(self.tally_group_line(g) for g in self.tally_view_groups(total))
+        lines.append(self.tally_verdict_line(total))
+        filled = sorted(((card, v) for card, v in views if v["double"]["windows"] + v["rest"]["windows"]),
+                        key=lambda cv: -(cv[1]["double"]["windows"] + cv[1]["rest"]["windows"]))
+        if filled:
+            lines.append(f"各卡（连 {total['at']} 场以上 对 其余，每份实际；成交场次多的在前）：")
+            for card, v in filled[:self.TALLY_LINES]:
+                d, r = v["double"], v["rest"]
+                lines.append(f"· {tally_name(card)}：连 {total['at']} 场以上 {d['windows']} 场 {per(v['rate_double'])}｜其余 {r['windows']} 场 {per(v['rate_rest'])}"
+                             + ("" if v["z"] is None else f"｜相差 {'+' if v['z'] >= 0 else '−'}{abs(v['z']):.1f}σ"))
+            if len(filled) > self.TALLY_LINES:
+                lines.append(f"· 另有 {len(filled) - self.TALLY_LINES} 张卡在文件里")
+        quiet = len(views) - len(filled)
+        if quiet:
+            lines.append(f"没有预挂成交的卡 {quiet} 张")
+        if unread:
+            lines.append(f"⚠️ K 线没读到、没算进去的卡：{'、'.join(unread[:8])}" + ("…" if len(unread) > 8 else ""))
+        if gaps:
+            lines.append(f"⚠️ K 线有缺的卡（缺的那几场和它后面一场按“前面没有连续”算）：{'、'.join(gaps[:8])}" + ("…" if len(gaps) > 8 else ""))
+        lines.append("单看一张卡（含每一场的明细文件）：/tally BTC-5M 7d")
+        return "\n".join(lines)
+
+    def tally_windows_csv(self, card: Any, payload: dict, raw: dict) -> bytes:
+        """A card's windows of the range as a CSV, a row a window: the candles' result, Predict's where the bot holds it, the run
+        before, and the pre-open mode's fills there with what they cost, were worth against a coin toss and made."""
+        when = lambda ms: dt.datetime.fromtimestamp(ms / 1000, BEIJING).strftime("%Y-%m-%d %H:%M:%S")
+        names = {"u": "涨", "d": "跌", "f": "平", "x": "没数据", "s": "50/50", "": ""}
+        before, fills = tally_runs(raw["rows"]), tally_window_fills(raw["rows"], raw["fills"])
+        r4 = lambda v: "" if v is None else round(float(v), 4)
+        rows = []
+        for r in raw["rows"]:
+            side, length = before[r["s"]]
+            w = fills.get(r["s"])
+            rows.append([payload["name"], when(r["s"]), when(r["e"]), "" if r.get("a") is None else r["a"], "" if r.get("b") is None else r["b"], names[r["r"]],
+                         "是" if r.get("n") else "", names.get(r.get("o", ""), ""), names[side], length,
+                         *((r4(w["up"]), r4(w["down"]), r4(w["cost"]), r4(w["ev"]), r4(w["pnl"])) if w else ("", "", "", "", ""))])
+        return self.export_csv(self.TALLY_WINDOW_COLUMNS, rows)
 
     def market_slug_of(self, text: str, now_ms: int) -> tuple[str, str]:
         """(the Predict slug, the card's key) a command's words name: a slug as written, else a card by part of its name or
@@ -24971,6 +25544,10 @@ class Bot:
         """The pre-open mode's ledger records (LiveBot.preopen_rows); none here, where there is no mode."""
         return []
 
+    def rules_records(self) -> dict[str, dict]:
+        """The rule taker's records (LiveBot.rules_records); none here, where there is no real trading module."""
+        return {}
+
     def preopen_cards(self, first: str, last: str) -> list[dict]:
         """The pre-open mode's 按市场 rows over the Beijing dates ``first``..``last`` (LiveBot.preopen_cards); none here."""
         return []
@@ -25063,14 +25640,17 @@ class Bot:
                 await self.tell(sub["chat"], sub["thread"], text)
             self.deliver(f"sim:{self.sim_seq}:{sub_id}", send)
 
-    def tally_payload(self, key: str, frm: str = "", to: str = "", rng: str = "") -> dict:
+    def tally_payload(self, key: str, frm: str = "", to: str = "", rng: str = "", ledger: list | None = None, raw: dict | None = None) -> dict:
         """journal.json?tally=<card>&from=<date>&to=<date> (or &range=today | yesterday | 7d) — the review page's 市场涨跌统计
         (1.143.0): every window of the card that started on those days (Beijing) and is over, up or down by Binance's 1-minute
         candles (tally_rows: the bot's own pre-settlement), with the counts, the longest runs, the hours, Predict's own result
         where the bot holds one (tally_official), the time the figures cover; 跟随还是反转 (tally_follow) and the pre-open
         mode's filled side against chance (tally_fills), 1.144.0. Past days as well as today (Binance keeps
         the candles), TALLY_MAX_DAYS at most. The candles come from a background read (tally_fetch) the first time: "ready"
-        false until then — the page asks again a second on."""
+        false until then — the page asks again a second on.
+        1.154.51 (/tally, /export): ``ledger`` — the pre-open records to count in place of every one (a caller going through
+        several cards hands each the records of the range, read once); ``raw`` — a dict that is handed the candles' rows
+        ("rows") and the fills ("fills") the figures were made of, for the sums and the table a row a window."""
         now_ms = self.market.now_ms()
         card = tally_card(key) or tally_card("BTC-5M") or preopen_cards()[0]
         today = dt.datetime.fromtimestamp(now_ms / 1000, BEIJING).date()
@@ -25099,8 +25679,10 @@ class Bot:
         if waiting:
             return {**base, "ready": False, "message": f"正在读币安 1 分钟 K 线（{len(waiting)} 段，每段 1000 分钟）…"}
         rows = tally_rows(windows, closes, tally_tie(card))
-        summary = tally_summary(rows, self.tally_official(card, {w[0] for w in windows}))
-        fill_rows = self.tally_fill_rows(card, {w[0] for w in windows})  # (read once: 预挂成交的那一边 and 按前面连涨 / 连跌 both take them)
+        summary = tally_summary(rows, self.tally_official(card, {w[0] for w in windows}, ledger))
+        fill_rows = self.tally_fill_rows(card, {w[0] for w in windows}, ledger)  # (read once: 预挂成交的那一边 and 按前面连涨 / 连跌 both take them)
+        if raw is not None:
+            raw["rows"], raw["fills"] = rows, fill_rows
         at = lambda ms: dt.datetime.fromtimestamp(ms / 1000, BEIJING)
         if not rows:
             label = f"{d0:%m-%d}" + (f" 到 {d1:%m-%d}" if d1 != d0 else "") + " 还没有结束的场次"
@@ -25158,12 +25740,13 @@ class Bot:
         while len(self.tally_cache) > TALLY_KEEP_CHUNKS:
             self.tally_cache.pop(next(iter(self.tally_cache)))
 
-    def tally_fill_rows(self, card: Any, starts: set) -> list[dict]:
+    def tally_fill_rows(self, card: Any, starts: set, ledger: list | None = None) -> list[dict]:
         """The pre-open mode's ledger records with a fill in the card's windows starting at ``starts`` (tally_fills): the window's
-        start, the shares filled a side, the price, Predict's result where the record keeps it (u / d / s, else "")."""
+        start, the shares filled a side, the price, Predict's result where the record keeps it (u / d / s, else ""). ``ledger``:
+        the records to look through in place of every one (1.154.51)."""
         from preopen import quote_of, window_of
         out = []
-        for pair in self.preopen_rows():
+        for pair in self.preopen_rows() if ledger is None else ledger:
             start = card.start_of(window_of(pair))
             if start not in starts:
                 continue
@@ -25173,12 +25756,12 @@ class Bot:
                             "result": {"up": "u", "down": "d", "split": "s"}.get(q["result"], "")})
         return out
 
-    def tally_official(self, card: Any, starts: set) -> dict[int, str]:
+    def tally_official(self, card: Any, starts: set, ledger: list | None = None) -> dict[int, str]:
         """Window start -> Predict's own result ("u" / "d" / "s": 50-50) where the bot holds it: the pre-open mode's settled
         windows (its ledger keeps the result) and the model trader's records Predict confirmed or corrected."""
         from preopen import window_of
         out: dict[int, str] = {}
-        for pair in self.preopen_rows():
+        for pair in self.preopen_rows() if ledger is None else ledger:
             start = card.start_of(window_of(pair))
             if start in starts and pair.get("result") in {"up", "down", "split"}:
                 out[start] = {"up": "u", "down": "d", "split": "s"}[pair["result"]]
