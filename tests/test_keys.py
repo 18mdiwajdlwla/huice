@@ -438,7 +438,7 @@ class KeyTests(unittest.IsolatedAsyncioTestCase):
         line = bot.live_key_load()
         self.assertIn("主 Key 118 次（等节拍 2 次共 1 秒）", line)
         self.assertIn("预挂专用 Key 219 次（等节拍 40 次共 60 秒）", line)
-        self.assertIn("规则吃单专用 Key 150 次（其中盘口借用 90 次、预挂借用 55 次；空闲，借给盘口和预挂用）", line)
+        self.assertIn("规则吃单专用 Key 150 次（其中盘口借用 90 次、预挂借用 55 次；空闲，借给盘口和预挂用，原策略的读请求在主 Key 上等不到时也走这里）", line)  # (1.154.45: tests/test_relief.py)
         self.assertIn("“等节拍”= 这把 Key 已经用满、请求在排队", line)
         bot.rules = rule_taker([0])
         self.assertIn("规则吃单专用 Key 150 次（其中盘口借用 90 次、预挂借用 55 次；现在不借——规则吃单正在用）", bot.live_key_load())

@@ -4,7 +4,8 @@ strings of its own for its keys, a few hundred words 61,000 times over — a qua
 start. They are parsed a chunk at a call now (main.parse_rows), read as they come and not all held as text first; the
 collector is off while they are read (main.gc_held: it walked the growing heap again and again, a heap with no garbage in
 it) and what was read is set aside from it at once (GcWatch.set_aside: the first settle walked it all once more, 0.7–1.0 s
-of the event loop ninety seconds into every start).
+of the event loop ninety seconds into every start) — 1.154.44: before the collector is on again, not a line after (it ran
+in between, and walked what had just been read: gc_held's ``aside``).
 
 Here: parse_rows gives what json.loads gives for each text alone — every kind of value, the keys shared and nothing else,
 a text that does not parse (or not alone) raising as it always did; the store's and the ledger's reads through it give the
@@ -278,6 +279,29 @@ def the_collector_is_off_while_a_start_reads() -> None:
             ms = m.GC_WATCH.settle()  # the first settle after it: what was made since, not everything again
             assert m.GC_WATCH.settles == 1 and ms >= 0
             ledger.close()
+            # 1.154.44: ...set aside BEFORE the collector is on again. It counts what was made since its last collection — every
+            # object of a read made with it off — and runs at the first chance once it is back on: set aside a line after that,
+            # the records had just been walked (production, 11-25: 292 ms). No collection now begins with them still counted
+            big_path = str(Path(folder) / "big.preopen.sqlite3")
+            made = p.Ledger(big_path)
+            made.save_many([{"slug": f"w{n}", "key": "BTC-15M", "phase": "closed", "accounted": True, "start_ms": NOW + n,
+                             "orders": {side: {"state": "cancelled", "hash": f"0x{n:063x}{i}", "fills": [], "events": [{"at": NOW, "what": "下单"}]} for i, side in enumerate(("up", "down"))}}
+                            for n in range(1500)])
+            made.close()
+            counted: list[int] = []  # what the collector had counted as new when each of its collections began
+            watch = lambda phase, info: counted.append(gc.get_count()[0]) if phase == "start" else None
+            gc.callbacks.append(watch)
+            try:
+                big = p.Ledger(big_path)
+                bot.sim_cache = None
+                index = bot.sim_kept()
+                spare = [[n] for n in range(5000)]  # (what were still young would be walked by now at the latest)
+            finally:
+                gc.callbacks.remove(watch)
+            limit = gc.get_threshold()[0] + 500  # a collection begins when that many were made: with the two reads' objects counted, thousands
+            assert len(big.rows) == 1500 and len(index.records) == 600 and len(spare) == 5000 and gc.isenabled()
+            assert counted and max(counted) <= limit, f"a collection began with {max(counted)} objects counted as new: what was just read was walked"
+            big.close()
         finally:
             m.GC_WATCH.stop()
         assert gc.get_freeze_count() <= base and m.GC_WATCH.early == 0 and m.GC_WATCH.settles == 0 and gc.isenabled(), "as it was found"

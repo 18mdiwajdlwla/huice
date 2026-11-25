@@ -782,6 +782,7 @@ class PredictApi:
     low = False            # 1.154.11: this client's reads (and patient orders) leave the key's reserve to the others (PredictPacer.LOW_RESERVE) —
     #                        the pre-open mode's placements and re-reads, behind its account snapshot's pages
     leave = 0.0            # 1.154.21: ...and this many tokens more: the pre-open mode's snapshot on a borrowed key, behind what else is borrowed there
+    relief: Any = None     # 1.154.45: the bot's own client's alone (ReadRelief) — another key for its reads while its own has no token for them
 
     def __init__(self, base: str, api_key: str, wallet: Wallet | None):
         self.base, self.api_key, self.wallet = base.rstrip("/"), api_key, wallet
@@ -822,7 +823,16 @@ class PredictApi:
         # 1.154.0: the key's request budget first (core.PredictPacer): a read waits for its token; an order or a cancel may borrow a
         # burst ahead of the reads — and Predict's 429, with its twenty seconds of silence for every client on the key, is not met
         write = priority and not self.patient
-        await core.predict_pacer(self.api_key).take(write, low=self.low and not write, leave=0.0 if write else self.leave)
+        wait = TOKEN_WAIT.get() if method == "GET" and not write and not path.startswith("/auth") else None
+        if wait is None:
+            await core.predict_pacer(self.api_key).take(write, low=self.low and not write, leave=0.0 if write else self.leave)
+        else:
+            # 1.154.45: a read that has another key to go to (relieved) waits for this one's token only so long — given up
+            # before anything is sent, never once it is on its way
+            try:
+                await asyncio.wait_for(core.predict_pacer(self.api_key).take(False, low=self.low, leave=self.leave), wait)
+            except asyncio.TimeoutError:
+                raise NoToken(f"这把 Key {wait:g} 秒内没有轮到这次读取（额度被下单撤单占着）") from None
         self.calls += 1
         if priority:
             self.writes_inflight += 1
@@ -953,7 +963,11 @@ class PredictApi:
     async def market(self, market_id: str, priority: bool = False) -> dict:
         """A market's details. ``priority`` (1.154.22): a read on an order's way — the rule taker's look at whether matching has
         opened, an offer already in hand — goes ahead of the key's other reads, as the order itself does."""
-        data = await self.call("GET", f"/markets/{core.urllib.parse.quote(str(market_id))}", priority=priority)
+        path = f"/markets/{core.urllib.parse.quote(str(market_id))}"
+        if priority or getattr(self, "relief", None) is None:
+            data = await self.call("GET", path, priority=priority)
+        else:  # 1.154.45: the bot's own client's, not on an order's way: as its other reads (relieved)
+            data, _ = await relieved(self, path, signed=False)
         if isinstance(data, dict) and data.get("success") is False:
             raise core.RemoteError("Predict 接口返回 success=false：" + (core.http_error_text(data) or core.brief_error(json.dumps(data, ensure_ascii=False), 120)))
         market = data.get("data", data) if isinstance(data, dict) else {}
@@ -1009,11 +1023,12 @@ class PredictApi:
         pages = limit if not max_pages else max(1, min(limit, int(max_pages)))
         asked = full = 0  # requests made; rows of a page that had a next one (a full page: Predict's real page size)
         self.__dict__.setdefault("paging", {})[path] = 0
+        via = None  # 1.154.45: the lent key's client once a page went out there (relieved): the pages after it stay on that key
         for _ in range(pages):
             q = {**query, "first": self.ORDERS_PAGE}
             if after:
                 q["after"] = after
-            data = await self.authed("GET", f"{path}?{core.urllib.parse.urlencode(q)}")
+            data, via = await relieved(self, f"{path}?{core.urllib.parse.urlencode(q)}", via)
             asked += 1
             self.__dict__.setdefault("paging", {})[path] = asked  # the read under way, page by page (1.154.8: the pre-open hold's progress)
             page = self.rows(data)
@@ -1063,7 +1078,7 @@ class PredictApi:
         it (404). Without a hash only the open list can be searched, by id."""
         if hash_:
             try:
-                data = await self.authed("GET", f"/orders/{core.urllib.parse.quote(str(hash_))}")
+                data, _ = await relieved(self, f"/orders/{core.urllib.parse.quote(str(hash_))}")
             except core.RemoteError as error:
                 if http_status(error) == 404:
                     return None
@@ -1097,6 +1112,218 @@ class PredictApi:
         for the open-order reads and the once-a-minute positions readers (twenty pages already cost seconds), and
         positions_complete stays theirs: this read neither raises their cap nor writes their flag."""
         return await self.paged("/positions", {}, cap=pages)
+
+
+TOKEN_WAIT: contextvars.ContextVar = contextvars.ContextVar("predict_token_wait", default=None)  # seconds the read under way waits for its key's token (PredictApi.call; relieved sets it)
+
+
+class NoToken(core.RemoteError):
+    """A read given up before it was sent: its key had no token for it within the time it was given (PredictApi.call under
+    TOKEN_WAIT) — the orders and cancels ahead of it took them. Nothing went out."""
+
+
+async def relieved(api: Any, path: str, via: Any = None, signed: bool = True) -> tuple[Any, Any]:
+    """GET ``path`` for ``api`` — signed in (authed), or plainly (``signed`` False: a market's details) — and the lent key's
+    client when the read went out there, else None (1.154.45).
+
+    A client with nothing to borrow (no ``relief``: the pre-open mode's, the rule taker's, a test's stand-in — or the
+    bot's own while nothing is lent to it, ReadRelief.lane) asks on its own key, the one call it always made. Otherwise:
+    on its own key when that has a token for the read now; with none, it waits there ReadRelief.WAIT_S at the most
+    (TOKEN_WAIT: given up before anything is sent) and then goes out on the lent key. ``via``: the lent key's client a
+    list's earlier page went out through — this page goes there at once (a list stays on a key once it has moved).
+
+    The lent key refusing the read before anything was done with it (its limit or its cooldown, a 401 / 403:
+    ReadRelief.refused, which pauses the borrowing) is no answer about the read: asked once more on the client's own key,
+    waiting there as long as it takes. Any other failure is the read's own, raised as it is, on either key."""
+    ask = (lambda client: client.authed("GET", path)) if signed else (lambda client: client.call("GET", path))
+    relief = getattr(api, "relief", None)
+    lane = via if via is not None else (relief.lane() if relief is not None else None)
+    if lane is None:
+        return await ask(api), None
+    if via is None:
+        if relief.home_token():
+            return await ask(api), None
+        if signed:
+            await api.ensure_auth()  # (outside the wait below: a sign-in is not given up for a token)
+        token = TOKEN_WAIT.set(relief.WAIT_S)
+        try:
+            return await ask(api), None
+        except NoToken:
+            pass
+        finally:
+            TOKEN_WAIT.reset(token)
+    relief.went()
+    try:
+        # (signed in there already — lane; a 401 is this client's refusal there, below: no sign-in is made on a read's way)
+        return await lane.call("GET", path), lane
+    except core.RemoteError as error:
+        if not relief.refused(error):
+            raise
+    return await ask(api), None
+
+
+class LentApi(PredictApi):
+    """The bot's own client on a key lent to it (ReadRelief, 1.154.45): the same wallet, a sign-in of its own on that key, and
+    the lender's cooldown — one key, one limit at Predict: a 429 answered here pauses the key's owner too, and its pause is
+    this client's (``lending``: preopen.KeyLending, whose blocked_until is the rule taker's client's)."""
+
+    def __init__(self, base: str, api_key: str, wallet: Wallet | None, lending: Any):
+        self.lending = lending
+        super().__init__(base, api_key, wallet)
+
+    @property
+    def blocked_until(self) -> float:
+        return max(self.__dict__.get("_blocked_until", 0.0), float(getattr(self.lending, "blocked_until", 0.0) or 0.0))
+
+    @blocked_until.setter
+    def blocked_until(self, value: float) -> None:
+        self.__dict__["_blocked_until"] = value
+        if value > float(getattr(self.lending, "blocked_until", 0.0) or 0.0):
+            self.lending.blocked_until = value
+
+
+class ReadRelief:
+    """The model trader's reads on the rule taker's key, while that taker is idle, when the bot's own key has no token for
+    them (1.154.45, LIVE_READ_LEND).
+
+    11-25 17:52, production, seven minutes into a start: 模拟交易 and Predict 盘口 both "上一轮失败…用时 300.0s…TimeoutError", and
+    主 Key 220 次（等节拍 33 次共 1257 秒）. The key's pace is 220 requests a minute, 3.67 a second; an order or a cancel takes its
+    token ahead of the reads (core.PredictPacer), and every re-quote is three requests there — the cancel, the cancelled
+    order's fills read by its hash (live_cancel_fills_read), the new order. At 0.79 re-quotes a second (11-18) that left the
+    reads a token a second and they waited 8–15 s; at 1.3 a second (this report: 587 in 455 s) the re-quotes alone ask for
+    3.9 a second — more than the key has. The writes go first, so everything that queued was a read: the fills of the
+    cancelled orders (their unfilled shares held against the caps until read: fills_pending), the sync's open list, its
+    reads by hash, the minute's positions — 33 of them a minute got through, 38 s each, and a sync that needs several in a
+    row was given up at REFERENCE_TIMEOUT. The same pacer under the same traffic, 20 times faster: a sync round 1 s at 0.79
+    re-quotes a second, 2 s at 1.0, timed out at 300 s from 1.3 (tests/test_relief.py has the shape of it).
+
+    Meanwhile the rule taker's own key (RULE_API_KEY) is idle outside its hours and already lent (preopen.KeyLending,
+    1.154.21: the orderbook feed's reads, the pre-open mode's overflow — which took 208 of its 221 requests that minute).
+    The trader's reads go there too now (relieved), by that policy:
+
+    - a read only — an order by its hash, a page of the open list or of the positions, a market's details: never an order
+      or a cancel, which keep the bot's key, where they wait for nothing;
+    - the bot's key first: a token there now, there, as ever; none, it waits there WAIT_S, and only then goes to the lent
+      key. Going at once took a hundred reads a minute off that key at 0.79 re-quotes a second, where the bot's own had
+      room for nearly all of them a moment later (the pre-open mode's overflow there 220 → 120 a minute); choosing by the
+      bucket's depth alone left the reads that had chosen to wait starving as before. With two seconds' wait (the clients
+      and the pacer as they are, Predict's answers stood in for, 20 times faster): 19 a minute borrowed at 0.79 re-quotes
+      a second, 72 at 1.3 and 101 at 1.5 — a cancelled order's fills read within 3–7 s, a sync round 2–4 s;
+    - only while the key is lent (KeyLending.why: not from five minutes before the rule taker needs it, nor after a
+      refusal) and this client is signed in on it (warm: in a task beside, never on a read's way);
+    - a list that has moved to the lent key stays there for its later pages;
+    - that key's limit (a 429, its cooldown) pauses all borrowing, as it does for the others (KeyLending.off), and a 401 /
+      403 there this client's own (the others' sign-ins are their own); either way the read is asked again on the bot's
+      key. Any other failure is the read's own, as on the bot's key.
+
+    On the lent key these are ordinary reads (a whole token), as the rule taker's own; the other borrowers are low ones and
+    leave the reserve (PredictPacer.LOW_RESERVE), which is what these take."""
+    WAIT_S = 2.0   # how long a read waits for a token on the bot's own key before it goes out on the lent one
+    WARM_S = 60.0  # the sign-in on that key is tried this often at the most (as preopen.LEND_WARM_S)
+    OFF_S = 600.0  # after a 401 / 403 on that key: this client borrows nothing for this long (as preopen.LEND_OFF_S)
+
+    def __init__(self, owner: Any):
+        self.owner = owner
+        self.client: Any = None  # the bot's client on the lent key, made when there is one to borrow (made)
+        self.sent: collections.deque = collections.deque(maxlen=4096)  # monotonic times of the reads that went out there (lent_last)
+        self.warm_task: asyncio.Task | None = None
+        self.warmed = -1e9
+        self.warm_error = ""  # why the sign-in on that key last failed (tried again WARM_S on; nothing is borrowed meanwhile)
+        self.off_until, self.off_why = 0.0, ""  # after that key refused this client (a 401 / 403): nothing more there until then, and why
+
+    def home(self) -> Any:
+        return getattr(getattr(self.owner, "live", None), "api", None)
+
+    def lending(self) -> Any:
+        return getattr(self.owner, "key_lending", None)
+
+    def made(self) -> Any:
+        """The bot's client on the key that may be lent to it — None with the switch off (LIVE_READ_LEND), with no key to lend
+        (KeyLending.key: RULE_API_KEY unset or not the rule taker's alone, RULE_KEY_LEND off) or no client of the bot's own."""
+        home, lending = self.home(), self.lending()
+        if not isinstance(home, PredictApi) or lending is None or not getattr(self.owner.config, "live_read_lend", True):
+            return None  # (a stand-in for the bot's client — the tests' — borrows nothing)
+        key = lending.key()
+        if not key or key == home.api_key:
+            return None
+        if self.client is None or self.client.api_key != key or self.client.wallet is not home.wallet:
+            self.client = LentApi(home.base, key, home.wallet, lending)
+        return self.client
+
+    def home_token(self) -> bool:
+        """Whether the bot's own key has a token for a read this instant."""
+        return core.predict_pacer(self.home().api_key).spare()
+
+    def lane(self) -> Any:
+        """The lent key's client while a read of the bot's may go out there, else None. Kept from borrowing by the sign-in
+        on that key alone, a read that finds the bot's key without a token asks for that sign-in (warm) — and stays on the
+        bot's key this time."""
+        client = self.made()
+        if client is None or time.monotonic() < self.off_until or self.lending().why() or client.blocked_until - time.monotonic() > 0:
+            return None
+        if not client.fresh():
+            if not self.home_token():
+                self.warm()
+            return None
+        return client
+
+    def went(self) -> None:
+        self.sent.append(time.monotonic())
+
+    def refused(self, error: BaseException) -> bool:
+        """Whether a read's failure on the lent key is that key's refusal of it, unprocessed (relieved). Its limit — a 429,
+        or its cooldown: nothing more is borrowed there for a while, by anyone (KeyLending.off, the lending's own rule). A
+        401 / 403: this client's sign-in there is what was refused — it borrows nothing for OFF_S; the feed and the pre-open
+        mode, on sign-ins of their own, go on."""
+        status, text = http_status(error), core.clean_error(error) or type(error).__name__
+        if status == 429 or "限流冷却中" in text:
+            self.lending().off("那把 Key 被限流（429）")
+            return True
+        if status in (401, 403):
+            if status == 401 and self.client is not None:
+                self.client.jwt = ""  # the token it was refused with: signed in afresh when it next borrows (warm)
+            self.off_until, self.off_why = time.monotonic() + self.OFF_S, f"那把 Key 拒绝了原策略的读取（HTTP {status}）"
+            LOG.warning("原策略的读请求暂停借用规则吃单的 Key %d 分钟：%s", int(self.OFF_S // 60), self.off_why)
+            return True
+        return False
+
+    def why(self) -> str:
+        """Why this client borrows nothing now though the key is lent ("" when it may): its own pause after a 401 / 403, or its
+        sign-in there failing (/diag)."""
+        if time.monotonic() < self.off_until:
+            return f"{self.off_why}，{-(-int(self.off_until - time.monotonic()) // 60)} 分钟内不借"
+        return f"在这把 Key 上没登录成：{core.brief_error(self.warm_error, 60)}" if self.warm_error else ""
+
+    def lent_last(self, seconds: float = 60.0) -> int:
+        """The reads that went out on the lent key in the last ``seconds`` (/diag)."""
+        cut = time.monotonic() - seconds
+        return sum(1 for t in self.sent if t >= cut)
+
+    def warm(self) -> None:
+        """The sign-in on the lent key made — and made again once its token is about to expire — when a read would have
+        gone there (lane), in a task beside it: a read never waits for it, it stays on the bot's key until there is one. A
+        sign-in that fails is tried again WARM_S on."""
+        client, lending = self.made(), self.lending()
+        if client is None or client.fresh() or lending.why() or time.monotonic() - self.warmed < self.WARM_S:
+            return
+        if self.warm_task is not None and not self.warm_task.done():
+            return
+        self.warmed = time.monotonic()
+
+        async def sign() -> None:
+            try:
+                await client.ensure_auth()
+                self.warm_error = ""
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # (this client's own sign-in: nothing of the lending is paused for it)
+                self.warm_error = core.clean_error(error) or type(error).__name__
+        self.warm_task = asyncio.create_task(sign(), name="live-relief-warm")
+
+    def stop(self) -> None:
+        """The run is over: a sign-in under way is ended with it."""
+        if self.warm_task is not None and not self.warm_task.done():
+            self.warm_task.cancel()
 
 
 def row_mark(row: dict) -> Any:
@@ -2062,6 +2289,10 @@ class LiveBot(core.Bot):
         self.key_lending = preopen.KeyLending(self)
         if getattr(self, "predict", None) is not None:
             self.predict.lend = self.key_lending
+        # 1.154.45: ...and to the model trader's own reads while the bot's key has no token for them — used up by its orders and
+        # cancels (ReadRelief, LIVE_READ_LEND): the fills of its cancelled orders and its sync no longer queue behind them
+        self.live_relief = ReadRelief(self)
+        self.live.api.relief = self.live_relief
         self.handlers["/rules"] = self.cmd_rules
 
     # --- readiness -------------------------------------------------------------------------------------------------------
@@ -2639,6 +2870,8 @@ class LiveBot(core.Bot):
             self.live_note_error(f"同步真实订单失败：{core.clean_error(error) or type(error).__name__}")
         self.live_step_ms = marks
         calls = getattr(self.live.api, "calls", 0)
+        if isinstance(calls, int) and (lent := getattr(getattr(self, "live_relief", None), "client", None)) is not None:
+            calls += int(getattr(lent, "calls", 0) or 0)  # 1.154.45: its reads on the lent key are its requests too (ReadRelief)
         self.live_rate_samples.append((time.monotonic(), calls if isinstance(calls, int) else len(calls or ())))  # a counter (a stand-in's call log: its length)
         while len(self.live_rate_samples) > 2 and self.live_rate_samples[-1][0] - self.live_rate_samples[1][0] >= 60:
             self.live_rate_samples.popleft()  # the last minute's
@@ -3807,11 +4040,16 @@ class LiveBot(core.Bot):
             if key == rule:
                 lent = self.preopen.lent_last() if getattr(self, "preopen", None) is not None and callable(getattr(self.preopen, "lent_last", None)) else 0
                 book = self.predict.lent_last() if callable(getattr(getattr(self, "predict", None), "lent_last", None)) else 0
+                relief = getattr(self, "live_relief", None)  # 1.154.45: the model trader's own reads there (ReadRelief)
+                mine = relief.lent_last() if relief is not None else 0
                 why = self.key_lending.why() if getattr(self, "key_lending", None) is not None and self.key_lending.key() else ""
-                if lent or book:
-                    notes.append("其中" + "、".join(text for n, text in ((book, f"盘口借用 {book} 次"), (lent, f"预挂借用 {lent} 次")) if n))
+                if lent or book or mine:
+                    notes.append("其中" + "、".join(text for n, text in ((mine, f"原策略借用 {mine} 次"), (book, f"盘口借用 {book} 次"), (lent, f"预挂借用 {lent} 次")) if n))
                 if getattr(self, "key_lending", None) is not None and self.key_lending.key():
-                    notes.append(f"现在不借——{why}" if why else "空闲，借给盘口和预挂用")
+                    reads = relief is not None and getattr(self.config, "live_read_lend", True)
+                    notes.append(f"现在不借——{why}" if why else "空闲，借给盘口和预挂用" + ("，原策略的读请求在主 Key 上等不到时也走这里" if reads else ""))
+                    if reads and not why and (mine_why := relief.why()):
+                        notes.append(f"原策略现在不借——{mine_why}")
             if hits:
                 notes.append(f"24 小时内 429 {len(hits)} 次，当时前 60 秒 {min(hits)}～{max(hits)} 次、中位 {mid:g} 次"
                              + ("，远低于 240：这个 Key 可能还有别的程序或别人在用" if shared else ""))
@@ -7722,6 +7960,7 @@ class LiveBot(core.Bot):
             return await self._run_live()
         finally:
             self.stopping.set()
+            self.live_relief.stop()  # (1.154.45: a sign-in on the lent key under way)
             await self.rules_stop()
             await self.preopen_stop("进程停止", keep=True)  # the orders stay on the book: the signed expiry is the backstop, the next process takes them over
 
