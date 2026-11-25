@@ -85,11 +85,15 @@ def run():
         assert m._http_get(f"https://{host}/a") == b"e"; fresh = LOG[-1][0]
         m._POOL[(host, 443)][-1] = (m._POOL[(host, 443)][-1][0], time.monotonic() - 10)  # idle for 10 s
         assert m._http_get(f"https://{host}/orders", {"b": 2}) == b"f" and LOG[-1][0] != fresh, "a stale-ish connection is not trusted with a body"
+        posted = LOG[-1][0]
         m._POOL[(host, 443)][-1] = (m._POOL[(host, 443)][-1][0], time.monotonic() - 10)
-        assert m._http_get(f"https://{host}/a") == b"g" and LOG[-1][0] == LOG[-2][0], "a GET reuses it"
-        m._POOL[(host, 443)][-1] = (m._POOL[(host, 443)][-1][0], time.monotonic() - 60)
+        # 1.154.40: on a host that is sent requests with a body, a read takes the pooled connection unused the longest (within
+        # KEEPALIVE_IDLE_SECONDS) and leaves the most recent one for the next request with a body (tests/test_audit_feeds.py)
+        assert m._http_get(f"https://{host}/a") == b"g" and LOG[-1][0] == fresh != posted, "a GET reuses one: here the one unused longest"
+        assert [c.id for c, _ in m._POOL[(host, 443)]] == [posted, fresh]
+        m._POOL[(host, 443)][:] = [(c, time.monotonic() - 60) for c, _ in m._POOL[(host, 443)]]
         SCRIPT[host] = [ok(b"h")]
-        assert m._http_get(f"https://{host}/a") == b"h" and LOG[-1][0] != LOG[-2][0], "a connection idle a minute is dropped"
+        assert m._http_get(f"https://{host}/a") == b"h" and LOG[-1][0] not in (fresh, posted), "a connection idle a minute is dropped"
         # 6. HTTP errors: the status, the service's words, Retry-After (and Binance's 418/429 floor), Predict's 403 hint
         SCRIPT[host] = [Answer(429, b'{"message": "slow down"}', {"Retry-After": "7"})]
         try:

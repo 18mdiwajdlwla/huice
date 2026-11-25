@@ -123,6 +123,7 @@ def the_open_test_covers_every_look() -> None:
             st is not None and st.get("state") == "cancelling",                                                          # ...to cancel
             st is not None and st.get("state") in L.PLACING,                                                             # ...to follow (live_sync)
             m.sim_in_flight(t) or t["status"] == "filled",                                                               # the feed's hot markets
+            m.trade_counts(t),                                                                                           # the caps on money at risk (1.154.40: sim_group_room, sim_window_open_usd)
         ]
         assert not any(looked) or m.trade_open(t), (t, looked)
     assert not m.trade_open({"status": "settled", "final": {"up": 1.0}, "shares": 100.0, "live": {"state": "done"}})
@@ -523,10 +524,172 @@ def the_diag_lines() -> None:
     assert L.LiveBot.live_signer_note(types.SimpleNamespace(config=types.SimpleNamespace(live_mode="off"))) == ""
 
 
+def old_window_open_usd(bot, trades, key):
+    """Bot.sim_window_open_usd as it was written before 1.154.40: a walk of every record."""
+    total = 0.0
+    for t in trades.values():
+        if t.get("key") != key or not (t.get("settle") or {}).get("window"):
+            continue
+        unfilled = m.sim_open_order(t)
+        if t.get("status") not in {"filled", "resting"} and not unfilled:
+            continue
+        price = float(t.get("price") or 0)
+        total += price * float(t.get("shares") or 0)
+        if unfilled:
+            total += bot.sim_resting_cost(t) * max(float(t.get("order") or 0) - float(t.get("shares") or 0), 0.0)
+    return total
+
+
+def old_record_of_order(trades, order_id):
+    """LiveBot.live_cancel_fills_read's search for its record, as it was written before 1.154.40."""
+    return next(((k, t) for k, t in trades.items() if isinstance(t.get("live"), dict) and str(t["live"].get("order_id") or "") == order_id), None)
+
+
+async def the_caps_go_by_the_open_records() -> None:
+    """1.154.40: the group cap (sim_group_room), a card's windows' money (sim_window_open_usd) and the read of a cancelled
+    order's fills (live_cancel_fills_read → trade_of_order) look at the open records and the orders' index — where the first
+    walked its driver's whole list (every real attempt ever withdrawn stays on it), the second every record, the third every
+    record again for the one that holds an order. The answers are the walks', to the digit and to the object."""
+    rnd = random.Random(40)
+    bot = make_bot(SIM_GROUP_USD="300")
+    await bot.live_prepare()
+    tids = [await taker(bot, NOW + i * 5000, str(101 + i)) for i in range(3)]
+    seed, old = bot.sim_trades()[tids[0]], {}
+    for i in range(3000):  # the history: on the first order's driver, three in five a real attempt withdrawn (kept on the driver's list for good)
+        t = copy.deepcopy(seed)
+        t["market"] = t["slug"] = f"old-{i // 4}"
+        t["live"].update(state="done", order_id=str(900000 + i), hash="0x" + f"{i:064x}")
+        if i % 10 < 6:
+            t.update(status="cancelled", shares=0.0)
+        else:
+            t.update(status="settled", shares=100.0, payout=1.0, settled=NOW - 3600_000, confirm="confirmed", final={"up": 1.0, "name": "Up", "status": "RESOLVED"})
+        old[f"old-{i // 4}|up|吃#{i % 4 + 1}"] = t
+    # a card's 15-minute windows: positions, orders resting, in flight, being cancelled, their fills still to be read — and the ended ones
+    windows = {}
+    for i in range(400):
+        t = copy.deepcopy(seed)
+        t["market"] = t["slug"] = f"btc-15m-{i // 2}"
+        t.update(key="BTC-15M", driver="BTCUSDT", driver_name="BTC", settle={"key": "BTC-15M", "window": True, "pair": "BTCUSDT", "close_ms": CLOSE},
+                 price=rnd.choice([0.47, 0.5, 0.613, 0.07]), order=rnd.choice([10.0, 33.3, 100.0]))
+        kind = i % 40
+        if kind == 0:
+            t.update(status="resting", shares=0.0); t["live"].update(state="open", order_id=str(700000 + i))
+        elif kind == 1:
+            t.update(status="filled", shares=round(t["order"] * rnd.random(), 3)); t["live"].update(state="done", order_id=str(700000 + i))
+        elif kind == 2:
+            t.update(status="cancelled", shares=3.0); t["live"].update(state="cancelling", order_id=str(700000 + i))
+        elif kind == 3:
+            t.update(status="cancelled", shares=0.0); t["live"].update(state="done", order_id=str(700000 + i), fills_pending=time.time() * 1000)
+        elif kind == 4:
+            t.update(status="filled", shares=t["order"]); t["live"].update(state="done", order_id=str(700000 + i))
+        elif kind < 30:
+            t.update(status="cancelled", shares=0.0); t["live"].update(state="done", order_id=str(700000 + i))
+        else:
+            t.update(status="settled", shares=t["order"], payout=1.0, settled=NOW - 60_000, confirm="confirmed", final={"up": 1.0, "name": "Up", "status": "RESOLVED"})
+            t["live"].update(state="done", order_id=str(700000 + i))
+        t["live"]["hash"] = "0x" + f"{10 ** 6 + i:064x}"
+        windows[f"btc-15m-{i // 2}|{'up' if i % 2 else 'down'}|吃"] = t
+    bot.sim_save(list(old.items()) + list(windows.items()))
+    view = bot.sim_trades()
+    driver = m.trade_driver(seed)[0]
+    assert view.open_items() is not None and len(m.trades_of_driver(view, driver)) > 1500, "the driver's list keeps every real attempt withdrawn"
+    counts = lambda rows: [t for t in rows if m.trade_counts(t)]
+    for name in (driver, "BTCUSDT", "nobody"):
+        mine, whole = m.trades_open_of_driver(view, name), m.trades_of_driver(view, name)
+        assert len(counts(mine)) == len(counts(whole)) and all(a is b for a, b in zip(counts(mine), counts(whole))), name
+        assert len(mine) <= len(view.open_items()) and all(m.driver_may_count(t) and m.trade_driver(t)[0] == name for t in mine)
+    assert counts(m.trades_open_of_driver(view, driver)) == [seed] and len(counts(m.trades_open_of_driver(view, "BTCUSDT"))) == 50
+    # the cap's own answer, for a candidate that fits and one that does not: the walk's words
+    def the_walks_answer(*args):
+        new, m.trades_open_of_driver = m.trades_open_of_driver, m.trades_of_driver
+        try:
+            return bot.sim_group_room(view, *args)
+        finally:
+            m.trades_open_of_driver = new
+    btc = m.SimMarket("btc-15m-9999", "BTC 15 分钟", "updown", "BTC-15M", 0.5, None, 0.03, "", ("涨", "跌"), {"key": "BTC-15M", "window": True, "pair": "BTCUSDT", "close_ms": CLOSE}, {})
+    assert m.market_driver(btc.kind, btc.key, btc.settle, btc.item)[0] == "BTCUSDT"
+    hsi = mk("hsi-101", 0.70, [], [("0.58", "400")], NOW, "101")
+    answers = []
+    for market in (hsi, btc):
+        for shares in (1.0, 100.0, 5000.0, 10 ** 6):
+            for side in ("up", "down"):
+                got = bot.sim_group_room(view, market, side, 0.58, shares)
+                assert got == the_walks_answer(market, side, 0.58, shares), (market.market, side, shares, got)
+                answers.append(bool(got))
+    assert True in answers and False in answers, "(candidates that fit and candidates the cap refuses)"
+    # ...and it looks at the open records alone: no record of the history is asked whether its order may still fill
+    asked, plain_open = [], m.sim_open_order
+    m.sim_open_order = lambda t: asked.append(t) or plain_open(t)
+    audit, m.TRADE_AUDIT = m.TRADE_AUDIT, False  # (the audit itself walks the driver's list: off for these counts)
+    walks, values, items = [], m.TradeMap.values, m.TradeMap.items
+    m.TradeMap.values = lambda self: walks.append("values") or values(self)
+    m.TradeMap.items = lambda self: walks.append("items") or items(self)
+    try:
+        bot.sim_group_room(view, hsi, "up", 0.58, 100.0)
+        assert len(asked) == 1 and asked[0] is seed, len(asked)
+        asked.clear()
+        bot.sim_group_room(view, btc, "up", 0.58, 100.0)
+        assert 0 < len(asked) <= len(view.open_items()) < 200, (len(asked), len(view.open_items()))
+        # a card's windows' money: the open records, and the sum the walk of every record gave
+        assert walks == []
+        total = bot.sim_window_open_usd(view, "BTC-15M")
+        assert walks == [] and total > 0 and repr(total) == repr(old_window_open_usd(bot, view, "BTC-15M")), (total, walks)
+        assert bot.sim_window_open_usd(view, "ETH-15M") == 0.0 == old_window_open_usd(bot, view, "ETH-15M")
+        walks.clear()
+        # the record of an order: by the orders' index, the same record the walk finds first
+        found = m.trade_of_order(view, "700002")
+        assert walks == [] and found is not None and found[1]["live"]["order_id"] == "700002" and found[1]["live"]["state"] == "cancelling"
+        for oid in ("900000", "902999", "700399", seed["live"]["order_id"]):
+            got = m.trade_of_order(view, oid)
+            assert walks == [] and got is not None and got[1] is view[got[0]], oid
+            want = old_record_of_order(view, oid)
+            assert got[0] == want[0] and got[1] is want[1], oid
+            walks.clear()
+        assert m.trade_of_order(view, "no-such-order") is None and m.trade_of_order(view, "") is None, "(none: the walk says so)"
+        walks.clear()
+        # an order id two records hold (an order adopted back onto an older record): the first in the map's order, as the walk
+        twin = copy.deepcopy(windows["btc-15m-0|down|吃"])
+        twin["live"]["order_id"] = "900007"
+        bot.sim_save([("btc-15m-0|down|吃", twin)])
+        fresh = bot.sim_trades()
+        walks.clear()
+        got = m.trade_of_order(fresh, "900007")
+        assert walks == [] and got[0] == old_record_of_order(fresh, "900007")[0] == "old-1|up|吃#4", got[0]
+        # an id written onto a record and not saved yet is not in the index: found by the walk, as before
+        fresh["btc-15m-1|down|吃"]["live"]["order_id"] = "fresh-id"
+        walks.clear()
+        got = m.trade_of_order(fresh, "fresh-id")
+        assert got is not None and got[0] == "btc-15m-1|down|吃" and walks == ["items"]
+        # a map that is not the kept records as they stand (its holder put a record in), or no view at all: the walk
+        fresh["scratch|up|吃"] = {"market": "scratch", "status": "resting", "live": {"state": "open", "order_id": "scratch-1"}}
+        assert fresh.kept() is None and m.trade_of_order(fresh, "scratch-1")[0] == "scratch|up|吃" and m.trade_of_order(fresh, "900000")[0] == old_record_of_order(fresh, "900000")[0]
+        plain = dict(view)
+        assert m.trade_of_order(plain, "900000")[1] is old_record_of_order(plain, "900000")[1] and m.trades_open_of_driver(plain, driver) == m.trades_of_driver(plain, driver)
+        assert repr(bot.sim_window_open_usd(plain, "BTC-15M")) == repr(old_window_open_usd(bot, plain, "BTC-15M"))
+    finally:
+        m.sim_open_order, m.TRADE_AUDIT, m.TradeMap.values, m.TradeMap.items = plain_open, audit, values, items
+    # with the audit on (every suite), each of the three is checked against its walk at every call; none differed
+    for name in (driver, "BTCUSDT"):
+        m.trades_open_of_driver(bot.sim_trades(), name)
+    assert m.trade_of_order(bot.sim_trades(), "700004") is not None and not m.TRADE_AUDIT_FAILS, m.TRADE_AUDIT_FAILS[:3]
+    # the read of a cancelled order's fills finds its record without a walk of them all
+    order_id = seed["live"]["order_id"]
+    bot.live.api.open[order_id].update(status="CANCELLED", amountFilled="0")
+    audit, m.TRADE_AUDIT = m.TRADE_AUDIT, False
+    m.TradeMap.items = lambda self: walks.append("items") or items(self)
+    walks.clear()
+    try:
+        await bot.live_cancel_fills_read(order_id, seed["live"]["hash"], None)
+        assert "items" not in walks, walks
+    finally:
+        m.TradeMap.items, m.TRADE_AUDIT = items, audit
+
+
 async def main():
     the_open_test_covers_every_look()
     the_index_follows_every_change()
     await the_bot_keeps_it_in_step()
+    await the_caps_go_by_the_open_records()
     await the_orders_are_found_by_the_index()
     the_ledgers_fills_and_unverified()
     the_diag_lines()

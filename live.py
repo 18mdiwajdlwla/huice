@@ -196,6 +196,8 @@ class Wallet:
         self.signer: str = self.account.address
         self.predict_account = eth_utils.to_checksum_address(predict_account) if predict_account else ""
         self.maker: str = self.predict_account or self.signer  # the orders' maker: whoever holds the USDT and the shares
+        self.direct: Any = None                # the direct path's kept pieces (direct_parts), None until first used; False once it is off for good (direct_off)
+        self.direct_checked: set[str] = set()  # the exchanges (and "kernel") whose direct answer has been checked against eth_account's own
 
     @property
     def kind(self) -> str:
@@ -210,17 +212,102 @@ class Wallet:
                 "message": {name: order[name] for name, _ in ORDER_TYPES}}
 
     def order_hash(self, order: dict, neg_risk: bool, yield_bearing: bool) -> str:
+        digest = self.order_digest(order, neg_risk, yield_bearing)
+        if digest is None:
+            return self.order_hash_plain(order, neg_risk, yield_bearing)
+        text = "0x" + digest.hex()
+        if exchange_key(neg_risk, yield_bearing) not in self.direct_checked or core.TRADE_AUDIT:  # (until sign_order has checked this exchange: beside the plain one)
+            plain = self.order_hash_plain(order, neg_risk, yield_bearing)
+            if text != plain:
+                self.direct_off(f"{exchange_key(neg_risk, yield_bearing)}: {text} / {plain}")
+                return plain
+        return text
+
+    def order_hash_plain(self, order: dict, neg_risk: bool, yield_bearing: bool) -> str:
+        """The order's hash by eth_account's own typed-data encoder: the reference the direct path is checked against
+        (order_digest), and the way taken whenever that one is not sure."""
         _, _, encode_typed_data, hash_eip191, _, _ = _eth()
         return "0x" + hash_eip191(encode_typed_data(full_message=self.typed_data(order, neg_risk, yield_bearing))).hex()
 
     def sign_order(self, order: dict, neg_risk: bool, yield_bearing: bool) -> tuple[str, str]:
-        """(order hash, signature) for ``order`` on the exchange that settles its market."""
-        _, encode_defunct, encode_typed_data, _, _, _ = _eth()
-        digest = self.order_hash(order, neg_risk, yield_bearing)
+        """(order hash, signature) for ``order`` on the exchange that settles its market. 1.154.40: the hash worked out
+        directly and signed as it is (order_digest, sign_digest) — sign_order_plain's answer to the byte, checked against it
+        on each exchange's first order (and on every order in the tests), and the way back to it for good if they ever
+        differ. Until now the order's typed data went through eth_account's encoder twice (once for the hash, once more
+        inside sign_message) and the key object was built anew — its public key derived again — for every signature:
+        0.50 ms an order with the native library, of which the signature itself is 0.1; on the event loop, for every order
+        of the three strategies (the pre-open mode signs two a pair, hundreds at a quarter hour)."""
+        digest = self.order_digest(order, neg_risk, yield_bearing)
+        if digest is None:
+            return self.sign_order_plain(order, neg_risk, yield_bearing)
+        exchange = exchange_key(neg_risk, yield_bearing)
+        try:
+            signed = "0x" + digest.hex(), (self.kernel_sign("0x" + digest.hex()) if self.predict_account else "0x" + self.sign_digest(digest).hex())
+        except Exception as error:  # (never seen: a signature the direct way cannot make is made the plain way)
+            return self.direct_off(f"{type(error).__name__}: {error}") or self.sign_order_plain(order, neg_risk, yield_bearing)
+        if exchange not in self.direct_checked or core.TRADE_AUDIT:
+            plain = self.sign_order_plain(order, neg_risk, yield_bearing)
+            if signed != plain:
+                self.direct_off(f"{exchange}: {signed[0]} / {plain[0]}")
+                return plain
+            self.direct_checked.add(exchange)
+        return signed
+
+    def sign_order_plain(self, order: dict, neg_risk: bool, yield_bearing: bool) -> tuple[str, str]:
+        """sign_order by eth_account's own encoder and sign_message: the reference (see order_hash_plain)."""
+        digest = self.order_hash_plain(order, neg_risk, yield_bearing)
         if self.predict_account:
-            return digest, self.kernel_sign(digest)
+            return digest, self.kernel_sign_plain(digest)
+        _, _, encode_typed_data, _, _, _ = _eth()
         signed = self.account.sign_message(encode_typed_data(full_message=self.typed_data(order, neg_risk, yield_bearing)))
         return digest, "0x" + signed.signature.hex()
+
+    def direct_off(self, why: str) -> None:
+        """The direct path gave another answer than eth_account's own, or could not give one: never taken again by this
+        wallet (every hash and signature the plain way from here on), and said once."""
+        if self.direct is not False:
+            self.direct = False
+            core.LOG.error("订单签名：直接计算的结果和 eth_account 的不一致（%s），本次运行改回原来的算法", str(why)[:200])
+
+    def direct_parts(self) -> dict | None:
+        """What the direct path keeps (made at its first use): the type hashes, each exchange's domain hash, the key as the
+        object eth_account signs with — or None when it is off (direct_off) or cannot be had here."""
+        if self.direct is None:
+            try:
+                _, _, _, _, _, eth_utils = _eth()
+                from eth_keys import keys
+                keccak = eth_utils.keccak
+                domain_type = keccak(text="EIP712Domain(" + ",".join(f"{kind} {name}" for name, kind in DOMAIN_TYPES) + ")")
+                self.direct = {"keccak": keccak, "key": keys.PrivateKey(bytes(self.account.key)), "domains": {}, "domain_type": domain_type,
+                               "order_type": keccak(text="Order(" + ",".join(f"{kind} {name}" for name, kind in ORDER_TYPES) + ")")}
+            except Exception as error:
+                self.direct_off(f"{type(error).__name__}: {error}")
+        return self.direct or None
+
+    def order_digest(self, order: dict, neg_risk: bool, yield_bearing: bool) -> bytes | None:
+        """The order's EIP-712 hash, worked out directly: keccak(0x1901 ‖ the exchange's domain hash ‖ keccak(the Order type's
+        hash ‖ its twelve fields, a 32-byte word each)) — what eth_account's encoder comes to (order_hash_plain; the SDK's own
+        vector and 20,000 random orders in tests/test_trading.py). None when the direct path is off, or for an order with a
+        field it does not read for certain (order_word): the plain way then."""
+        parts = self.direct_parts()
+        if parts is None:
+            return None
+        try:
+            keccak, exchange = parts["keccak"], exchange_key(neg_risk, yield_bearing)
+            domain = parts["domains"].get(exchange)
+            if domain is None:
+                domain = parts["domains"][exchange] = keccak(
+                    parts["domain_type"] + keccak(text=PROTOCOL_NAME) + keccak(text=PROTOCOL_VERSION)
+                    + order_word("uint256", self.chain_id) + order_word("address", self.addresses[exchange]))
+            return keccak(b"\x19\x01" + domain + keccak(parts["order_type"] + b"".join(order_word(kind, order[name]) for name, kind in ORDER_TYPES)))
+        except Exception:
+            return None
+
+    def sign_digest(self, digest: bytes) -> bytes:
+        """The key's signature of a 32-byte hash (r ‖ s ‖ v, as eth_account assembles it), with the key object kept: what
+        sign_message makes of a message with that hash."""
+        Account, _, _, _, _, _ = _eth()
+        return bytes(Account.unsafe_sign_hash(digest, self.direct["key"]).signature)
 
     def sign_text(self, message: str) -> str:
         """The sign-in message (GET /v1/auth/message), EIP-191 signed; wrapped for a Predict account."""
@@ -231,7 +318,38 @@ class Wallet:
 
     def kernel_sign(self, message_hash: str) -> str:
         """A Predict account's signature of ``message_hash``: the hash wrapped in the Kernel domain of the account,
-        signed as a personal message, prefixed with 0x01 and the ECDSA validator (the official SDKs' format)."""
+        signed as a personal message, prefixed with 0x01 and the ECDSA validator (the official SDKs' format). 1.154.40: the
+        account's Kernel domain hash kept (it never changes) and the wrapped hash signed as it is (sign_digest) —
+        kernel_sign_plain's answer to the byte, checked against it at the first one."""
+        parts = self.direct_parts()
+        if parts is None:
+            return self.kernel_sign_plain(message_hash)
+        try:
+            keccak = parts["keccak"]
+            kernel = parts.get("kernel")
+            if kernel is None:
+                _, _, _, _, eth_abi, _ = _eth()
+                kernel = parts["kernel"] = (keccak(eth_abi.encode(
+                    ["bytes32", "bytes32", "bytes32", "uint256", "address"],
+                    [keccak(text="EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                     keccak(text=KERNEL_NAME), keccak(text=KERNEL_VERSION), self.chain_id, self.predict_account])), keccak(text="Kernel(bytes32 hash)"))
+            raw = bytes.fromhex(message_hash.removeprefix("0x"))
+            if len(raw) != 32:
+                raise ValueError("not a 32-byte hash")
+            digest = keccak(b"\x19\x01" + kernel[0] + keccak(kernel[1] + raw))
+            signed = "0x01" + self.addresses["ECDSA_VALIDATOR"][2:] + self.sign_digest(keccak(b"\x19Ethereum Signed Message:\n32" + digest)).hex()
+        except Exception as error:
+            return self.direct_off(f"kernel: {type(error).__name__}: {error}") or self.kernel_sign_plain(message_hash)
+        if "kernel" not in self.direct_checked or core.TRADE_AUDIT:
+            plain = self.kernel_sign_plain(message_hash)
+            if signed != plain:
+                self.direct_off("kernel: 签名不同")
+                return plain
+            self.direct_checked.add("kernel")
+        return signed
+
+    def kernel_sign_plain(self, message_hash: str) -> str:
+        """kernel_sign by eth_abi and sign_message: the reference."""
         _, encode_defunct, _, _, eth_abi, eth_utils = _eth()
         keccak = eth_utils.keccak
         domain = keccak(eth_abi.encode(
@@ -247,6 +365,25 @@ class Wallet:
     def sign_transaction(self, tx: dict) -> bytes:
         signed = self.account.sign_transaction(tx)
         return bytes(getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction"))
+
+
+def order_word(kind: str, value: Any) -> bytes:
+    """One field of an order (or of its domain) as EIP-712 encodes it, a 32-byte word: a uint of ``kind`` as the number, an
+    address left-padded. Raises for anything it does not read for certain — a uint that is neither an int nor a string of
+    decimal digits (the SDK's and build_order's spelling), a number out of the type's range, an address that is not 0x and
+    forty hex digits: Wallet.order_digest then leaves the order to eth_account's own encoder."""
+    if kind == "address":
+        if not (isinstance(value, str) and len(value) == 42 and value[:2] in ("0x", "0X")):
+            raise ValueError("address")
+        return bytes(12) + bytes.fromhex(value[2:])
+    if kind.startswith("uint") and kind[4:].isdigit():
+        if isinstance(value, bool) or not (isinstance(value, int) or (isinstance(value, str) and value.isascii() and value.isdigit())):
+            raise ValueError("uint")
+        number = int(value)
+        if not 0 <= number < 1 << int(kind[4:]):
+            raise ValueError("uint range")
+        return number.to_bytes(32, "big")
+    raise ValueError(kind)
 
 
 def build_order(wallet: Wallet, token_id: str, maker_amount: int, taker_amount: int, fee_bps: int, expiration: int,
@@ -2927,8 +3064,15 @@ class LiveBot(core.Bot):
                       price_per_share=from_wei(amounts["price_per_share"]), usd_cap=from_wei(amounts["maker"]),
                       shares_requested=from_wei(amounts["amount"]))
             self.sim_save([(tid, trade)])
+            # 1.154.40: the order waits for this record's write (and what was queued before it: Store.reached), not for
+            # everything queued since (Store.flush) — the bot never stops writing, and an order behind a step's save of
+            # hundreds of records waited for those too (with 400 records queued behind it: 38 ms at the 99th percentile and
+            # half a second at the worst, against 8 ms and 13 for its own write) — and on a thread kept for these waits
+            # (core.store_wait), not one of the sixteen the Binance and Telegram requests share (asyncio.to_thread: with
+            # every one of those held by a request at its timeout, the order stood in their queue)
+            mark = self.store.mark()
             flushing = time.monotonic()
-            flushed = await asyncio.to_thread(self.store.flush)  # the hash on disk before the request goes out: a crash in between is reconciled by it
+            flushed = await core.store_wait(self.store.reached, mark)  # the hash on disk before the request goes out: a crash in between is reconciled by it
             st["flush_ms"] = int((time.monotonic() - flushing) * 1000)  # the wait for the writer (live_latency, /diag: 落盘等待)
             # 1.122.0: the flush may have waited seconds — LIVE=off, a pause, the loss stop, a withdrawal by the express lane (the
             # record is "cancelling" then) may have come meanwhile: judged once more, as a pending order is, right before the request
@@ -3545,7 +3689,7 @@ class LiveBot(core.Bot):
 
         async def one(tid: str, trade: dict) -> None:
             st = trade["live"]
-            before = json.dumps(trade, sort_keys=True, default=str)
+            before = core.trade_mark(trade)
             try:
                 if st["state"] == "placing":
                     await self.live_reconcile(tid, trade, by_hash, now_ms)
@@ -3558,7 +3702,7 @@ class LiveBot(core.Bot):
             except Exception as error:
                 st["last_error"] = core.clean_error(error) or type(error).__name__
                 self.live_note_error(f"{trade['item']} {trade['label']} 订单同步失败：{st['last_error']}")
-            if json.dumps(trade, sort_keys=True, default=str) != before:
+            if core.trade_mark(trade) != before:
                 self.live_save(tid, trade)  # where it lives: moved to an attempt record (tid#n) meanwhile, there — never again under the old key
         # 1.137.2: a resting maker order the list did not show is read by its hash LIVE_TRACK_READS a step at most, each at most every
         # LIVE_TRACK_READ_MS, the longest unread first — seventeen of them read every step, two at a time, were most of the sync's seconds
@@ -3898,12 +4042,12 @@ class LiveBot(core.Bot):
             st = trade["live"]
             if st.get("state") != "cancelling" or (not st.get("order_id") and st.get("hash")) or tid in self.live_placing:
                 return  # (no id and no hash: never sent — live_cancel closes it without a request, 1.138.1)
-            before = json.dumps(trade, sort_keys=True, default=str)
+            before = core.trade_mark(trade)
             try:
                 await self.live_cancel(tid, trade, {}, markets.get(trade["market"]), now_ms)
             except Exception as error:
                 st["last_error"] = core.clean_error(error) or type(error).__name__
-            if json.dumps(trade, sort_keys=True, default=str) != before:
+            if core.trade_mark(trade) != before:
                 self.live_save(tid, trade)  # moved to an attempt record meanwhile: there, never again under the old key (1.138.1, as live_sync_orders)
         await asyncio.gather(*(one(tid, trade) for tid, trade in active.items()))
 
@@ -3964,7 +4108,7 @@ class LiveBot(core.Bot):
                     break
                 await asyncio.sleep(max(1.0 + attempt, float(getattr(error, "retry_after", 0) or 0)))
         trades = self.sim_trades()
-        cur = next(((k, t) for k, t in trades.items() if isinstance(t.get("live"), dict) and str(t["live"].get("order_id") or "") == order_id), None)
+        cur = core.trade_of_order(trades, order_id)  # (1.154.40: by the orders' index, not a walk of every record)
         if cur is None:
             return
         tid, trade = cur

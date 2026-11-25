@@ -252,6 +252,7 @@ def feed_pool_post() -> None:
     m.HTTPS_CONNECTION = FakeConn
     try:
         m._POOL.pop((host, 443), None)
+        m._POOL_BODIES.discard((host, 443))
         now = time.monotonic()
         m._POOL[(host, 443)] = [(Pooled(0), now - 60)] + [(Pooled(i), now - 5) for i in range(1, 12)]
         conn, reused = m._pool_take(host, 443, 10, m.KEEPALIVE_POST_IDLE_SECONDS)
@@ -266,9 +267,45 @@ def feed_pool_post() -> None:
         m._POOL[(host, 443)] = [(Pooled(i), now - 40) for i in range(20, 23)]
         conn, reused = m._pool_take(host, 443, 10, m.KEEPALIVE_IDLE_SECONDS)
         assert not reused and not m._POOL[(host, 443)] and closed[-3:] == [20, 21, 22], closed
+        # 1.154.40 — once the host has been sent a request with a body (an order, a cancel), its reads take the pooled connection
+        # unused the LONGEST and leave the most recent one to the next request with a body. Every request took the most recent:
+        # the reads in flight held just the connections an order could have used (one used within KEEPALIVE_POST_IDLE_SECONDS),
+        # and the order opened a new one — a TCP + TLS handshake before its bytes
+        assert (host, 443) not in m._POOL_BODIES, "(reads alone so far: the most recent, as above)"
+        closed.clear()
+        now = time.monotonic()
+        m._POOL[(host, 443)] = [(Pooled(30), now - 40), (Pooled(31), now - 30), (Pooled(32), now - 20), (Pooled(33), now - 9), (Pooled(34), now - 1)]
+        conn, reused = m._pool_take(host, 443, 10, m.KEEPALIVE_POST_IDLE_SECONDS, True)
+        assert reused and conn.n == 34 and (host, 443) in m._POOL_BODIES and not closed, "a request with a body: the most recent one, used a second ago"
+        m._pool_put(host, 443, conn)
+        conn, reused = m._pool_take(host, 443, 10, m.KEEPALIVE_IDLE_SECONDS)
+        assert reused and conn.n == 32 and closed == [30, 31], (conn.n, closed)  # a read: the one unused longest within the limit — those past it dropped on the way
+        assert [c.n for c, _ in m._POOL[(host, 443)]] == [33, 34]
+        other, reused = m._pool_take(host, 443, 10, m.KEEPALIVE_IDLE_SECONDS)
+        assert reused and other.n == 33, "a second read beside it: the next one — the most recent still left alone"
+        late, reused = m._pool_take(host, 443, 10, m.KEEPALIVE_POST_IDLE_SECONDS, True)
+        assert reused and late.n == 34, "...and there for the order that comes while both reads are out"
+        for c in (conn, other, late):
+            m._pool_put(host, 443, c)
+        assert [c.n for c, _ in m._POOL[(host, 443)]] == [32, 33, 34], "back in the pool as they return: each read's turn comes round"
+        # a request with a body that finds none recent enough opens a new one, as before (the reads' are not taken from them)
+        m._POOL[(host, 443)] = [(Pooled(40), now - 9), (Pooled(41), now - 5)]
+        conn, reused = m._pool_take(host, 443, 10, m.KEEPALIVE_POST_IDLE_SECONDS, True)
+        assert not reused and conn.n > 100 and [c.n for c, _ in m._POOL[(host, 443)]] == [40, 41]
+        # every pooled connection past the limit: a read drops them all and opens one, as before
+        m._POOL[(host, 443)] = [(Pooled(i), now - 40) for i in range(50, 53)]
+        conn, reused = m._pool_take(host, 443, 10, m.KEEPALIVE_IDLE_SECONDS)
+        assert not reused and conn.n > 100 and not m._POOL[(host, 443)] and closed[-3:] == [50, 51, 52], closed
+        # a host that is only ever read keeps its rule (the quote feeds: nothing to keep a connection for)
+        quotes = "qt.example.test"
+        m._POOL[(quotes, 443)] = [(Pooled(60), now - 9), (Pooled(61), now - 1)]
+        conn, reused = m._pool_take(quotes, 443, 10, m.KEEPALIVE_IDLE_SECONDS)
+        assert reused and conn.n == 61 and (quotes, 443) not in m._POOL_BODIES
     finally:
         m.HTTPS_CONNECTION = real_conn
         m._POOL.pop((host, 443), None)
+        m._POOL.pop(("qt.example.test", 443), None)
+        m._POOL_BODIES.discard((host, 443))
 
 
 feed_pool_post()

@@ -30,6 +30,7 @@ import logging
 import math
 import operator
 import os
+import pickle
 import re
 import secrets
 import signal
@@ -53,7 +54,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.39"
+VERSION = "1.154.40"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -1677,6 +1678,7 @@ KEEPALIVE_PER_HOST = 24             # pooled connections per host: at least PRED
                                     # (Telegram's long poll holds one for half a minute)
 HTTPS_CONNECTION = http.client.HTTPSConnection  # (the tests put a fake here)
 _POOL: dict[tuple[str, int], list[tuple[Any, float]]] = {}  # (host, port) -> [(connection, last used, monotonic)], oldest first
+_POOL_BODIES: set[tuple[str, int]] = set()  # the (host, port) sent a request with a body so far: their reads take the pooled connection unused longest (_pool_take, 1.154.40)
 _POOL_LOCK = threading.Lock()
 HTTP_STATS = {"new": 0, "reused": 0, "retried": 0}  # connections opened / reused / requests retried on a fresh one (/diag)
 # 1.154.17 — how far a host is (/rules: the rule taker's race is won or lost on the way to Predict). host -> "connect": the last new
@@ -1689,13 +1691,33 @@ def http_net(host: str) -> dict:
     return HTTP_NET.setdefault(host, {"connect": collections.deque(maxlen=40), "edge": ""})
 
 
-def _pool_take(host: str, port: int, timeout: float, max_idle: float) -> tuple[Any, bool]:
+def _pool_take(host: str, port: int, timeout: float, max_idle: float, body: bool = False) -> tuple[Any, bool]:
     """The most recently used pooled connection to host:port, when used within ``max_idle`` seconds, else a new one.
     On a miss only the pooled connections idle longer than KEEPALIVE_IDLE_SECONDS are dropped: the others stay for the
-    GETs. (connection, whether it came from the pool)."""
+    GETs. (connection, whether it came from the pool).
+
+    1.154.40 — on a host that is also sent requests with a body (``body``: an order, a cancel — reused only on a connection
+    used within KEEPALIVE_POST_IDLE_SECONDS, and never sent twice), a read takes the pooled connection unused the LONGEST
+    (within ``max_idle``; the ones past it dropped), not the most recent one. Every request took the most recent: the reads
+    in flight held exactly the connections an order could have used, and those left in the pool were the ones nobody had
+    touched for a while — an order got a recently used one only at a quiet moment, and otherwise paid a TCP + TLS handshake
+    first (31 ms at the median by /rules' own line, 11-18): some 4–13% of orders by a replay of the pool's rules at the
+    bot's request rates, 13–46% for the second order of a burst. Taking turns, the reads keep every pooled connection in
+    use (opened anew a hundredth as often) and leave the newest where it is. A host that is only ever read is as before."""
     with _POOL_LOCK:
         rows = _POOL.get((host, port))
         now = time.monotonic()
+        if body:
+            _POOL_BODIES.add((host, port))
+        elif rows and (host, port) in _POOL_BODIES:
+            while rows and now - rows[0][1] > max_idle:  # (oldest first: _pool_put appends)
+                rows.pop(0)[0].close()
+            if rows:
+                conn, _ = rows.pop(0)
+                HTTP_STATS["reused"] += 1
+                if getattr(conn, "sock", None) is not None:
+                    conn.sock.settimeout(timeout)
+                return conn, True
         if rows and now - rows[-1][1] <= max_idle:
             conn, _ = rows.pop()
             HTTP_STATS["reused"] += 1
@@ -1819,7 +1841,7 @@ def _http_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str, st
     for _hop in range(4):
         max_idle = KEEPALIVE_POST_IDLE_SECONDS if data is not None else KEEPALIVE_IDLE_SECONDS
         while True:
-            conn, reused = _pool_take(host, port, timeout, max_idle)
+            conn, reused = _pool_take(host, port, timeout, max_idle, data is not None)
             try:
                 if not reused and callable(getattr(conn, "connect", None)):  # (timed: http_net — request() would have made it itself)
                     began = time.perf_counter()
@@ -5726,6 +5748,28 @@ async def predict_blocking(fn: Any, *args: Any, pool: ThreadPoolExecutor | None 
     return await asyncio.get_running_loop().run_in_executor(pool or predict_pool(), fn, *args)
 
 
+STORE_WAIT_WORKERS = 4  # the threads an order's wait for its record's write runs on (store_wait): one an order at its gate, never many at once
+_STORE_POOL: ThreadPoolExecutor | None = None
+
+
+async def store_wait(fn: Any, *args: Any) -> Any:
+    """A wait for the store's writer (Store.reached) beside the event loop, on threads kept for it (1.154.40): the default
+    pool is the Binance and Telegram requests' (sixteen threads, a request held up to its 15-second timeout) — an order's
+    wait for its hash to be on disk queued behind them (asyncio.to_thread) whenever they were all taken."""
+    global _STORE_POOL
+    if _STORE_POOL is None:
+        _STORE_POOL = ThreadPoolExecutor(max_workers=STORE_WAIT_WORKERS, thread_name_prefix="store-wait")
+    return await asyncio.get_running_loop().run_in_executor(_STORE_POOL, fn, *args)
+
+
+def store_wait_close() -> None:
+    """The end of a run: store_wait's threads let go (made again by the next wait — a test's next bot)."""
+    global _STORE_POOL
+    pool, _STORE_POOL = _STORE_POOL, None
+    if pool is not None:
+        pool.shutdown(wait=False)
+
+
 PREDICT_PACING = os.environ.get("PREDICT_PACING", "on").strip().lower() != "off"  # the offline tests switch it off (tests/offline.py)
 
 
@@ -8577,6 +8621,39 @@ def touch_outcome(name: str, spec: TouchSpec) -> str:
     return "low" if has_low and not has_high else "high" if has_high and not has_low else ""
 
 
+def kept_read(card: Any, name: str, family: str, key: Any, read: Any) -> Any:
+    """What ``read()`` made of a card's kept record (touch:, flip:, range:, updown:<slug>:start | end | lead), kept on the
+    card until the store has seen a write of that family (Store.touched: every put, delete and replace of a key counts for
+    its family — the count Bot.sim_kept goes by) or the card is asked about another market (``key``).
+
+    1.154.40: pricing a market read its card's record from the database at every look — a SELECT and a JSON parse each,
+    137 of them for one pricing of the 77 markets (a first-touch card five, a flip four, a ladder one a level), and the
+    markets are priced once a second, before every book round and at every express look. The record changes when the
+    card's own scan writes it, some minutes apart. A store that keeps no count (a test's stand-in) is read every time."""
+    store = card.store
+    touched = getattr(store, "touched", None)
+    if touched is None:
+        return read()
+    generation = touched.get(family, 0)
+    kept = card.__dict__.setdefault("kept_reads", {})
+    held = kept.get(name)
+    if held is None or held[0] is not store or held[1] != generation or held[2] != key:  # (another store: its count is its own)
+        held = kept[name] = (store, generation, key, read())
+    return held[3]
+
+
+def kept_record(card: Any, family: str, key: str, start_ms: Any) -> dict:
+    """A card's own record (``key``: touch:<slug>, flip:<slug>, range:<slug>) when it is of the window that starts at
+    ``start_ms``, else {} — through kept_read. Handed out as a dict of the caller's own, as a read of the store is (the
+    scans add to theirs before saving it): a copy of the top for a record of plain values, of everything otherwise."""
+    def read() -> tuple[dict, bool]:
+        saved = card.store.get(key, {})
+        saved = saved if isinstance(saved, dict) and saved.get("start") == start_ms else {}
+        return saved, any(isinstance(v, (dict, list)) for v in saved.values())
+    saved, nested = kept_read(card, "history", family, (key, start_ms), read)
+    return copy.deepcopy(saved) if nested else dict(saved)
+
+
 class TouchMarket:
     """A Binance spot pair vs its two barriers: live price, 30-day σ, and the path since the market opened.
 
@@ -8624,8 +8701,7 @@ class TouchMarket:
     @property
     def history(self) -> dict:
         """{'kind': 'clear'|'low'|'high'|'ambiguous', 'through'/'time': ms, 'start': ms} or {}."""
-        saved = self.store.get(f"touch:{self.spec.slug}", {})
-        return saved if isinstance(saved, dict) and saved.get("start") == self.start_ms else {}
+        return kept_record(self, "touch", f"touch:{self.spec.slug}", self.start_ms)  # (1.154.40: read once a write, not once a look)
 
     async def refresh(self, now_ms: int) -> None:
         mono = time.monotonic()
@@ -9839,8 +9915,13 @@ class UpDownMarket:
         return UpDownMarket(self.store, spec)
 
     def close_of(self, which: str) -> D | None:
-        """The kept close of the "start" or "end" candle, None until it has been read."""
+        """The kept close of the "start" or "end" candle, None until it has been read. 1.154.40: its record read once a write
+        of the cards' closes (kept_read), not at every odds() — two or three reads a card a look."""
         open_ms = self.spec.start_ms if which == "start" else self.spec.end_ms
+        return kept_read(self, "close:" + which, "updown", (self.spec.slug, open_ms), lambda: self.close_read(which, open_ms))
+
+    def close_read(self, which: str, open_ms: int) -> D | None:
+        """close_of, from the store."""
         saved = self.store.get(f"updown:{self.spec.slug}:{which}")
         with contextlib.suppress(TypeError, KeyError, ValueError, decimal.InvalidOperation):
             if int(saved["open"]) == open_ms:
@@ -10231,7 +10312,11 @@ class IndexUpDownMarket(UpDownMarket):
 
     def lead_start(self) -> tuple[D, int] | None:
         """The exchange price in force at the window's start moment and its time, kept per window (updown:<slug>:lead);
-        None until kept, or when the bot came too late for it (note_lead)."""
+        None until kept, or when the bot came too late for it (note_lead). (1.154.40: read once a write — kept_read.)"""
+        return kept_read(self, "lead", "updown", self.spec.slug, self.lead_read)
+
+    def lead_read(self) -> tuple[D, int] | None:
+        """lead_start, from the store."""
         saved = self.store.get(f"updown:{self.spec.slug}:lead")
         with contextlib.suppress(TypeError, KeyError, ValueError, decimal.InvalidOperation):
             if isinstance(saved, dict) and saved.get("price") is not None:
@@ -10718,8 +10803,7 @@ class FlipMarket:
     def history(self) -> dict:
         """{'kind': 'clear'|'flip', 'through': ms (next hour to check), 'top'/'top_at': highest hourly-close ratio,
         'time'/'a'/'b': the flip minute and both closes, 'start': the window} or {}."""
-        saved = self.store.get(f"flip:{self.spec.slug}", {})
-        return saved if isinstance(saved, dict) and saved.get("start") == self.spec.start_ms else {}
+        return kept_record(self, "flip", f"flip:{self.spec.slug}", self.spec.start_ms)  # (1.154.40: read once a write, not once a look)
 
     async def refresh(self, now_ms: int) -> None:
         mono, errors = time.monotonic(), []
@@ -11687,7 +11771,16 @@ def hit_level_parser(slug: str) -> Any:
 def level_direction(rules: str, *titles: str) -> tuple[str, str]:
     """('up' | 'down' | '', where it was read): a market's own rules (High ≥ / Low ≤; rules naming both say nothing about
     this one market), else an arrow in its title or question, else a word there (reach / dip); '' when nothing says. An
-    arrow against the rules (the rules text may be the whole category's) is returned as the arrow says, marked "冲突"."""
+    arrow against the rules (the rules text may be the whole category's) is returned as the arrow says, marked "冲突".
+    1.154.40: read once a text (level_read) — a level's rules run to 3,000 characters and were gone over by four
+    expressions at every pricing of every level (Bot.sim_markets: once a second, before every book round, and at every
+    express look of the ladder — some 135 a second): more than half of what pricing the 77 markets cost."""
+    return level_read(str(rules), tuple(str(t) for t in titles))
+
+
+@functools.lru_cache(maxsize=1024)
+def level_read(rules: str, titles: tuple[str, ...]) -> tuple[str, str]:
+    """level_direction's reading of one market's texts, kept (a pure function of them; the answer is two words)."""
     text = re.sub(r"\s+", " ", re.sub(r"[\"'“”‘’*]", "", str(rules))).lower()
     down = re.search(r"\blow(?: price)? (?:is )?(?:equal to or (?:lower|less|below)|at or below|<=|≤)|\bfinal low\b", text)
     up = re.search(r"\bhigh(?: price)? (?:is )?(?:equal to or (?:greater|higher|above)|at or above|>=|≥)|\bfinal high\b", text)
@@ -11731,21 +11824,33 @@ def predict_reward_status(meta: dict, now_ms: int) -> dict:
         return {**out, "points_active": False, "points_note": "积分未激活"}
     if not isinstance(current, dict):
         return out
-    try:
-        rate = D(str(current.get("hourlyRate")))
-        start = dt.datetime.fromisoformat(str(current.get("startsAt")).replace("Z", "+00:00"))
-        end = dt.datetime.fromisoformat(str(current.get("endsAt")).replace("Z", "+00:00"))
-        if not rate.is_finite() or rate < 0 or start.utcoffset() is None or end.utcoffset() is None or end <= start:
-            return out
-        start_ms, end_ms = int(start.timestamp() * 1000), int(end.timestamp() * 1000)
-        rate_float = float(rate)
-        if not math.isfinite(rate_float):
-            return out
-    except (ValueError, TypeError, OverflowError, decimal.InvalidOperation):
+    window = reward_window(str(current.get("hourlyRate")), str(current.get("startsAt")), str(current.get("endsAt")))
+    if window is None:
         return out
+    rate, start_ms, end_ms, rate_float = window
     active = rate > 0 and start_ms <= now_ms < end_ms
     note = "积分已激活" if active else "积分未开始" if now_ms < start_ms else "积分已结束" if now_ms >= end_ms else "积分未激活"
     return {"points_active": active, "points_note": note, "points_rate": rate_float, "points_end_ms": end_ms}
+
+
+@functools.lru_cache(maxsize=1024)
+def reward_window(hourly_rate: str, starts_at: str, ends_at: str) -> tuple[D, int, int, float] | None:
+    """(the rate, the period's start and end in ms, the rate as a float) of a reward period as Predict writes it, None for
+    one that cannot be read (predict_reward_status: unknown then). 1.154.40: read once a period — the two dates and the
+    rate were parsed anew for every ladder level at every pricing (Bot.points_status)."""
+    try:
+        rate = D(hourly_rate)
+        start = dt.datetime.fromisoformat(starts_at.replace("Z", "+00:00"))
+        end = dt.datetime.fromisoformat(ends_at.replace("Z", "+00:00"))
+        if not rate.is_finite() or rate < 0 or start.utcoffset() is None or end.utcoffset() is None or end <= start:
+            return None
+        start_ms, end_ms = int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+        rate_float = float(rate)
+        if not math.isfinite(rate_float):
+            return None
+    except (ValueError, TypeError, OverflowError, decimal.InvalidOperation):
+        return None
+    return rate, start_ms, end_ms, rate_float
 
 
 def low_probability(spot: float, level: float, sigma: float, years: float, drift: float = -0.5) -> float:
@@ -11867,8 +11972,7 @@ class RangeMarket:
     def history(self) -> dict:
         """{'start': ms, 'through': ms (the next hour to read), 'open': the window's first price, 'high'/'low': prices,
         'high_at'/'low_at': hour opens}."""
-        saved = self.store.get(f"range:{self.spec.slug}", {})
-        return saved if isinstance(saved, dict) and saved.get("start") == self.start_ms else {}
+        return kept_record(self, "range", f"range:{self.spec.slug}", self.start_ms)  # (1.154.40: read once a write, not once a look)
 
     # the window and the card's wording: a stock market (StockRangeMarket) answers these differently
     @property
@@ -13680,6 +13784,74 @@ def trades_open(trades: Mapping) -> Iterable[tuple[str, dict]]:
                            f"{[k for k, _ in mine][-6:]} / {[k for k, _ in walked][-6:]}"):
             return trades.items()
     return rows
+
+
+def trade_mark(trade: Mapping) -> Any:
+    """A record as it stands, to tell afterwards whether a look changed it (the step's and the express lane's walks of the
+    open records, the real trader's reads of its orders: saved only when changed). 1.154.40: its pickle — until now its
+    JSON with the keys sorted, made before and after for every open record at every step and every resting order at every
+    express look: 45–50 µs each for a record of 5 KB, twice — 9 ms of a step with 77 records open, where the pickle takes 7.
+    Two marks are equal only if the records are (a pickle is the record, value for value); a record put back together
+    exactly as it was can give another one (the keys' order, an equal string made anew), which costs one more save of
+    what is already saved — never a change left unsaved. A record that cannot be pickled (none is made today) is marked
+    as before."""
+    try:
+        return pickle.dumps(trade, 5)
+    except Exception:
+        return json.dumps(trade, sort_keys=True, default=str)
+
+
+def trade_counts(trade: Mapping) -> bool:
+    """Whether a record holds anything the caps on money at risk count (Bot.sim_group_room, sim_window_open_usd: a
+    position, or an order that may still fill — sim_open_order). Every such record is an open one (trade_open)."""
+    return trade.get("status") in {"filled", "resting"} or sim_open_order(trade)
+
+
+def trades_open_of_driver(trades: Mapping, driver: str) -> list[dict]:
+    """The records settling on one driver that the group cap may count now, in the map's order: the open ones among the
+    driver's (1.154.40) — of a view that knows its open records (TradeMap.open_items); the driver's whole list
+    (trades_of_driver) of any other map, as before.
+
+    The driver's list keeps every record that could count again (driver_may_count): since 1.150.0 that leaves out the
+    settled and the lapsed, but a real order withdrawn stays on it for good (live_readopt can revive one), and with real
+    trading nearly every record is one — 2,113 on BTCUSDT's list in a store of 16,000, 11 of them counting. The cap walked
+    that list at every candidate, three times over for one the real-trading gates refuse (its size searched downwards),
+    under the step's lock and at every pushed book. What it counts — a position, an order that may still fill
+    (trade_counts) — is an open record every time (trade_open: tests/test_index.py), so the open ones are walked instead:
+    the same records, in the same order, the same sum."""
+    of = getattr(trades, "open_items", None)
+    rows = of() if of is not None else None
+    if rows is None:
+        return trades_of_driver(trades, driver)
+    mine = [t for _, t in rows if driver_may_count(t) and trade_driver(t)[0] == driver]
+    if TRADE_AUDIT:
+        now, was = [t for t in mine if trade_counts(t)], [t for t in trades_of_driver(trades, driver) if trade_counts(t)]
+        if not trade_audit("trades_open_of_driver", len(now) == len(was) and all(a is b for a, b in zip(now, was)), f"{driver}: {len(now)} / {len(was)}"):
+            return trades_of_driver(trades, driver)
+    return mine
+
+
+def trade_of_order(trades: Mapping, order_id: str) -> tuple[str, dict] | None:
+    """(tid, record) of the first record, in the map's order, whose real order is ``order_id``; None with none. 1.154.40: by
+    the orders' index (TradeIndex.by_order) when the map is the kept records as they stand (TradeMap.kept) — the read of a
+    cancelled order's fills (LiveBot.live_cancel_fills_read, once a confirmed cancel: most of a second's re-quotes) walked
+    every record to find its own, 18–20 ms each time with 16,000 kept. The walk itself for any other map, and when the
+    index names no record that still holds the id (one written onto a record and not saved since)."""
+    def walk() -> tuple[str, dict] | None:
+        return next(((k, t) for k, t in trades.items() if isinstance(t.get("live"), dict) and str(t["live"].get("order_id") or "") == order_id), None)
+    kept = getattr(trades, "kept", None)
+    index = kept() if kept is not None and order_id else None
+    if index is None:
+        return walk()
+    for tid in index.in_order(index.by_order.get(order_id, ())):
+        t = trades.get(tid)
+        if isinstance(t, dict) and isinstance(t.get("live"), dict) and str(t["live"].get("order_id") or "") == order_id:
+            if TRADE_AUDIT:
+                was = walk()
+                if not trade_audit("trade_of_order", was is not None and was[0] == tid and was[1] is t, order_id):
+                    return was
+            return tid, t
+    return walk()
 
 
 def side_held(trades: Mapping, market: str, side: str) -> dict:
@@ -21414,9 +21586,11 @@ class Bot:
         for mkt in self.updowns.values():
             if only is not None and mkt.spec.key != only:
                 continue
-            odds = mkt.odds(now_ms)
             book, _ = self.updown_book(mkt.spec)
-            if isinstance(odds, UpDownOdds) and book is not None:
+            if book is None:
+                continue  # 1.154.40: the book first — the cards nobody follows (22 of 26 by default) have none, and their odds were worked out for nothing at every pricing
+            odds = mkt.odds(now_ms)
+            if isinstance(odds, UpDownOdds):
                 out.append(SimMarket(mkt.spec.slug, mkt.spec.name, "updown", mkt.spec.key, odds.fair_up, book,
                                      self.edge_need(mkt.model_swing(odds)), self.updown_hold(mkt, odds, now_ms)[0], ("涨", "跌"),
                                      self.updown_settle(mkt.spec),
@@ -21757,9 +21931,12 @@ class Bot:
 
     def sim_window_open_usd(self, trades: Mapping, key: str) -> float:
         """What one card's 15-minute windows hold unsettled, in dollars (SIM_CRYPTO_15M_OPEN_USD): every window's positions
-        at cost and its orders resting or in flight — a cancel not yet confirmed too (sim_open_order) — at their price."""
+        at cost and its orders resting or in flight — a cancel not yet confirmed too (sim_open_order) — at their price.
+        1.154.40: over the open records (trades_open: every record that adds a term below is one — trade_counts), in the
+        map's order as before; it walked every record kept, 16,000 of them, for every candidate on a 15-minute window —
+        seven times in one build of the page's data, 2–4 ms each, and on the way of every order there."""
         total = 0.0
-        for t in trades.values():
+        for _, t in trades_open(trades):
             if t.get("key") != key or not (t.get("settle") or {}).get("window"):
                 continue
             unfilled = sim_open_order(t)
@@ -23442,7 +23619,7 @@ class Bot:
                 continue  # settled and confirmed: nothing below applies (and no JSON round trip for it every step)
             if trade["status"] in {"expired", "cancelled"} and float(trade.get("shares") or 0) <= 1e-9:
                 continue  # withdrawn or lapsed before anything filled: nothing to fill, mark out or settle (the journal keeps it)
-            before = json.dumps(trade, sort_keys=True, default=str)
+            before = trade_mark(trade)
             mk = markets.get(trade["market"])
             fresh = mk is not None and not mk.book.stale(now_ms) and not book_crossed(mk.book)
             if trade["status"] == "resting" and fresh:
@@ -23476,7 +23653,7 @@ class Bot:
                     trade["local"] = {"up": up, "note": note, "at": now_ms, "evidence": proof}
                     self.sim_settle(trade, up, note, now_ms, "本地数据更正" if local else "本地预结算")
                     trade["confirm"] = "local"
-            if json.dumps(trade, sort_keys=True, default=str) != before:
+            if trade_mark(trade) != before:
                 changed.append((tid, trade))
         if self.sim_paper_used:
             # What paper fills took on a market that is over is forgotten (sim_paper_used) here, once the records above have had
@@ -23630,7 +23807,7 @@ class Bot:
             trade = trades.get(tid)
             if trade is None or trade.get("final") or trade["status"] != "resting":
                 continue
-            before = json.dumps(trade, sort_keys=True, default=str)
+            before = trade_mark(trade)
             self.sim_fill(trade, mk, now_ms)
             if trade["status"] == "resting":
                 why = self.sim_withdraw_reason(trade, mk, now_ms)
@@ -23642,7 +23819,7 @@ class Bot:
                     self.sim_express_withdrawn[tid] = (time.monotonic(), float(trade.get("price") or 0))
                     if float(trade.get("shares") or 0) <= 1e-9:
                         rekeys.append(tid)
-            if json.dumps(trade, sort_keys=True, default=str) != before:
+            if trade_mark(trade) != before:
                 changed.append((tid, trade))
         for tid in rekeys:
             new_tid = self.sim_rekey(tid, trades[tid])
@@ -23966,7 +24143,7 @@ class Bot:
             return ""
         driver, name = market_driver(mk.kind, mk.key, mk.settle, mk.item)
         mine = []
-        for t in trades_of_driver(trades, driver):
+        for t in trades_open_of_driver(trades, driver):  # (1.154.40: the driver's open records — every one counted below is one)
             unfilled = sim_open_order(t)  # resting, or a real order whose cancel is not confirmed yet: it may still fill
             if t.get("status") not in {"filled", "resting"} and not unfilled:
                 continue
@@ -28071,6 +28248,7 @@ class Bot:
                 _PREDICT_POOL.shutdown(wait=False)
             if _FIRST_POOL is not None:
                 _FIRST_POOL.shutdown(wait=False)
+            store_wait_close()
             if self.reference_pool:
                 self.reference_pool.shutdown(wait=False, cancel_futures=True)
             for pool in (self.__dict__.get("diag_pool"), self.__dict__.get("speed_pool")):  # 1.154.33 (CR-11): made by /diag and /speed when first asked

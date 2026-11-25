@@ -92,6 +92,65 @@ assert k.sign_text("Sign in to Predict\nNonce: abc123") == (
 try: L.Wallet(KEY, 1); assert False
 except ValueError: pass
 
+# 1.154.40 — the hash and the signature worked out directly (Wallet.order_digest, sign_digest: the Order's twelve fields as 32-byte
+# words, each exchange's domain hash and the key object kept) are eth_account's own, byte for byte. The vectors above went that way
+# already (and beside the plain way: the suites check every signature against it, core.TRADE_AUDIT); here random orders of every
+# shape build_order makes, on the four exchanges and both chains, for a plain wallet and a Predict account
+import random as _random
+_rnd = _random.Random(1154)
+assert isinstance(w.direct, dict) and isinstance(k.direct, dict) and "CTF_EXCHANGE" in w.direct_checked and {"CTF_EXCHANGE", "kernel"} <= k.direct_checked
+_wallets = [w, k, L.Wallet("0x" + "ef" * 32, 97), L.Wallet("0x" + "cd" * 32, 97, "0x" + "22" * 20)]
+def _order(wal):
+    amount = _rnd.choice([WEI, 46 * WEI, 300 * WEI, _rnd.randrange(10 ** 16, 10 ** 24)])
+    return L.build_order(wal, str(_rnd.randrange(1, 2 ** 256)), _rnd.randrange(1, 100) * 10 ** 16 * amount // WEI, amount, _rnd.choice([0, 100, 200, 1000]),
+                         _rnd.randrange(1_700_000_000, 2_000_000_000), salt=_rnd.choice([0, 1, L.MAX_SALT - 1, _rnd.randrange(0, L.MAX_SALT)]))
+for _i in range(2400):
+    _wal, _flags = _wallets[_i % 4], (bool(_i & 4), bool(_i & 8))
+    _o = _order(_wal)
+    assert "0x" + _wal.order_digest(_o, *_flags).hex() == _wal.order_hash_plain(_o, *_flags) == _wal.order_hash(_o, *_flags), (_i, _o)
+    if _i < 240:
+        assert _wal.sign_order(_o, *_flags) == _wal.sign_order_plain(_o, *_flags), (_i, _o)
+assert all(isinstance(x.direct, dict) and len(x.direct["domains"]) == 4 for x in _wallets), "every exchange's domain hash made once and kept"
+# outside the suites (no audit) the plain way is taken beside the direct one for each exchange's first order alone
+_audit, m.TRADE_AUDIT = m.TRADE_AUDIT, False
+try:
+    for _account in ("", "0x" + "33" * 20):
+        _x, _plain = L.Wallet("0x" + "12" * 32, 56, _account), []
+        _x.sign_order_plain = lambda *a, _x=_x, _plain=_plain: _plain.append(a[1:]) or type(_x).sign_order_plain(_x, *a)
+        _o = _order(_x)
+        _first = _x.sign_order(_o, False, False)
+        assert len(_plain) == 1 and _first == type(_x).sign_order_plain(_x, _o, False, False)
+        assert _x.sign_order(_order(_x), False, False) and _x.sign_order(_o, False, False) == _first and len(_plain) == 1, "checked once an exchange"
+        assert _x.sign_order(_order(_x), True, True) and _x.sign_order(_order(_x), True, True) and len(_plain) == 2, "another exchange: its own first order"
+        # a field the direct way does not read for certain (a uint written in hex, as eth_account takes it too): that order the plain way
+        _odd = {**_o, "expiration": hex(int(_o["expiration"]))}
+        assert _x.order_digest(_odd, False, False) is None and _x.sign_order(_odd, False, False) == _first and len(_plain) == 3 and isinstance(_x.direct, dict)
+        for _bad in ({**_o, "maker": "0x1234"}, {**_o, "side": 256}, {**_o, "salt": "-1"}, {**_o, "nonce": True}, {k2: v for k2, v in _o.items() if k2 != "tokenId"}):
+            assert _x.order_digest(_bad, False, False) is None, _bad
+    # ...and a direct answer that ever differs from eth_account's (never seen: a kept piece spoilt here) is not given out: that order
+    # is signed the plain way, the direct way is off for this wallet from then on, and the log says so once
+    for _account, _spoil in (("", "domain"), ("0x" + "33" * 20, "domain"), ("0x" + "33" * 20, "kernel"), ("", "key")):
+        _x, _notes = L.Wallet("0x" + "34" * 32, 56, _account), []
+        _o = _order(_x)
+        _good = type(_x).sign_order_plain(_x, _o, False, False)
+        _x.direct_parts()
+        if _spoil == "domain":
+            _x.direct["domains"]["CTF_EXCHANGE"] = bytes(32)
+        elif _spoil == "kernel":
+            _x.direct["kernel"] = (bytes(32), bytes(32))
+        else:
+            from eth_keys import keys as _keys
+            _x.direct["key"] = _keys.PrivateKey(bytes.fromhex("56" * 32))
+        _error, m.LOG.error = m.LOG.error, lambda *a, **kw: _notes.append(a)
+        try:
+            assert _x.sign_order(_o, False, False) == _good and _x.direct is False, (_account, _spoil, _x.direct)
+            assert _x.sign_order(_order(_x), False, False) and _x.order_hash(_o, False, False) == _good[0] and _x.order_digest(_o, False, False) is None
+            assert len(_notes) == 1 and "订单签名" in _notes[0][0], _notes
+        finally:
+            m.LOG.error = _error
+finally:
+    m.TRADE_AUDIT = _audit
+
 # --- small parsers ----------------------------------------------------------------------------------------------------------
 tok = "x." + base64.urlsafe_b64encode(json.dumps({"exp": 1800000000}).encode()).decode().rstrip("=") + ".y"
 assert L.jwt_expiry(tok) == 1800000000 and L.jwt_expiry("bad") == 0 and L.jwt_expiry("") == 0
@@ -2498,21 +2557,22 @@ async def flush_rechecks():
     answer that the order already exists is "result unknown", not a refusal; an error answered with HTTP 200 is an error."""
     tid = f"{HSI_SLUG}|up|吃"
     sent = lambda bot: [c for c in bot.live.api.calls if c[0] == "create"]
-    to_thread = asyncio.to_thread
-    async def inline(fn, *a, **kw):  # the flush on this thread: what it does to the bot happens under the event loop
+    store_wait = m.store_wait
+    async def inline(fn, *a, **kw):  # the wait on this thread: what it does to the bot happens under the event loop
         return fn(*a, **kw)
-    asyncio.to_thread = inline
+    m.store_wait = inline  # (1.154.40: the order waits for its own record's write — Store.reached, through core.store_wait — not for Store.flush)
     try:
         for case in ("off", "withdrawn", "clear"):
             bot = make_bot(SIM_WAYS="taker")
             await bot.live_prepare(); await bot.live_prefetch(NOW)
-            def flush(timeout=10.0, bot=bot, case=case):
+            def flush(mark=0, timeout=10.0, bot=bot, case=case):
                 if case == "off":
                     bot.control_set({"LIVE": "off"})
                 elif case == "withdrawn":
                     bot.sim_withdraw(bot.sim_trades()[tid], "测试撤单", NOW)
                 return True
-            bot.store.flush = flush
+            bot.store.reached = flush
+            bot.store.flush = lambda *a, **k: (_ for _ in ()).throw(AssertionError("an order waits for its own write (Store.reached), not for everything queued (Store.flush)"))
             await step(bot, NOW, hsi(0.70, [("0.55", "300")], [("0.58", "400")], NOW))
             if case == "clear":
                 assert len(sent(bot)) == 1 and bot.sim_trades()[tid]["live"]["state"] == "open", bot.sim_trades()[tid]["live"]
@@ -2524,7 +2584,7 @@ async def flush_rechecks():
             assert t["note"].startswith("未下单：发出前已撤单（") and not any(k[:2] == (HSI_SLUG, "up") for k in bot.live_backoff), (case, t["note"], bot.live_backoff)
             assert bot.store.get(f"sim:{tid}#1")["live"]["state"] == "done" and bot.store.get(f"sim:{tid}") is None, "one copy, in the store too"
     finally:
-        asyncio.to_thread = to_thread
+        m.store_wait = store_wait
     async def down(): raise m.RemoteError("HTTP 503: sign-in down")
     async def up(): pass
     for key, value in (("SIM_SKIP", "HSI"), ("SIM_WAYS", "maker"), ("SIM_MARKETS", "touch")):
