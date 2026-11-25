@@ -42,6 +42,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import weakref
 import zlib
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -54,7 +55,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.40"
+VERSION = "1.154.41"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -13296,10 +13297,12 @@ class TradeIndex:
     new tuple where a list changes. The rest is read live, by the looks that take the records as they are now."""
 
     __slots__ = ("records", "market", "driver", "lent", "where", "counting", "seq", "tick", "open", "ordered", "orders", "by_order",
-                 "by_hash", "order_tick", "numbers", "swaps", "dead", "keys_tick", "settled", "settled_tick", "stat_rows", "stat_touched", "stat_queue")
+                 "by_hash", "order_tick", "numbers", "swaps", "dead", "keys_tick", "settled", "settled_tick", "stat_rows", "stat_touched", "stat_queue",
+                 "views")
 
     def __init__(self, records: dict[str, dict]):
         self.records = records
+        self.views: list = []                      # weak references to the views still reading these records (LazyTradeMap, 1.154.41): detach
         self.lent = False                          # a view holds market / driver as they are
         self.where: dict[str, str] = {}            # tid -> the market its record is listed under
         self.counting: dict[str, str] = {}         # tid -> the driver its record is listed under (driver_may_count)
@@ -13432,9 +13435,29 @@ class TradeIndex:
                 if not held:
                     del index[key]
 
+    def viewed(self, view: "LazyTradeMap") -> None:
+        """A view that reads these records without a copy of its own was just handed out (TradeMap.of): remembered, weakly,
+        to be told before they change (detach). The references to views long gone are dropped as the list grows."""
+        self.views.append(weakref.ref(view))
+        if len(self.views) > 256:
+            self.views = [ref for ref in self.views if (kept := ref()) is not None and kept.__dict__.get("_src") is self.records]
+
+    def detach(self) -> None:
+        """Before the records' keys change — one added, one removed, one given another record: every view still reading them
+        takes its own copy now (LazyTradeMap.own), as it stood when the view was taken. A record saved again under its key
+        changes nothing a view holds, and none is told."""
+        if self.views:
+            views, self.views = self.views, []
+            for ref in views:
+                view = ref()
+                if view is not None and view.__dict__.get("_src") is self.records:
+                    view.own("the kept records changed")
+
     def put(self, tid: str, t: dict) -> None:
         """A record saved under ``tid`` (Bot.sim_save, sim_rekey's new key): into the cache and the lists."""
         was = self.records.get(tid)
+        if was is not t:
+            self.detach()
         self.records[tid] = t
         if was is not None and was is not t:
             self.swaps += 1
@@ -13454,6 +13477,8 @@ class TradeIndex:
         self.remove(tid)
 
     def remove(self, tid: str) -> None:
+        if tid in self.records:
+            self.detach()
         self.records.pop(tid, None)
         if self.stat_rows is not None:
             self.stat_touched.add(tid)
@@ -13545,13 +13570,42 @@ class TradeMap(dict):
         self._added: dict[str, None] = {}            # the keys this view was given (at its end, in that order)
         self._swaps = self._keys_tick = 0
 
+    _src: dict | None = None  # the kept records a view still reads in place of a copy of its own (LazyTradeMap); None: this map holds its records itself
+
     @classmethod
     def of(cls, index: TradeIndex) -> "TradeMap":
-        """A view of the kept records as they stand: a copy of the map, the index's lists as they are."""
-        view = cls(index.records)
+        """A view of the kept records as they stand, the index's lists as they are. 1.154.41: one that reads the kept
+        records themselves until it, or they, are about to change (LazyTradeMap) — it was a copy of the whole map, made
+        at once. SIM_VIEW_COPY=on (TRADE_VIEWS_COPY) makes that copy again, as before."""
+        if TRADE_VIEWS_COPY:
+            view = cls(index.records)
+        else:
+            view = LazyTradeMap()
+            view._src = index.records
+            view.__dict__["get"] = index.records.get  # (the kept records' own get, until the view has its copy: own)
+            index.viewed(view)
+            LAZY_VIEWS["made"] += 1
+            if TRADE_AUDIT:  # every view beside the copy it stands for: compared when it takes its own, and at its end (lazy_audit)
+                held = [True]
+                view.__dict__["_audit"] = (held, dict(index.records))
+                weakref.finalize(view, lazy_audit, held, index.records, view.__dict__["_audit"][1], "at its end")
         view._index, view._market, view._driver, view._swaps, view._keys_tick = index, index.market, index.driver, index.swaps, index.keys_tick
         index.lent = True
         return view
+
+    # the walks, of either kind of map (a view that has not copied reads the kept records): methods of this class, where a
+    # test can still count them
+    def keys(self) -> Any:
+        src = self._src
+        return dict.keys(self) if src is None else src.keys()
+
+    def values(self) -> Any:
+        src = self._src
+        return dict.values(self) if src is None else src.values()
+
+    def items(self) -> Any:
+        src = self._src
+        return dict.items(self) if src is None else src.items()
 
     def of_market(self, market: str) -> list[dict]:
         """The records of one market, in the map's order (not to be changed by the caller)."""
@@ -13749,6 +13803,131 @@ class TradeMap(dict):
 
     def copy(self) -> "TradeMap":
         return TradeMap(self)
+
+
+TRADE_VIEWS_COPY = os.environ.get("SIM_VIEW_COPY", "").strip().lower() in {"on", "1", "true", "yes"}  # the views as before 1.154.41: a copy each, made at once
+LAZY_VIEWS = {"made": 0, "copied": 0}  # the views handed out since the start, and those that had to take a copy of their own (/diag)
+
+
+def lazy_audit(held: list, src: dict, shadow: dict, where: str) -> None:
+    """The tests' check of a view that reads the kept records (TRADE_AUDIT): while it has no copy of its own, those records
+    must be what the copy made at once would hold — the same keys in the same order, the same records. A difference is a
+    change of the kept map that told no view (TradeIndex.detach): noted, and the suite fails (tests/offline.py)."""
+    if held[0]:
+        trade_audit("lazy view", len(src) == len(shadow) and all(a == b and src[a] is shadow[b] for a, b in zip(src, shadow)), f"{where}: {len(src)} / {len(shadow)} records")
+
+
+class LazyTradeMap(TradeMap):
+    """A view of the kept records that has not copied them (1.154.41). Bot.sim_trades handed every caller a copy of the whole
+    map — 16,000 entries: a third of a millisecond to make and as much again to throw away — at every express look (some 135
+    a second), nine times a step and seven on the way of one order (each of its gates takes the records as they stand); and
+    nearly every caller only reads. This view reads the kept records in place (``_src``) and becomes the copy (own) at the
+    first moment the two could differ: when its holder changes it (a key put in, taken out), or when the kept records' keys
+    are about to change (TradeIndex.detach, before a key is added, removed or given another record). So at every moment it
+    holds what the copy would hold; once it has its own records it is a plain TradeMap again (its class is put back).
+
+    Its own storage is empty meanwhile: everything Python asks of a mapping goes to the kept records (below), but code that
+    reads a dict's storage directly would find nothing — the JSON encoder does (json.dumps of a whole view: "{}"). A view
+    is the records of a look, never written out whole; the tests check every view against the copy it stands for
+    (lazy_audit)."""
+
+    def own(self, why: str = "the view changed") -> None:
+        """This view's own copy of the records, from now on: what TradeMap.of made at once before 1.154.41."""
+        src = self.__dict__.pop("_src", None)
+        if src is None:
+            return
+        self.__dict__.pop("get", None)
+        audit = self.__dict__.pop("_audit", None)
+        if audit is not None:
+            lazy_audit(audit[0], src, audit[1], f"at its copy ({why})")
+            audit[0][0] = False
+        self.__class__ = TradeMap
+        dict.update(self, src)
+        LAZY_VIEWS["copied"] += 1
+
+    # reads: the kept records'
+    def __getitem__(self, key: Any) -> Any:
+        return self._src[key]  # type: ignore[index]
+
+    def __contains__(self, key: Any) -> bool:
+        return key in self._src  # type: ignore[operator]
+
+    def __iter__(self) -> Any:
+        return iter(self._src)  # type: ignore[arg-type]
+
+    def __len__(self) -> int:
+        return len(self._src)  # type: ignore[arg-type]
+
+    def __reversed__(self) -> Any:
+        return reversed(self._src)  # type: ignore[arg-type]
+
+    def __eq__(self, other: Any) -> bool:
+        return self._src == (other._src if isinstance(other, LazyTradeMap) else other)
+
+    def __ne__(self, other: Any) -> bool:
+        return not self.__eq__(other)
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __repr__(self) -> str:
+        return repr(self._src)
+
+    def copy(self) -> TradeMap:
+        return TradeMap(self._src)  # type: ignore[arg-type]
+
+    def __reduce_ex__(self, protocol: Any) -> Any:  # (pickled, copied by the copy module: as the plain map it stands for)
+        self.own("pickled or copied")
+        return TradeMap.__reduce_ex__(self, protocol)
+
+    def __or__(self, other: Any) -> Any:
+        return TradeMap(self._src) | other  # type: ignore[arg-type]
+
+    def __ror__(self, other: Any) -> Any:
+        return other | TradeMap(self._src)  # type: ignore[arg-type]
+
+    def __ior__(self, other: Any) -> Any:
+        self.own()
+        return TradeMap.__ior__(self, other)
+
+    # changes: the copy first, then as a TradeMap makes them — but for the ones that change nothing
+    def __setitem__(self, key: str, value: dict) -> None:
+        if self._src.get(key, _MISSING) is value:  # type: ignore[union-attr]
+            self.taken = None  # (the same record under its own key: nothing moves — TradeMap._put)
+            return
+        self.own()
+        TradeMap.__setitem__(self, key, value)
+
+    def __delitem__(self, key: str) -> None:
+        self.own()
+        TradeMap.__delitem__(self, key)
+
+    def pop(self, key: Any, *default: Any) -> Any:
+        if key not in self._src:  # type: ignore[operator]
+            if default:
+                return default[0]
+            raise KeyError(key)
+        self.own()
+        return TradeMap.pop(self, key, *default)
+
+    def popitem(self) -> Any:
+        self.own()
+        return TradeMap.popitem(self)
+
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        if key in self._src:  # type: ignore[operator]
+            return self._src[key]  # type: ignore[index]
+        self.own()
+        return TradeMap.setdefault(self, key, default)
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        given = dict(*args, **kwargs)
+        if given:
+            self.own()
+            TradeMap.update(self, given)
+
+    def clear(self) -> None:
+        self.own()
+        TradeMap.clear(self)
 
 
 def trades_of_market(trades: Mapping, market: str) -> list[dict]:
@@ -21220,6 +21399,7 @@ class Bot:
     def sim_cache(self, records: dict[str, dict] | None) -> None:
         index = self.__dict__.get("sim_index")
         if index is not None:
+            index.detach()  # (1.154.41: the views still reading the old records keep them as they are, whatever becomes of that dict)
             index.dead = True
         self.__dict__["_sim_cache"], self.__dict__["sim_index"] = records, None
 
@@ -27042,6 +27222,8 @@ class Bot:
                     size = self.sim_step_info
                     detail += ("（决策内：" + "、".join(f"{k} {v / 1000:.1f}s" for k, v in self.sim_step_ms.items())
                                + (f"；{size['markets']} 个市场、{size['records']} 条记录" + (f"（其中 {size['open']} 条还没结束，每步只看这些）" if size.get("open", -1) >= 0 else "") if size else "")
+                               + (f"；记录表每次取用都整表复制（SIM_VIEW_COPY=on）" if TRADE_VIEWS_COPY else
+                                  f"；记录表取用 {LAZY_VIEWS['made']:,} 次、其中 {LAZY_VIEWS['copied']:,} 次要整表复制" if LAZY_VIEWS["made"] else "")  # 1.154.41
                                + (f"；记录索引自检 {drift['n']} 条没跟上（{stamp(drift['at'], seconds=False)}，如 {drift['tids'][0]}），已更正" if (drift := getattr(self, "sim_index_drift", None)) else "")
                                + (f"；合计自检 {stale['n']} 条改了没保存（{stamp(stale['at'], seconds=False)}，如 {stale['tids'][0]}），已重算" if (stale := getattr(self, "sim_stat_stale", None)) else "") + "）")
                 sync = getattr(self, "live_sync_detail", None)

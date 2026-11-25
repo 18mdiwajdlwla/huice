@@ -136,7 +136,9 @@ async def run():
     bot.sim_step_ms, bot.sim_step_info = {"盘口": 100, "判断": 40, "结算": 5, "保存": 1}, {"markets": 172, "records": 3000}
     st = "\n".join(bot.diag_state(NOW))
     assert "✅ Predict 盘口：3 秒前成功｜上次用时 1.8s｜共 90 轮｜上轮 14 个市场（阶梯 5 档），最慢 NIULAI 1.2s" in st, st
-    assert "✅ 模拟交易：2 秒前成功｜上次用时 0.9s｜共 50 轮（决策内：盘口 0.1s、判断 0.0s、结算 0.0s、保存 0.0s；172 个市场、3000 条记录）" in st, st
+    assert "✅ 模拟交易：2 秒前成功｜上次用时 0.9s｜共 50 轮（决策内：盘口 0.1s、判断 0.0s、结算 0.0s、保存 0.0s；172 个市场、3000 条记录" in st, st
+    # 1.154.41: ...and how often a view of the records had to copy them (the views read the kept records in place: main.LazyTradeMap)
+    assert __import__("re").search(r"3000 条记录；记录表取用 [\d,]+ 次、其中 [\d,]+ 次要整表复制）", st), st
     bot.predict.round_info = {"keys": 3, "rows": 0, "ms": 500, "slowest": None}
     # 1.86.0: the stream's state follows the round's. 1.154.29: ...and, after it, how many 15- / 5-minute cards nobody trades the
     # feed follows or (1.154.30, the default) leaves alone (Bot.follow_note; test_follow.py) — the line ends there
