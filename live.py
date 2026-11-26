@@ -4094,7 +4094,8 @@ class LiveBot(core.Bot):
         rates (live_request_rates) only add up to when nothing else is on the key (the rule taker, /diag's own reads are).
         1.154.5: the orderbook feed's own key too (PREDICT_BOOK_API_KEY), and a key's 429s of the last day with the count it
         had let through in the minute before each — below Predict's 240, the limit is not counted the way the pacer counts.
-        The keys themselves are never shown."""
+        1.154.61: what Predict's answers on each key said of its limits (core.predict_buckets_short). The keys themselves are
+        never shown."""
         keys = [("主 Key", str(getattr(self.config, "predict_api_key", "") or ""))]
         if own := self.preopen_own_key():
             keys.append(("预挂专用 Key", own))
@@ -4143,11 +4144,16 @@ class LiveBot(core.Bot):
                         notes.append(f"原策略现在不借——{mine_why}")
             if hits:
                 notes.append(f"24 小时内 429 {len(hits)} 次，当时前 60 秒 {min(hits)}～{max(hits)} 次、中位 {mid:g} 次"
-                             + ("，远低于 240：这个 Key 可能还有别的程序或别人在用" if shared else ""))
+                             + ("，远低于上限：这个 Key 可能还有别的程序或别人在用" if shared else ""))
+            if said := core.predict_buckets_short(key):  # 1.154.61: the limits Predict's own answers on this key gave
+                notes.append(said)
             parts.append(f"{name} {pacer.last_minute()} 次" + (f"（{'；'.join(notes)}）" if notes else ""))
         if not parts:
             return ""
-        return "、".join(parts) + f"（节流每分钟 {core.PREDICT_RATE['per_min']:g} 次，Predict 默认上限 240；“等节拍”= 这把 Key 已经用满、请求在排队）"
+        # (1.154.61: "Predict 默认上限 240" was said here — the limits are an app's, by its volume tier, reads and orders apart: the
+        # answers' own figures are beside each key that had any)
+        return "、".join(parts) + (f"（节流每分钟 {core.PREDICT_RATE['per_min']:g} 次；Predict 的上限按 App 和交易量档位给，读取和下单分开算——"
+                                   "有的 Key 括号里写着它自己应答里报的；“等节拍”= 这把 Key 已经用满、请求在排队）")
 
     def live_limited_counts(self) -> str:
         """The 429s answered in the last 24 hours, by client — /diag (1.138.0): whether a key is over Predict's limit. In-memory: a
