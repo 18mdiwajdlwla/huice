@@ -140,6 +140,8 @@ class Said(unittest.TestCase):
         # the figures set: compared, not suggested
         self.assertTrue(m.predict_buckets_line("pre", (5000, 1000)).endswith("。→ 填的 Trading 5000 比 Predict 报的 2000 大——会被拒；填的 General 1000 比 Predict 报的 2000 小，可以改大"))
         self.assertNotIn("。→ ", m.predict_buckets_line("pre", (2000, 2000)), "the figures set are Predict's: nothing to say")
+        # one of the two set (1.154.62): the other said missing, with Predict's figure
+        self.assertTrue(m.predict_buckets_line("pre", (2000, 0)).endswith("。→ 还没填 General（两项都填了才生效），Predict 报的是 2000"), m.predict_buckets_line("pre", (2000, 0)))
         self.assertNotIn("。→ ", m.predict_buckets_line("pre"), "(another key's line: nothing suggested)")
         # reads of several groups at different limits: each said
         m.note_limit_headers(HOST, {"x-api-key": "pre"}, 200, answer({"ratelimit-limit": "120", "ratelimit-remaining": "100"}), "GET", "/v1/categories/x")

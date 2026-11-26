@@ -59,11 +59,15 @@ class Fast(unittest.IsolatedAsyncioTestCase):
     def test_the_limits_and_the_paces_they_give(self):
         config = m.Config.from_env({**BASE, **KEYS})
         self.assertEqual((config.preopen.app_trading, config.preopen.app_general, m.preopen_paces(config)), (0, 0, (0.0, 0.0)))
-        # both or neither, whole numbers, 240 to 100,000
-        for env in ({"PREOPEN_APP_TRADING_PER_MIN": "5000"}, {"PREOPEN_APP_GENERAL_PER_MIN": "5000"}, {**BIG, "PREOPEN_APP_GENERAL_PER_MIN": "239"},
-                    {**BIG, "PREOPEN_APP_TRADING_PER_MIN": "100001"}, {**BIG, "PREOPEN_APP_TRADING_PER_MIN": "-5"}):
-            with self.assertRaisesRegex(ValueError, "要一起填"):
+        # whole numbers, each 0 or 240 to 100,000
+        for env in ({**BIG, "PREOPEN_APP_GENERAL_PER_MIN": "239"}, {**BIG, "PREOPEN_APP_TRADING_PER_MIN": "100001"}, {**BIG, "PREOPEN_APP_TRADING_PER_MIN": "-5"},
+                    {"PREOPEN_APP_TRADING_PER_MIN": "100"}):
+            with self.assertRaisesRegex(ValueError, "要么填 0"):
                 m.Config.from_env({**BASE, **KEYS, **env})
+        # 1.154.62: one alone is kept (the control page saves one setting at a time) — and nothing is in force until both are
+        for env in ({"PREOPEN_APP_TRADING_PER_MIN": "5000"}, {"PREOPEN_APP_GENERAL_PER_MIN": "5000"}):
+            half = m.Config.from_env({**BASE, **KEYS, **env})
+            self.assertEqual((half.preopen.app_trading + half.preopen.app_general, m.preopen_paces(half)), (5000, (0.0, 0.0)))
         with self.assertRaisesRegex(ValueError, "必须是整数"):
             m.Config.from_env({**BASE, **KEYS, **BIG, "PREOPEN_APP_GENERAL_PER_MIN": "5k"})
         # the $50K tier (5,000 and 5,000) with the bot's key and the rule taker's beside the mode's: 80% of each limit, less 60
@@ -422,6 +426,13 @@ class Fast(unittest.IsolatedAsyncioTestCase):
         shared, _, _ = T.controller(PREDICT_API_KEY="main-key", **BIG)
         self.assertIn("PREOPEN_APP_*（Predict 后台的限额）填了但没起作用：预挂没有自己单独的 Key", shared.pace_line())
         await self.finish(shared)
+        # one of the two alone (1.154.62): said which is missing; nothing in force
+        for env, words in (({"PREOPEN_APP_TRADING_PER_MIN": "2000"}, "——“Predict 限额”只填了 Trading，还差 General：两项都填了才生效；"),
+                           ({"PREOPEN_APP_GENERAL_PER_MIN": "2000"}, "——“Predict 限额”只填了 General，还差 Trading：两项都填了才生效；")):
+            half, _, _ = T.controller(**KEYS, **env)
+            self.assertFalse(half.fast())
+            self.assertIn(words, half.pace_line())
+            await self.finish(half)
 
     async def test_a_withdrawn_pairs_final_reads_wait_out_a_cooldown(self):
         """A 429's twenty seconds: the thousands of withdrawn pairs waiting do not each spend a try on a read that cannot go out."""
@@ -588,13 +599,19 @@ class Fast(unittest.IsolatedAsyncioTestCase):
         env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "PREOPEN_15M": "on", **KEYS}
         bot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(T.NOW), None)
         self.assertEqual((bot.control_value("PREOPEN_APP_TRADING_PER_MIN"), bot.control_value("PREOPEN_APP_GENERAL_PER_MIN")), ("0", "0"))
+        # 1.154.62: one at a time, as the page saves them (each box its own 保存) — the first kept and not in force, the second
+        # puts both in force. They were refused one at a time ("要一起填") and could never be saved from the page at all
         answer = bot.control_set({"PREOPEN_APP_TRADING_PER_MIN": "5000"})
-        self.assertFalse(answer["ok"])
-        self.assertIn("要一起填", answer["message"])
-        answer = bot.control_set({"PREOPEN_APP_TRADING_PER_MIN": "5000", "PREOPEN_APP_GENERAL_PER_MIN": "5000"})
+        self.assertTrue(answer["ok"], answer)
+        self.assertEqual((bot.config.preopen.app_trading, bot.config.preopen.app_general, m.PREDICT_TRADE_OF), (5000, 0, {}))
+        answer = bot.control_set({"PREOPEN_APP_GENERAL_PER_MIN": "5000"})
         self.assertTrue(answer["ok"], answer)
         self.assertEqual((m.PREDICT_RATE_OF, m.PREDICT_TRADE_OF), ({"pre-key": 3560.0}, {"pre-key": 3880.0}))
         self.assertEqual(bot.config.preopen.app_trading, 5000)
+        self.assertFalse(bot.control_set({"PREOPEN_APP_GENERAL_PER_MIN": "100"})["ok"], "under 240: refused, the value in force kept")
+        self.assertEqual(bot.config.preopen.app_general, 5000)
+        # ...and the pre-open key's own pace, typed 2000 there by mistake (11-26 16:05): refused, as ever (60～1000)
+        self.assertFalse(bot.control_set({"PREOPEN_RATE_PER_MIN": "2000"})["ok"])
         self.assertTrue(bot.control_set({"PREOPEN_APP_TRADING_PER_MIN": "0", "PREOPEN_APP_GENERAL_PER_MIN": "0"})["ok"])
         self.assertEqual((m.PREDICT_RATE_OF, m.PREDICT_TRADE_OF), ({}, {}))
 

@@ -4395,7 +4395,11 @@ class Controller:
                     f"（Trading {self.settings.app_trading}、General {self.settings.app_general} 次/分钟，PREOPEN_APP_*）："
                     f"下单撤单每分钟最多 {self.trade_pace:g} 次、其他请求最多 {self.read_pace:g} 次——各用到限额的 {core.PREOPEN_APP_SHARE:.0%}，再扣掉机器人别的 Key 可能用的份额；"
                     f"同时挂 {self.place_workers()} 对、同时核对 {self.fast_verify()} 对；" + self.cut_line() + self.borrow_line())
-        limits = (f"——PREOPEN_APP_*（Predict 后台的限额）填了但没起作用：预挂没有自己单独的 Key" if (self.settings.app_trading or self.settings.app_general) and not self.fast() else "")
+        trading, general = int(self.settings.app_trading), int(self.settings.app_general)
+        limits = ("" if not (trading or general) or self.fast()
+                  # (1.154.62: one of the two saved alone — kept, not in force)
+                  else f"——“Predict 限额”只填了 {'Trading' if trading else 'General'}，还差 {'General' if trading else 'Trading'}：两项都填了才生效" if not (trading and general)
+                  else "——PREOPEN_APP_*（Predict 后台的限额）填了但没起作用：预挂没有自己单独的 Key")
         pace = ("不节流" if not ((mine or per_min) and core.PREDICT_PACING)
                 else f"每分钟最多 {mine:g} 次（PREOPEN_RATE_PER_MIN：只管预挂这把 Key，别的 Key {f'仍是 {per_min:g}' if per_min else '不节流'}；读等节拍、下单撤单优先）" if mine
                 else f"每分钟最多 {per_min:g} 次（PREDICT_RATE_PER_MIN，读等节拍、下单撤单优先）"
