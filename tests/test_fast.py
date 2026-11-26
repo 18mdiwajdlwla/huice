@@ -42,10 +42,12 @@ class Fast(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.kept = (m.PREDICT_PACING, m.PREDICT_RATE["per_min"], dict(m.PREDICT_PACERS), dict(m.PREDICT_RATE_OF), dict(m.PREDICT_TRADE_OF), dict(m.PREDICT_TRADE_PACERS))
         m.PREDICT_PACERS.clear(); m.PREDICT_TRADE_PACERS.clear(); m.PREDICT_RATE_OF.clear(); m.PREDICT_TRADE_OF.clear(); m.PREOPEN_CUTS.clear()
-        m.PREOPEN_AUTO_LIMITS.clear(); m.PREDICT_BUCKETS_SAID.clear()
+        m.PREOPEN_AUTO_LIMITS.clear(); m.PREDICT_BUCKETS_SAID.clear(); m.KEYS_APART.clear()
+        self.kept_rate = dict(m.PREDICT_RATE)
 
     def tearDown(self):
-        m.PREOPEN_CUTS.clear(); m.PREOPEN_AUTO_LIMITS.clear(); m.PREDICT_BUCKETS_SAID.clear()
+        m.PREOPEN_CUTS.clear(); m.PREOPEN_AUTO_LIMITS.clear(); m.PREDICT_BUCKETS_SAID.clear(); m.KEYS_APART.clear()
+        m.PREDICT_RATE.clear(); m.PREDICT_RATE.update(self.kept_rate)
         m.PREDICT_PACING, m.PREDICT_RATE["per_min"] = self.kept[0], self.kept[1]
         for table, was in ((m.PREDICT_PACERS, self.kept[2]), (m.PREDICT_RATE_OF, self.kept[3]), (m.PREDICT_TRADE_OF, self.kept[4]), (m.PREDICT_TRADE_PACERS, self.kept[5])):
             table.clear(); table.update(was)
@@ -689,6 +691,69 @@ class Fast(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((given.trade_pace, given.read_pace, given.auto_pending()), (1360.0, 360.0, False))
         self.assertIn("按 Predict 后台给这个 App 的限额跑（Trading 2000、General 1000 次/分钟，PREOPEN_APP_*）", given.pace_line())
         await self.finish(given)
+
+    def test_each_key_at_its_own_limits_and_no_room_for_other_apps(self):
+        """1.154.66 — 11-26 19:10: the bot's key said 5,000 / 5,000, the rule taker's 2,000 / 2,000, the pre-open key's 2,000 / 1,000."""
+        config = m.Config.from_env({**BASE, **KEYS})
+        self.assertTrue(config.predict_rate_auto)
+        m.set_predict_rates(config)
+        self.assertEqual([m.predict_rate(k) for k in ("main-key", "rule-key", "pre-key")], [220.0] * 3, "nothing said yet: the usual pace")
+        self.said("main-key", 5000, 5000)
+        self.said("rule-key", 2000, 2000)
+        self.assertEqual((m.predict_rate("main-key"), m.predict_rate("rule-key")), (1000.0, 1000.0), "half the lower limit, 1,000 at the most")
+        self.assertEqual(m.predict_pacer("main-key").per_min, 1000.0)
+        self.said("rule-key", 300, 2000)
+        self.assertEqual(m.predict_rate("rule-key"), 220.0, "never under the usual pace")
+        self.said("rule-key", 2000, 2000)
+        # off, or no pacing at all, or a pace of the key's own: as they were
+        m.set_predict_rates(m.Config.from_env({**BASE, **KEYS, "PREDICT_RATE_AUTO": "off"}))
+        self.assertEqual(m.predict_rate("main-key"), 220.0)
+        m.set_predict_rates(m.Config.from_env({**BASE, **KEYS, "PREDICT_RATE_PER_MIN": "0"}))
+        self.assertEqual(m.predict_rate("main-key"), 0.0)
+        m.set_predict_rates(config)
+        # the pre-open key's paces: no room kept for keys of other apps (they said other limits) — unknown ones, room as before
+        self.said("pre-key", 2000, 1000)
+        m.preopen_auto_freeze(config)
+        m.PREDICT_BUCKETS_SAID.pop("rule-key")
+        self.assertEqual(m.preopen_paces(config), (1600.0 - 120, 800.0 - 220), "the rule taker's key not said: room for it at its usual pace")
+        self.said("rule-key", 2000, 2000)
+        self.assertEqual(m.preopen_paces(config), (1600.0, 800.0), "three apps: the whole 80% of each")
+        # a key that said the same limits may be the same app: room for it at its own pace
+        m.KEYS_APART.clear()
+        self.said("rule-key", 2000, 1000)
+        self.assertEqual((m.predict_rate("rule-key"), m.preopen_paces(config)), (500.0, (1600.0 - 120, 800.0 - 500)))
+        # once seen to be another app's, for good — a key quiet for half an hour has its figures forgotten, not its app
+        self.said("rule-key", 2000, 2000)
+        m.preopen_paces(config)
+        self.said("rule-key", 2000, 2000, at=time.time() - m.BUCKET_FRESH_S - 1)
+        self.assertEqual((m.predict_said_limits("rule-key"), m.predict_may_share("pre-key", "rule-key")), ((0, 0), False))
+        # /diag says which keys go by their own limits
+        ns = types.SimpleNamespace(config=config, KEY_SHARED_BELOW=L.LiveBot.KEY_SHARED_BELOW)
+        ns.preopen_own_key = lambda: L.LiveBot.preopen_own_key(ns)
+        ns.book_own_key = lambda: L.LiveBot.book_own_key(ns)
+        m.predict_pacer("main-key").sent.append(time.monotonic())
+        self.assertIn("主 Key 1 次（按它自己报的限额定速：每分钟 1000 次（PREDICT_RATE_AUTO）", L.LiveBot.live_key_load(ns))
+
+    async def test_the_mode_takes_the_room_back_once_the_other_keys_have_said(self):
+        m.PREDICT_PACING = True
+        self.said("pre-key")
+        ctl, api, _ = T.controller(**KEYS)
+        m.set_predict_rates(ctl.owner.config)
+        self.assertEqual((ctl.trade_pace, ctl.read_pace), (1360.0, 360.0), "the other keys not said yet: room kept for them")
+        ctl.workers_started = ctl.place_workers()
+        gate = ctl.reconcile_gate
+        self.said("main-key", 5000, 5000)
+        self.said("rule-key", 2000, 2000)
+        ctl.fast_watch()
+        self.assertEqual((ctl.trade_pace, ctl.read_pace, m.PREDICT_TRADE_OF, m.PREDICT_RATE_OF), (1600.0, 800.0, {"pre-key": 1600.0}, {"pre-key": 800.0}))
+        self.assertIsNot(ctl.reconcile_gate, gate)
+        self.assertEqual((ctl.workers_started, len(ctl.extra_workers)), (8, 1))
+        ctl.fast_watch()
+        self.assertEqual(len(ctl.extra_workers), 1, "nothing moved: nothing done")
+        for task in ctl.extra_workers:
+            task.cancel()
+        await asyncio.gather(*ctl.extra_workers, return_exceptions=True)
+        await self.finish(ctl)
 
     def test_the_control_page(self):
         class FM:

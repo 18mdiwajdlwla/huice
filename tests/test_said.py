@@ -37,7 +37,7 @@ def sent(key, method, path, times=1):
 class Said(unittest.TestCase):
     def setUp(self):
         self.kept = (dict(m.PREDICT_SENT), dict(m.PREDICT_BUCKETS_SAID), dict(m.PREDICT_LIMITS_SAID))
-        m.PREDICT_SENT.clear(); m.PREDICT_BUCKETS_SAID.clear(); m.PREDICT_LIMITS_SAID.clear()
+        m.PREDICT_SENT.clear(); m.PREDICT_BUCKETS_SAID.clear(); m.PREDICT_LIMITS_SAID.clear(); m.KEYS_APART.clear()
 
     def tearDown(self):
         for table, was in zip((m.PREDICT_SENT, m.PREDICT_BUCKETS_SAID, m.PREDICT_LIMITS_SAID), self.kept):
@@ -122,6 +122,11 @@ class Said(unittest.TestCase):
         self.assertEqual(whose(1958, 42, 45, mine_clock=5, all_clock=5), "和这把 Key 同期发的对得上")
         self.assertEqual(whose(1700, 42, 45), "比机器人所有 Key 同期发的还多——还有别的程序在用同一个 App 或 Key")
         self.assertEqual(whose(1650, 168, 468), "", "between the two: nothing said")
+        # 1.154.66: a limiter by sliding window counter — this clock window's count and the last one's in the share still under the
+        # minute: 11-26 19:10:33, 360 counted where the key had sent 215 since 19:10:00 and some 320 in the minute before
+        slid = {"limit": 2000, "window": 60.0, "remaining": 1640, "elapsed": 33.0, "mine": 520, "mine_clock": 215, "mine_prev": 320,
+                "all": 900, "all_clock": 500, "all_prev": 500}
+        self.assertEqual(m.predict_bucket_whose(slid), "只算这把 Key 自己的")
 
     def test_what_the_status_says_and_suggests(self):
         self.assertEqual((m.predict_buckets_line("pre"), m.predict_buckets_short("pre")), ("", ""))
@@ -149,6 +154,15 @@ class Said(unittest.TestCase):
         line = m.predict_buckets_line("pre", (0, 0))
         self.assertIn("General：市场 每分钟 2000 次、分类 每分钟 120 次——", line)
         self.assertTrue(line.endswith("可以照这个填：Trading 2000、General 120"), line)
+        # keys of other apps (their answers said other limits): never "together", whatever the counts
+        m.PREDICT_SENT.clear(); m.KEYS_APART.clear()
+        sent("pre", "POST", "/v1/orders", 42)
+        sent("main", "POST", "/v1/orders", 400)
+        m.note_limit_headers(HOST, {"x-api-key": "main"}, 200, answer({"ratelimit-limit": "5000", "ratelimit-remaining": "4000"}), "POST", "/v1/orders")
+        m.note_limit_headers(HOST, {"x-api-key": "main"}, 200, answer({"ratelimit-limit": "5000", "ratelimit-remaining": "4900"}), "GET", "/v1/markets/1")
+        m.PREDICT_BUCKETS_SAID["pre"]["下单撤单"].update(remaining=2000 - 440, at=time.time())
+        self.assertIn("→只算这把 Key 自己的——别的 Key 报的限额和它不一样，不在同一个 App", m.predict_buckets_line("pre"))
+        m.PREDICT_BUCKETS_SAID["pre"]["下单撤单"]["remaining"] = 1958
         # /diag's few words
         self.assertEqual(m.predict_buckets_short("pre"), "Predict 报：General 每分钟 120 次（剩 100）、Trading（含读订单） 每分钟 2000 次（剩 1958）")
         # figures older than half an hour are not today's word

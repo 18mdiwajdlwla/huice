@@ -1901,6 +1901,8 @@ SHARE_VERSION = 1           # of the counts kept in the file (ArchiveShare.state
 SHARE_KEY, SHARE_GEN_KEY = "archive_share", "archive_gen"  # the ledger's settings they are kept under, and the archive's generation (share_gen)
 SHARE_READ_STEP = 1_000     # ArchiveShare.read: the archive's rows a query (never the whole of it in memory)
 SHARE_STEP = 100            # the background preparation: rows read / windows looked up before the event loop has its turn (a hundredth of a second each)
+SHARE_STEP_S = 0.02         # 1.154.66: ...or this long, whichever comes first — 11-26 19:07, after a start: a step of a hundred windows' look-ups held the
+#                             event loop 1,031 ms (the archive's pages not in the disk's cache yet: each look-up a read of the disk, on the loop)
 SHARE_LOOP_ROWS = 2_000     # a call on the event loop reads no more rows of the archive than this (an hour's pass moves a few hundred in)...
 SHARE_LOOP_WINDOWS = 1_500  # ...and looks up no more windows it does not hold
 
@@ -1953,17 +1955,26 @@ class ShareWork:
         """More than a call on the event loop may do (ArchiveShare.read, whole=False)."""
         return self.rows_left > SHARE_LOOP_ROWS or self.windows_left > SHARE_LOOP_WINDOWS
 
-    def step(self, n: int = SHARE_STEP) -> bool:
-        """The next ``n`` rows read and counted — then, the rows done, the next ``n`` windows looked up; whether more is left."""
+    def step(self, n: int = SHARE_STEP, budget_s: float | None = None) -> bool:
+        """The next ``n`` rows read and counted — then, the rows done, the next ``n`` windows looked up; whether more is left.
+        ``budget_s`` (1.154.66): no longer than that either — what is left the next step's (a page cut short is read on from
+        the row it reached)."""
         share = self.share
+        began = time.perf_counter()
+        over = lambda: budget_s is not None and time.perf_counter() - began >= budget_s
         if self.stage == "rows":
             page = self.conn.execute("SELECT rowid, slug, body FROM archive WHERE rowid > ? ORDER BY rowid LIMIT ?", (self.reached, n)).fetchall()
+            done = 0
             for rowid, slug, body in page:
                 pair = json.loads(body)
                 if not self.fresh and window_of(pair) not in share.known:  # (a window quoted and archived since the last call: an earlier record of it would be among the rows counted)
                     share.learn(self.conn, window_of(pair))
                 share.add(slug, pair)
                 self.reached, self.added, share.last = rowid, self.added + 1, (slug,)
+                done += 1
+                if done < len(page) and over():
+                    self.rows_left = max(0, self.rows_left - done)
+                    return True  # (the page's rest from the row reached, next step)
             self.rows_left = max(0, self.rows_left - len(page))
             if len(page) < n:
                 share.top, share.count = self.reached, share.count + self.added
@@ -1972,11 +1983,14 @@ class ShareWork:
             return True
         if self.stage == "windows":
             part, self.todo = self.todo[:n], self.todo[n:]
-            for window in part:
+            for at, window in enumerate(part):
                 if self.fresh:
                     share.known[window] = ()  # (every window of the archive is held just now: this one has no record there)
                 else:
                     share.learn(self.conn, window)
+                    if at + 1 < len(part) and over():
+                        self.todo = part[at + 1:] + self.todo  # (the rest of this part, next step)
+                        break
             self.windows_left = 0 if self.fresh else len(self.todo)
             if not self.todo:
                 share.known = {window: share.known[window] for window in self.windows}
@@ -4417,6 +4431,14 @@ class Controller:
                     LOG.warning("开盘前预挂：Predict 拒绝了请求（429），%s的节拍已经是最低的每分钟 %g 次", name, after)
                     self.notify(f"⚠️ 开盘前预挂：{name}已经降到最低的每分钟 {after:g} 次，仍被 Predict 拒绝（429）——填的限额（{limits}）对这把 Key 不成立。"
                                 f"把“Predict 限额”那两项改成 0（不填），预挂就回到原来的方式", key=f"preopen:cut:{bucket}:floor")
+            paces = core.preopen_paces(self.owner.config)
+            if all(paces) and paces != (self.trade_pace, self.read_pace):
+                # 1.154.66: the paces moved without a refusal — the bot's other keys' answers came in (a fresh process: seconds after
+                # the start), and those of other apps need no room kept here (core.preopen_paces): the mode runs at them now
+                before = (self.trade_pace, self.read_pace)
+                core.set_predict_rates(self.owner.config)
+                self.go_fast()
+                LOG.info("开盘前预挂：节拍从 %g / %g 改为 %g / %g（别的 Key 报的限额到了：不同 App 的不再预留份额）", *before, self.trade_pace, self.read_pace)
         except Exception as error:
             LOG.warning("开盘前预挂：被拒绝后的降速没做成：%s", core.clean_error(error) or type(error).__name__)
 

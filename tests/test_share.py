@@ -128,6 +128,15 @@ def the_steps_are_the_one_read(folder) -> None:
     while work.step(10):
         pass
     assert dumped(P.review(rows, later, whole)) == exact(saved, later) and whole.count == 1404 + 145
+    # 1.154.66: a step cut short by its time (budget_s: none at all here — one row, one window a step) comes to the same counts
+    for kept in (None,):
+        cut = P.ShareWork(led.conn, led.path, rows, kept)
+        steps = 0
+        while cut.step(100, budget_s=0.0):
+            steps += 1
+            assert steps < 100_000
+        assert cut.done and dumped(P.review(rows, later, cut.share)) == exact(saved, later), "a step cut short by its time: the same read"
+        assert steps >= cut.share.count, (steps, cut.share.count)
     assert dumped(P.review(rows, later, P.ArchiveShare.read(led.conn, led.path, rows, whole))) == exact(saved, later), "and nothing new: as it stands"
     # a row replaced in place while the steps go: said (the work is begun again by whoever runs it)
     work = P.ShareWork(led.conn, led.path, rows, whole)

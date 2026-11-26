@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.65"
+VERSION = "1.154.66"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -954,6 +954,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_APP_AUTO", "按 Predict 报的限额自动定速", "开（默认，1.154.64）：上面两项“Predict 限额”都没填时，照 Predict 每个应答里报的这把 Key 的限额自动定速——"
      "预挂每次启动时取最新的（下单、撤单和读订单按 Trading，读市场、分类等按 General），交易量档位变了、换了新号都跟着变，不用手填；两项填了的以填的为准。"
      "关 = 没填就照原来每分钟 220 次。只在预挂有自己单独的 Key 时起作用"),
+    ("PREDICT_RATE_AUTO", "其他 Key 也按 Predict 报的限额定速", "开（默认，1.154.66）：主 Key、盘口 Key、规则吃单 Key 各按它自己应答里报的限额定速——两类里小的那个数的一半，"
+     "每分钟最多 1000 次，不低于原来的 220；关 = 都按每分钟 220 次。11-26 主 Key 报的是 5000、规则吃单 Key 2000，却都按 220 跑：盘口读取在规则吃单 Key 上排队，一分钟里等了 182 秒"),
     ("PREOPEN_EXCLUSIVE", "预挂时原策略暂停开新仓", "开 = 本模式真实运行时普通模型策略不开新仓（原策略也在交易同一批 15 分钟市场时建议开）；关 = 两边同时跑，额度和日亏损合并计算"),
     ("PREOPEN_MARKETS", "预挂哪几张卡", "点亮要挂的卡，可多选，全选 = all（默认只挂 BTC）；BTC 5分、ETH 5分、BNB 5分 是每 5 分钟一场的卡（1.137.0，只给预挂用）；BTC 小时、ETH 小时、BNB 小时 是每小时一场（bitcoin-up-or-down-<日期>-<几点>-et，那一小时开始前撤单），BTC 日、ETH 日、BNB 日 是每天一场（<币>-up-or-down-on-<日期>，前一天 12:00 ET 开始，开始前撤单）（1.142.0，只给预挂用）；“一键全关”= none：一张都不挂、已挂的预挂单撤掉，本模式仍开着，再点亮一张就恢复；和“做哪些市场”互不影响：那边排除 15 分钟卡只管原策略，预挂只认这里"),
     ("PREOPEN_WEEKEND", "周末也挂", "开 = 周末的场次照挂；关 = 周末不挂：北京时间周六 00:00 到周一 08:00 开始的场次不挂（周日晚到周一早上是币圈最薄的时段），周五起就不挂周六的场次，周末里已挂的按“设置不同”撤掉（不算再报价次数），周一 08:00 起恢复。股票卡周末本来没有场次，这项只影响 BTC、ETH、BNB 这些周末也有场次的卡"),
@@ -1236,6 +1238,7 @@ class Config:
     live_max_order_usd: float = 100.0  # LIVE_MAX_ORDER_USD: the most one order may cost
     live_orders_page: int = 50         # LIVE_ORDERS_PAGE: orders per page when the account's open list is read (a page is a round trip; 1.112.1)
     predict_rate_per_min: float = 220.0  # PREDICT_RATE_PER_MIN: every API key's requests paced to this many a minute (PredictPacer, 1.154.0); 0 = no pacing
+    predict_rate_auto: bool = True       # PREDICT_RATE_AUTO (1.154.66): a key whose answers say its limits, paced by them (predict_rate) — never under the above
     preopen_api_key: str = ""          # PREOPEN_API_KEY: a second Predict API key for the pre-open mode alone — its own request budget (1.154.0)
     preopen_api_keys: tuple = field(default=(), repr=False)  # PREOPEN_API_KEYS (1.154.59): further keys for the pre-open mode alone, each a budget of
     #                                    its own — the mode's requests go out on them when its first key has no token (preopen.Controller.lane)
@@ -1473,6 +1476,7 @@ class Config:
             live_max_order_usd=parse_bounded(e, "LIVE_MAX_ORDER_USD", "100", 1, 1_000_000),
             live_orders_page=bounded_int(e, "LIVE_ORDERS_PAGE", 50, 10, 500),
             predict_rate_per_min=float(bounded_int(e, "PREDICT_RATE_PER_MIN", 220, 0, 100_000)),
+            predict_rate_auto=str(e.get("PREDICT_RATE_AUTO", "on")).strip().lower() != "off",
             preopen_api_key=preopen_keys_of(e)[0],
             preopen_api_keys=preopen_keys_of(e)[1],
             preopen_rate_per_min=preopen_rate_of(e),
@@ -2041,10 +2045,16 @@ def predict_bucket_sample(key: str, group: str, raw: Mapping[str, str], status: 
     kind = "trade" if group in ("下单撤单", "订单") else "read"  # (1.154.63: the order reads are the Trading bucket's)
     window = float(numbers.get("window") or 60)
     began = now - now % window
+    mine_clock, all_clock = predict_sent_since(began, kind, key), predict_sent_since(began, kind)
     groups[group] = {"at": now, "status": status, "limit": numbers["limit"], "remaining": numbers["remaining"],
-                     "reset": numbers.get("reset"), "window": window, "kind": kind,
-                     "mine": predict_sent_since(now - window, kind, key), "mine_clock": predict_sent_since(began, kind, key),
-                     "all": predict_sent_since(now - window, kind), "all_clock": predict_sent_since(began, kind),
+                     "reset": numbers.get("reset"), "window": window, "kind": kind, "elapsed": now - began,
+                     "mine": predict_sent_since(now - window, kind, key), "mine_clock": mine_clock,
+                     "all": predict_sent_since(now - window, kind), "all_clock": all_clock,
+                     # 1.154.66: the clock's window before this one — a limiter by "sliding window counter" (this window's count, and the
+                     # last one's in the share of it still under the sliding minute) counts that: 11-26 19:10:33, 360 counted on the
+                     # pre-open key's orders where it had sent 215 since 19:10:00 — and some 320 the minute before, × 27/60
+                     "mine_prev": max(0, predict_sent_since(began - window, kind, key) - mine_clock),
+                     "all_prev": max(0, predict_sent_since(began - window, kind) - all_clock),
                      "mine_any": predict_sent_since(now - window, "trade", key) + predict_sent_since(now - window, "read", key)}
 
 
@@ -2054,8 +2064,10 @@ def predict_bucket_whose(sample: Mapping) -> str:
     other keys sent next to nothing of the kind) or nothing fits."""
     used = int(sample["limit"]) - int(sample["remaining"])
     near = lambda a, b: abs(a - b) <= max(15, 0.2 * max(a, b))
-    mine = min((sample["mine"], sample["mine_clock"]), key=lambda n: abs(n - used))
-    every = min((sample["all"], sample["all_clock"]), key=lambda n: abs(n - used))
+    left = max(0.0, 1.0 - float(sample.get("elapsed") or 0) / float(sample.get("window") or 60))  # (the last window's share still in the sliding minute)
+    slid = lambda who: int(sample[f"{who}_clock"] + sample.get(f"{who}_prev", 0) * left)  # (1.154.66: a sliding window counter's estimate)
+    mine = min((sample["mine"], sample["mine_clock"], slid("mine")), key=lambda n: abs(n - used))
+    every = min((sample["all"], sample["all_clock"], slid("all")), key=lambda n: abs(n - used))
     if used > 1.25 * max(sample["all"], sample["all_clock"]) + 20:
         return "比机器人所有 Key 同期发的还多——还有别的程序在用同一个 App 或 Key"
     if near(sample["all"], sample["mine"]):
@@ -2088,6 +2100,9 @@ def predict_buckets_line(key: str, app: tuple[int, int] | None = None) -> str:
     if not groups:
         return ""
     hms = lambda at: dt.datetime.fromtimestamp(at, BEIJING).strftime("%H:%M:%S")
+    # (1.154.66: every other key that sent anything known to be another app's — its answers said other limits: none counts here)
+    others = {k for (k, _) in list(PREDICT_SENT)} - {key, ""}
+    apart = bool(others) and all(not predict_may_share(key, other) for other in others)
     parts = []
     for kind, title, count in (("read", "General", "读取"), ("trade", "Trading", "下单、撤单和读订单")):
         seen = sorted(((g, s) for g, s in groups.items() if s["kind"] == kind), key=lambda gs: gs[1]["at"])
@@ -2102,6 +2117,8 @@ def predict_buckets_line(key: str, app: tuple[int, int] | None = None) -> str:
             head = f"{title}：" + "、".join(f"{g} 每分钟 {s['limit']} 次" for g, s in seen)
         title = count
         whose = predict_bucket_whose(last)
+        if apart and whose in ("机器人几把 Key 合在一起算（同一个 App）", ""):
+            whose = "只算这把 Key 自己的——别的 Key 报的限额和它不一样，不在同一个 App"
         mine_n = last["mine"] if abs(last["mine"] - used) <= abs(last["mine_clock"] - used) else last["mine_clock"]
         all_n = last["all"] if abs(last["all"] - used) <= abs(last["all_clock"] - used) else last["all_clock"]
         parts.append(f"{head}——{hms(last['at'])} 那次（{group}）已算 {used} 次、剩 {last['remaining']}"
@@ -6667,10 +6684,25 @@ PREDICT_TRADE_PACERS: dict[str, "PredictPacer"] = {}
 PREOPEN_CUTS: dict[tuple, dict[str, float]] = {}
 
 
+KEY_AUTO_SHARE, KEY_AUTO_MAX = 0.5, 1000.0  # 1.154.66: a key paced by its own said limits (PREDICT_RATE_AUTO): this share of the lower, this many a minute at most
+
+
 def predict_rate(key: str) -> float:
     """The requests a minute an API key is paced to: the speed test's figure while a step of it runs (PREDICT_RATE_TEST), else
-    the key's own where it has one (PREDICT_RATE_OF), else every key's."""
-    return float(PREDICT_RATE_TEST.get(key) or PREDICT_RATE_OF.get(key) or PREDICT_RATE["per_min"])
+    the key's own where it has one (PREDICT_RATE_OF), else every key's — 1.154.66: or, PREDICT_RATE_AUTO on, KEY_AUTO_SHARE
+    of the lower of the two limits the key's own answers say (predict_said_limits), KEY_AUTO_MAX at the most, never under
+    every key's. 11-26 19:10: the bot's key said 5,000 and 5,000, the rule taker's 2,000 and 2,000 — each paced to 220,
+    the orderbook feed's reads queued on the rule taker's key 182 seconds in a minute. One pacer for both kinds on such a
+    key (the pre-open key's are apart: PREDICT_TRADE_OF)."""
+    fixed = PREDICT_RATE_TEST.get(key) or PREDICT_RATE_OF.get(key)
+    if fixed:
+        return float(fixed)
+    base = float(PREDICT_RATE["per_min"])
+    if PREDICT_RATE.get("auto") and base > 0:
+        trading, general = predict_said_limits(key)
+        if trading and general:
+            return float(max(base, min(KEY_AUTO_MAX, math.floor(KEY_AUTO_SHARE * min(trading, general)))))
+    return base
 
 
 def preopen_own_keys(config: Any) -> tuple[str, ...]:
@@ -6703,6 +6735,23 @@ def predict_said_limits(key: str) -> tuple[int, int]:
     groups = [s for s in (PREDICT_BUCKETS_SAID.get(key) or {}).values() if now - s["at"] <= BUCKET_FRESH_S]
     lowest = lambda kind: min((int(s["limit"]) for s in groups if s["kind"] == kind), default=0)
     return lowest("trade"), lowest("read")
+
+
+KEYS_APART: set[frozenset] = set()  # pairs of keys their answers showed to be two apps' (predict_may_share): a key never changes its app
+
+
+def predict_may_share(key: str, other: str) -> bool:
+    """Whether two keys may be one app's tokens, and so count in the same buckets (1.154.66): not where both keys' answers said
+    their limits and those differ — an app's limits are every token's of it — once seen, for good (a key quiet for half an
+    hour has its figures forgotten, not its app). Unknown: they may."""
+    pair = frozenset((key, other))
+    if pair in KEYS_APART:
+        return False
+    mine, theirs = predict_said_limits(key), predict_said_limits(other)
+    if all(mine) and all(theirs) and mine != theirs:
+        KEYS_APART.add(pair)
+        return False
+    return True
 
 
 def preopen_auto_freeze(config: Any) -> bool:
@@ -6755,9 +6804,13 @@ def preopen_paces(config: Any, whole: bool = False) -> tuple[float, float]:
     every = float(getattr(config, "predict_rate_per_min", 220.0) or 0) or 220.0  # (the others unpaced: reckoned at the usual pace)
     mine = float(getattr(config, "preopen_rate_per_min", 0) or 0) or every
     others = {str(getattr(config, name, "") or "") for name in ("predict_api_key", "predict_book_api_key", "rule_api_key")} - {"", home}
+    # 1.154.66: room kept only for the keys that may be this app's tokens — one whose answers say other limits than this key's is
+    # another app's (an app's limits are its every token's): 11-26 the three keys said 5,000/5,000, 2,000/2,000 and 2,000/1,000,
+    # and 440 reads a minute were kept back for two keys that never count here. Room for each at its own pace (predict_rate)
+    sharing = [key for key in sorted(others) if predict_may_share(home, key)]
     further = (len(own) - 1) * mine
-    trade = max(mine, math.floor(PREOPEN_APP_SHARE * trading - len(others) * min(every, PREOPEN_OTHERS_TRADE) - further))
-    read = max(mine, math.floor(PREOPEN_APP_SHARE * general - len(others) * every - further))
+    trade = max(mine, math.floor(PREOPEN_APP_SHARE * trading - sum(min(predict_rate(key) or every, PREOPEN_OTHERS_TRADE) for key in sharing) - further))
+    read = max(mine, math.floor(PREOPEN_APP_SHARE * general - sum(predict_rate(key) or every for key in sharing) - further))
     cut = {} if whole else PREOPEN_CUTS.get(preopen_cut_key(config)) or {}
     # (+1e-6: a pace cut to 960 of 3,760 is 3,760 × 960 / 3,760 — 959.999… in floating point, not 960)
     return tuple(float(max(mine, math.floor(pace * float(cut.get(bucket, 1.0)) + 1e-6))) for bucket, pace in (("trade", trade), ("read", read)))
@@ -6801,6 +6854,7 @@ def set_predict_rates(config: Any) -> None:
     key by Predict's own two buckets where its app's limits are given (preopen_paces) — its orders and cancels on a bucket
     of their own (PREDICT_TRADE_OF), every other request of it on the key's."""
     PREDICT_RATE["per_min"] = float(getattr(config, "predict_rate_per_min", 220.0))
+    PREDICT_RATE["auto"] = bool(getattr(config, "predict_rate_auto", False))  # (1.154.66: predict_rate)
     PREDICT_RATE_OF.clear()
     PREDICT_TRADE_OF.clear()
     if (rate := float(getattr(config, "preopen_rate_per_min", 0) or 0)) > 0:
@@ -13603,6 +13657,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_MARKETS": {"kind": "multi", "group": "预挂", "none": "none", "options": [["btc", "BTC"], ["eth", "ETH"], ["bnb", "BNB"], ["btc5", "BTC 5分"], ["eth5", "ETH 5分"], ["bnb5", "BNB 5分"], ["btc1h", "BTC 小时"], ["eth1h", "ETH 小时"], ["bnb1h", "BNB 小时"], ["btc1d", "BTC 日"], ["eth1d", "ETH 日"], ["bnb1d", "BNB 日"], ["xau", "黄金"], ["cl", "原油"], ["skhynix", "SK 海力士"], ["unitree", "宇树"], ["zhipu", "智谱"], ["mu", "美光"], ["sndk", "闪迪"], ["avgo", "博通"], ["spcx", "SPCX"], ["nvda", "英伟达"], ["googl", "谷歌"], ["meta", "Meta"], ["tsm", "台积电"], ["amzn", "亚马逊"], ["qqq", "纳指ETF"], ["spy", "标普ETF"], ["msft", "微软"]]},  # 1.130.7: pick the cards one by one; 1.134.0: 黄金、原油、智谱; 1.135.0: 美股 12 张; 1.136.0: "none" = the page's 一键全关
     "PREOPEN_WEEKEND": {"kind": "choice", "group": "预挂", "options": [["on", "on 周末照挂"], ["off", "off 周末不挂"]]},
     "PREOPEN_APP_AUTO": {"kind": "choice", "group": "预挂", "options": [["on", "on 自动（照 Predict 报的）"], ["off", "off 不自动"]]},  # 1.154.64
+    "PREDICT_RATE_AUTO": {"kind": "choice", "group": "预挂", "options": [["on", "on 按各自报的限额"], ["off", "off 都按 220"]]},  # 1.154.66
     "PREOPEN_EXCLUSIVE": {"kind": "choice", "group": "预挂", "options": [["off", "off 两边同时跑"], ["on", "on 预挂时原策略不开新仓"]]},
     "PREOPEN_SHARES": {"kind": "number", "group": "预挂", "presets": ["5", "10", "20", "50", "100"], "unit": "份"},
     "PREOPEN_PRICE_CENTS": {"kind": "number", "group": "预挂", "presets": ["45", "47", "48", "49", "50"], "unit": "¢"},
@@ -27849,7 +27904,7 @@ class Bot:
                                                else ",".join(f"{float(p) * 100:g}x{float(s):g}" for p, s in c.preopen.btc5_deep)),
                   "PREOPEN_MAX_OPEN_USD": plain(c.preopen.max_open_usd), "PREOPEN_RATE_PER_MIN": plain(c.preopen_rate_per_min),
                   "PREOPEN_APP_TRADING_PER_MIN": str(c.preopen.app_trading), "PREOPEN_APP_GENERAL_PER_MIN": str(c.preopen.app_general),
-                  "PREOPEN_EXCLUSIVE": flag(c.preopen.exclusive), "PREOPEN_APP_AUTO": flag(c.preopen.app_auto),
+                  "PREOPEN_EXCLUSIVE": flag(c.preopen.exclusive), "PREOPEN_APP_AUTO": flag(c.preopen.app_auto), "PREDICT_RATE_AUTO": flag(c.predict_rate_auto),
                   "RULE_TAKER": c.rules.mode, "RULE_MAX_DAY_USD": plain(c.rules.max_day_usd), **{name: str(c.rules.price(key)) for key, name in RULE_SETTING_KEYS.items()},
                   **{switch: flag(c.rules.on(mk)) for mk, (switch, _) in RULE_MARKET_KEYS.items()},
                   **{size: str(c.rules.shares_of(mk)) for mk, (_, size) in RULE_MARKET_KEYS.items()},
