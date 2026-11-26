@@ -4097,6 +4097,9 @@ class LiveBot(core.Bot):
         keys = [("主 Key", str(getattr(self.config, "predict_api_key", "") or ""))]
         if own := self.preopen_own_key():
             keys.append(("预挂专用 Key", own))
+        for i, extra in enumerate(getattr(self.config, "preopen_api_keys", ()) or ()):  # 1.154.59: the pre-open mode's further keys
+            if extra and extra not in {key for _, key in keys}:
+                keys.append((f"预挂专用 Key {i + 2}", str(extra)))
         if (book := self.book_own_key()) and book != own:
             keys.append(("盘口专用 Key", book))
         rule = str(getattr(self.config, "rule_api_key", "") or "")  # 1.154.12: the rule taker's own (RULE_API_KEY)

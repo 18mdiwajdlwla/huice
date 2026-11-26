@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.58"
+VERSION = "1.154.59"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -229,6 +229,26 @@ def preopen_rate_of(env: Mapping) -> float:
     if rate and not 60 <= rate <= 1000:
         raise ValueError("PREOPEN_RATE_PER_MIN 是 0（跟所有 Key 一样，按 PREDICT_RATE_PER_MIN）或 60～1000（预挂专用 Key 每分钟最多发多少个请求）")
     return float(rate)
+
+
+PREOPEN_KEYS_MAX = 8  # PREOPEN_API_KEYS: more keys than this for the pre-open mode are a mistake in the variable, said at the start
+
+
+def preopen_keys_of(env: Mapping) -> tuple[str, tuple[str, ...]]:
+    """The pre-open mode's API keys (1.154.59): (its key — PREOPEN_API_KEY — and the further ones, PREOPEN_API_KEYS, separated by
+    commas, spaces or line breaks). Predict limits each key by itself, so each further key is another budget of requests for
+    the mode. With PREOPEN_API_KEY empty the first of the list is the mode's key. A further key that is another role's — the
+    bot's own, the orderbook feed's, the rule taker's — is left out: that budget is not the mode's to fill (the rule taker's is
+    borrowed while it idles, by its own rule: RULE_KEY_LEND)."""
+    home = str(env.get("PREOPEN_API_KEY", "")).strip()
+    more = [key for key in re.split(r"[\s,;]+", str(env.get("PREOPEN_API_KEYS", "")).strip()) if key]
+    if not home and more:
+        home = more.pop(0)
+    others = {str(env.get(name, "")).strip() for name in ("PREDICT_API_KEY", "PREDICT_BOOK_API_KEY", "RULE_API_KEY")} | {home}
+    more = [key for key in dict.fromkeys(more) if key not in others]
+    if len(more) > PREOPEN_KEYS_MAX:
+        raise ValueError(f"PREOPEN_API_KEYS 最多 {PREOPEN_KEYS_MAX} 把（现在 {len(more)} 把）")
+    return home, tuple(more)
 
 
 def bounded_int(env: dict[str, str], key: str, default: int, low: int, high: int) -> int:
@@ -928,7 +948,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
      "3～1440：调小就只挂快开场的几场，少占资金、少读接口，但新场次要等进了范围才挂，排在先挂的人后面"),
     ("PREOPEN_BTC5_LEVELS", "BTC 5 分钟：整串价格档位（旧写法）", "1.154.37 的写法，留着兼容：价格x份数、逗号分隔、第一档在前，如 47x10,43x40，一次把 BTC 5 分钟的所有档写全；空 = 不用。"
      "1.154.56 起用“开盘前预挂 · BTC 5 分钟”那一组里的“第一档价格”“第一档每边份数”“更深的价格档位”分开填就行——那三项填了的，盖在这里的整串之上"),
-    ("PREOPEN_RATE_PER_MIN", "预挂专用 Key：每分钟请求数", "0 = 跟所有 Key 一样（PREDICT_RATE_PER_MIN，默认 220）；60～1000 = 只给预挂自己那把 Key（PREOPEN_API_KEY）单独定速，"
+    ("PREOPEN_RATE_PER_MIN", "预挂专用 Key：每分钟请求数", "0 = 跟所有 Key 一样（PREDICT_RATE_PER_MIN，默认 220）；60～1000 = 只给预挂自己的 Key（PREOPEN_API_KEY，以及 PREOPEN_API_KEYS 里的每一把）单独定速，"
      "主 Key、盘口 Key 和规则吃单的 Key 不受影响（1.154.57）。Predict 给每把 Key 的上限默认是每分钟 240 次，超了会拒绝（429）并让这把 Key 停约 20 秒"
      "（这 20 秒预挂不能下单也不能撤单，到了撤单时间的单靠签在单里的到期时间兜底）。"
      "该设多少：在 Telegram 发 /preopen 测速（1.154.58），机器人自己一档一档往上试，把这把 Key 的实际上限和建议值发给你——"
@@ -1169,6 +1189,8 @@ class Config:
     live_orders_page: int = 50         # LIVE_ORDERS_PAGE: orders per page when the account's open list is read (a page is a round trip; 1.112.1)
     predict_rate_per_min: float = 220.0  # PREDICT_RATE_PER_MIN: every API key's requests paced to this many a minute (PredictPacer, 1.154.0); 0 = no pacing
     preopen_api_key: str = ""          # PREOPEN_API_KEY: a second Predict API key for the pre-open mode alone — its own request budget (1.154.0)
+    preopen_api_keys: tuple = field(default=(), repr=False)  # PREOPEN_API_KEYS (1.154.59): further keys for the pre-open mode alone, each a budget of
+    #                                    its own — the mode's requests go out on them when its first key has no token (preopen.Controller.lane)
     preopen_rate_per_min: float = 0.0  # PREOPEN_RATE_PER_MIN (1.154.57): that key's own pace, 0 = PREDICT_RATE_PER_MIN — raised a step at a time to
     #                                    see where Predict's limit for a key lies (/preopen's 速度 line counts its 429s), the other keys left alone
     rule_key_lend: bool = True         # RULE_KEY_LEND: on = while the rule taker is idle its own key (RULE_API_KEY) also carries the orderbook feed's
@@ -1403,7 +1425,8 @@ class Config:
             live_max_order_usd=parse_bounded(e, "LIVE_MAX_ORDER_USD", "100", 1, 1_000_000),
             live_orders_page=bounded_int(e, "LIVE_ORDERS_PAGE", 50, 10, 500),
             predict_rate_per_min=float(bounded_int(e, "PREDICT_RATE_PER_MIN", 220, 0, 100_000)),
-            preopen_api_key=str(e.get("PREOPEN_API_KEY", "")).strip(),
+            preopen_api_key=preopen_keys_of(e)[0],
+            preopen_api_keys=preopen_keys_of(e)[1],
             preopen_rate_per_min=preopen_rate_of(e),
             rule_key_lend=not off(e.get("RULE_KEY_LEND", "on")),
             live_read_lend=not off(e.get("LIVE_READ_LEND", "on")),
@@ -6320,6 +6343,16 @@ class PredictPacer:
         self.refill()
         return self.tokens >= 1.0 + (self.LOW_RESERVE if low else 0.0) + max(0.0, leave) - 1e-9
 
+    def wait_for(self, low: bool = False, leave: float = 0.0) -> float:
+        """Seconds until a read (a ``low`` one, leaving ``leave`` more behind) would get its token at the pace as it is: 0.0 when
+        it would now (spare), and with the pacing off. What a request that may go out on any of several keys sleeps before it
+        looks at them again (preopen.Controller.lane_wait, 1.154.59)."""
+        if not (self.per_min > 0 and PREDICT_PACING):
+            return 0.0
+        self.refill()
+        short = 1.0 + (self.LOW_RESERVE if low else 0.0) + max(0.0, leave) - self.tokens
+        return max(0.0, short) * 60.0 / self.per_min
+
     def waited_last(self, seconds: float = 60.0) -> tuple[int, float]:
         """(requests that waited for a token, the seconds they waited together) in the last ``seconds``: a key at its pace
         shows them, an idle one none (/diag: 等节拍)."""
@@ -6373,21 +6406,29 @@ def predict_rate(key: str) -> float:
     return float(PREDICT_RATE_TEST.get(key) or PREDICT_RATE_OF.get(key) or PREDICT_RATE["per_min"])
 
 
+def preopen_own_keys(config: Any) -> tuple[str, ...]:
+    """The keys that are the pre-open mode's alone, its first one first (1.154.59: PREOPEN_API_KEYS' too): those given that are
+    not another role's — the bot's own, the orderbook feed's, the rule taker's."""
+    others = {str(getattr(config, name, "") or "") for name in ("predict_api_key", "predict_book_api_key", "rule_api_key")}
+    keys = [str(getattr(config, "preopen_api_key", "") or ""), *(str(key or "") for key in getattr(config, "preopen_api_keys", ()) or ())]
+    return tuple(key for key in dict.fromkeys(keys) if key and key not in others)
+
+
 def preopen_own_rate(config: Any) -> float:
     """PREOPEN_RATE_PER_MIN where it is in force — the pre-open key's own pace: 0 when not set, and when that key is not the
     mode's alone (none given, or the same as the bot's, the orderbook feed's or the rule taker's: their pace is every key's)."""
     own, rate = str(getattr(config, "preopen_api_key", "") or ""), float(getattr(config, "preopen_rate_per_min", 0) or 0)
-    others = {str(getattr(config, name, "") or "") for name in ("predict_api_key", "predict_book_api_key", "rule_api_key")}
-    return rate if own and own not in others and rate > 0 else 0.0
+    return rate if own in preopen_own_keys(config) and rate > 0 else 0.0
 
 
 def set_predict_rates(config: Any) -> None:
     """The keys' paces as the configuration says them: PREDICT_RATE_PER_MIN for every key, and PREOPEN_RATE_PER_MIN (0 = the same) for
-    the pre-open mode's key where that is in force (preopen_own_rate)."""
+    each key that is the pre-open mode's alone (preopen_own_keys: its first, and PREOPEN_API_KEYS')."""
     PREDICT_RATE["per_min"] = float(getattr(config, "predict_rate_per_min", 220.0))
     PREDICT_RATE_OF.clear()
-    if rate := preopen_own_rate(config):
-        PREDICT_RATE_OF[str(config.preopen_api_key)] = rate
+    if (rate := float(getattr(config, "preopen_rate_per_min", 0) or 0)) > 0:
+        for key in preopen_own_keys(config):
+            PREDICT_RATE_OF[key] = rate
 
 
 def predict_pacer(key: str) -> PredictPacer:
