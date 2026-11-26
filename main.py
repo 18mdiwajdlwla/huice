@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.57"
+VERSION = "1.154.58"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -931,8 +931,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_RATE_PER_MIN", "预挂专用 Key：每分钟请求数", "0 = 跟所有 Key 一样（PREDICT_RATE_PER_MIN，默认 220）；60～1000 = 只给预挂自己那把 Key（PREOPEN_API_KEY）单独定速，"
      "主 Key、盘口 Key 和规则吃单的 Key 不受影响（1.154.57）。Predict 给每把 Key 的上限默认是每分钟 240 次，超了会拒绝（429）并让这把 Key 停约 20 秒"
      "（这 20 秒预挂不能下单也不能撤单，到了撤单时间的单靠签在单里的到期时间兜底）。"
-     "测上限的办法：有一批单在补挂时（/preopen 有“已发布未挂”，“速度”一行写“用满了”），从 220 起每次加 20，每档看两三分钟 /preopen 的“速度”一行——“被拒绝（429）0 次”就再加，"
-     "一出现被拒绝（同时会收到“限流冷却中”的通知）就退回上一档，那就是这把 Key 实际能跑的速度。平时单都挂着、这把 Key 没用满，调它看不出区别。没有专用 Key 时这一项不起作用"),
+     "该设多少：在 Telegram 发 /preopen 测速（1.154.58），机器人自己一档一档往上试，把这把 Key 的实际上限和建议值发给你——"
+     "节拍要比上限低 20 左右，因为撤单可以预支名额、一分钟里最多会多出 16 次。平时单都挂着、这把 Key 没用满，调它看不出区别。没有专用 Key 时这一项不起作用"),
     ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "0～1000000，0 = 不限（默认）：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金，成交时才扣款；余额够一场双边就挂）；设了上限时每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放，/preopen 会算出把已发布的全部挂上需要多少"),
     # 1.153.0: 规则吃单 (rules.py) — the gold / oil windows the backtest found mispriced (README「规则吃单」)
     ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段，开场前吃：Predict 撮合开启后到开场前 15 秒（最后 130 秒的单见下面“开场前最后 2 分钟也吃”；关掉它就到开场前 130 秒为止），盘口一出现规则价以内的指定方向就立即买"
@@ -6361,11 +6361,16 @@ PREDICT_RATE = {"per_min": 220.0}  # PREDICT_RATE_PER_MIN, set by Config (Bot.ap
 # 多少". Where Predict's limit for a key really lies is found by raising that key's pace alone and watching for its 429s: the
 # one setting for every key would have tried it on the rule taker's key too, whose cooldown falls in a race's seconds
 PREDICT_RATE_OF: dict[str, float] = {}
+# 1.154.58: ...and a pace held for a while by the speed test (preopen.Controller.speed_run: /preopen 测速) stands over both — its own
+# table, so that a setting saved meanwhile (set_predict_rates clears and fills the one above) neither ends a step nor is
+# overwritten by it; the test takes its entry out when a step ends, however it ends
+PREDICT_RATE_TEST: dict[str, float] = {}
 
 
 def predict_rate(key: str) -> float:
-    """The requests a minute an API key is paced to: its own figure where it has one (PREDICT_RATE_OF), else every key's."""
-    return float(PREDICT_RATE_OF.get(key) or PREDICT_RATE["per_min"])
+    """The requests a minute an API key is paced to: the speed test's figure while a step of it runs (PREDICT_RATE_TEST), else
+    the key's own where it has one (PREDICT_RATE_OF), else every key's."""
+    return float(PREDICT_RATE_TEST.get(key) or PREDICT_RATE_OF.get(key) or PREDICT_RATE["per_min"])
 
 
 def preopen_own_rate(config: Any) -> float:
