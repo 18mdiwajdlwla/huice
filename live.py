@@ -825,7 +825,8 @@ class PredictApi:
         write = priority and not self.patient
         wait = TOKEN_WAIT.get() if method == "GET" and not write and not path.startswith("/auth") else None
         if wait is None:
-            await core.predict_pacer(self.api_key).take(write, low=self.low and not write, leave=0.0 if write else self.leave)
+            # 1.154.60: an order or a cancel from the bucket Predict counts them in, where the key has one of its own for them (core.predict_pacer)
+            await core.predict_pacer(self.api_key, core.predict_trading(method, path)).take(write, low=self.low and not write, leave=0.0 if write else self.leave)
         else:
             # 1.154.45: a read that has another key to go to (relieved) waits for this one's token only so long — given up
             # before anything is sent, never once it is on its way
@@ -868,7 +869,7 @@ class PredictApi:
                 self.blocked_until = max(self.blocked_until, time.monotonic() + max(error.retry_after, self.BACKOFF_SECONDS))
                 if http_status(error) == 429:
                     self.limited.append(time.monotonic())
-                    core.predict_pacer(self.api_key).note_429()  # the key's minute then, for /diag (1.154.5)
+                    core.predict_pacer(self.api_key, core.predict_trading(method, path)).note_429()  # the key's minute then (the bucket's the request was of), for /diag (1.154.5)
             raise
 
     async def authed(self, method: str, path: str, payload: dict | None = None, timeout: int = API_TIMEOUT, priority: bool = False) -> Any:
@@ -4121,7 +4122,11 @@ class LiveBot(core.Bot):
             # the rule taker's key while that one was idle (preopen.Controller.lender)
             waited, seconds = pacer.waited_last() if hasattr(pacer, "waited_last") else (0, 0.0)
             notes = [f"等节拍 {waited} 次共 {seconds:.0f} 秒"] if waited else []
-            if core.PREDICT_RATE_OF.get(key):  # 1.154.57: the pre-open key at a pace of its own (PREOPEN_RATE_PER_MIN)
+            if core.PREDICT_TRADE_OF.get(key):  # 1.154.60: the pre-open key by Predict's two buckets (PREOPEN_APP_*): this figure is its reads', the orders' said beside
+                trade = core.PREDICT_TRADE_PACERS.get(key)
+                notes.insert(0, f"按 Predict 后台的限额：这是下单撤单以外的请求，节拍每分钟 {core.PREDICT_RATE_OF.get(key, 0):g} 次；"
+                                f"下单撤单另算，最近 60 秒 {trade.last_minute() if trade is not None else 0} 次、节拍 {core.PREDICT_TRADE_OF[key]:g} 次")
+            elif core.PREDICT_RATE_OF.get(key):  # 1.154.57: the pre-open key at a pace of its own (PREOPEN_RATE_PER_MIN)
                 notes.insert(0, f"单独节流每分钟 {core.PREDICT_RATE_OF[key]:g} 次：PREOPEN_RATE_PER_MIN")
             if key == rule:
                 lent = self.preopen.lent_last() if getattr(self, "preopen", None) is not None and callable(getattr(self.preopen, "lent_last", None)) else 0

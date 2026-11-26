@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.59"
+VERSION = "1.154.60"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -232,6 +232,17 @@ def preopen_rate_of(env: Mapping) -> float:
 
 
 PREOPEN_KEYS_MAX = 8  # PREOPEN_API_KEYS: more keys than this for the pre-open mode are a mistake in the variable, said at the start
+PREOPEN_APP_MIN, PREOPEN_APP_MAX = 240, 100_000  # PREOPEN_APP_*_PER_MIN: Predict's limits a minute for the app (0 = not given)
+PREOPEN_APP_SHARE = 0.8      # ...of which the bot's keys use this share together at the most: the rest is room for how Predict counts its minute
+PREOPEN_OTHERS_TRADE = 60    # ...and for each other key of the bot's this many orders and cancels a minute are kept (its reads: its whole pace)
+# ...and Predict refusing a request all the same (a 429 on that key) says the figures given are not what it counts this key
+# by — another app's page (the user has two, 5,000 a minute and 1,000), a tier that moved with the volume of thirty days, a
+# limit the page does not name. The bucket refused is then paced to what Predict did let through (preopen_refused):
+PREOPEN_CUT_OF_SENT = 0.8                    # this share of what the bucket had let through in the minute before the 429 (what Predict did accept) ...
+PREOPEN_CUT_LEAST, PREOPEN_CUT_MOST = 0.1, 0.8   # ...no less than this share of the pace it went at (a count that says little: a 429 in a quiet minute), no more than this
+PREOPEN_CUT_EPISODE_S = 90.0                 # ...once for the 429s within this of one another's cut: Predict's minute is still full then, the requests already out meet it too
+# ...and never under the pace the key has without the limits. Each step is one more minute in which the app's other tokens
+# — the bot's own key, the rule taker's — are refused with the mode's: hence by the count, at once, not by halves
 
 
 def preopen_keys_of(env: Mapping) -> tuple[str, tuple[str, ...]]:
@@ -568,6 +579,11 @@ class PreopenSettings:
     open_quiet_minutes: int = 15  # PREOPEN_OPEN_QUIET_MINUTES: a stock card's windows starting within this of a session segment's open (the day's, the afternoon's) are not quoted — the auction's indicative price, the break's news (1.135.1); gold's and oil's within this of CME's 18:00 ET reopen (1.150.1), a US stock card's of the 09:30 open (1.151.0); 1.151.1: at least the first window whatever it says (preopen.open_quiet_ms) — 0 is 15
     markets: frozenset = frozenset({"BTC-15M"})  # PREOPEN_MARKETS: BTC alone by default; "all" = every 15-minute card
     exclusive: bool = False    # PREOPEN_EXCLUSIVE: on = the model trader opens nothing while this mode runs for real (off: both run, jointly capped)
+    # 1.154.60: Predict's own limits for the app the mode's key is a token of, as its Rate limits page says them (requests a minute; both
+    # 0 = not given: the key keeps the one pace it has). Predict counts order placements and cancels (Trading) apart from every
+    # other request (General), thousands of each a minute by the account's volume — the bot paced each key to 220 of both together
+    app_trading: int = 0       # PREOPEN_APP_TRADING_PER_MIN
+    app_general: int = 0       # PREOPEN_APP_GENERAL_PER_MIN
     weekend: bool = True       # PREOPEN_WEEKEND: off = no window starting Saturday 00:00 to Monday 08:00 (Beijing time) is quoted, resting ones withdrawn (1.136.0; 1.139.2)
     db: str = ""
     # 1.152.0: BTC 5-minute's own timing (PREOPEN_BTC5_*), each 0 = the general one above — a five-minute window's cancel, expiry,
@@ -639,6 +655,13 @@ class PreopenSettings:
         price = D(cents) / 100
         exclusive = str(e.get("PREOPEN_EXCLUSIVE", "off")).strip().lower() == "on"
         weekend = str(e.get("PREOPEN_WEEKEND", "on")).strip().lower() != "off"
+        try:
+            app = [int(str(e.get(name, "0")).strip() or 0) for name in ("PREOPEN_APP_TRADING_PER_MIN", "PREOPEN_APP_GENERAL_PER_MIN")]
+        except ValueError:
+            raise ValueError("PREOPEN_APP_TRADING_PER_MIN / PREOPEN_APP_GENERAL_PER_MIN 必须是整数") from None
+        if any(app) and not all(PREOPEN_APP_MIN <= n <= PREOPEN_APP_MAX for n in app):
+            raise ValueError(f"PREOPEN_APP_TRADING_PER_MIN 和 PREOPEN_APP_GENERAL_PER_MIN 要一起填（Predict 后台 Rate limits 页上 Trading、General 两个每分钟的数，"
+                             f"{PREOPEN_APP_MIN}～{PREOPEN_APP_MAX}），或者都留 0（不用：预挂的 Key 照原来的速度）；现在是 {app[0]} 和 {app[1]}")
         def ladder(name: str, example: str) -> list[tuple[int, int]]:  # "价格x份数, …" as (cents, shares) (PREOPEN_LEVELS; PREOPEN_BTC5_LEVELS, 1.154.37)
             out = []
             for part in [x.strip() for x in str(e.get(name, "")).replace("，", ",").split(",") if x.strip()]:
@@ -697,6 +720,7 @@ class PreopenSettings:
         return cls(enabled, poll=poll, cancel_seconds=cancel, expiry_seconds=expiry, entry_seconds=entry, ahead_minutes=ahead, max_open_usd=cap,
                    price=price, shares=D(shares), markets=markets, exclusive=exclusive, weekend=weekend, db=cls.db_of(e),
                    levels=tuple((D(c) / 100, D(s)) for c, s in levels), deep_ahead_minutes=deep, limit_gap_pct=limit_gap, open_quiet_minutes=open_quiet,
+                   app_trading=app[0], app_general=app[1],
                    btc5_cancel_seconds=b5[0], btc5_expiry_seconds=b5[1], btc5_entry_seconds=b5[2], btc5_ahead_minutes=b5[3],
                    btc5_levels=tuple((D(c) / 100, D(s)) for c, s in btc5_own), btc5_price=D(b5_cents) / 100, btc5_shares=D(b5_shares),
                    btc5_deep=None if b5_deep is None else tuple((D(c) / 100, D(s)) for c, s in b5_deep),
@@ -948,9 +972,19 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
      "3～1440：调小就只挂快开场的几场，少占资金、少读接口，但新场次要等进了范围才挂，排在先挂的人后面"),
     ("PREOPEN_BTC5_LEVELS", "BTC 5 分钟：整串价格档位（旧写法）", "1.154.37 的写法，留着兼容：价格x份数、逗号分隔、第一档在前，如 47x10,43x40，一次把 BTC 5 分钟的所有档写全；空 = 不用。"
      "1.154.56 起用“开盘前预挂 · BTC 5 分钟”那一组里的“第一档价格”“第一档每边份数”“更深的价格档位”分开填就行——那三项填了的，盖在这里的整串之上"),
+    ("PREOPEN_APP_TRADING_PER_MIN", "Predict 限额：Trading（每分钟）", "照抄 Predict 开发者后台 → 预挂那把 Key 所在的 App → Rate limits 页上 “Trading … requests per minute” 的数（比如 5000）；"
+     "0 = 不填（预挂的 Key 照原来的速度，每分钟 220 次）。和下面的 General 要一起填。填了之后（1.154.60）：预挂的下单撤单和读取各按各的额度跑——Predict 本来就是分开算的——"
+     "机器人只用到限额的八成，并先扣掉主 Key、规则吃单 Key 可能用的份额（/preopen 会写出实际用的两个数）；挂单、撤后核对、重读的并发跟着放大。"
+     "原来按“每把 Key 每分钟 240 次”自己限速，一天的场次全撤后挂回要约 3 小时；$50K 档（5000 / 5000）填上后模拟约 8 分钟。"
+     "交易量档位变了（后台的数变了）记得回来改。填的数不对（抄成了另一个 App 的、档位降了）会被 Predict 拒绝（429）：机器人这时自己把被拒的那一类降到 Predict 实际放行的量以下，"
+     "发通知并写在 /preopen 里，一直保持到改这两项或重启"),
+    ("PREOPEN_APP_GENERAL_PER_MIN", "Predict 限额：General（每分钟）", "同一页上 “General … requests per minute” 的数（市场、盘口、账户读取等所有不是下单撤单的请求；比如 5000 或 1000）；0 = 不填。"
+     "和上面的 Trading 要一起填。这个额度是整个 App 共用的：盘口、原策略、规则吃单的读取也算在里面，所以这个数小的档位（比如 1000）撤后核对会比较慢——每张撤掉的单要读一次"),
     ("PREOPEN_RATE_PER_MIN", "预挂专用 Key：每分钟请求数", "0 = 跟所有 Key 一样（PREDICT_RATE_PER_MIN，默认 220）；60～1000 = 只给预挂自己的 Key（PREOPEN_API_KEY，以及 PREOPEN_API_KEYS 里的每一把）单独定速，"
-     "主 Key、盘口 Key 和规则吃单的 Key 不受影响（1.154.57）。Predict 给每把 Key 的上限默认是每分钟 240 次，超了会拒绝（429）并让这把 Key 停约 20 秒"
+     "主 Key、盘口 Key 和规则吃单的 Key 不受影响（1.154.57）。超过 Predict 的限额会被拒绝（429）并让这把 Key 停约 20 秒"
      "（这 20 秒预挂不能下单也不能撤单，到了撤单时间的单靠签在单里的到期时间兜底）。"
+     "1.154.60：Predict 的限额是按 App、按交易量档位给的，后台 Rate limits 页上写着（不是原来以为的每把 Key 每分钟 240 次）——"
+     "把那一页的两个数填进上面“Predict 限额”两项就行，不用再靠这一项一档一档试；填了那两项之后，这一项只是预挂那把 Key 的最低速度。"
      "该设多少：在 Telegram 发 /preopen 测速（1.154.58），机器人自己一档一档往上试，把这把 Key 的实际上限和建议值发给你——"
      "节拍要比上限低 20 左右，因为撤单可以预支名额、一分钟里最多会多出 16 次。平时单都挂着、这把 Key 没用满，调它看不出区别。没有专用 Key 时这一项不起作用"),
     ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "0～1000000，0 = 不限（默认）：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金，成交时才扣款；余额够一场双边就挂）；设了上限时每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放，/preopen 会算出把已发布的全部挂上需要多少"),
@@ -1823,7 +1857,8 @@ def http_error_text(body: Any) -> str:
 KEEPALIVE_IDLE_SECONDS = 25.0       # a pooled connection unused this long is dropped (servers close idle ones around a minute)
 KEEPALIVE_POST_IDLE_SECONDS = 3.0   # a request with a body reuses only a connection used this recently (a stale one could
                                     # swallow it, and it is never sent again)
-KEEPALIVE_PER_HOST = 24             # pooled connections per host: at least PREDICT_PARALLEL, or every round opens the rest anew
+KEEPALIVE_PER_HOST = 64             # pooled connections per host: at least PREDICT_PARALLEL, or every round opens the rest anew (1.154.60: 24 —
+#                                     the pre-open mode at Predict's real limits has some fifty requests in flight, each connection past the pool's size opened anew)
                                     # (Telegram's long poll holds one for half a minute)
 HTTPS_CONNECTION = http.client.HTTPSConnection  # (the tests put a fake here)
 _POOL: dict[tuple[str, int], list[tuple[Any, float]]] = {}  # (host, port) -> [(connection, last used, monotonic)], oldest first
@@ -5910,7 +5945,7 @@ PREDICT_KEYS = {title: key for key, title, _ in PREDICT_ITEMS}
 PREDICT_STALE_MS = 90_000       # a book older than this is shown as stale and never recommended
 PREDICT_PARALLEL = 16           # Predict requests in flight at once, on Predict's own thread pool (predict_blocking): the
                                 # hot round (a dozen markets, each answer about a second) goes out in one batch
-PREDICT_POOL_WORKERS = 64       # that pool: the orderbook feed's requests and the real-trading client's, apart from the quote
+PREDICT_POOL_WORKERS = 192      # (1.154.60: 64) that pool: the orderbook feed's requests and the real-trading client's, apart from the quote
                                 # feeds' pool, where a 502-ing scraper held threads for the 12-second timeout (a round took 60 s).
                                 # It must hold every request the asyncio gates above it can let through at once, or an order or a
                                 # cancel that got its client's priority slot still waits in this pool's FIFO queue behind reads
@@ -5921,7 +5956,11 @@ PREDICT_POOL_WORKERS = 64       # that pool: the orderbook feed's requests and t
                                 # KEEPALIVE_PER_HOST is no cap here: it only bounds the idle connections kept. 1.154.33 (an outside review,
                                 # CR-07): 64 — the pool has since gained the pre-open mode's snapshot client (1.154.11), its fresh-listing
                                 # client and the two on the borrowed key (1.154.21): the feed's 16 + the trader's 5 + seven pre-open clients
-                                # of 5 = 56 the gates can let through at once, 40 threads under it (the rule taker's are its own: first_pool)
+                                # of 5 = 56 the gates can let through at once, 40 threads under it (the rule taker's are its own: first_pool).
+                                # 1.154.60: 192 — at Predict's real limits (PREOPEN_APP_*) the pre-open mode's low client and its fresh-listing
+                                # client let 68 through each (28 reads, and two orders for each of twenty pairs placed side by side), beside
+                                # the feed's 16, the trader's 5 and the mode's other five clients: 182 at the most. Threads are started as
+                                # they are needed: without those limits no more of them than before
 PREDICT_LADDER_PARALLEL = 8     # of those, at most this many may be ladder levels at once: a hot ladder's levels never
                                 # queue the daily cards' books behind them
 _PREDICT_POOL: ThreadPoolExecutor | None = None
@@ -6398,6 +6437,15 @@ PREDICT_RATE_OF: dict[str, float] = {}
 # table, so that a setting saved meanwhile (set_predict_rates clears and fills the one above) neither ends a step nor is
 # overwritten by it; the test takes its entry out when a step ends, however it ends
 PREDICT_RATE_TEST: dict[str, float] = {}
+# 1.154.60: ...and a key whose orders and cancels are paced by themselves: Predict counts them in a bucket of their own (Trading),
+# apart from every other request (General) — key -> their pace, and the pacers of it (predict_pacer(key, trade=True))
+PREDICT_TRADE_OF: dict[str, float] = {}
+PREDICT_TRADE_PACERS: dict[str, "PredictPacer"] = {}
+# ...and what Predict's refusals have taken off those paces since the start (preopen_refused): (the key, the two limits as
+# given) -> {"trade" / "read": the share of the pace left, "trade_at" / "read_at": when it was last cut (monotonic)}. Kept
+# here, not on the controller: a setting saved — any of them builds a new one — must not bring back a pace Predict refused.
+# Other limits given, another key, or a restart, and it is gone
+PREOPEN_CUTS: dict[tuple, dict[str, float]] = {}
 
 
 def predict_rate(key: str) -> float:
@@ -6421,18 +6469,100 @@ def preopen_own_rate(config: Any) -> float:
     return rate if own in preopen_own_keys(config) and rate > 0 else 0.0
 
 
+def preopen_cut_key(config: Any) -> tuple:
+    """What a cut of the pre-open key's paces belongs to (PREOPEN_CUTS): the key and the two limits as given."""
+    settings = getattr(config, "preopen", None)
+    return (str(getattr(config, "preopen_api_key", "") or ""), int(getattr(settings, "app_trading", 0) or 0), int(getattr(settings, "app_general", 0) or 0))
+
+
+def preopen_paces(config: Any, whole: bool = False) -> tuple[float, float]:
+    """(orders and cancels a minute, every other request a minute) the pre-open mode's first key is paced to where Predict's
+    limits for its app are given (PREOPEN_APP_TRADING_PER_MIN, PREOPEN_APP_GENERAL_PER_MIN — 1.154.60); (0, 0) where they are
+    not, or that key is not the mode's alone. The limits are the app's — every token of it counts in them — so what the
+    bot's other keys may send is taken off: PREOPEN_APP_SHARE of each limit, less each other key's whole pace from the
+    reads and PREOPEN_OTHERS_TRADE from the orders (the model trader's and the rule taker's are few), less a further key of
+    the mode's whole pace from both — less what Predict's own refusals have taken off since (PREOPEN_CUTS:
+    preopen_refused; ``whole``: the paces without that). Never under the pace the key has without the limits."""
+    settings = getattr(config, "preopen", None)
+    trading, general = int(getattr(settings, "app_trading", 0) or 0), int(getattr(settings, "app_general", 0) or 0)
+    own = preopen_own_keys(config)
+    home = str(getattr(config, "preopen_api_key", "") or "")
+    if not (trading and general) or home not in own:
+        return 0.0, 0.0
+    every = float(getattr(config, "predict_rate_per_min", 220.0) or 0) or 220.0  # (the others unpaced: reckoned at the usual pace)
+    mine = float(getattr(config, "preopen_rate_per_min", 0) or 0) or every
+    others = {str(getattr(config, name, "") or "") for name in ("predict_api_key", "predict_book_api_key", "rule_api_key")} - {"", home}
+    further = (len(own) - 1) * mine
+    trade = max(mine, math.floor(PREOPEN_APP_SHARE * trading - len(others) * min(every, PREOPEN_OTHERS_TRADE) - further))
+    read = max(mine, math.floor(PREOPEN_APP_SHARE * general - len(others) * every - further))
+    cut = {} if whole else PREOPEN_CUTS.get(preopen_cut_key(config)) or {}
+    return tuple(float(max(mine, math.floor(pace * float(cut.get(bucket, 1.0))))) for bucket, pace in (("trade", trade), ("read", read)))
+
+
+def preopen_refused(config: Any, bucket: str, sent: int = 0) -> tuple[float, float] | None:
+    """Predict answered a request of the pre-open key's ``bucket`` ("trade": an order, a cancel; "read": anything else) with a
+    429 while the key ran at the app's limits as given (preopen_paces). That bucket's pace is cut — to PREOPEN_CUT_OF_SENT of
+    ``sent`` (what the bucket had let through in the minute before: what Predict did accept), between PREOPEN_CUT_LEAST
+    and PREOPEN_CUT_MOST of the pace it went at, never under the pace the key has without the limits — and the keys'
+    paces set again (set_predict_rates). (The pace before, the pace now) — the same twice where it is at that least
+    already; None for a 429 within PREOPEN_CUT_EPISODE_S of the bucket's last cut (the same episode), and where no such
+    paces are in force. The cut stays for as long as the process runs with that key and those limits."""
+    at = 0 if bucket == "trade" else 1
+    before = preopen_paces(config)[at]
+    if not before:
+        return None
+    key = preopen_cut_key(config)
+    cut = PREOPEN_CUTS.get(key)
+    if cut is None:
+        PREOPEN_CUTS.clear()  # (a cut of other limits, or another key's: those are no longer what is given)
+        cut = PREOPEN_CUTS[key] = {}
+    now = time.monotonic()
+    if now - float(cut.get(bucket + "_at", -1e9)) < PREOPEN_CUT_EPISODE_S:
+        return None
+    cut[bucket + "_at"] = now
+    whole = preopen_paces(config, whole=True)[at]
+    aim = min(PREOPEN_CUT_MOST * before, max(PREOPEN_CUT_LEAST * before, PREOPEN_CUT_OF_SENT * max(0, int(sent))))
+    was = float(cut.get(bucket, 1.0))
+    cut[bucket] = min(was, aim / whole) if whole > 0 else was
+    after = preopen_paces(config)[at]
+    if after >= before:
+        cut[bucket] = was  # (at the floor already: nothing taken off, nothing noted as taken off)
+    set_predict_rates(config)
+    return before, after
+
+
 def set_predict_rates(config: Any) -> None:
     """The keys' paces as the configuration says them: PREDICT_RATE_PER_MIN for every key, and PREOPEN_RATE_PER_MIN (0 = the same) for
-    each key that is the pre-open mode's alone (preopen_own_keys: its first, and PREOPEN_API_KEYS')."""
+    each key that is the pre-open mode's alone (preopen_own_keys: its first, and PREOPEN_API_KEYS'). 1.154.60: the mode's first
+    key by Predict's own two buckets where its app's limits are given (preopen_paces) — its orders and cancels on a bucket
+    of their own (PREDICT_TRADE_OF), every other request of it on the key's."""
     PREDICT_RATE["per_min"] = float(getattr(config, "predict_rate_per_min", 220.0))
     PREDICT_RATE_OF.clear()
+    PREDICT_TRADE_OF.clear()
     if (rate := float(getattr(config, "preopen_rate_per_min", 0) or 0)) > 0:
         for key in preopen_own_keys(config):
             PREDICT_RATE_OF[key] = rate
+    trade, read = preopen_paces(config)
+    if trade and read:
+        PREDICT_RATE_OF[str(config.preopen_api_key)], PREDICT_TRADE_OF[str(config.preopen_api_key)] = read, trade
 
 
-def predict_pacer(key: str) -> PredictPacer:
-    """The pacer of an API key (one for every client on it); its pace follows PREDICT_RATE_PER_MIN — or the key's own (predict_rate)."""
+def predict_trading(method: str, path: str) -> bool:
+    """Whether a request is one Predict counts in an app's Trading bucket — an order's placement, a cancel — not in its General
+    one (everything else: markets, orderbooks, the account's reads, the sign-in)."""
+    return method == "POST" and path.split("?", 1)[0].rstrip("/") in ("/orders", "/orders/remove")
+
+
+def predict_pacer(key: str, trade: bool = False) -> PredictPacer:
+    """The pacer of an API key (one for every client on it); its pace follows PREDICT_RATE_PER_MIN — or the key's own (predict_rate).
+    ``trade`` (1.154.60): the pacer an order or a cancel on the key takes its token from — the key's own, as ever, unless its
+    orders and cancels have a bucket of theirs (PREDICT_TRADE_OF: Predict counts them apart), then that one."""
+    if trade and (rate := PREDICT_TRADE_OF.get(key)):
+        pacer = PREDICT_TRADE_PACERS.get(key)
+        if pacer is None:
+            pacer = PREDICT_TRADE_PACERS[key] = PredictPacer(rate)
+        pacer.per_min = rate
+        return pacer
     pacer = PREDICT_PACERS.get(key)
     if pacer is None:
         pacer = PREDICT_PACERS[key] = PredictPacer(predict_rate(key))
@@ -13225,6 +13355,8 @@ CONTROL_FORMS: dict[str, dict] = {
                                    "captions": {"1440": "挂满：一发布就挂"}},  # 1.152.2: every listed window, each placed the moment it is listed
     "PREOPEN_BTC5_LEVELS": {"kind": "text", "group": "高级", "presets": ["", "47x10", "47x10,43x40", "47x20,43x80,40x80", "47x30,43x160,40x160,37x160"], "unit": "",
                             "empty": "不用"},  # 1.154.37; 1.154.56: the older way, among the advanced ones
+    "PREOPEN_APP_TRADING_PER_MIN": {"kind": "number", "group": "预挂", "presets": ["0", "2000", "5000", "6000"], "unit": "次/分钟", "zero": "不填"},  # 1.154.60
+    "PREOPEN_APP_GENERAL_PER_MIN": {"kind": "number", "group": "预挂", "presets": ["0", "1000", "5000", "6000"], "unit": "次/分钟", "zero": "不填"},
     "PREOPEN_RATE_PER_MIN": {"kind": "number", "group": "预挂", "presets": ["0", "220", "240", "260", "280", "300"], "unit": "次/分钟", "zero": "跟所有 Key 一样"},  # 1.154.57
     "PREOPEN_MAX_OPEN_USD": {"kind": "number", "group": "预挂", "presets": ["0", "1000", "5000", "7000", "20000"], "unit": "$", "zero": "不限"},
     "RULE_TAKER": {"kind": "choice", "group": "规则", "options": [["off", "off 关"], ["paper", "paper 只记录不下单"], ["on", "on 真实吃单（需要 LIVE=on）"]]},
@@ -27445,6 +27577,7 @@ class Bot:
                   "PREOPEN_BTC5_DEEP_LEVELS": ("" if c.preopen.btc5_deep is None else "none" if not c.preopen.btc5_deep
                                                else ",".join(f"{float(p) * 100:g}x{float(s):g}" for p, s in c.preopen.btc5_deep)),
                   "PREOPEN_MAX_OPEN_USD": plain(c.preopen.max_open_usd), "PREOPEN_RATE_PER_MIN": plain(c.preopen_rate_per_min),
+                  "PREOPEN_APP_TRADING_PER_MIN": str(c.preopen.app_trading), "PREOPEN_APP_GENERAL_PER_MIN": str(c.preopen.app_general),
                   "PREOPEN_EXCLUSIVE": flag(c.preopen.exclusive),
                   "RULE_TAKER": c.rules.mode, "RULE_MAX_DAY_USD": plain(c.rules.max_day_usd), **{name: str(c.rules.price(key)) for key, name in RULE_SETTING_KEYS.items()},
                   **{switch: flag(c.rules.on(mk)) for mk, (switch, _) in RULE_MARKET_KEYS.items()},

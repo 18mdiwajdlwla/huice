@@ -246,12 +246,13 @@ class MoreKeys(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctl.firsts_waiting, 0)
 
         # place_pair: a fresh listing's first level says so; its deeper levels, and a window quoted again, do not
-        asked = []
+        asked, trades = [], []
         real = ctl.lane_wait
 
-        async def spy(home, first=False):
+        async def spy(home, first=False, trade=False):
             asked.append(first)
-            return await real(home, first)
+            trades.append(trade)
+            return await real(home, first, trade)
         ctl.lane_wait = spy
         bucket("pre-key", 8.0), bucket("k2", 8.0), bucket("k3", 8.0)
         c = p.candidate(T.market(), T.NOW, ctl.owner.config, ctl.settings)
@@ -266,6 +267,7 @@ class MoreKeys(unittest.IsolatedAsyncioTestCase):
         asked.clear()
         self.assertEqual(await ctl.place_pair({**c2, "market": later, "read_ms": T.NOW}), "")
         self.assertEqual(asked, [False, False], "a window of the backlog: not a fresh listing")
+        self.assertTrue(trades and all(trades), "every one of them an order: the lane looks at the bucket the key counts orders in (1.154.60)")
         await self.finish(ctl)
         # one key (and the borrowed one beside it): the request goes as it always did — no waiting here, it waits on its own key's pacer
         one, one_api, _ = T.controller(PREDICT_API_KEY="main-key", PREOPEN_API_KEY="pre-key", RULE_API_KEY="rule-key")
