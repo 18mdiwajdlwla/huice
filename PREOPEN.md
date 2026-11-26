@@ -82,6 +82,7 @@ PREOPEN_API_KEYS=            # 预挂专用的更多 Key，逗号分隔（1.154.
 PREOPEN_APP_TRADING_PER_MIN=0  # Predict 后台 Rate limits 页上这把 Key 所在 App 的 Trading 每分钟限额（1.154.60）；0 = 不用
 PREOPEN_APP_GENERAL_PER_MIN=0  # 同一页的 General 每分钟限额；两项一起填才生效
 PREOPEN_APP_AUTO=on            # 上面两项没填时照 Predict 应答里报的这把 Key 的限额自动跑（1.154.64）；off = 没填就照原来每分钟 220 次
+PREDICT_RATE_AUTO=on           # 主 Key、盘口 Key、规则吃单 Key 按各自报的限额定速（一半、最多每分钟 1000）（1.154.66）；off = 都按 220
 PREOPEN_RATE_PER_MIN=0       # 预挂专用 Key 自己的每分钟请求数；0 = 跟所有 Key 一样（PREDICT_RATE_PER_MIN）。测上限用（1.154.57）
 PREOPEN_MAX_OPEN_USD=0       # 0 = 不限（默认，1.132.3）
 PREOPEN_EXCLUSIVE=off        # on = 预挂时原策略不开新仓

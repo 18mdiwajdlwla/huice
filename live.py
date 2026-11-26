@@ -4129,6 +4129,8 @@ class LiveBot(core.Bot):
                                 f"Trading 一类（下单、撤单、读订单）另算，最近 60 秒 {trade.last_minute() if trade is not None else 0} 次、节拍 {core.PREDICT_TRADE_OF[key]:g} 次")
             elif core.PREDICT_RATE_OF.get(key):  # 1.154.57: the pre-open key at a pace of its own (PREOPEN_RATE_PER_MIN)
                 notes.insert(0, f"单独节流每分钟 {core.PREDICT_RATE_OF[key]:g} 次：PREOPEN_RATE_PER_MIN")
+            elif (rate := core.predict_rate(key)) != float(core.PREDICT_RATE["per_min"]):  # 1.154.66: paced by its own said limits
+                notes.insert(0, f"按它自己报的限额定速：每分钟 {rate:g} 次（PREDICT_RATE_AUTO）")
             if key == rule:
                 lent = self.preopen.lent_last() if getattr(self, "preopen", None) is not None and callable(getattr(self.preopen, "lent_last", None)) else 0
                 book = self.predict.lent_last() if callable(getattr(getattr(self, "predict", None), "lent_last", None)) else 0
@@ -7946,7 +7948,7 @@ class LiveBot(core.Bot):
         rows at a time (a hundredth of a second), the loop's turn after each, and the counts nobody else's meanwhile
         (preopen_share_away: the review counts the working records alone and says so, preopen_review_build)."""
         import sqlite3
-        from preopen import SHARE_READ_STEP, ShareWork, read_rows, share_load
+        from preopen import SHARE_READ_STEP, SHARE_STEP_S, ShareWork, read_rows, share_load
         began, steps = time.monotonic(), 0
         for _ in range(4):
             await self.preopen_share_turn()
@@ -7966,7 +7968,7 @@ class LiveBot(core.Bot):
                     while not work.done and not work.stale:
                         await self.preopen_share_turn()
                         at = time.perf_counter()
-                        work.step()
+                        work.step(budget_s=SHARE_STEP_S)  # (1.154.66: no longer than that a step, however slow the disk)
                         steps += 1
                         await asyncio.sleep(max(0.01, (time.perf_counter() - at) * self.PREOPEN_SHARE_PAUSE))
                     if work.stale:
