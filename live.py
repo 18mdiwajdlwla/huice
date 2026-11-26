@@ -2291,6 +2291,13 @@ class LiveBot(core.Bot):
         self.preopen_day_read: tuple | None = None  # (ledger file, Beijing day, its accounted P&L, valid until): read while no controller holds it (preopen_file_day)
         self.preopen_tidied = -1e9  # monotonic time of the last archive pass over the ledger file while the mode is off (preopen_tidy)
         self.preopen_share: Any = None  # the archive's share of the review's figures, kept from call to call (preopen.ArchiveShare; preopen_review)
+        self.preopen_share_task: asyncio.Task | None = None  # ...kept ready in the background (preopen_share_keeper, 1.154.53)
+        self.preopen_share_saved: tuple = ()  # ...as last written into the ledger's file: (its top row, its count)
+        self.preopen_share_failed = -1e9      # ...monotonic time of that task's last failure (not tried again sooner than PREOPEN_SHARE_RETRY_S)
+        self.preopen_share_waiting = False    # ...whether that task waits for the rule taker just now (preopen_share_turn)
+        self.preopen_share_away = False       # ...whether the counts are that task's just now — asked of it, or a long round under way — and no caller's (preopen_share_now)
+        self.preopen_share_seen: tuple | None = None  # ...(the controller's ledger file, its count of its archive) when they were last brought up to date (preopen_share_due)
+        self.preopen_share_wanted: asyncio.Event | None = None  # ...set when somebody waits for the counts (preopen_share_start)
         self.preopen_factory: Any = None  # the tests' stand-in controller class
         self.preopen_lock = asyncio.Lock()
         self.handlers["/preopen"] = self.cmd_preopen  # the status, on / off, pause / resume, and the read-only probe of the listing
@@ -2820,7 +2827,7 @@ class LiveBot(core.Bot):
         beyond it."""
         import preopen
         outer = getattr(self, "review_kept", None)
-        self.review_kept = {} if outer is None else outer
+        self.review_kept = held if (held := self.review_held()) is not None else {}  # (an outer build's, or what /export 全部 shares among its files)
         # (the running controller's own records alone: what a build reads off a file — the archive, the working file while the
         # mode is off — is never kept, preopen.quotes_kept)
         rows = getattr(getattr(getattr(self, "preopen", None), "ledger", None), "rows", None)
@@ -7678,7 +7685,7 @@ class LiveBot(core.Bot):
         from preopen import archive_share, read_archive, read_rows, review
         # 1.154.26: asked twice a build of the review page (the daily summary, then the analysis) — a walk of every record
         # each, seconds of the event loop with 39,000 of them: within one build (review_scope) the second is the first's
-        kept = getattr(self, "review_kept", None)
+        kept = self.review_held()
         if kept is not None and "preopen" in kept:
             return kept["preopen"]
         out = self.preopen_review_build(archive_share, read_archive, read_rows, review)
@@ -7696,13 +7703,29 @@ class LiveBot(core.Bot):
             LOG.warning("预挂复盘读取失败：%s", core.clean_error(error) or type(error).__name__)
             return None
         now_ms = self.market.now_ms()
+        why = "preparing"
         try:
-            share = self.preopen_share = archive_share(self.preopen.ledger if self.preopen is not None else self.config.preopen.db, rows, getattr(self, "preopen_share", None))
-            if share.fits(now_ms):
-                return review(rows, now_ms, share) if rows or share.count else None
-        except Exception as error:  # the counts could not be had: dropped (they may be half brought up to date), and the archive read record by record below
-            self.preopen_share = None
-            LOG.warning("预挂复盘的归档统计没用上（这次逐条读归档）：%s", core.clean_error(error) or type(error).__name__)
+            share = self.preopen_share_now(rows)
+            if share is not None:
+                if share.fits(now_ms):
+                    return review(rows, now_ms, share) if rows or share.count else None
+                why = "unfit"
+        except Exception as error:  # the counts could not be had: dropped (they may be half brought up to date) — a small archive is read record by record below
+            self.preopen_share, why = None, "failed"
+            LOG.warning("预挂复盘的归档统计没用上（归档小就逐条读，大就这次只算工作记录）：%s", core.clean_error(error) or type(error).__name__)
+        many = self.preopen_archive_rows()
+        if many < 0 or many > self.PREOPEN_ARCHIVE_WALK:
+            # 1.154.53: never the archive record by record on the event loop once it is large (11-26: 187,104 records, twenty
+            # seconds in which the bot did nothing else) or of a size nobody could say. The working records alone — every
+            # fill and every P&L is theirs (an archived record filled nothing) — and said: the older days' records, windows
+            # and withdrawals come out short
+            if not rows and many < 0:
+                return None
+            out = review(rows, now_ms)
+            out["archive_note"] = (
+                (f"归档的 {many:,} 条旧记录" if many >= 0 else "归档的旧记录") + "（都是没成交、已撤的挂单）" + self.preopen_share_word(why)
+                + "：这里暂时只算了账本里的工作记录——较早日子的挂出记录数、场次数、已撤数会偏少，成交和盈亏不受影响")
+            return out
         keys = {p.get("slug") for p in rows}  # a record in both (its move undone by hand) counts once: the working one
         more: list[int] = [0]
         failed: list[Exception] = []
@@ -7721,6 +7744,233 @@ class LiveBot(core.Bot):
             LOG.warning("预挂复盘读取失败（归档）：%s", core.clean_error(failed[0]) or type(failed[0]).__name__)
             return None
         return out if rows or more[0] else None
+
+    PREOPEN_ARCHIVE_WALK = 2_000    # an archive of more records than this is never walked record by record on the event loop (preopen.SHARE_LOOP_ROWS)
+    PREOPEN_SHARE_DELAY_S = 30.0    # after a start the archive's counts are made ready this long on (the start's own work first; at once when somebody asks)...
+    PREOPEN_SHARE_EVERY_S = 60.0    # ...then looked at this often: the records a pass moved into the archive since are counted in...
+    PREOPEN_SHARE_PAUSE = 2.0       # ...a long read a step at a time, the loop's turn after each for this many times the step's length (10 ms at the least)...
+    PREOPEN_SHARE_CLEAR_S = 2.0     # ...nothing while the rule taker goes first or will within this long...
+    PREOPEN_SHARE_RETRY_S = 300.0   # ...and after a failure not again sooner than this
+
+    def preopen_archive_rows(self) -> int:
+        """How many records the pre-open ledger's archive holds: the running controller's own count (kept as its passes move
+        records in), else — the mode off — the file's (one count over the archive's keys, no record read); -1 when
+        neither can say (then it is not walked either: preopen_review_build)."""
+        ledger = getattr(getattr(self, "preopen", None), "ledger", None)
+        try:
+            if ledger is not None:
+                return int(ledger.archived_count or 0)
+            from preopen import archive_rows
+            return archive_rows(self.config.preopen.db)
+        except Exception:
+            return -1
+
+    def preopen_share_word(self, why: str) -> str:
+        """Why the archive's records are not in the review just now, as its note says it (preopen_review_build): they cannot
+        be counted at all; the background's last try failed and is made again later; they are being counted in the
+        background (and whether that waits for the rule taker); or nothing counts them (no keeper: a one-off call)."""
+        if why == "unfit":
+            return "这次没计入（归档里有按条数算不了的记录）"
+        if why == "preparing":
+            if time.monotonic() - getattr(self, "preopen_share_failed", -1e9) < self.PREOPEN_SHARE_RETRY_S:
+                return f"这次没计入（后台计数上次没做成，{self.PREOPEN_SHARE_RETRY_S / 60:.0f} 分钟内会自动再试）"
+            task = getattr(self, "preopen_share_task", None)
+            if task is not None and not task.done():
+                if getattr(self, "preopen_share_waiting", False):
+                    return "要等规则吃单的优先时段过去，才在后台接着计数（计完就全了）"
+                return "还在后台计数，一两分钟后再看就全了"
+        return "这次没计入（归档的计数没读成）"
+
+    def preopen_share_line(self) -> str:
+        """/preopen's last line (1.154.53): where the archive's counts stand — ready (the review reads nothing of the archive
+        on anybody's turn), being made, waiting for the rule taker, or failed and tried again later. Nothing without an
+        archive, or where nothing keeps them (no keeper: a bot a test built)."""
+        task = getattr(self, "preopen_share_task", None)
+        if task is None or task.done() or self.preopen_archive_rows() <= 0:
+            return ""
+        share = getattr(self, "preopen_share", None)
+        if share is not None and not getattr(self, "preopen_share_away", False):
+            return f"\n归档计数：已备好（{share.count:,} 条；后台每分钟跟进新归档的，复盘不再整读归档）"
+        if time.monotonic() - getattr(self, "preopen_share_failed", -1e9) < self.PREOPEN_SHARE_RETRY_S:
+            return f"\n归档计数：⚠️ 后台上次没做成，{self.PREOPEN_SHARE_RETRY_S / 60:.0f} 分钟内自动再试；这期间复盘只算工作记录（成交和盈亏不受影响）"
+        if getattr(self, "preopen_share_waiting", False):
+            return "\n归档计数：后台准备中，在等规则吃单的优先时段过去；这期间复盘只算工作记录（成交和盈亏不受影响）"
+        return "\n归档计数：后台准备中（启动后约半分钟开始，一两分钟内好）；这期间复盘只算工作记录（成交和盈亏不受影响）"
+
+    def preopen_share_now(self, rows: list[dict]) -> Any:
+        """The archive's share of the review's figures for the working records ``rows`` (preopen.ArchiveShare), brought up to
+        date — or None while that is the keeper's (preopen_share_keeper), which is told here that somebody waits. 1.154.53:
+        on the event loop only what is little — the rows a pass moved in since the keeper last looked, a small archive
+        whole; an archive to be read whole (a start's first call: 187,104 records and twenty seconds on 11-26) or far
+        behind is the keeper's, a step at a time."""
+        from preopen import ShareBehind, archive_share
+        if getattr(self, "preopen_share_away", False):
+            return None  # (asked of the keeper and not made yet, or a long round of its under way: the counts are its own meanwhile)
+        source = self.preopen.ledger if self.preopen is not None else self.config.preopen.db
+        stamp = self.preopen_share_stamp(source)
+        try:
+            share = archive_share(source, rows, getattr(self, "preopen_share", None), whole=False)
+        except ShareBehind as behind:
+            LOG.info("预挂复盘：%s，交给后台准备", behind)
+            self.preopen_share_away = True
+            self.preopen_share_start()
+            return None
+        self.preopen_share = share
+        self.preopen_share_mark(source, share, stamp)
+        return share
+
+    @staticmethod
+    def preopen_share_stamp(source: Any) -> tuple | None:
+        """What a controller's ledger says of its archive now — (its file, its count of the archived records, kept as its
+        passes move them in) — None for a file no controller holds: the keeper looks again when it says otherwise than
+        when the counts were last brought up to date (preopen_share_due)."""
+        return None if source is None or isinstance(source, str) else (getattr(source, "path", ""), int(getattr(source, "archived_count", 0) or 0))
+
+    def preopen_share_mark(self, source: Any, share: Any, stamp: tuple | None) -> None:
+        """The counts in hand are the archive's as it was at ``stamp`` (preopen_share_stamp, taken before they were brought up
+        to date: what a pass moved in meanwhile is the next look's): noted, and written into the ledger's file when they
+        changed — the next start has them."""
+        if share.count and (share.top, share.count) != getattr(self, "preopen_share_saved", ()):
+            self.preopen_share_keep(source, share)
+        self.preopen_share_seen = stamp
+
+    def preopen_share_keep(self, source: Any, share: Any) -> None:
+        """The counts written into the ledger's file for the next start (preopen.share_save): a controller's connection, or
+        one of its own on the file while the mode is off."""
+        from preopen import share_save
+        try:
+            if not isinstance(source, str):
+                done = share_save(source.conn, share)
+            elif source == ":memory:":
+                done = False
+            else:
+                import sqlite3
+                conn = sqlite3.connect(source)
+                try:
+                    done = share_save(conn, share)
+                finally:
+                    conn.close()
+        except Exception:
+            done = False
+        if done:
+            self.preopen_share_saved = (share.top, share.count)
+
+    def preopen_share_start(self, delay: float = 0.0) -> None:
+        """The keeper of the archive's counts (preopen_share_keeper) started unless it runs, its first look ``delay`` on — and
+        without a delay told that somebody waits: it looks now. Nothing where there is no loop to run it on (a bot a test
+        built, a one-off call: nothing in the background there)."""
+        task = getattr(self, "preopen_share_task", None)
+        if task is None or task.done():
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            self.preopen_share_wanted = asyncio.Event()
+            self.preopen_share_task = loop.create_task(self.preopen_share_keeper(delay), name="preopen-share")
+        if delay <= 0:
+            self.preopen_share_wanted.set()
+
+    def preopen_share_due(self) -> bool:
+        """Whether the keeper has a round to make: one was asked for (a caller's counts were too far behind: preopen_share_now),
+        there are no counts in hand (none made yet, or dropped), a row of the archive was replaced in place since they were
+        made, or — a controller running — its ledger's count of its archive is not what it was when they were last brought
+        up to date (a pass moved records in; another file). Never for a ledger in memory."""
+        from preopen import Ledger
+        ledger = getattr(getattr(self, "preopen", None), "ledger", None)
+        if (getattr(ledger, "path", "") if ledger is not None else self.config.preopen.db) == ":memory:":
+            return False  # (a ledger in memory: read whole by whoever asks, as it always was — nothing of it is kept, preopen.ArchiveShare.read)
+        share = getattr(self, "preopen_share", None)
+        if getattr(self, "preopen_share_away", False) or share is None or share.rewrites != Ledger.rewrites:
+            return True
+        return ledger is not None and self.preopen_share_stamp(ledger) != getattr(self, "preopen_share_seen", None)
+
+    async def preopen_share_keeper(self, delay: float = 0.0) -> None:
+        """The archive's counts kept ready off the callers' way, for as long as the bot runs (1.154.53). 11-26: whoever asked
+        for the review first after a start — the page, /journal, /summary, /export — read the archive whole on the bot's one
+        event loop: 187,104 records, 20.8 s in which no book was read and no order sent or withdrawn. Here instead:
+        ``delay`` after the start (at once when somebody asks: preopen_share_start) the counts kept in the ledger's file are
+        brought up to date — or, none kept or no use any more, the archive is read whole — a step at a time
+        (preopen_share_round); then every PREOPEN_SHARE_EVERY_S a look whether a pass moved records in since, and those
+        counted in. So what a caller finds to do on its own turn is nothing, or a few rows. A round that fails is said and
+        tried again PREOPEN_SHARE_RETRY_S on; the review counts the working records alone meanwhile, and says so."""
+        wait = delay
+        while True:
+            wanted = self.preopen_share_wanted
+            if not wanted.is_set():
+                try:
+                    await asyncio.wait_for(wanted.wait(), max(0.01, wait))
+                except asyncio.TimeoutError:
+                    pass
+            wanted.clear()
+            wait = self.PREOPEN_SHARE_EVERY_S
+            if time.monotonic() - getattr(self, "preopen_share_failed", -1e9) < self.PREOPEN_SHARE_RETRY_S:
+                continue
+            try:
+                if self.preopen_share_due():
+                    await self.preopen_share_round()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self.preopen_share, self.preopen_share_failed = None, time.monotonic()  # (the counts may be half brought up to date: dropped)
+                LOG.warning("预挂复盘：归档的计数没准备成（%d 秒后再试；这段时间复盘只算工作记录）：%s", self.PREOPEN_SHARE_RETRY_S, core.clean_error(error) or type(error).__name__)
+
+    async def preopen_share_turn(self) -> None:
+        """Before each piece of the keeper's work: not while the rule taker goes first, nor within PREOPEN_SHARE_CLEAR_S of it
+        (its races are won by milliseconds; a step is a hundredth of a second)."""
+        while not self.rules_clear(self.PREOPEN_SHARE_CLEAR_S):
+            self.preopen_share_waiting = True  # (the review's note says so: preopen_share_word)
+            await asyncio.sleep(1.0)
+        self.preopen_share_waiting = False
+
+    async def preopen_share_round(self) -> None:
+        """One round of the keeper: the counts in hand — else those kept in the ledger's file (after a start) — brought up to
+        date, or the archive read whole where neither is any use; then written back into the file, so the next start has
+        them. What is little (preopen.ShareWork.heavy: an hour's pass, a few hundred rows) in one piece, as a caller would
+        on its own turn. What is not — the archive whole, a start's thousands of windows to look up — preopen.SHARE_STEP
+        rows at a time (a hundredth of a second), the loop's turn after each, and the counts nobody else's meanwhile
+        (preopen_share_away: the review counts the working records alone and says so, preopen_review_build)."""
+        import sqlite3
+        from preopen import SHARE_READ_STEP, ShareWork, read_rows, share_load
+        began, steps = time.monotonic(), 0
+        for _ in range(4):
+            await self.preopen_share_turn()
+            ledger = self.preopen.ledger if self.preopen is not None else None
+            path = ledger.path if ledger is not None else self.config.preopen.db
+            if ledger is None and (path == ":memory:" or not core.Path(path).exists()):
+                self.preopen_share_away = False
+                return  # (no file: no archive — a caller's share is the empty one)
+            conn = ledger.conn if ledger is not None else sqlite3.connect(path)
+            try:
+                rows, stamp = list(ledger.rows.values()) if ledger is not None else read_rows(path), self.preopen_share_stamp(ledger)
+                base = getattr(self, "preopen_share", None)
+                work = ShareWork(conn, path, rows, base if base is not None else share_load(conn, path))
+                whole, left = work.fresh, work.rows_left
+                if work.heavy():
+                    self.preopen_share, self.preopen_share_away = None, True  # (changed in place as the steps go: nobody else's meanwhile)
+                    while not work.done and not work.stale:
+                        await self.preopen_share_turn()
+                        at = time.perf_counter()
+                        work.step()
+                        steps += 1
+                        await asyncio.sleep(max(0.01, (time.perf_counter() - at) * self.PREOPEN_SHARE_PAUSE))
+                    if work.stale:
+                        continue  # a row of the archive was replaced in place meanwhile: begun again, whole
+                else:
+                    while work.step(SHARE_READ_STEP):
+                        pass
+                self.preopen_share, self.preopen_share_away = work.share, False
+                self.preopen_share_mark(ledger if ledger is not None else path, work.share, stamp)
+                if steps or left:
+                    LOG.info("预挂复盘：归档的计数已备好（%d 条，%s，%.0f 秒）", work.share.count,
+                             "整读一遍" if whole else f"接着上次的往后读 {left} 条" if left else "接着上次存下的，只查了工作记录的场次", time.monotonic() - began)
+                return
+            except sqlite3.ProgrammingError:
+                self.preopen_share = None  # (the ledger was closed under the steps — the controller restarted: once more, on the one there is now)
+                await asyncio.sleep(1.0)
+            finally:
+                if ledger is None:
+                    conn.close()
+        raise RuntimeError("账本一直在变，没准备成")
 
     async def preopen_apply(self) -> None:
         """The pre-open mode as PREOPEN_15M and the PREOPEN_* settings say now (the environment, the control page's saved
@@ -7956,9 +8206,8 @@ class LiveBot(core.Bot):
             return None, None
         share = None
         try:
-            share = self.preopen_share = archive_share(self.preopen.ledger if self.preopen is not None else self.config.preopen.db, rows,
-                                                       getattr(self, "preopen_share", None))
-            if not share.fits(self.market.now_ms()):
+            share = self.preopen_share_now(rows)  # (1.154.53: None while a large archive's counts are made ready in the background)
+            if share is not None and not share.fits(self.market.now_ms()):
                 share = None
         except Exception as error:
             self.preopen_share = share = None
@@ -8061,17 +8310,22 @@ class LiveBot(core.Bot):
                 return line + "\n" + self.preopen.status()
         elif action:
             return "用法：/preopen｜/preopen check｜/preopen on｜/preopen off｜/preopen pause｜/preopen resume｜/preopen probe"
-        return self.preopen.status()
+        return self.preopen.status() + self.preopen_share_line()
 
     async def run(self) -> int:
         core.GC_WATCH.start()  # (1.154.43: before the pre-open ledger is read — its records are set aside from the collector as they come: GcWatch.set_aside)
         await self.preopen_apply()  # PREOPEN_15M as the environment and the control page's saved values say at the start
         self.rules_start()
+        self.preopen_share_start(self.PREOPEN_SHARE_DELAY_S)  # 1.154.53: the archive's counts ready before the review is first asked for
         try:
             return await self._run_live()
         finally:
             self.stopping.set()
             self.live_relief.stop()  # (1.154.45: a sign-in on the lent key under way)
+            if (share_task := getattr(self, "preopen_share_task", None)) is not None:
+                share_task.cancel()  # (the keeper of the archive's counts: before the ledger it reads is closed)
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await share_task
             await self.rules_stop()
             await self.preopen_stop("进程停止", keep=True)  # the orders stay on the book: the signed expiry is the backstop, the next process takes them over
 

@@ -2546,7 +2546,7 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(t.record(slug)["seen"]["bought"], 0.0, "the watch stays that of the time before the start")
         self.assertEqual(R.course_part(t.record(slug))[:2], (40.0, 40 * 0.65))
         status = t.status()
-        self.assertIn("盘口一有就买，到开场前 130 秒（订单签到开场前 5 秒到期，Predict 不收有效期不足 2 分钟的单）；"
+        self.assertIn("开场时还没撤掉会马上通知；RULE_TAIL=off 关掉）；"
                       "设了盘中价格的规则开场后接着买（开场 3 秒后到结束前 130 秒，第 1 分钟最高按盘前的价格）", status)
         self.assertIn("· 黄金休市 4 档 买涨 ≤58¢｜盘中 ≤70¢（指数比起点高 0.005% 以上才买）", status)
         self.assertIn("｜这一场 11-17 06:00：这一场已买满 40 份", status)
@@ -3823,11 +3823,11 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         under two minutes to its expiry), far outside STOP_MS / LIVE_STOP_MS — an order decided at that edge whose way took the
         spare is held back for its life."""
         slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
-        for wait in (0, R.LIFE_SPARE_MS):
-            t, api, clock, x = taker("on")
+        for wait, tail in ((0, "off"), (R.LIFE_SPARE_MS, "off"), (R.LIFE_SPARE_MS, "on")):
+            t, api, clock, x = taker("on", RULE_TAIL=tail, RULE_GOLD_SHARES="200")
             api.markets["901"] = gold_market(GOLD_0600)
             api.listed.add(slug)
-            api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
+            api.books["901"] = {"bids": [], "asks": [[0.51, 130]]}
             clock.ms = GOLD_0600 - R.ORDER_BEFORE_MS
             t.warm_ms = clock.ms  # (no preparation beside the tick: its sign-in would take the same seconds)
 
@@ -3838,6 +3838,13 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
             order = t.record(slug)["orders"][0]
             if not wait:
                 self.assertEqual((len(api.sent), order["state"]), (1, "open"), "decided and sent 130 s before the start: 125 s of life")
+                continue
+            if tail == "on":
+                # 1.154.55: its way ran into the start's last two minutes, where an order is signed as short as Predict takes — it goes
+                # out so, and for what stands at the price (its look, a moment before those minutes, had it for all the window's 200)
+                signed = api.sent[0]["data"]["order"]
+                self.assertEqual((order["state"], order.get("tail"), int(signed["expiration"]), L.from_wei(int(signed["takerAmount"]))),
+                                 ("open", True, clock.ms // 1000 + R.TAIL_LIFE_S, 130.0))
                 continue
             self.assertEqual((api.sent, order["state"]), ([], "not_sent"))
             self.assertTrue(order["error"].startswith(R.LIFE_WORD) and order["error"].startswith(R.RECHECKED), order["error"])
@@ -3870,7 +3877,7 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
         self.assertEqual((R.ORDER_BEFORE_MS, R.PREDICT_MIN_LIFE_MS, R.EXPIRY_BEFORE_S), (130_000, 120_000, 5))
         for mode in ("on", "paper"):
-            t, api, clock, x = taker(mode)
+            t, api, clock, x = taker(mode, RULE_TAIL="off")  # (1.154.55: on, the start's last two minutes are bought in — its own test)
             api.markets["901"] = gold_market(GOLD_0600)
             api.listed.add(slug)
             api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
@@ -3879,22 +3886,168 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(api.sent, [], mode)
             self.assertEqual(sum(R.filled(r) for r in t.recs.values()), 0.0, "nothing bought, nothing recorded as bought")
             self.assertFalse([o for r in t.recs.values() for o in r.get("orders") or []], "no order on the record: none refused, none counted (MAX_REJECTS)")
-            self.assertEqual(t.track[slug]["word"], "盘口有 ≤58¢ 的涨 30 份，但离开场不足 130 秒，不下单：订单签到开场前 5 秒到期，Predict 不收有效期不足 2 分钟的单")
+            self.assertEqual(t.track[slug]["word"], "盘口有 ≤58¢ 的涨 30 份，但离开场不足 130 秒，不下单：订单签到开场前 5 秒到期，Predict 不收有效期不足 2 分钟的单"
+                                                    "（最后 2 分钟也吃：RULE_TAIL=on）")
             seen = next(r["seen"] for r in t.recs.values() if r["slug"] == slug)
             self.assertTrue(seen["offer_ms"] == clock.ms and seen["offer_max"] == 30.0, "the offer is watched all the same: when it showed, how much")
             clock.ms += 30_000  # ...and at the next looks: no order, no pause for a refusal
             await t.tick()
             self.assertEqual((api.sent, t.track[slug]["word"].startswith("盘口有 ≤58¢ 的涨 30 份，但离开场不足 130 秒")), ([], True))
         # a second earlier it goes out, signed to expire 5 s before the start: 125 s of life
-        t, api, clock, x = taker("on")
+        t, api, clock, x = taker("on", RULE_TAIL="off")
         api.markets["901"] = gold_market(GOLD_0600)
         api.listed.add(slug)
         api.books["901"] = {"bids": [], "asks": [[0.51, 30]]}
         clock.ms = GOLD_0600 - R.ORDER_BEFORE_MS
         await t.tick()
         self.assertEqual((len(api.sent), int(api.sent[0]["data"]["order"]["expiration"]) * 1000 - clock.ms), (1, 125_000))
-        self.assertIn("盘口一有就买，到开场前 130 秒（订单签到开场前 5 秒到期，Predict 不收有效期不足 2 分钟的单）", t.status().split("\n")[0])
+        self.assertNotIn("tail", t.record(slug)["orders"][0])
+        self.assertIn("盘口一有就买，到开场前 130 秒（订单签到开场前 5 秒到期，Predict 不收有效期不足 2 分钟的单；最后 2 分钟也吃：RULE_TAIL=on）", t.status().split("\n")[0])
         self.assertNotIn("开场前 15 秒", t.status().split("\n")[0])
+
+    async def test_the_last_two_minutes_before_the_start(self):
+        """1.154.55 — the user: "最后 2 分钟要抢". Predict takes no order whose signed expiry is under two minutes away, so an order
+        of a start's last two minutes cannot expire before the start: it is signed as short as Predict takes it (TAIL_LIFE_S
+        from now — past the start) and what the expiry gave is kept by hand. It asks for what stands at the rule's price and no
+        more; its rest is withdrawn FILL_READ_MS on like any order's, and asked again each second until Predict's word (an
+        answer gone missing looked for as often); not known off the book when the window starts, it is told at once, and told
+        again when it is. Nothing within STOP_MS of the start, as ever; RULE_TAIL=off is 1.154.52's edge (the test above)."""
+        slug = f"xau-updown-15m-{GOLD_0600 // 1000}"
+
+        def ready(mode="on", **env):
+            t, api, clock, x = taker(mode, RULE_GOLD_SHARES="200", **env)
+            api.markets["901"] = gold_market(GOLD_0600)
+            api.listed.add(slug)
+            api.books["901"] = {"bids": [], "asks": [[0.51, 130]]}
+            return t, api, clock, x
+        self.assertEqual((R.TAIL_LIFE_S, R.TAIL_AGAIN_MS, m.CONTROL_FORMS["RULE_TAIL"]["group"]), (125, 1_000, "规则"))
+        t, api, clock, x = ready()
+        self.assertTrue(t.settings.tail, "on unless switched off")
+        # a minute before the start: bought — signed for 125 s from now, a minute and five seconds into the window; for the 130 on
+        # offer, not the 200 the window may buy (a ladder's first step is swept only where the order ends before the start)
+        clock.ms = GOLD_0600 - 60_000
+        api.fill[1] = 100.0
+        await t.tick()
+        api.books["901"] = {"bids": [], "asks": []}  # (taken: by this order, and by somebody else's)
+        order, signed = t.record(slug)["orders"][0], api.sent[0]["data"]["order"]
+        self.assertEqual((int(signed["expiration"]), order["expires"], order.get("tail")), (clock.ms // 1000 + 125, clock.ms // 1000 + 125, True))
+        self.assertEqual(int(signed["expiration"]) * 1000, GOLD_0600 + 65_000)
+        self.assertEqual(L.from_wei(int(signed["takerAmount"])), 130.0)
+        clock.ms += R.FILL_READ_MS  # its rest withdrawn then, as any order's: long before the start
+        await t.tick()
+        self.assertEqual((api.removed, order["state"], order["filled"]), (["1"], "cancelling", 100.0))
+        clock.ms += R.FOLLOW_EVERY_MS
+        await t.tick()
+        self.assertEqual(order["state"], "closing", "off the book on Predict's word: final by a read a minute on, as any order")
+        clock.ms = GOLD_0600 + 1_000
+        await t.tick()
+        self.assertFalse([n for n in x.notes if n.startswith("⚠️ 规则吃单")], "off the book before the start: nothing to tell")
+        self.assertIn("盘口一有就买，到开场前 15 秒（最后 130 秒里的单签成约 2 分钟后到期——Predict 不收更短的——所以只按盘口现有的份数下，"
+                      "没成交的部分照常 1.5 秒后撤、没确认撤掉就每秒再撤，开场时还没撤掉会马上通知；RULE_TAIL=off 关掉）", t.status().split("\n")[0])
+        # 131 s before the start an order still ends before it: as ever (swept: all the window may buy)
+        t, api, clock, x = ready()
+        clock.ms = GOLD_0600 - R.ORDER_BEFORE_MS - 1_000
+        await t.tick()
+        order, signed = t.record(slug)["orders"][0], api.sent[0]["data"]["order"]
+        self.assertEqual((int(signed["expiration"]), order.get("tail"), L.from_wei(int(signed["takerAmount"]))), (GOLD_0600 // 1000 - R.EXPIRY_BEFORE_S, None, 200.0))
+        # within STOP_MS of the start: nothing, as ever
+        t, api, clock, x = ready()
+        clock.ms = GOLD_0600 - R.STOP_MS + 1_000
+        await t.tick()
+        self.assertEqual(api.sent, [])
+        # Predict says "nothing to remove" while the order stands: asked again each second — not five seconds on, then ten
+        t, api, clock, x = ready()
+        clock.ms = GOLD_0600 - 60_000
+        asked = []
+        real = api.remove_orders
+
+        async def noop(ids):
+            asked.append(clock.ms)
+            return {"removed": [], "noop": list(ids)}
+        api.remove_orders = noop
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        api.books["901"] = {"bids": [], "asks": []}  # (the offer gone: somebody else's, this time)
+        clock.ms += R.FILL_READ_MS
+        await t.tick()
+        for _ in range(4):
+            clock.ms += R.TAIL_AGAIN_MS
+            await t.tick()
+        self.assertEqual([b - a for a, b in zip(asked, asked[1:])], [R.TAIL_AGAIN_MS] * 4, asked)
+        self.assertEqual((len(api.sent), order["state"], order["noops"]), (1, "cancelling", 5))
+        # ...still not off the book as the window starts: told at once, once — what may be taken, at what price, until when
+        clock.ms = GOLD_0600 + 200
+        await t.tick()
+        clock.ms += R.TAIL_AGAIN_MS
+        await t.tick()
+        warned = [n for n in x.notes if n.startswith("⚠️ 规则吃单")]
+        until = m.dt.datetime.fromtimestamp(order["expires"], m.BEIJING).strftime("%H:%M:%S")
+        self.assertEqual(len(warned), 1, x.notes)
+        self.assertIn(f"已经开场，开场前最后 2 分钟下的一张单还没确认撤掉——可能还挂着 130 份、买价 ≤58¢，签名 {until} 到期。机器人每秒在重试撤单", warned[0])
+        self.assertGreater(len(asked), 6, "and asked on, each second")
+        api.remove_orders = real  # ...Predict takes the removal: told that it is off the book
+        clock.ms += R.TAIL_AGAIN_MS
+        await t.tick()
+        clock.ms += R.FOLLOW_EVERY_MS
+        await t.tick()
+        cleared = [n for n in x.notes if n.startswith("✅ 规则吃单")]
+        self.assertEqual((len(cleared), order["state"]), (1, "closing"), x.notes)
+        self.assertIn("那张单已经不在簿上（共成交 0/130 份）", cleared[0])
+        # the taker's key cooling down as the window starts (no read of the order then: they are the key's): told all the same, the
+        # withdrawal asked on the bot's own client each second; its signature run out, told that too
+        t, api, clock, x = ready()
+        clock.ms = GOLD_0600 - 60_000
+        api.remove_orders = noop
+        del asked[:]
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        api.books["901"] = {"bids": [], "asks": []}
+        clock.ms += R.FILL_READ_MS
+        await t.tick()
+        spare_asked = []
+
+        async def spare_noop(ids):
+            spare_asked.append(clock.ms)
+            return {"removed": [], "noop": list(ids)}
+        x.owner.live.api.remove_orders = spare_noop
+        api.blocked_until = time.monotonic() + 300
+        clock.ms = GOLD_0600 + 100
+        await t.tick()
+        clock.ms += R.TAIL_AGAIN_MS
+        await t.tick()
+        clock.ms += R.TAIL_AGAIN_MS
+        await t.tick()
+        warned = [n for n in x.notes if n.startswith("⚠️ 规则吃单")]
+        self.assertEqual((len(warned), [b - a for a, b in zip(spare_asked, spare_asked[1:])]), (1, [R.TAIL_AGAIN_MS] * 2), (x.notes, spare_asked))
+        clock.ms = order["expires"] * 1000
+        await t.tick()
+        cleared = [n for n in x.notes if n.startswith("✅ 规则吃单")]
+        self.assertEqual(len(cleared), 1, x.notes)
+        self.assertIn("那张单的签名已到期，不会再成交（共成交 0/130 份）", cleared[0])
+        api.blocked_until = 0.0
+        # past its signed expiry an order of the last two minutes is asked as any other (it can fill no more)
+        late = {"tail": True, "expires": GOLD_0600 // 1000, "noops": 3, "noop_ms": 0, "id": "9"}
+        self.assertEqual((R.RuleTaker.noop_wait(late, GOLD_0600 - 1), R.RuleTaker.noop_wait(late, GOLD_0600), R.RuleTaker.noop_wait({**late, "tail": False}, GOLD_0600 - 1)),
+                         (R.TAIL_AGAIN_MS, R.NOOP_AGAIN_MS * 4, R.NOOP_AGAIN_MS * 4))
+        # the placement's answer goes missing: the order looked for a second on (not ten), found, its rest withdrawn
+        t, api, clock, x = ready()
+        clock.ms = GOLD_0600 - 60_000
+        api.timeout = True
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        self.assertEqual((order["state"], order["next_ms"] - clock.ms, api.removed), ("unknown", R.TAIL_AGAIN_MS, []))
+        clock.ms += R.TAIL_AGAIN_MS
+        await t.tick()
+        self.assertEqual((api.removed, order["id"]), (["1"], "1"))
+        # on paper the last two minutes are recorded too (what an order would have bought)
+        t, api, clock, x = ready("paper")
+        clock.ms = GOLD_0600 - 60_000
+        await t.tick()
+        self.assertEqual(sum(R.filled(r) for r in t.recs.values()), 130.0)
+        # a setting read from the environment: on, off, nothing else
+        self.assertFalse(m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "RULE_TAKER": "paper", "RULE_TAIL": "off"}).rules.tail)
+        with self.assertRaises(ValueError):
+            m.Config.from_env({"TELEGRAM_BOT_TOKEN": "offline", "RULE_TAKER": "paper", "RULE_TAIL": "maybe"})
 
     def test_an_order_of_a_later_showing_is_timed_from_it(self):
         """1.154.52 — a window's offers may show, be taken and show again hours on (11-24 07:00: listed a day ahead, a second order 19

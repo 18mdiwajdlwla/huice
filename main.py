@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.52"
+VERSION = "1.154.56"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -514,6 +514,7 @@ BASELINE_MODES = {
 # validation and wording as at start-up), and applied at once; it survives restarts until cleared.
 PREOPEN_MIN_SIDE_USD = 1.0  # Predict refuses an order worth under about a dollar (live.MIN_ORDER_USD): a pre-open side must reach it
 PREOPEN_MAX_LEVELS = 8  # PREOPEN_LEVELS: the first level and up to seven deeper ones a side (1.139.1: 5 — 49/48/47/46 and 43, 40 did not fit)
+PREOPEN_NO_DEEP = frozenset({"none", "无", "不挂"})  # PREOPEN_BTC5_DEEP_LEVELS: no deeper level at all — BTC 5-minute quotes its first alone (1.154.56)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -546,7 +547,15 @@ class PreopenSettings:
     btc5_ahead_minutes: int = 0    # PREOPEN_BTC5_AHEAD_MINUTES
     # 1.154.37: BTC 5-minute's own ladder (PREOPEN_BTC5_LEVELS): (price, shares) a side per level, its first level included; () = the
     # general one above (levels_for) — the user: "单独 BTC 5 分钟的预挂，可以设置挂多少份额的吗"
+    # 1.154.56: ...that was the whole ladder typed out at once. Its first level by itself now (PREOPEN_BTC5_PRICE_CENTS, PREOPEN_BTC5_SHARES:
+    # 0 = the general one's) and its deeper levels by themselves (PREOPEN_BTC5_DEEP_LEVELS: empty = the general ones, "none" = none) — the
+    # user: "BTC 5 分钟也可以设置第一个档预挂的". btc5_levels is what comes of them all — over the whole ladder where one is still set
+    # (btc5_whole), else over the general one — and () when that is the general ladder itself
     btc5_levels: tuple = ()
+    btc5_price: D = D("0")
+    btc5_shares: D = D("0")
+    btc5_deep: tuple | None = None
+    btc5_whole: tuple = ()
 
     @property
     def side_usd(self) -> float:
@@ -616,6 +625,21 @@ class PreopenSettings:
         if btc5 and bad_ladder(btc5):
             raise ValueError(f"PREOPEN_BTC5_LEVELS（BTC 5 分钟自己的价格档位，含第一档）至多 {PREOPEN_MAX_LEVELS} 档，每档价格 1～50¢、份数 1～500、"
                              f"每边不少于 ${PREOPEN_MIN_SIDE_USD:g}，价格逐档递减；空 = 跟所有卡一样")
+        # 1.154.56: BTC 5-minute's first level and its deeper ones, each by itself (0 / empty = as every card's)
+        b5_cents, b5_shares = int(str(e.get("PREOPEN_BTC5_PRICE_CENTS", "0")).strip() or 0), int(str(e.get("PREOPEN_BTC5_SHARES", "0")).strip() or 0)
+        b5_deep_text = str(e.get("PREOPEN_BTC5_DEEP_LEVELS", "")).strip()
+        b5_deep = (None if not b5_deep_text else [] if b5_deep_text.lower() in PREOPEN_NO_DEEP
+                   else ladder("PREOPEN_BTC5_DEEP_LEVELS", "43x40,40x80（第 2 档起；none = 不挂更深的档；空 = 跟所有卡一样）"))
+        btc5_own = list(btc5)
+        if b5_cents or b5_shares or b5_deep is not None:
+            base = btc5 or levels  # (over the whole ladder of its own where one is still set — 1.154.37 — else over every card's)
+            btc5_own = [(b5_cents or base[0][0], b5_shares or base[0][1]), *(b5_deep if b5_deep is not None else base[1:])]
+            if b5_cents < 0 or b5_shares < 0 or bad_ladder(btc5_own):
+                raise ValueError("BTC 5 分钟的价格档位合起来是 " + ",".join(f"{c}x{n}" for c, n in btc5_own) + "（第一档 = “BTC 5 分钟：第一档价格” × “第一档每边份数”，"
+                                 f"0 = 跟所有卡一样；后面的 = “BTC 5 分钟：更深的价格档位”，留空 = 跟所有卡一样、none = 不挂）：至多 {PREOPEN_MAX_LEVELS} 档，每档价格 1～50¢、"
+                                 f"份数 1～500、每边不少于 ${PREOPEN_MIN_SIDE_USD:g}，价格要逐档递减——第一档不比后面的档高时，把“更深的价格档位”也单独填上")
+        if btc5_own == levels:
+            btc5_own = []  # (as every card's: nothing of its own)
         deep = int(e.get("PREOPEN_DEEP_AHEAD_MINUTES", "0") or 0) or ahead
         limit_gap = float(e.get("PREOPEN_LIMIT_GAP_PCT", "2") or 0)
         if not 0 <= limit_gap <= 20:
@@ -643,7 +667,9 @@ class PreopenSettings:
                    price=price, shares=D(shares), markets=markets, exclusive=exclusive, weekend=weekend, db=cls.db_of(e),
                    levels=tuple((D(c) / 100, D(s)) for c, s in levels), deep_ahead_minutes=deep, limit_gap_pct=limit_gap, open_quiet_minutes=open_quiet,
                    btc5_cancel_seconds=b5[0], btc5_expiry_seconds=b5[1], btc5_entry_seconds=b5[2], btc5_ahead_minutes=b5[3],
-                   btc5_levels=tuple((D(c) / 100, D(s)) for c, s in btc5))
+                   btc5_levels=tuple((D(c) / 100, D(s)) for c, s in btc5_own), btc5_price=D(b5_cents) / 100, btc5_shares=D(b5_shares),
+                   btc5_deep=None if b5_deep is None else tuple((D(c) / 100, D(s)) for c, s in b5_deep),
+                   btc5_whole=tuple((D(c) / 100, D(s)) for c, s in btc5))
 
     @classmethod
     def from_config(cls, config: "Config", force: bool = False) -> "PreopenSettings":
@@ -710,6 +736,8 @@ class RuleSettings:
     live: tuple = ()            # RULE_*_LIVE_CENTS (1.154.14): (rule key, cents) — the highest price in the window's course; none or 0 = only before it
     lead_minutes: int = 300     # RULE_LEAD_MINUTES (1.154.13): how long before a window's start the makers post their orders (5 hours, 11-17) — the
     #                             rule taker sprints around that moment of every window (rules.RuleTaker.sprinting); 0 = no such moment
+    tail: bool = True           # RULE_TAIL (1.154.55): on = it buys in a start's last two minutes too, with orders signed to outlive the start
+    #                             (Predict takes none shorter than two minutes: rules.TAIL_LIFE_S); off = nothing nearer than rules.ORDER_BEFORE_MS
 
     @property
     def enabled(self) -> bool:
@@ -770,12 +798,15 @@ class RuleSettings:
             raise ValueError("RULE_*_LIVE_CENTS 是 0（盘中不做）或 1～97（¢，开场后的最高买价）")
         if any(v not in {"on", "off"} for v in switches.values()):
             raise ValueError("RULE_GOLD、RULE_OIL 只能是 on 或 off")
+        tail = str(e.get("RULE_TAIL", "on")).strip().lower() or "on"
+        if tail not in {"on", "off"}:
+            raise ValueError("RULE_TAIL 只能是 on（开场前最后 2 分钟也吃）或 off")
         if (any(not (c == 0 or 1 <= c <= 95) for c in cents.values()) or any(not 1 <= n <= 100_000 for n in shares.values())
                 or not 0 <= max_day <= 1_000_000):
             raise ValueError("RULE_*_CENTS 是 0（不做这条规则）或 1～95（¢，最高买价）；RULE_GOLD_SHARES、RULE_OIL_SHARES 每场最多买 1～100000 份；"
                              "RULE_MAX_DAY_USD 0～1000000（每天最多花多少，0 = 不限）")
         return cls(mode, tuple(cents.items()), frozenset(m for m, v in switches.items() if v == "on"), tuple(shares.items()), max_day, fast,
-                   tuple(live.items()), lead)
+                   tuple(live.items()), lead, tail == "on")
 
 
 CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
@@ -867,20 +898,28 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_OPEN_QUIET_MINUTES", "开盘后几分钟内开始的场次不挂", "15～120：海力士、宇树、智谱每个交易时段（开盘、午后）开始后，黄金、原油休市后重新开盘（纽约时间 18:00，周末和节假日之后也算）后，美股卡 09:30 开盘后，这么多分钟内开始的场次不挂。集合竞价的参考价（韩交所 08:30 起、港交所 09:00 起、上交所 09:15 起）、午休和休市期间的消息在指数动之前就已公开，这几场的方向不是五五开，49¢ 的买单正好给知道方向的人接。1.151.1 起开盘后第一场（15 分钟）固定不挂，这里只能再加长，填 0 也按 15 算；默认 15"),
     ("PREOPEN_LIMIT_GAP_PCT", "股票卡距涨跌停不足几 % 时不挂", "0～20：海力士、宇树（智谱在港交所没有涨跌停，只看临停）的交易所现价离当日涨停或跌停（按前收盘价算：科创板 ±20%、韩交所 ±30%）不到这么多时不新挂、撤掉已挂的；交易时段里成交时间 3 分钟没动（临停、VI）同样处理；0 = 不管（默认 2）"),
     ("PREOPEN_AHEAD_MINUTES", "只挂几分钟内开始的场次", "3～1440：默认 1440 = 24 小时内已发布的全部场次，发布一场挂一场、最近的先；想少占资金就调小"),
-    ("PREOPEN_CANCEL_SECONDS", "开场前几秒撤单", "至少比到期多 5 秒、至多 900：撤单发出后到到期前每 2 秒催一次（默认 20）"),
-    ("PREOPEN_EXPIRY_SECONDS", "签名开场前几秒到期", "5～600：撤单发不出去时的兜底，到期后不再撮合（默认 10）"),
+    ("PREOPEN_CANCEL_SECONDS", "开场前几秒撤单", "至少比到期多 5 秒、至多 900：撤单发出后到到期前每 2 秒催一次（默认 20）。改了不撤已挂的单：它们在新的撤单时间、"
+     "或自己签名的到期时间（哪个早按哪个）离场"),
+    ("PREOPEN_EXPIRY_SECONDS", "签名开场前几秒到期", "5～600：撤单发不出去时的兜底，到期后不再撮合（默认 10）。到期时间签在订单里、改不了："
+     "把它改小（更靠近开场）不撤已挂的单，它们按原来签的时间到期，新挂的才按新值（1.154.54）；把它改大（离开场更远）会把已挂的单全部撤掉重签重挂——"
+     "排队位置会丢，一天的场次全部挂回要几个小时（/preopen 的“撤后待核对”写着进度）"),
     ("PREOPEN_ENTRY_SECONDS", "距开场不足几秒不再新挂", "至少比撤单时间多 60 秒、至多 3600（默认 180）"),
+    ("PREOPEN_BTC5_PRICE_CENTS", "BTC 5 分钟：第一档价格（¢）", "只管 BTC 5 分钟卡（1.154.56）；0 = 跟所有卡一样（上面的“预挂价格”）。1～50：BTC 5 分钟每场两边的第一档按这个价挂；"
+     "要比它后面的档位高——后面的档默认跟所有卡的一样，第一档调低到不比它们高时，把下面“更深的价格档位”也单独填上。改了只撤、重挂 BTC 5 分钟第一档的单（几分钟，离开场近的先回来），别的卡不动"),
+    ("PREOPEN_BTC5_SHARES", "BTC 5 分钟：第一档每边份数", "只管 BTC 5 分钟卡（1.154.56）；0 = 跟所有卡一样（上面的“预挂每边份数”）。1～500，每边不少于 $1。改了只撤、重挂 BTC 5 分钟第一档的单"),
+    ("PREOPEN_BTC5_DEEP_LEVELS", "BTC 5 分钟：更深的价格档位", "只管 BTC 5 分钟卡（1.154.56）；第 2 档起，价格x份数、逗号分隔、价格逐档递减，如 43x40,40x80。留空 = 跟所有卡一样（上面的“更深的价格档位”）；"
+     "none = BTC 5 分钟只挂第一档。改了只撤、重挂 BTC 5 分钟有变化的那几档"),
     ("PREOPEN_BTC5_CANCEL_SECONDS", "BTC 5 分钟：开场前几秒撤单", "只管 BTC 5 分钟卡（1.152.0）；0 = 跟上面所有卡的一样。至少比它自己的到期多 5 秒、至多 900"),
     ("PREOPEN_BTC5_EXPIRY_SECONDS", "BTC 5 分钟：签名开场前几秒到期", "只管 BTC 5 分钟卡；0 = 跟上面所有卡的一样。5～600：撤单发不出去时的兜底，到期后不再撮合"),
     ("PREOPEN_BTC5_ENTRY_SECONDS", "BTC 5 分钟：距开场不足几秒不再新挂", "只管 BTC 5 分钟卡；0 = 跟上面所有卡的一样。至少比它自己的撤单时间多 60 秒、至多 3600"),
     ("PREOPEN_BTC5_AHEAD_MINUTES", "BTC 5 分钟：只挂几分钟内开始的场次", "只管 BTC 5 分钟卡；0 = 跟上面所有卡的一样。1440 = 挂满：Predict 发布的场次全部挂上，"
      "新场次一发布就挂（0.5 秒内），排在 49¢ 买单队伍最前面；24 小时最多 288 场，每场两边各 49¢ × 每次份数，预挂资金上限不够时最晚发布的几场挂不上（预挂状态写“已发布未挂”）。"
      "3～1440：调小就只挂快开场的几场，少占资金、少读接口，但新场次要等进了范围才挂，排在先挂的人后面"),
-    ("PREOPEN_BTC5_LEVELS", "BTC 5 分钟：自己的价格档位", "只管 BTC 5 分钟卡（1.154.37）；价格x份数、逗号分隔、第一档在前、价格逐档递减，最多 8 档，如 47x10,43x40："
-     "BTC 5 分钟每场每边就挂这几档（第一档也按这里的价格和份数）；空 = 跟上面所有卡的一样（预挂价格 × 每次份数，加更深的价格档位）。改了只撤、重挂 BTC 5 分钟的单"),
+    ("PREOPEN_BTC5_LEVELS", "BTC 5 分钟：整串价格档位（旧写法）", "1.154.37 的写法，留着兼容：价格x份数、逗号分隔、第一档在前，如 47x10,43x40，一次把 BTC 5 分钟的所有档写全；空 = 不用。"
+     "1.154.56 起用“开盘前预挂 · BTC 5 分钟”那一组里的“第一档价格”“第一档每边份数”“更深的价格档位”分开填就行——那三项填了的，盖在这里的整串之上"),
     ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "0～1000000，0 = 不限（默认）：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金，成交时才扣款；余额够一场双边就挂）；设了上限时每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放，/preopen 会算出把已发布的全部挂上需要多少"),
     # 1.153.0: 规则吃单 (rules.py) — the gold / oil windows the backtest found mispriced (README「规则吃单」)
-    ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段，开场前吃：Predict 撮合开启后到开场前 130 秒（订单签到开场前 5 秒到期，Predict 不收有效期不足 2 分钟的单），盘口一出现规则价以内的指定方向就立即买"
+    ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段，开场前吃：Predict 撮合开启后到开场前 15 秒（最后 130 秒的单见下面“开场前最后 2 分钟也吃”；关掉它就到开场前 130 秒为止），盘口一出现规则价以内的指定方向就立即买"
      "（盘口变化由推送送来，不等下一次读）；黄金休市 4 档、开盘第一档另设了盘中价格时，开场后规则方向领先也接着吃（1.154.14）。off 关；paper 只记录不下单：按当时盘口记下会买到多少、按 Predict 的结果结算，先看几天再开；"
      "on 真实吃单（需要 LIVE=on；真实交易暂停、今日亏损停机、接口限流冷却时都不下单）"),
     ("RULE_GOLD", "规则吃单：黄金", "on = 做黄金的规则（下面价格设为 0 的那条不做）；off = 黄金一条都不做"),
@@ -927,6 +966,10 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("RULE_LEAD_MINUTES", "规则吃单：对手提前多少分钟挂单", "0～1440，默认 300（5 小时）：有人在每场开场前这么久把单挂出来（06:00 的场 01:00 挂）。每个规则场次在这个时刻的前 1 分钟到后 15 分钟"
      "每秒检查，并先做好准备；时刻前 10 秒到后 2 分钟里这一场的盘口每秒用 REST 读一次（推送之外的第二条路）。按场次算，不受上面时段和夏令时影响；0 = 不按这个时刻。"
      "/rules 会写出卖单实际出现在开场前多久，可以对着调"),
+    ("RULE_TAIL", "规则吃单：开场前最后 2 分钟也吃", "on（默认，1.154.55）= 开场前 130 秒到 15 秒之间出现的卖单也买。Predict 不收有效期不足 2 分钟的单，所以这段时间的单只能签成"
+     "“下单后约 2 分钟到期”，也就是最晚到开场后约 1 分 50 秒；为此这段时间的单只按盘口上当时有的份数下（正常全部成交、不留剩余），没成交的部分照常 1.5 秒后撤，"
+     "没确认撤掉就每秒再撤，开场时还没撤掉会立刻发通知。剩下的风险：某张单没全成交、撤单又一直发不出去（Predict 接口故障）时，剩余部分可能在开场后的头两分钟按规则价成交，"
+     "最多是这一场的份数上限。off = 开场前 130 秒起不再下单（1.154.52 的做法）。盘中（开场后）的最后 130 秒不受这项影响，一直不下单"),
 )
 CONTROL_KEY_SET = frozenset(k for k, _, _ in CONTROL_KEYS)
 # One-click combinations for the control page (一键搭配): the strategy settings only. What to trade (SIM_MARKETS, SIM_SKIP),
@@ -13021,13 +13064,18 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_CANCEL_SECONDS": {"kind": "number", "group": "预挂", "presets": ["10", "15", "20", "30", "60"], "unit": "秒"},
     "PREOPEN_EXPIRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["5", "10", "15", "30"], "unit": "秒"},
     "PREOPEN_ENTRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["90", "120", "180", "300"], "unit": "秒"},
-    "PREOPEN_BTC5_CANCEL_SECONDS": {"kind": "number", "group": "预挂", "presets": ["0", "10", "15", "20", "30"], "unit": "秒", "zero": "跟所有卡一样"},
-    "PREOPEN_BTC5_EXPIRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["0", "5", "10", "15"], "unit": "秒", "zero": "跟所有卡一样"},
-    "PREOPEN_BTC5_ENTRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["0", "90", "120", "180", "300"], "unit": "秒", "zero": "跟所有卡一样"},
-    "PREOPEN_BTC5_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "30", "60", "120", "240", "1440"], "unit": "分钟", "zero": "跟所有卡一样",
+    # 1.154.56: BTC 5-minute's own settings in a group of their own on the page (预挂5), its first level by itself at the head of it
+    "PREOPEN_BTC5_PRICE_CENTS": {"kind": "number", "group": "预挂5", "presets": ["0", "45", "46", "47", "48", "49"], "unit": "¢", "zero": "跟所有卡一样"},
+    "PREOPEN_BTC5_SHARES": {"kind": "number", "group": "预挂5", "presets": ["0", "10", "20", "30", "50", "100"], "unit": "份", "zero": "跟所有卡一样"},
+    "PREOPEN_BTC5_DEEP_LEVELS": {"kind": "text", "group": "预挂5", "presets": ["", "none", "43x40", "43x80,40x80", "43x160,40x160,37x160"], "unit": "",
+                                 "empty": "跟所有卡一样", "captions": {"none": "只挂第一档"}},
+    "PREOPEN_BTC5_CANCEL_SECONDS": {"kind": "number", "group": "预挂5", "presets": ["0", "10", "15", "20", "30"], "unit": "秒", "zero": "跟所有卡一样"},
+    "PREOPEN_BTC5_EXPIRY_SECONDS": {"kind": "number", "group": "预挂5", "presets": ["0", "5", "10", "15"], "unit": "秒", "zero": "跟所有卡一样"},
+    "PREOPEN_BTC5_ENTRY_SECONDS": {"kind": "number", "group": "预挂5", "presets": ["0", "90", "120", "180", "300"], "unit": "秒", "zero": "跟所有卡一样"},
+    "PREOPEN_BTC5_AHEAD_MINUTES": {"kind": "number", "group": "预挂5", "presets": ["0", "30", "60", "120", "240", "1440"], "unit": "分钟", "zero": "跟所有卡一样",
                                    "captions": {"1440": "挂满：一发布就挂"}},  # 1.152.2: every listed window, each placed the moment it is listed
-    "PREOPEN_BTC5_LEVELS": {"kind": "text", "group": "预挂", "presets": ["", "47x10", "47x10,43x40", "47x20,43x80,40x80", "47x30,43x160,40x160,37x160"], "unit": "",
-                            "empty": "跟所有卡一样"},  # 1.154.37
+    "PREOPEN_BTC5_LEVELS": {"kind": "text", "group": "高级", "presets": ["", "47x10", "47x10,43x40", "47x20,43x80,40x80", "47x30,43x160,40x160,37x160"], "unit": "",
+                            "empty": "不用"},  # 1.154.37; 1.154.56: the older way, among the advanced ones
     "PREOPEN_MAX_OPEN_USD": {"kind": "number", "group": "预挂", "presets": ["0", "1000", "5000", "7000", "20000"], "unit": "$", "zero": "不限"},
     "RULE_TAKER": {"kind": "choice", "group": "规则", "options": [["off", "off 关"], ["paper", "paper 只记录不下单"], ["on", "on 真实吃单（需要 LIVE=on）"]]},
     "RULE_GOLD_SHUT_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "55", "58", "60", "65"], "unit": "¢", "zero": "不做"},
@@ -13047,6 +13095,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "RULE_MAX_DAY_USD": {"kind": "number", "group": "规则", "presets": ["0", "50", "100", "200", "500", "1000"], "unit": "$", "zero": "不限"},
     "RULE_LEAD_MINUTES": {"kind": "number", "group": "规则", "presets": ["0", "240", "300", "360"], "unit": "分钟", "zero": "不按这个时刻",
                           "captions": {"300": "5 小时"}},
+    "RULE_TAIL": {"kind": "choice", "group": "规则", "options": [["on", "on 也吃（到开场前 15 秒）"], ["off", "off 不吃（到开场前 130 秒）"]]},  # 1.154.55
     "RULE_FAST_HOURS": {"kind": "text", "group": "规则", "presets": ["off", "01:00-07:00", "00:00-07:00", "00:55-02:00", "00:00-24:00"], "unit": "",
                         "captions": {"off": "不做每秒检查", "01:00-07:00": "凌晨 1 点到早上 7 点", "00:00-24:00": "全天"}},
     "SIM_EDGE_CENTS": {"kind": "number", "group": "策略", "presets": ["3", "5", "8", "10", "15", "20"], "unit": "¢"},
@@ -16909,6 +16958,7 @@ function preopenSection(po){  // 开盘前预挂 (1.128.0): the mode's own ledge
   p("有成交",t.filled_windows+" 场 · "+num(t.filled)+" 份 · "+usd(t.volume)+(t.pending?" · 待结算 "+t.pending+" 场":""));
   p("已结算",t.settled?[t.settled+" 场（赢 "+t.wins+" 输 "+t.losses+(t.ties?" 平 "+t.ties:"")+"）盈亏 ",poPn(t.pnl)," · 平均每场 ",poPn(t.pnl/t.settled)]:"还没有结算的场次");
   poEvRows(po.ev,t.pnl).forEach(([k,v])=>p(k,v));  // 1.154.34: the settled fills against a coin toss, and where the gap came from
+  if(po.archive_note)el.append($("p","small warn","⚠️ "+po.archive_note));  // 1.154.53: the archive's records not counted in yet (being counted in the background)
   el.append(d,...bigTable("按日期",poTable(po.days||[]),(po.days||[]).length),$("div","sub","按标的"),poTable(po.cards||[]));
   if((po.levels||[]).length)el.append($("p","small mut","按价格档位的预期对实际在上面“按市场”下方，跟着那里选的日期（全部日子选“全部”）。"));  // 1.154.35: moved up
   el.append(...bigTable("按开始时间",poTable(po.hours||[]),(po.hours||[]).length));
@@ -17437,7 +17487,7 @@ function switchMode(v){if(data.live&&v===data.live.mode)return;
   const ask={on:"切到 LIVE=on 后，模拟交易的每个决定都会在 Predict 真实下单。继续？",off:"切到 LIVE=off 会撤掉未成交的真实挂单并回到只记账（已有持仓继续跟踪到结算）。继续？",pause:"切到 LIVE=pause：登录 Predict、可自检和挂单测试，不开新仓。继续？"}[v];
   if(ask&&!confirm(ask))return;act({action:"mode",value:v})}
 $("modebtns").addEventListener("click",e=>{const b=e.target.closest("button");if(!b||b.disabled)return;switchMode(b.dataset.mode)});
-const GROUPS=[["策略","策略"],["风控","真实交易风控"],["预挂","开盘前预挂（15 分钟市场）"],["规则","规则吃单（黄金、原油固定时段）"],["高级","高级参数"]];
+const GROUPS=[["策略","策略"],["风控","真实交易风控"],["预挂","开盘前预挂（15 分钟市场）"],["预挂5","开盘前预挂 · BTC 5 分钟单独设置（留 0 / 留空 = 跟上面所有卡一样）"],["规则","规则吃单（黄金、原油固定时段）"],["高级","高级参数"]];
 function fmt(s,v){return s.unit==="$"?"$"+v:s.unit==="¢"?v+"¢":s.unit?v+" "+s.unit:v}
 function capOf(s,v){return s.captions&&s.captions[v]?"（"+s.captions[v]+"）":""}  // a preset's own name: 1440 分钟（挂满） (1.152.2)
 function selected(s){return new Set(s.kind==="multi"?(s.value==="all"?s.options.map(o=>o[0]):s.value.split(",")):[s.value])}
@@ -18661,6 +18711,10 @@ class Document:
     mime: str = "text/csv"
 
 
+# /export 全部 (1.154.53): what its files share — the pre-open review, made by the first that asks and handed to the others —
+# for the length of that one command, in its own task alone (a page built meanwhile makes its own: Bot.review_held). Held as
+# [the dict]: [None] once the command is over, so that nothing begun under it and still running finds anything kept
+REVIEW_SHARED: contextvars.ContextVar = contextvars.ContextVar("review_shared", default=None)
 DOCUMENT_GZIP_BYTES = 20_000_000  # a file larger than this is sent gzipped (Telegram takes 50 MB from a bot; an upload has DOCUMENT_TIMEOUT_S)
 DOCUMENT_MAX_BYTES = 49_000_000   # ...and one still larger than this once compressed is not sent
 DOCUMENT_TIMEOUT_S = 120
@@ -20195,8 +20249,9 @@ class Bot:
         if not n:
             return f"没有符合的记录（筛选：{journal_filter_text(flt)}）" if flt else "还没有交易记录"
         scope = f"筛选：{journal_filter_text(flt)}" if flt else "全部"
-        return Document(self.export_name("journal", flt), self.journal_csv(flt).encode("utf-8"),
-                        f"交易日记 {n} 笔（{scope}）；一笔一行，列的含义见 README")
+        with self.review_scope():  # (1.154.53: one build — the pre-open review and each record's figures once, as the page's builds)
+            data = self.journal_csv(flt).encode("utf-8")
+        return Document(self.export_name("journal", flt), data, f"交易日记 {n} 笔（{scope}）；一笔一行，列的含义见 README")
 
     async def cmd_summary(self, req: Request) -> Any:
         """/summary [筛选词]: the review page's summary and analysis tables (journal_summary_csv — its 导出汇总 CSV) as a
@@ -20207,9 +20262,12 @@ class Bot:
         if not self.sim_trades():
             return "还没有交易记录"
         scope = f"筛选：{journal_filter_text(flt)}" if flt else "全部记录"
-        return Document(self.export_name("summary", flt), self.journal_summary_csv(flt).encode("utf-8"),
+        with self.review_scope():  # (1.154.53: the daily summary and the analysis both ask for the pre-open review: once)
+            data = self.journal_summary_csv(flt).encode("utf-8")
+            note = "" if flt else self.archive_note()  # (the pre-open mode's quotes are counted in without a filter: summary_rows)
+        return Document(self.export_name("summary", flt), data,
                         f"复盘汇总（{scope}）：每日汇总、今日按市场、按标的 / 净优势 / 公平价 / 时段、按设置版本、15 分钟表、"
-                        "挂单效率与撤单原因、被拦下的机会；第一列是表名")
+                        "挂单效率与撤单原因、被拦下的机会；第一列是表名" + (f"｜⚠️ 其中开盘前预挂的部分：{note}" if note else ""))
 
     # --- 1.154.51: everything the review page holds, by Telegram (/export, /tally) --------------------------------------------------
     EXPORT_BUSY = "规则吃单正在优先时段（抢单时刻前后、开场前 15 分钟和盘中），导出和统计这段时间不做——做一次要占住机器人几秒；过一会儿再发"
@@ -20219,6 +20277,7 @@ class Bot:
     EXPORT_KINDS = {"日记": "journal", "journal": "journal", "汇总": "summary", "summary": "summary", "样本": "samples", "samples": "samples", "json": "json",
                     "预挂": "preopen", "preopen": "preopen", "规则": "rules", "rules": "rules", "涨跌": "tally", "连涨": "tally", "tally": "tally",
                     "全部": "all", "所有": "all", "all": "all"}
+    EXPORT_BREATH_S = 1.0  # /export 全部: this long between two files — each is a second or more of the loop in one piece: the trader catches up
     TALLY_WAIT_S = 90.0   # /tally: a card's candles are waited for this long at the most
     TALLY_PACE_S = 0.5    # /tally over several cards: this long a chunk of candles just read before the next card's are asked for — Binance futures'
     #                       index candles are 5 of the IP's 2,400 a minute a read: every card over a month is 750 reads
@@ -20313,16 +20372,26 @@ class Bot:
             return await self.export_json(words[1:])
         parts: list = []
         nothing: list[str] = []
-        for name, made in (("日记", self.cmd_journal), ("汇总", self.cmd_summary), ("样本", self.cmd_samples)):
-            answer = await made(dataclasses.replace(req, args=[]))
-            (parts if isinstance(answer, Document) else nothing).append(answer if isinstance(answer, Document) else name)
-            await asyncio.sleep(0)  # (each is seconds of the loop: the trader's turn between two)
-        for name, answer in (("预挂", await self.export_preopen([])), ("规则", self.export_rules())):
-            docs = [x for x in (answer if isinstance(answer, list) else [answer]) if isinstance(x, Document)]
-            parts.extend(docs)
-            if not docs:
-                nothing.append(name)
-            await asyncio.sleep(0)
+        # 1.154.53: the pre-open review is asked for by the summary and the pre-open files alike — a second of the loop each
+        # time with 40,000 working records: made by the first and handed to the others (REVIEW_SHARED: as within one build
+        # of the page, for this command's own task), with a breath between two files
+        shared: list = [{}]
+        token = REVIEW_SHARED.set(shared)
+        try:
+            bare = dataclasses.replace(req, args=[])
+            for name, made in (("日记", lambda: self.cmd_journal(bare)), ("汇总", lambda: self.cmd_summary(bare)), ("样本", lambda: self.cmd_samples(bare)),
+                               ("预挂", lambda: self.export_preopen([])), ("规则", self.export_rules)):
+                answer = made()
+                if inspect.isawaitable(answer):
+                    answer = await answer
+                docs = [x for x in (answer if isinstance(answer, list) else [answer]) if isinstance(x, Document)]
+                parts.extend(docs)
+                if not docs:
+                    nothing.append(name)
+                await asyncio.sleep(self.EXPORT_BREATH_S)
+        finally:
+            shared[0] = None
+            REVIEW_SHARED.reset(token)
         tally = await self.cmd_tally(dataclasses.replace(req, args=[]))
         later = isinstance(tally, str) and tally.startswith("统计中")
         parts.extend(x for x in (tally if isinstance(tally, list) else []) if isinstance(x, Document))
@@ -20340,7 +20409,8 @@ class Bot:
         flt, problem = self.journal_filter_words(words)
         if problem:
             return problem
-        payload = self.journal_payload(full=True, history=0)
+        with self.review_scope():
+            payload = self.journal_payload(full=True, history=0)
         mine = self.sim_trades()
         trades = [t for t in payload.pop("trades") if not flt or journal_match(mine.get(t["id"]) or {}, flt)]
         if not trades:
@@ -20376,8 +20446,10 @@ class Bot:
                          "涨跌两边在同一行；更早的、没成交且已撤的旧记录已归档，不在这个文件里")]
         review = self.preopen_review()
         if review:
+            note = str(review.get("archive_note") or "")
             docs.append(Document(f"preopen-summary-{self.export_stamp()}.csv", self.preopen_summary_csv(review),
-                                 "预挂统计表（全部日期，归档的旧记录也计入）：合计、按天、按卡、按档位（按五五开的预期对实际）、按开始小时、按方向、周末对工作日；第一列是表名"))
+                                 ("预挂统计表（全部日期，归档的旧记录也计入）：" if not note else "预挂统计表（全部日期）：")
+                                 + "合计、按天、按卡、按档位（按五五开的预期对实际）、按开始小时、按方向、周末对工作日；第一列是表名" + (f"｜⚠️ {note}" if note else "")))
         return docs
 
     EXPORT_SLICE = 2_000  # /export 预挂: this many records are looked at before the trader has its turn (tens of thousands: a second in one go)
@@ -27218,13 +27290,16 @@ class Bot:
                   "PREOPEN_EXPIRY_SECONDS": str(c.preopen.expiry_seconds), "PREOPEN_ENTRY_SECONDS": str(c.preopen.entry_seconds),
                   "PREOPEN_BTC5_CANCEL_SECONDS": str(c.preopen.btc5_cancel_seconds), "PREOPEN_BTC5_EXPIRY_SECONDS": str(c.preopen.btc5_expiry_seconds),
                   "PREOPEN_BTC5_ENTRY_SECONDS": str(c.preopen.btc5_entry_seconds), "PREOPEN_BTC5_AHEAD_MINUTES": str(c.preopen.btc5_ahead_minutes),
-                  "PREOPEN_BTC5_LEVELS": ",".join(f"{float(p) * 100:g}x{float(s):g}" for p, s in c.preopen.btc5_levels),
+                  "PREOPEN_BTC5_LEVELS": ",".join(f"{float(p) * 100:g}x{float(s):g}" for p, s in c.preopen.btc5_whole),
+                  "PREOPEN_BTC5_PRICE_CENTS": f"{float(c.preopen.btc5_price) * 100:g}", "PREOPEN_BTC5_SHARES": plain(float(c.preopen.btc5_shares)),
+                  "PREOPEN_BTC5_DEEP_LEVELS": ("" if c.preopen.btc5_deep is None else "none" if not c.preopen.btc5_deep
+                                               else ",".join(f"{float(p) * 100:g}x{float(s):g}" for p, s in c.preopen.btc5_deep)),
                   "PREOPEN_MAX_OPEN_USD": plain(c.preopen.max_open_usd), "PREOPEN_EXCLUSIVE": flag(c.preopen.exclusive),
                   "RULE_TAKER": c.rules.mode, "RULE_MAX_DAY_USD": plain(c.rules.max_day_usd), **{name: str(c.rules.price(key)) for key, name in RULE_SETTING_KEYS.items()},
                   **{switch: flag(c.rules.on(mk)) for mk, (switch, _) in RULE_MARKET_KEYS.items()},
                   **{size: str(c.rules.shares_of(mk)) for mk, (_, size) in RULE_MARKET_KEYS.items()},
                   **{name: str(c.rules.live_price(key)) for key, name in RULE_LIVE_KEYS.items()},
-                  "RULE_FAST_HOURS": day_spans_text(c.rules.fast), "RULE_LEAD_MINUTES": str(c.rules.lead_minutes),
+                  "RULE_FAST_HOURS": day_spans_text(c.rules.fast), "RULE_LEAD_MINUTES": str(c.rules.lead_minutes), "RULE_TAIL": flag(c.rules.tail),
                   "SOURCES_OFF": ",".join(sorted(c.sources_off)), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
                   "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait), "LIVE_TAKER_PRICE": c.live_taker_price,
@@ -28564,6 +28639,20 @@ class Bot:
         """A context for one build of the review page's data (WebServer.cached): nothing here; LiveBot keeps each pre-open
         record's figures for the length of it (preopen.quotes_kept)."""
         return contextlib.nullcontext()
+
+    def review_held(self) -> dict | None:
+        """What is kept of the review's data where this is asked: the build under way's (review_scope: review_kept), else —
+        within /export 全部, in its own task — what that command's files share (REVIEW_SHARED, 1.154.53); None: nothing kept."""
+        kept = getattr(self, "review_kept", None)
+        if kept is None and (shared := REVIEW_SHARED.get()):
+            kept = shared[0]
+        return kept
+
+    def archive_note(self) -> str:
+        """The pre-open review's word that its archived records are not counted in just now (LiveBot.preopen_review_build,
+        1.154.53) — "" when they are, or there is no such mode: said under whatever is made of that review meanwhile. Within
+        a build or an export the review asked for here is the one already made (review_held)."""
+        return str((self.preopen_review() or {}).get("archive_note") or "")
 
     def rules_clear(self, seconds: float) -> bool:
         """Whether the rule taker neither goes first now nor will within ``seconds`` (LiveBot: by its own plan of the day).

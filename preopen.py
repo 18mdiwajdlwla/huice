@@ -553,10 +553,15 @@ class Ledger:
                 self.conn.executemany("INSERT INTO archive VALUES (?,?) ON CONFLICT(slug) DO UPDATE SET body=excluded.body",
                                       ((slug, json.dumps(self.rows[slug], ensure_ascii=False)) for slug in part))
                 self.conn.executemany("DELETE FROM pairs WHERE slug=?", ((slug,) for slug in part))
+                now_held = int(self.conn.execute("SELECT COUNT(*) FROM archive").fetchone()[0])
+                if now_held - held != len(part):
+                    # 1.154.53: ...and said in the file itself, with the rows, in one transaction: the counts kept of the archive
+                    # across a restart (share_save) are the archive's only while none of its rows was replaced in place
+                    share_gen_bump(self.conn)
             for slug in part:  # (on disk first: a chunk that could not be written leaves its records where they were)
                 self.unindex(slug, self.rows.pop(slug))
-            self.archived_count = self.archive_count()
-            if self.archived_count - held != len(part):  # a record the archive held already — saved again after its move by a task that still had it — was replaced there, in place
+            self.archived_count = now_held
+            if now_held - held != len(part):  # a record the archive held already — saved again after its move by a task that still had it — was replaced there, in place
                 Ledger.rewrites += 1
         return len(gone)
 
@@ -1365,6 +1370,21 @@ def read_archive(path: str) -> Iterator[dict]:
         conn.close()
 
 
+def archive_rows(path: str) -> int:
+    """How many records the ledger file's archive holds, while no controller holds the file (a controller's ledger keeps
+    the count: archived_count) — one count over the archive's keys, no record read; 0 without a file or before the first
+    move. 1.154.53: LiveBot.preopen_review asks before it would read the archive record by record."""
+    if path == ":memory:" or not Path(path).exists():
+        return 0
+    conn = sqlite3.connect(path)
+    try:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='archive'").fetchone() is None:
+            return 0
+        return int(conn.execute("SELECT COUNT(*) FROM archive").fetchone()[0])
+    finally:
+        conn.close()
+
+
 def archive_file(path: str, now_ms: int) -> int:
     """Ledger.archive_old on the ledger file while no controller holds it (the mode off: LiveBot.preopen_tidy) — the
     positions check and the review page read that file's working records whole, twice a minute and six times a build;
@@ -1673,7 +1693,16 @@ class ArchiveShare:
     they are and passed by here (``skip``). What another hand changes leaving every key where it was — a body rewritten
     in place — is not seen before the next start. And the counts are not used at all (fits) when the archive holds a
     record that is no plain withdrawn quote, or one of a window after today's: the page reads the archive record by
-    record then, as it did. After a start the first call reads the archive whole, once."""
+    record then, as it did — a small one; a large one is left out and said (LiveBot.preopen_review_build).
+
+    1.154.53: after a start the first call read the archive whole, once — on the bot's one event loop: 187,104 records
+    and 20.8 s on 11-26. The read is cut into steps (ShareWork) that a background task takes one at a time
+    (LiveBot.preopen_share_keeper); a caller on the loop reads only what is little (read, whole=False). And the counts
+    are kept in the ledger's file (state / restored, share_save / share_load), so a start reads only the rows archived
+    since — while the archive's generation in that file (share_gen) is the one they were counted under: a pass that
+    replaces a row of the archive in place moves it on in the same transaction (Ledger.archive_old). A version before
+    this one run on the file in between does not: what it replaced in place then is not seen (a count or two of
+    withdrawn quotes off, never a fill or a P&L) until the archive is next read whole."""
     def __init__(self, path: str = "") -> None:
         self.path = path
         self.top = self.count = 0  # the archive's rows counted here: those up to this rowid, this many
@@ -1736,41 +1765,50 @@ class ArchiveShare:
         self.known[window] = seen
 
     @classmethod
-    def read(cls, conn: sqlite3.Connection, path: str, rows: list[dict], kept: ArchiveShare | None = None) -> ArchiveShare:
+    def read(cls, conn: sqlite3.Connection, path: str, rows: list[dict], kept: ArchiveShare | None = None, whole: bool = True) -> ArchiveShare:
         """The archive's share as the archive is now, for the working records ``rows``: ``kept`` — the last call's — with the
         rows moved in since counted in (none read when there are none), or the archive read whole (the first call, a
         ledger in memory, another file, and whenever its rows did not only grow: the class's own words). ``known`` then
-        holds the windows of ``rows`` and no other. ``kept`` is changed in place: after an error it is no use."""
-        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='archive'").fetchone() is None:
-            return cls(path)  # (a file nothing was moved in yet)
-        count = conn.execute("SELECT COUNT(*) FROM archive").fetchone()[0]
-        mine = [slug for slug in {p.get("slug") for p in rows} if isinstance(slug, str)]
-        skip = frozenset(slug for at in range(0, len(mine), 500) for (slug,) in conn.execute(
-            f"SELECT slug FROM archive WHERE slug IN ({','.join('?' * len(mine[at:at + 500]))})", mine[at:at + 500]))
-        share = kept
-        # still the rows it counted, and nothing but rows after them: the last of them is where it was, and they and the later ones are all there is
-        fresh = (share is None or not share.count or path == ":memory:" or share.path != path or share.rewrites != Ledger.rewrites or share.skip != skip
-                 or conn.execute("SELECT slug FROM archive WHERE rowid = ?", (share.top,)).fetchone() != share.last
-                 or share.count + conn.execute("SELECT COUNT(*) FROM archive WHERE rowid > ?", (share.top,)).fetchone()[0] != count)
-        if fresh:
+        holds the windows of ``rows`` and no other. ``kept`` is changed in place: after an error it is no use.
+        1.154.53: the work itself is ShareWork's, a step at a time — here to its end. ``whole`` false: only while that is
+        little (SHARE_LOOP_ROWS rows to read, SHARE_LOOP_WINDOWS windows to look up) — else ShareBehind, nothing read and
+        ``kept`` as it was: the caller is on the event loop, and the rest is a background task's (LiveBot.preopen_share_round)."""
+        work = ShareWork(conn, path, rows, kept)
+        if not whole and path != ":memory:" and work.heavy():  # (a ledger in memory is read whole at every call, as it always was: no counts of it are kept)
+            raise ShareBehind(f"归档 {work.total} 条里还有 {work.rows_left} 条没计数、{work.windows_left} 个场次没查", work.total)
+        while work.step(SHARE_READ_STEP):
+            pass
+        return work.share
+
+    def state(self, gen: int) -> dict:
+        """These counts as they are kept in the ledger's file (share_save): everything but ``known``, which is the working
+        records' and looked up again (learn). ``gen``: the archive's generation they were counted under (share_gen)."""
+        return {"v": SHARE_VERSION, "kinds": list(REVIEW_KINDS), "gen": int(gen), "top": self.top, "count": self.count, "last": list(self.last) if self.last else None,
+                "skip": sorted(self.skip), "plain": self.plain, "sent": dict(self.sent),
+                "lines": {kind: [[key, line.records, line.windows, None if line.latest == -math.inf else line.latest] for key, line in lines.items()]
+                          for kind, lines in self.lines.items()}}
+
+    @classmethod
+    def restored(cls, path: str, state: Any, gen: int) -> ArchiveShare | None:
+        """The counts kept in the file as a share again — None when they are not this code's (SHARE_VERSION, the tables' kinds),
+        not of this generation of the archive, or not what state() writes. Whether the archive is still the rows they were
+        counted from is read's own check, as for a share kept in memory (the last row where it was, the rows adding up)."""
+        thaw = lambda k: tuple(thaw(x) for x in k) if isinstance(k, list) else k
+        try:
+            if state["v"] != SHARE_VERSION or state["kinds"] != list(REVIEW_KINDS) or int(state["gen"]) != int(gen):
+                return None
             share = cls(path)
-            share.skip = skip
-        reached, added = share.top, 0
-        for rowid, slug, body in conn.execute("SELECT rowid, slug, body FROM archive WHERE rowid > ? ORDER BY rowid", (share.top,)):
-            pair = json.loads(body)
-            if not fresh and window_of(pair) not in share.known:  # (a window quoted and archived since the last call: an earlier record of it would be among the rows counted)
-                share.learn(conn, window_of(pair))
-            share.add(slug, pair)
-            reached, added, share.last = rowid, added + 1, (slug,)
-        share.top, share.count = reached, share.count + added
-        windows = {window_of(p) for p in rows}
-        for window in windows - share.known.keys():
-            if fresh:
-                share.known[window] = ()  # (every window of the archive is held just now: this one has no record there)
-            else:
-                share.learn(conn, window)
-        share.known = {window: share.known[window] for window in windows}
-        return share
+            share.top, share.count = int(state["top"]), int(state["count"])
+            share.last = tuple(state["last"]) if state["last"] else None
+            share.skip, share.plain = frozenset(state["skip"]), bool(state["plain"])
+            share.sent = {"up": int(state["sent"]["up"]), "down": int(state["sent"]["down"])}
+            for kind in REVIEW_KINDS:
+                for key, records, windows, latest in state["lines"][kind]:
+                    line = share.lines[kind][thaw(key)] = ArchiveLine()
+                    line.records, line.windows, line.latest = int(records), int(windows), -math.inf if latest is None else latest
+            return share
+        except (KeyError, TypeError, ValueError):
+            return None
 
     def fits(self, now_ms: int) -> bool:
         """Whether these counts can stand for the archive's records in review(…, now_ms): each a plain withdrawn quote
@@ -1801,16 +1839,150 @@ class ArchiveShare:
         return r
 
 
-def archive_share(source: Ledger | str, rows: list[dict], kept: ArchiveShare | None = None) -> ArchiveShare:
+class ShareBehind(Exception):
+    """ArchiveShare.read(whole=False): bringing the share up to date is more than a call on the event loop may do. ``total``:
+    the archive's records."""
+    def __init__(self, text: str, total: int = 0) -> None:
+        super().__init__(text)
+        self.total = int(total)
+
+
+SHARE_VERSION = 1           # of the counts kept in the file (ArchiveShare.state): another number when what an archived record adds to a table changes
+SHARE_KEY, SHARE_GEN_KEY = "archive_share", "archive_gen"  # the ledger's settings they are kept under, and the archive's generation (share_gen)
+SHARE_READ_STEP = 1_000     # ArchiveShare.read: the archive's rows a query (never the whole of it in memory)
+SHARE_STEP = 100            # the background preparation: rows read / windows looked up before the event loop has its turn (a hundredth of a second each)
+SHARE_LOOP_ROWS = 2_000     # a call on the event loop reads no more rows of the archive than this (an hour's pass moves a few hundred in)...
+SHARE_LOOP_WINDOWS = 1_500  # ...and looks up no more windows it does not hold
+
+
+class ShareWork:
+    """ArchiveShare.read a step at a time (1.154.53). 11-26: the first call after a start read the archive whole on the
+    bot's one event loop — 187,104 records, 20.8 s in which no book was read, no order sent or withdrawn (/diag: 主循环最长
+    20783 ms，卡在 preopen.read) — whatever asked for the review first: the page, /journal, /summary, /export. And the
+    archive grows by some 14,000 records a day. The same work, in the same order, cut into steps: read() runs them to the
+    end where that is little; a background task (LiveBot.preopen_share_round) takes a step, lets the loop have its
+    turn, and takes the next. ``kept`` is changed in place as the steps go: nobody else may use it meanwhile.
+
+    The rows are read a page at a time by their rowid (no statement stays open between two steps). Rows a pass appends
+    while the steps go are read at the end like any others; a row replaced in place meanwhile is Ledger.rewrites' to say
+    (``stale``: the work is begun again)."""
+    def __init__(self, conn: sqlite3.Connection, path: str, rows: list[dict], kept: ArchiveShare | None = None) -> None:
+        self.conn, self.path = conn, path
+        self.windows = {window_of(p) for p in rows}
+        self.todo: list[str] = []
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='archive'").fetchone() is None:
+            self.share, self.fresh, self.stage, self.rows_left, self.windows_left, self.total = ArchiveShare(path), True, "done", 0, 0, 0  # (a file nothing was moved in yet)
+            return
+        count = self.total = conn.execute("SELECT COUNT(*) FROM archive").fetchone()[0]
+        mine = [slug for slug in {p.get("slug") for p in rows} if isinstance(slug, str)]
+        skip = frozenset(slug for at in range(0, len(mine), 500) for (slug,) in conn.execute(
+            f"SELECT slug FROM archive WHERE slug IN ({','.join('?' * len(mine[at:at + 500]))})", mine[at:at + 500]))
+        share = kept
+        # still the rows it counted, and nothing but rows after them: the last of them is where it was, and they and the later ones are all there is
+        fresh = (share is None or not share.count or path == ":memory:" or share.path != path or share.rewrites != Ledger.rewrites or share.skip != skip
+                 or conn.execute("SELECT slug FROM archive WHERE rowid = ?", (share.top,)).fetchone() != share.last
+                 or share.count + conn.execute("SELECT COUNT(*) FROM archive WHERE rowid > ?", (share.top,)).fetchone()[0] != count)
+        if fresh:
+            share = ArchiveShare(path)
+            share.skip = skip
+        self.share, self.fresh, self.stage = share, fresh, "rows"
+        self.reached, self.added = share.top, 0
+        self.rows_left = count - share.count  # (a fresh one's count is 0: every row)
+        self.windows_left = 0 if fresh else len(self.windows - share.known.keys())  # (read whole, every window of the archive is held: none to look up)
+
+    @property
+    def done(self) -> bool:
+        return self.stage == "done"
+
+    @property
+    def stale(self) -> bool:
+        """A row of the archive was replaced in place since this work began: what was counted of it may not be it any more."""
+        return self.share.rewrites != Ledger.rewrites
+
+    def heavy(self) -> bool:
+        """More than a call on the event loop may do (ArchiveShare.read, whole=False)."""
+        return self.rows_left > SHARE_LOOP_ROWS or self.windows_left > SHARE_LOOP_WINDOWS
+
+    def step(self, n: int = SHARE_STEP) -> bool:
+        """The next ``n`` rows read and counted — then, the rows done, the next ``n`` windows looked up; whether more is left."""
+        share = self.share
+        if self.stage == "rows":
+            page = self.conn.execute("SELECT rowid, slug, body FROM archive WHERE rowid > ? ORDER BY rowid LIMIT ?", (self.reached, n)).fetchall()
+            for rowid, slug, body in page:
+                pair = json.loads(body)
+                if not self.fresh and window_of(pair) not in share.known:  # (a window quoted and archived since the last call: an earlier record of it would be among the rows counted)
+                    share.learn(self.conn, window_of(pair))
+                share.add(slug, pair)
+                self.reached, self.added, share.last = rowid, self.added + 1, (slug,)
+            self.rows_left = max(0, self.rows_left - len(page))
+            if len(page) < n:
+                share.top, share.count = self.reached, share.count + self.added
+                self.todo = sorted(self.windows - share.known.keys())
+                self.stage, self.rows_left = "windows", 0
+            return True
+        if self.stage == "windows":
+            part, self.todo = self.todo[:n], self.todo[n:]
+            for window in part:
+                if self.fresh:
+                    share.known[window] = ()  # (every window of the archive is held just now: this one has no record there)
+                else:
+                    share.learn(self.conn, window)
+            self.windows_left = 0 if self.fresh else len(self.todo)
+            if not self.todo:
+                share.known = {window: share.known[window] for window in self.windows}
+                self.stage = "done"
+        return not self.done
+
+
+def share_gen(conn: sqlite3.Connection) -> int:
+    """The archive's generation as the file says it: one more each time a pass replaced a row of it in place (share_gen_bump);
+    0 in a file that says none (nothing replaced since this was first kept, or no settings table)."""
+    try:
+        row = conn.execute("SELECT body FROM settings WHERE key = ?", (SHARE_GEN_KEY,)).fetchone()
+        return int(row[0]) if row else 0  # (a bare number: no record is parsed for it)
+    except (sqlite3.Error, TypeError, ValueError):
+        return 0
+
+
+def share_gen_bump(conn: sqlite3.Connection) -> None:
+    """One more generation — inside the caller's transaction (Ledger.archive_old: with the rows that replaced one)."""
+    conn.execute("INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET body=excluded.body", (SHARE_GEN_KEY, str(share_gen(conn) + 1)))
+
+
+def share_load(conn: sqlite3.Connection, path: str) -> ArchiveShare | None:
+    """The archive's counts kept in the ledger's file (share_save) as a share to bring up to date — None when there are none,
+    they cannot be read, or they are no use (ArchiveShare.restored). 1.154.53: after a start only the rows archived since
+    are read; until then every start read the archive whole."""
+    try:
+        row = conn.execute("SELECT body FROM settings WHERE key = ?", (SHARE_KEY,)).fetchone()
+        return ArchiveShare.restored(path, json.loads(row[0]), share_gen(conn)) if row else None
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
+
+
+def share_save(conn: sqlite3.Connection, share: ArchiveShare) -> bool:
+    """These counts into the ledger's file, for the next start (one small row of its settings); False when they could not be
+    written (a file without the table, a full disk: the next start reads the archive whole, as before — in the background)."""
+    try:
+        with conn:
+            conn.execute("INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET body=excluded.body",
+                         (SHARE_KEY, json.dumps(share.state(share_gen(conn)), ensure_ascii=False)))
+        return True
+    except (sqlite3.Error, TypeError, ValueError):
+        return False
+
+
+def archive_share(source: Ledger | str, rows: list[dict], kept: ArchiveShare | None = None, whole: bool = True) -> ArchiveShare:
     """ArchiveShare.read on a ledger — a controller's, or while the mode is off the file's path (none there: an empty
-    share) — whose working records are ``rows``; ``kept`` is what the last call returned (LiveBot.preopen_review)."""
+    share) — whose working records are ``rows``; ``kept`` is what the last call returned (LiveBot.preopen_review).
+    ``whole`` false: ShareBehind where that would be more than a call on the event loop may do (ArchiveShare.read)."""
     if not isinstance(source, str):
-        return ArchiveShare.read(source.conn, source.path, rows, kept)
+        return ArchiveShare.read(source.conn, source.path, rows, kept, whole)
     if source == ":memory:" or not Path(source).exists():
         return ArchiveShare(source)
     conn = sqlite3.connect(source)
     try:
-        return ArchiveShare.read(conn, source, rows, kept)
+        return ArchiveShare.read(conn, source, rows, kept, whole)
     finally:
         conn.close()
 
@@ -1837,6 +2009,11 @@ REUSE_NEAR_MS = 30 * 60_000     #   (its tokens never change; a fee or a status 
 REREAD_QUEUE_MAX = 200          # 1.154.2: the known windows are not read again while this many levels already wait in the queue — read
 #                                 now, their details would be stale by their turn (11-17: 4,229 queued, 8 more read a pass, every one wasted)
 DISCOVER_READS = 8              # listed windows with a level still to quote read in one discovery pass, the soonest first (the rest the next pass); each card's next listing is read besides (1.132.2)
+FINALS_SAID = 20                # 1.154.54: /preopen says how many withdrawn pairs wait for their final reads once there are this many (finals_line)
+REREAD_WAIT_S = 5.0             # 1.154.54: ...and a re-read that has no answer by then ends the pass (the next one asks again): the same loop probes the
+#                                 listings, and on 11-26 it stood for an hour and a half in one re-read waiting for a token of the key's (read_final)
+FINALS_YIELD_S = 5.0            # 1.154.54: a withdrawn order's late final read waits while a pair is being placed or a known window re-read — this long
+FINALS_YIELD_STEP_S = 0.05      #   at the most, looking again this often (Controller.behind_placements)
 ALLOWANCE_MS = 60_000           # the exchange allowance is read again this often, not before every pair
 PROBE_HOURS = 2.0      # /preopen probe: the quarters of the next this many hours, each card's at most PROBE_PER_CARD — five cards over a day
 PROBE_PER_CARD = 8     # were hundreds of reads, and the commands are answered one after another (1.130.6)
@@ -1936,6 +2113,8 @@ class Controller:
         self.full_scan_ms = 0  # discover: when the last full scan ran (FULL_SCAN_MS)
         self.keep_on_stop = False  # the owner's stop for a settings change: the orders stay on the book, the next controller takes them over
         self.resumed = self.requoted = 0  # pairs taken over at this start; windows quoted again (superseded records) since
+        self.released_at: collections.deque = collections.deque(maxlen=4096)  # when a withdrawn pair was released (accounted, nothing filled: bookkeep) — the status's pace of the final reads (1.154.54)
+        self.rereading = False  # a known window's re-read is out (reread_known): the late final reads wait for it (behind_placements, 1.154.54)
         self.card_holds: dict[str, str] = {}  # card key -> why its windows are not quoted now (card_hold: near the day's limit, halted)
         self.card_checked_ms = 0
         self.listed_until_ms = max((int(p.get("start_ms") or 0) for p in self.ledger.rows.values()), default=0)  # the latest window seen listed
@@ -2622,8 +2801,18 @@ class Controller:
 
     def resumable(self, pair: dict) -> bool:
         """An active pair found at the start (a restart, a settings change) that keeps resting, its queue position with it:
-        every order open with an id, the card still quoted, the size, price and signed expiry as the settings say (the
-        cancel time is derived again), the start still ahead. Anything else is withdrawn."""
+        every order open with an id, the card still quoted, the size and price as the settings say, signed to expire no
+        later than they say (the cancel time is derived again: adopt), the start still ahead. Anything else is withdrawn.
+
+        1.154.54 — "no later", not "exactly when". 11-26 09:03: the cancel time set from 20 to 10 seconds before the start,
+        and with it (the expiry must be 5 seconds nearer the start than the cancel) the expiry from 10 to 5. The expiry is in
+        an order's signature, so not one resting pair was "as the settings say": 9,400 of them — every listed window of the
+        next day at seven levels, each placed at its listing, first in the queue at its price — were withdrawn to be signed
+        again, and the book was empty for hours (their final reads, 18,700 at the key's 220 a minute, then as many orders
+        again). An order signed to leave the book EARLIER than the settings now say is the more careful one: it rests on,
+        withdrawn at the new cancel time or at its own signed expiry, whichever is first (adopt), and the windows quoted
+        from now on are signed as the settings say. One signed to stay LONGER than they say is withdrawn as before: the
+        expiry moved away from the start is the operator asking for an earlier backstop."""
         import live
         if pair.get("key") not in self.settings.markets or self.now() >= pair["start_ms"]:
             return False
@@ -2637,8 +2826,9 @@ class Controller:
             return False  # 1.154.19: a window with a known lean (gold's 05:15 New York), quoted before the rule: withdrawn
         if not self.settings.weekend and on_weekend(int(pair["start_ms"])):
             return False  # 1.136.0: the weekend switched off since it was quoted: withdrawn
-        if int(pair.get("expires") or 0) != pair["start_ms"] // 1000 - self.settings.timing(str(pair.get("key") or "")).expiry_seconds:
-            return False  # signed to expire otherwise than the card's expiry says now (1.152.0: BTC 5-minute's own)
+        expires = int(pair.get("expires") or 0)
+        if not expires or expires > pair["start_ms"] // 1000 - self.settings.timing(str(pair.get("key") or "")).expiry_seconds:
+            return False  # signed to stay on the book longer than the card's expiry says now (1.152.0: BTC 5-minute's own); 1.154.54: an earlier one rests on
         price, shares = pair_quote(pair)
         index = int(pair.get("level") or 0)
         ladder = self.settings.levels_for(str(pair.get("key") or ""))  # (1.154.37: BTC 5-minute's own, where set)
@@ -2671,7 +2861,9 @@ class Controller:
                         pair.update(price=str(price), shares=str(int(shares) if shares == int(shares) else shares))
                         changed[pair["slug"]] = pair
                 if pair["phase"] == "active" and self.resumable(pair):
-                    cancel_ms = pair["start_ms"] - self.settings.timing(str(pair.get("key") or "")).cancel_seconds * 1000
+                    # (1.154.54: ...or at its own signed expiry, for a pair signed to leave the book before the cancel time the
+                    # settings say now — resumable: nothing rests past its signature, and nothing is asked of it after)
+                    cancel_ms = min(pair["start_ms"] - self.settings.timing(str(pair.get("key") or "")).cancel_seconds * 1000, int(pair["expires"]) * 1000)
                     if pair.get("cancel_ms") != cancel_ms:
                         # 1.154.20: saved only when its cancel time changes (the setting did). A restart with the same settings took
                         # over 12,000 resting pairs with a committed write each (synchronous=FULL: an fsync a pair, on the event loop)
@@ -2899,8 +3091,21 @@ class Controller:
                 continue
             st["reads"] += 1
             st["asked"] += 1
+            # 1.154.54: REREAD_WAIT_S at the most — this is the mode's low traffic, and the loop it holds is the one that probes the
+            # listings. A read given up (still waiting for its token, or for its answer) is a GET: nothing to undo
+            asked = asyncio.ensure_future(self.through(self.api, lambda api: category_market(api, slug)))
+            self.rereading = True  # (the withdrawn orders' late final reads wait for it: behind_placements)
             try:
-                market = await self.through(self.api, lambda api: category_market(api, slug))
+                done, _ = await asyncio.wait({asked}, timeout=REREAD_WAIT_S)
+            finally:
+                self.rereading = False
+                if not asked.done():
+                    asked.cancel()
+            if not done:
+                st["stopped"] = f"{slug.rsplit('-', 1)[-1]}：{REREAD_WAIT_S:g} 秒没等到（请求额度紧），下次再读"
+                return
+            try:
+                market = asked.result()
             except Exception as error:
                 st["stopped"] = f"{slug.rsplit('-', 1)[-1]}：{core.clean_error(error) or type(error).__name__}"
                 self.error = f"扫描 {st['stopped']}"
@@ -3249,14 +3454,32 @@ class Controller:
         if (not pair.get("accounted") and all(order_verified(o) for o in pair["orders"].values())
                 and all(float(o.get("filled") or 0) <= 0 for o in pair["orders"].values())):
             pair.update(accounted=True, accounted_day=dt.datetime.fromtimestamp(self.now() / 1000, core.BEIJING).date().isoformat(), pnl=0.0)
+            self.released_at.append(self.now())
         if save:
             self.ledger.save(pair)
 
-    async def read_final(self, order: dict, pair: dict) -> None:
+    async def read_final(self, order: dict, pair: dict, late: bool = False) -> None:
         """An order's own record, for its final fills: final → "final" once that record is its last word (ended: "removed",
         to be read again, till then); none, past the give-up — never placed (no id) or final as known (an id Predict no
-        longer answers to)."""
-        row = await self.cancel_api.order(order.get("id", ""), order.get("api_hash") or order["hash"])
+        longer answers to).
+
+        ``late`` (1.154.54): the read LATE_FILL_MS after a withdrawal, of an order already off the book (cancel_pair) —
+        nothing waits on it but the pair's release and its window's next quote. 11-26: a changed setting withdrew 9,400
+        pairs, and their 18,700 such reads — two at a time on the cancel client, each taking the key's next token the
+        moment it came — left the mode's low traffic none for an hour and a half: the discovery stood in a re-read that
+        never got its token (no listing was probed: 扫描 stayed at 09:06:14), the four placement workers in theirs, and not
+        one window was quoted, the new listings included. So such a read is the last in the mode's line: it waits while a
+        pair is being placed or a known window re-read (behind_placements), and goes out as the mode's low traffic does
+        (the api: behind the listings' probes and orders; on the borrowed key when this one is short — through). The
+        soonest windows' reads come first (due), so each window is read, released and quoted again in turn — the book
+        comes back from the near end within minutes, not all of it hours on — and the listings go on being found and
+        placed at once."""
+        if late:
+            await self.behind_placements()
+        if late and self.api is getattr(self, "api_made", None):  # (the tests' own api stands for every client: read there as before)
+            row = await self.through(self.api, lambda api: api.order(order.get("id", ""), order.get("api_hash") or order["hash"]))
+        else:
+            row = await self.cancel_api.order(order.get("id", ""), order.get("api_hash") or order["hash"])
         if row:
             if not order.get("id") and row.get("id") is not None:
                 order["id"] = str(row["id"])
@@ -3270,6 +3493,16 @@ class Controller:
                 order.update(state="final", note="撤单后按编号查不到记录，按已知成交记账")
             else:
                 order.update(state="not_found", note="按哈希查不到，签名已过期：视为从未下单")
+
+    async def behind_placements(self) -> None:
+        """Before a withdrawn order's late final read (read_final): waits while a pair is being placed or a known window
+        re-read — FINALS_YIELD_S at the most, so the reads go on whatever holds a placement up. The key's pace gives no
+        turns (core.PredictPacer: whoever asks at the right instant has the token), so the order is kept here: the
+        listings' probes and orders (ahead of all low traffic at the pacer), the placements and the re-reads that feed
+        them, and these reads when none of those is out — which is whenever nothing released is left to quote."""
+        began = time.monotonic()
+        while (self.placing or self.rereading) and time.monotonic() - began < FINALS_YIELD_S and not self.stopped():
+            await asyncio.sleep(FINALS_YIELD_STEP_S)
 
     async def cancel_pair(self, pair: dict, reason: str) -> None:
         if pair["slug"] in self.cancelling:
@@ -3288,7 +3521,7 @@ class Controller:
                     continue
                 if order["state"] == "removed":  # removed: its final fills, read once more (nothing is left to cancel)
                     if self.now() >= self.final_read_ms(order, pair):  # ...once that read can end it (ended), not before
-                        await self.read_final(order, pair)
+                        await self.read_final(order, pair, late=not self.gave_up(pair))  # (1.154.54: behind the placements — not once its window is long over: the result's booking waits on it)
                         self.ledger.save(pair)
                     continue
                 # Unknown submissions are reconciled by their original hash.
@@ -3623,6 +3856,14 @@ class Controller:
             for pair in pairs:
                 if self.now() < self.finals_wait(pair):
                     continue  # withdrawn this very pass, every order off the book: nothing to do before their final reads, which its bookkeep booked (ended)
+                waiting = self.settling.get("cancel:" + pair["slug"])
+                if waiting is not None and not waiting.done():
+                    # 1.154.54: its reconcile, started at an earlier try, still waits for its turn (thousands withdrawn at once go
+                    # two at a time: reconcile_gate) — nothing of the pair has changed, and launch_reconcile would start nothing.
+                    # It used to be booked and written again at every try all the same: 9,000 waiting pairs, each a record in
+                    # the pass's transaction every RETRY_MAX_MS. Looked at again that long on; the wait is not a save's worth
+                    pair["retry_ms"] = self.now() + RETRY_MAX_MS
+                    continue
                 self.bookkeep(pair, save=False)
                 booked.append(pair)
                 self.launch_reconcile(pair)  # (a task: it runs after this pass's write)
@@ -3922,6 +4163,20 @@ class Controller:
                          + (f"进入范围 {self.sprint_lead_ms() / 1000:.0f} 秒后开始每 {FAST_POLL_S:g} 秒探测" if self.sprint_lead_ms() else "进入范围就开始快速探测（样本还不够）"))
         return "；".join(parts)
 
+    def finals_line(self) -> str:
+        """The status's line on the withdrawn pairs whose orders' final fills are still to read (1.154.54): how many, how many
+        were released in the last minute, and how long the rest takes at that pace — a changed setting or a stop withdraws
+        thousands at once, each order read once LATE_FILL_MS after it left the book, at the key's pace. 11-26: "it has been
+        twenty minutes and nothing is placed again" — and nothing in /preopen said why, or for how long. "" with few waiting."""
+        waiting = sum(1 for p in self.ledger.pending()
+                      if not p.get("accounted") and p["phase"] != "active" and any(o["state"] == "removed" for o in p["orders"].values()))
+        if waiting < FINALS_SAID:
+            return ""
+        last = sum(1 for at in self.released_at if at >= self.now() - 60_000)
+        pace = f"最近一分钟核对完 {last} 条，照这个速度还要约 {max(1, round(waiting / last))} 分钟" if last else "最近一分钟还没有核对完的"
+        return (f"\n撤后待核对：{waiting} 条（撤掉的单要在撤后 {LATE_FILL_MS // 1000} 秒逐张读一次成交，确认没成交才释放、才能重新挂；"
+                f"离开场近的先读，读完一场重挂一场，新发布的场次不受影响；{pace}）")
+
     def unquotable(self) -> tuple[list[dict], list[dict]]:
         """The coming windows' levels (start beyond the new-order cutoff) this mode will not quote again, the soonest first:
         (their failures at MAX_ATTEMPTS, refused by Predict) — each level's latest record (1.131.6: /preopen says so; a
@@ -3979,11 +4234,15 @@ class Controller:
         reserved = self.risk()
         spent, refused = self.unquotable()
         quoted_to: dict[str, int] = {}  # card -> the latest window with a quote resting (the first level's, the deeper ones wait for the start)
+        early = 0  # ...and those signed, before a setting changed, to leave the book earlier than the settings say now (resumable, 1.154.54)
+        expiry_of = {"BTC-5M": self.settings.timing("BTC-5M").expiry_seconds}
         for p in self.ledger.rows.values():  # (one pass for the resting ones: their count, and each card's latest)
             if p["phase"] == "active":
                 resting += 1
                 if p.get("key"):
                     quoted_to[p["key"]] = max(quoted_to.get(p["key"], 0), int(p.get("start_ms") or 0))
+                if 0 < int(p.get("expires") or 0) < int(p.get("start_ms") or 0) // 1000 - expiry_of.get(p.get("key"), self.settings.expiry_seconds):
+                    early += 1
         windows_left, pairs_left, usd_left = self.unplaced()
         shut_cards = {h: "、".join(r.coin for r in core.preopen_cards() if getattr(r, "hours", "") == h and r.key in self.settings.markets) for h in SHUT_TEXT}  # 1.150.1: the cards a shut keeps back
         quiet = open_quiet_ms(self.settings) // 60_000  # 1.151.1: the minutes in force (the first window after an open always)
@@ -4020,11 +4279,13 @@ class Controller:
                 (f"BTC 5 分钟自己的档位：两边各 {'、'.join(f'{core.cents(float(lp))}×{float(ls):g} 份' for lp, ls in self.settings.btc5_levels)}\n"
                  if "BTC-5M" in self.settings.markets and self.settings.btc5_levels else "") +  # 1.154.37
                 f"已记录 {len(self.ledger.windows)} 场、{total} 条（{resting} 条挂着，{cleared} 条已结清）"
+                + (f"；挂着的里面 {early} 条是改设置前签的，到期时间签在单里改不了：它们最晚在原来签的到期时间离场（比现在的设置早），排队位置保留，新挂的按现在的设置" if early else "")
                 + (f"，另有 {self.ledger.archived_count} 条已归档（结束超过 {ARCHIVE_AFTER_MS // core.DAY_MS} 天、已撤且没成交的；复盘页照常统计）" if self.ledger.archived_count else "") + "，"
                 f"队列 {self.queue.qsize() + len(self.parked)} 场" + (f"（{len(self.parked)} 场在等，见暂不新挂）" if self.parked else "") + f"；{listed}"
                 + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"
                 f"预留 {reserved:.2f}U{f' / 限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '，不设上限'}（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉的场次在撤单 {LATE_FILL_MS // 1000} 秒后读到一份没成交才释放）"
                 + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {reserved + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，新发布的先挂，其余按开场先后补挂中") if pairs_left else "")
+                + self.finals_line()
                 + (f"\n请求约 {self.request_rate():.1f} 次/秒（最近一分钟）；" if self.request_rate() is not None else "\n")
                 + self.pace_line()
                 + f"账户快照每 {self.account_interval_s():.0f} 秒（{self.account_pages} 页挂单" + self.page_rows_note()
