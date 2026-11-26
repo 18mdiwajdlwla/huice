@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.54"
+VERSION = "1.154.55"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -710,6 +710,8 @@ class RuleSettings:
     live: tuple = ()            # RULE_*_LIVE_CENTS (1.154.14): (rule key, cents) — the highest price in the window's course; none or 0 = only before it
     lead_minutes: int = 300     # RULE_LEAD_MINUTES (1.154.13): how long before a window's start the makers post their orders (5 hours, 11-17) — the
     #                             rule taker sprints around that moment of every window (rules.RuleTaker.sprinting); 0 = no such moment
+    tail: bool = True           # RULE_TAIL (1.154.55): on = it buys in a start's last two minutes too, with orders signed to outlive the start
+    #                             (Predict takes none shorter than two minutes: rules.TAIL_LIFE_S); off = nothing nearer than rules.ORDER_BEFORE_MS
 
     @property
     def enabled(self) -> bool:
@@ -770,12 +772,15 @@ class RuleSettings:
             raise ValueError("RULE_*_LIVE_CENTS 是 0（盘中不做）或 1～97（¢，开场后的最高买价）")
         if any(v not in {"on", "off"} for v in switches.values()):
             raise ValueError("RULE_GOLD、RULE_OIL 只能是 on 或 off")
+        tail = str(e.get("RULE_TAIL", "on")).strip().lower() or "on"
+        if tail not in {"on", "off"}:
+            raise ValueError("RULE_TAIL 只能是 on（开场前最后 2 分钟也吃）或 off")
         if (any(not (c == 0 or 1 <= c <= 95) for c in cents.values()) or any(not 1 <= n <= 100_000 for n in shares.values())
                 or not 0 <= max_day <= 1_000_000):
             raise ValueError("RULE_*_CENTS 是 0（不做这条规则）或 1～95（¢，最高买价）；RULE_GOLD_SHARES、RULE_OIL_SHARES 每场最多买 1～100000 份；"
                              "RULE_MAX_DAY_USD 0～1000000（每天最多花多少，0 = 不限）")
         return cls(mode, tuple(cents.items()), frozenset(m for m, v in switches.items() if v == "on"), tuple(shares.items()), max_day, fast,
-                   tuple(live.items()), lead)
+                   tuple(live.items()), lead, tail == "on")
 
 
 CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
@@ -883,7 +888,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
      "BTC 5 分钟每场每边就挂这几档（第一档也按这里的价格和份数）；空 = 跟上面所有卡的一样（预挂价格 × 每次份数，加更深的价格档位）。改了只撤、重挂 BTC 5 分钟的单"),
     ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "0～1000000，0 = 不限（默认）：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金，成交时才扣款；余额够一场双边就挂）；设了上限时每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放，/preopen 会算出把已发布的全部挂上需要多少"),
     # 1.153.0: 规则吃单 (rules.py) — the gold / oil windows the backtest found mispriced (README「规则吃单」)
-    ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段，开场前吃：Predict 撮合开启后到开场前 130 秒（订单签到开场前 5 秒到期，Predict 不收有效期不足 2 分钟的单），盘口一出现规则价以内的指定方向就立即买"
+    ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段，开场前吃：Predict 撮合开启后到开场前 15 秒（最后 130 秒的单见下面“开场前最后 2 分钟也吃”；关掉它就到开场前 130 秒为止），盘口一出现规则价以内的指定方向就立即买"
      "（盘口变化由推送送来，不等下一次读）；黄金休市 4 档、开盘第一档另设了盘中价格时，开场后规则方向领先也接着吃（1.154.14）。off 关；paper 只记录不下单：按当时盘口记下会买到多少、按 Predict 的结果结算，先看几天再开；"
      "on 真实吃单（需要 LIVE=on；真实交易暂停、今日亏损停机、接口限流冷却时都不下单）"),
     ("RULE_GOLD", "规则吃单：黄金", "on = 做黄金的规则（下面价格设为 0 的那条不做）；off = 黄金一条都不做"),
@@ -930,6 +935,10 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("RULE_LEAD_MINUTES", "规则吃单：对手提前多少分钟挂单", "0～1440，默认 300（5 小时）：有人在每场开场前这么久把单挂出来（06:00 的场 01:00 挂）。每个规则场次在这个时刻的前 1 分钟到后 15 分钟"
      "每秒检查，并先做好准备；时刻前 10 秒到后 2 分钟里这一场的盘口每秒用 REST 读一次（推送之外的第二条路）。按场次算，不受上面时段和夏令时影响；0 = 不按这个时刻。"
      "/rules 会写出卖单实际出现在开场前多久，可以对着调"),
+    ("RULE_TAIL", "规则吃单：开场前最后 2 分钟也吃", "on（默认，1.154.55）= 开场前 130 秒到 15 秒之间出现的卖单也买。Predict 不收有效期不足 2 分钟的单，所以这段时间的单只能签成"
+     "“下单后约 2 分钟到期”，也就是最晚到开场后约 1 分 50 秒；为此这段时间的单只按盘口上当时有的份数下（正常全部成交、不留剩余），没成交的部分照常 1.5 秒后撤，"
+     "没确认撤掉就每秒再撤，开场时还没撤掉会立刻发通知。剩下的风险：某张单没全成交、撤单又一直发不出去（Predict 接口故障）时，剩余部分可能在开场后的头两分钟按规则价成交，"
+     "最多是这一场的份数上限。off = 开场前 130 秒起不再下单（1.154.52 的做法）。盘中（开场后）的最后 130 秒不受这项影响，一直不下单"),
 )
 CONTROL_KEY_SET = frozenset(k for k, _, _ in CONTROL_KEYS)
 # One-click combinations for the control page (一键搭配): the strategy settings only. What to trade (SIM_MARKETS, SIM_SKIP),
@@ -13050,6 +13059,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "RULE_MAX_DAY_USD": {"kind": "number", "group": "规则", "presets": ["0", "50", "100", "200", "500", "1000"], "unit": "$", "zero": "不限"},
     "RULE_LEAD_MINUTES": {"kind": "number", "group": "规则", "presets": ["0", "240", "300", "360"], "unit": "分钟", "zero": "不按这个时刻",
                           "captions": {"300": "5 小时"}},
+    "RULE_TAIL": {"kind": "choice", "group": "规则", "options": [["on", "on 也吃（到开场前 15 秒）"], ["off", "off 不吃（到开场前 130 秒）"]]},  # 1.154.55
     "RULE_FAST_HOURS": {"kind": "text", "group": "规则", "presets": ["off", "01:00-07:00", "00:00-07:00", "00:55-02:00", "00:00-24:00"], "unit": "",
                         "captions": {"off": "不做每秒检查", "01:00-07:00": "凌晨 1 点到早上 7 点", "00:00-24:00": "全天"}},
     "SIM_EDGE_CENTS": {"kind": "number", "group": "策略", "presets": ["3", "5", "8", "10", "15", "20"], "unit": "¢"},
@@ -27250,7 +27260,7 @@ class Bot:
                   **{switch: flag(c.rules.on(mk)) for mk, (switch, _) in RULE_MARKET_KEYS.items()},
                   **{size: str(c.rules.shares_of(mk)) for mk, (_, size) in RULE_MARKET_KEYS.items()},
                   **{name: str(c.rules.live_price(key)) for key, name in RULE_LIVE_KEYS.items()},
-                  "RULE_FAST_HOURS": day_spans_text(c.rules.fast), "RULE_LEAD_MINUTES": str(c.rules.lead_minutes),
+                  "RULE_FAST_HOURS": day_spans_text(c.rules.fast), "RULE_LEAD_MINUTES": str(c.rules.lead_minutes), "RULE_TAIL": flag(c.rules.tail),
                   "SOURCES_OFF": ",".join(sorted(c.sources_off)), "LIVE_MAX_ORDER_USD": plain(c.live_max_order_usd),
                   "LIVE_MAX_OPEN_USD": plain(c.live_max_open_usd), "LIVE_MAX_DAILY_LOSS_USD": plain(c.live_max_daily_loss_usd),
                   "LIVE_TAKER_WAIT_SECONDS": str(c.live_taker_wait), "LIVE_TAKER_PRICE": c.live_taker_price,

@@ -114,6 +114,18 @@ LIFE_SPARE_MS = 5_000          # ...none is decided with less than this over it 
 LIFE_SEND_SPARE_MS = 1_000     # ...and none sent with less than this over it (before_send: an order whose way took long)
 ORDER_BEFORE_MS = EXPIRY_BEFORE_S * 1000 + PREDICT_MIN_LIFE_MS + LIFE_SPARE_MS  # so: no order nearer than this (130 s) to the start — in a window's course, to its end
 LIFE_WORD = "距订单到期不足 2 分钟"  # before_send's word for it
+# 1.154.55 — the start's last two minutes after all (the user, 11-26: "最后 2 分钟要抢"; the 18:15 window of 11-24 again: an offer 34 s
+# before the start that nobody took). An order there cannot be signed to expire before the start — Predict wants two minutes —
+# so it is signed as short as Predict takes it, TAIL_LIFE_S from now: up to 110 s into the window (RULE_TAIL, on by default;
+# only before the start — in a window's course its last ORDER_BEFORE_MS stay as they were: an order outliving the window would
+# stand where the result is known). What the expiry before the start gave for nothing is now kept by hand: such an order asks
+# for no more than the book in hand offers at the rule's price (so that it fills whole and nothing rests), its rest is
+# withdrawn FILL_READ_MS on like any order's — still before the start: none is decided within STOP_MS of it — and asked again
+# every TAIL_AGAIN_MS until Predict's word (not NOOP_AGAIN_MS doubling), an answer gone missing looked for as often; one not
+# known off the book when its window starts is told at once (tail_alarm). What is left: a rest whose withdrawal fails for as
+# long as the signature lasts can be taken at the rule's price in the window's first two minutes — the window's size at most.
+TAIL_LIFE_S = (PREDICT_MIN_LIFE_MS + LIFE_SPARE_MS) // 1000  # 125
+TAIL_AGAIN_MS = 1_000
 FILL_READ_MS = 1_500          # an order is read this long after its answer; what has not filled then is withdrawn
 LATE_FILL_MS = 60_000         # an order off the book is final only by a read this long after it left: an earlier one may not show its
 #                               last matches yet (the pre-open mode's LATE_FILL_MS; 1.153.3 — the first read after the cancel ended it,
@@ -1249,8 +1261,9 @@ class RuleTaker:
             # 1.154.52: Predict would refuse it ("expiry is too soon"): decided with ORDER_BEFORE_MS in hand (look), its way — the
             # sign-in, the allowance's read, a token of the key's pace — took the spare. Held back as the look's own judgment
             # (RECHECKED: no refusal, no pause); the two checks below stand behind this one
-            return (LIFE_WORD + f"（Predict 不收；开场前的单签到开场前 {EXPIRY_BEFORE_S} 秒到期，盘中的单签到这一场结束前 {EXPIRY_BEFORE_S} 秒），不再发送"
-                    "（这张单在那之前决定，发出时已到这段时间）")
+            return (LIFE_WORD + ("（Predict 不收），不再发送（这张单签的是它允许的最短有效期，路上耽搁掉了余量）" if order.get("tail") else
+                                 f"（Predict 不收；开场前的单签到开场前 {EXPIRY_BEFORE_S} 秒到期，盘中的单签到这一场结束前 {EXPIRY_BEFORE_S} 秒），不再发送"
+                                 "（这张单在那之前决定，发出时已到这段时间）"))
         if int(order.get("expires") or 0) * 1000 - self.now() < SEND_MIN_LEFT_MS:
             return "距订单到期不足 5 秒（开场前 5 秒到期；盘中的单在这一场结束前 5 秒到期），不再发送"
         # 1.154.33 (an outside review, R18): nothing is placed within STOP_MS of the start (in a window's course, LIVE_STOP_MS of its
@@ -2073,12 +2086,14 @@ class RuleTaker:
         if not levels:
             w["word"] = ("盘中：" if course else "") + f"盘口没有 ≤{int(limit * 100)}¢ 的{rule.word}" + (f"（最低 {float(best[0][0]) * 100:g}¢）" if best else "（没人卖）")
             return
-        if (self.end_of(w) if course else w["start"]) - now < ORDER_BEFORE_MS:
+        tail = not course and w["start"] - now < ORDER_BEFORE_MS  # 1.154.55: the start's last two minutes
+        if (self.end_of(w) if course else w["start"]) - now < ORDER_BEFORE_MS and not (tail and self.settings.tail):
             # 1.154.52: Predict takes no order with under two minutes to its expiry, and this one would be signed to expire
             # EXPIRY_BEFORE_S before the start (in the course: the end). Not sent to be refused; the offer is still watched (above)
+            # (1.154.55: before the start it is signed for after it instead — place — unless RULE_TAIL is off)
             w["word"] = (("盘中：" if course else "") + f"盘口有 ≤{int(limit * 100)}¢ 的{rule.word} {sum(q for _, q in levels):g} 份，但离"
                          + ("这一场结束" if course else "开场") + f"不足 {ORDER_BEFORE_MS // 1000} 秒，不下单：订单签到" + ("结束" if course else "开场")
-                         + f"前 {EXPIRY_BEFORE_S} 秒到期，Predict 不收有效期不足 2 分钟的单")
+                         + f"前 {EXPIRY_BEFORE_S} 秒到期，Predict 不收有效期不足 2 分钟的单" + ("" if course else "（最后 2 分钟也吃：RULE_TAIL=on）"))
             return
         if not w["open_ms"]:
             near = w["start"] - now <= NEAR_MS
@@ -2116,7 +2131,8 @@ class RuleTaker:
             # (1.154.18: around the makers' moment an offer of SWEEP_SHARES is a ladder's first step, whatever part of the window it
             # is — 11-18 01:45, 46 shares in the first book of a ladder of 506: the order for all the window may buy then, not after
             # the next push)
-            take = room if fresh >= SWEEP_SHARES and (fresh >= room / SWEEP_PART or self.sprinting(w, now)) else min(fresh, room)
+            # (1.154.55: never in the start's last two minutes — an order there outlives the start, so it asks for what stands and no more)
+            take = room if not tail and fresh >= SWEEP_SHARES and (fresh >= room / SWEEP_PART or self.sprinting(w, now)) else min(fresh, room)
             usd_left = self.owner.live.usd() if callable(getattr(self.owner.live, "usd", None)) else None
             if usd_left is not None:  # no more than the USDT at hand buys at the order's price
                 # 1.154.33 (an outside review, CR-03): ...less what this taker's orders still out may take — those of this very turn
@@ -2387,6 +2403,15 @@ class RuleTaker:
             return
         # before the start, always: nothing of it matchable once the window runs — or, bought in the window's course (1.154.14), before its end
         expires = (self.end_of(w) if course else w["start"]) // 1000 - EXPIRY_BEFORE_S
+        # 1.154.55: ...but in the start's last two minutes, where Predict would take no such order: as short as it takes one (TAIL_LIFE_S)
+        tail = not course and self.settings.tail and expires * 1000 - now < PREDICT_MIN_LIFE_MS + LIFE_SPARE_MS
+        if tail:
+            expires = now // 1000 + TAIL_LIFE_S
+            # (...and for no more than stands at the price: its look may have been a moment before these two minutes, where an
+            # order is for all the window may buy — 1.154.15)
+            take = min(take, sum((q for _, q in levels), D(0))).to_integral_value(rounding="ROUND_FLOOR")
+            if take < 1 or float(take * limit) < 1.0:
+                return
         amounts = live.limit_amounts(True, live.to_wei(limit), live.to_wei(take))
         wallet = self.owner.live.wallet
         identity = f"rule-v1|{self.owner.config.live_chain}|{wallet.maker.lower()}|{info.market_id}|{outcome['token']}|{w['start']}|{len(rec['orders'])}"
@@ -2407,7 +2432,8 @@ class RuleTaker:
                     if w.get("open_wall") and w.get("rush_wall") and not w.get("open_told") else {}),
                  "seen": float(sum(q for _, q in levels)),  # what the book in hand offered at the price (the order may ask for more)
                  # 1.154.14: placed in the window's course. 1.154.24: ...by a look the index's arrival brought — when it arrived
-                 **({"live": True, **({"index_wall": int(w["index_wall"])} if w.get("index_wall") else {})} if course else {})}
+                 **({"live": True, **({"index_wall": int(w["index_wall"])} if w.get("index_wall") else {})} if course else {}),
+                 **({"tail": True} if tail else {})}  # 1.154.55: signed to outlive the start (its last two minutes): follow, tail_alarm
         w["open_told"] = True  # (the wait for matching to open is the first order's)
         rec["orders"].append(order)
         self.save(rec)
@@ -2477,7 +2503,7 @@ class RuleTaker:
                 # one that may exist. Looked for by its hash at once (FILL_READ_MS), not in ten seconds
                 # (``conflict``: Predict did answer — an order it then cannot show by its hash for CONFLICT_GRACE_MS was a
                 # refusal after all, follow_order; one whose answer went missing waits for its expiry, as before)
-                order.update(state="unknown", error=text, next_ms=self.now() + (FILL_READ_MS if status == 409 else UNKNOWN_EVERY_MS),
+                order.update(state="unknown", error=text, next_ms=self.now() + (FILL_READ_MS if status == 409 else self.again(order, self.now(), UNKNOWN_EVERY_MS)),
                              **({"conflict": True} if status == 409 else {}))
         finally:
             self.sending.pop(order["hash"], None)
@@ -2603,7 +2629,8 @@ class RuleTaker:
                     await self.follow_order(rec, order, now)
                 except Exception as error:
                     order["error"] = core.clean_error(error) or type(error).__name__
-                    order["next_ms"] = now + UNKNOWN_EVERY_MS
+                    order["next_ms"] = now + self.again(order, now, UNKNOWN_EVERY_MS)
+                self.tail_alarm(rec, order, now)
                 self.save(rec)
 
     async def follow_order(self, rec: dict, order: dict, now: int) -> None:
@@ -2642,10 +2669,10 @@ class RuleTaker:
                     order.update(state="not_found", error=f"Predict 答复 409，之后按哈希查了 {order['misses']} 次都没有这张单：视为被拒、没下成")
                     self.note(f"{rec.get('name') or rec.get('slug')} 那张答复 409 的单按哈希查不到，视为没下成（这一场可以再买）")
                 else:
-                    order["next_ms"] = now + UNKNOWN_EVERY_MS
+                    order["next_ms"] = now + self.again(order, now, UNKNOWN_EVERY_MS)
             else:
                 await self.withdraw_unread(order, now)  # (R07: an order with an id Predict's read cannot show — its rest withdrawn by the id)
-                order["next_ms"] = now + (UNKNOWN_EVERY_MS if order["state"] == "unknown" else FOLLOW_EVERY_MS)
+                order["next_ms"] = now + (self.again(order, now, UNKNOWN_EVERY_MS) if order["state"] == "unknown" else FOLLOW_EVERY_MS)
             return
         order["id"] = str(row.get("id") or order.get("id") or "")
         self.take_fills(rec, order, row)
@@ -2666,9 +2693,9 @@ class RuleTaker:
             if self.rest_due(order, now, NOOP_AGAIN_MS):
                 await self.withdraw_rest(order, now)
             else:  # (1.154.33, R01: Predict said "nothing to remove" a moment ago and still shows it open — read again when it is asked again)
-                order.update(state="cancelling", next_ms=max(now + FOLLOW_EVERY_MS, int(order.get("noop_ms") or 0) + self.noop_wait(order)))
+                order.update(state="cancelling", next_ms=max(now + FOLLOW_EVERY_MS, int(order.get("noop_ms") or 0) + self.noop_wait(order, now)))
         else:
-            order["next_ms"] = now + UNKNOWN_EVERY_MS
+            order["next_ms"] = now + self.again(order, now, UNKNOWN_EVERY_MS)
 
     def clients(self) -> list:
         """The taker's client, then the bot's own (owner.live.api) when it is another: a request the first fails (its key cooling
@@ -2718,17 +2745,52 @@ class RuleTaker:
         return None, why or "没有可用的查询客户端"
 
     @staticmethod
-    def noop_wait(order: dict) -> int:
+    def tail_out(order: dict, now: int) -> bool:
+        """An order of the start's last two minutes (1.154.55) whose signature still lasts: it may stand on the book once its
+        window runs, so nothing of it waits — its rest asked to be withdrawn, an answer gone missing looked for, every
+        TAIL_AGAIN_MS (again). Past its signed expiry it is an order like any other (it can fill no more)."""
+        return bool(order.get("tail")) and now < int(order.get("expires") or 0) * 1000
+
+    @classmethod
+    def again(cls, order: dict, now: int, wait_ms: int) -> int:
+        """``wait_ms`` — or, for an order that may stand past its window's start (tail_out), TAIL_AGAIN_MS when that is sooner."""
+        return min(wait_ms, TAIL_AGAIN_MS) if cls.tail_out(order, now) else wait_ms
+
+    @classmethod
+    def noop_wait(cls, order: dict, now: int | None = None) -> int:
         """How long after Predict's last "nothing to remove" the order is asked again: NOOP_AGAIN_MS, doubled for each such answer
-        in a row, NOOP_MAX_MS at the most (withdraw_rest counts them: noops)."""
-        return min(NOOP_AGAIN_MS * 2 ** max(int(order.get("noops") or 0) - 1, 0), NOOP_MAX_MS)
+        in a row, NOOP_MAX_MS at the most (withdraw_rest counts them: noops) — TAIL_AGAIN_MS for an order that may stand past
+        its window's start (``now`` given: tail_out)."""
+        wait = min(NOOP_AGAIN_MS * 2 ** max(int(order.get("noops") or 0) - 1, 0), NOOP_MAX_MS)
+        return wait if now is None else cls.again(order, now, wait)
 
     @classmethod
     def rest_due(cls, order: dict, now: int, again_ms: int) -> bool:
         """Whether an order's rest is to be asked to be withdrawn now: an id to withdraw it by, its removal not confirmed by
-        Predict, and no "nothing to remove" from Predict within ``again_ms`` (withdraw_rest) — or within noop_wait, when longer."""
+        Predict, and no "nothing to remove" from Predict within ``again_ms`` (withdraw_rest) — or within noop_wait, when longer
+        (both TAIL_AGAIN_MS at the most for an order that may stand past its window's start, 1.154.55)."""
         return (bool(order.get("id")) and not order.get("removed")
-                and now - int(order.get("noop_ms") or 0) >= max(again_ms, cls.noop_wait(order)))
+                and now - int(order.get("noop_ms") or 0) >= max(cls.again(order, now, again_ms), cls.noop_wait(order, now)))
+
+    def tail_alarm(self, rec: dict, order: dict, now: int) -> None:
+        """An order of the start's last two minutes not known off the book when its window starts (1.154.55): told at once —
+        what of it may still be taken, at what price, until when — and told again when it is off the book or its signature
+        has run out. The withdrawals go on every TAIL_AGAIN_MS meanwhile (follow)."""
+        if not order.get("tail") or order.get("paper"):
+            return
+        rest = max(float(order.get("shares") or 0) - float(order.get("filled") or 0), 0.0)
+        out = order.get("state") in REST_STATES and not order.get("removed") and rest > DUST
+        name = rec.get("name") or rec.get("slug")
+        if out and not order.get("tail_told") and int(rec.get("start_ms") or 0) <= now < int(order.get("expires") or 0) * 1000:
+            order["tail_told"] = now
+            until = dt.datetime.fromtimestamp(int(order["expires"]), core.BEIJING).strftime("%H:%M:%S")
+            self.notify(f"⚠️ 规则吃单：{name} 已经开场，开场前最后 2 分钟下的一张单还没确认撤掉——可能还挂着 {rest:g} 份、买价 ≤{round(float(order.get('limit') or 0) * 100)}¢，"
+                        f"签名 {until} 到期。机器人每秒在重试撤单；到期前有人按这个价卖过来就会成交。也可以到 Predict 上手动撤。",
+                        key=f"rule-tail:{order.get('hash')}")
+        elif order.get("tail_told") and not order.get("tail_clear") and (not out or now >= int(order.get("expires") or 0) * 1000):
+            order["tail_clear"] = now
+            self.notify(f"✅ 规则吃单：{name} 那张单" + ("已经不在簿上" if not out else "的签名已到期，不会再成交")
+                        + f"（共成交 {float(order.get('filled') or 0):g}/{float(order.get('shares') or 0):g} 份）", key=f"rule-tail-clear:{order.get('hash')}")
 
     async def withdraw_rest(self, order: dict, now: int, clients: list | None = None) -> None:
         """An order's rest asked to be withdrawn by its id (remove_ids): off the book on Predict's word that it removed it — final
@@ -3091,8 +3153,10 @@ class RuleTaker:
         now, s = self.now(), self.settings
         recs = self.recs
         in_course = any(self.live_cents(r) > 0 for r in RULES)
-        lines = [f"规则吃单：{MODES.get(s.mode, s.mode)}（RULE_TAKER={s.mode}）｜{'开场前吃' if in_course else '只在开场前吃'}，盘口一有就买，到开场前 {ORDER_BEFORE_MS // 1000} 秒"
-                 f"（订单签到开场前 {EXPIRY_BEFORE_S} 秒到期，Predict 不收有效期不足 2 分钟的单）"
+        lines = [f"规则吃单：{MODES.get(s.mode, s.mode)}（RULE_TAKER={s.mode}）｜{'开场前吃' if in_course else '只在开场前吃'}，盘口一有就买，"
+                 + (f"到开场前 {STOP_MS // 1000} 秒（最后 {ORDER_BEFORE_MS // 1000} 秒里的单签成约 2 分钟后到期——Predict 不收更短的——所以只按盘口现有的份数下，"
+                    f"没成交的部分照常 {FILL_READ_MS / 1000:g} 秒后撤、没确认撤掉就每秒再撤，开场时还没撤掉会马上通知；RULE_TAIL=off 关掉）" if s.tail else
+                    f"到开场前 {ORDER_BEFORE_MS // 1000} 秒（订单签到开场前 {EXPIRY_BEFORE_S} 秒到期，Predict 不收有效期不足 2 分钟的单；最后 2 分钟也吃：RULE_TAIL=on）")
                  + (f"；设了盘中价格的规则开场后接着买（开场 {LIVE_START_MS // 1000} 秒后到结束前 {ORDER_BEFORE_MS // 1000} 秒，"
                     f"第 1 分钟最高按盘前的价格）" if in_course else "")
                  + (f"｜每天最多花 ${s.max_day_usd:g}（今天已花 ${spent_on(recs, day_of(now), s.mode):,.2f}）" if s.max_day_usd else "")
