@@ -963,6 +963,16 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((pair["seen_ms"], pair["placed_ms"]), (NOW - 1_200, NOW))
         self.assertIn("发现→挂上中位 1.2 秒（最长 1.2；1 场）", ctl.status())
         self.assertIn("发布比预计中位 +3 秒", ctl.status())
+        # 1.154.63: a listing found while this start's first account snapshot was still being read waited for it — said apart,
+        # not in the median (11-26 16:25:54: 27 s, the settings just saved; the listings before and after it 2.5 s and less)
+        ctl.started_ms, ctl.first_snapshot_ms = NOW - 60_000, NOW - 10_000
+        pair["seen_ms"] = NOW - 37_200  # found 23 s after the start, placed 37 s on — once the snapshot was read
+        self.assertNotIn("发现→挂上中位", ctl.timing_line())
+        self.assertIn("另有 1 场是本次启动后等第一次账户快照读完才挂上的（发现→挂上 37～37 秒；启动后 50 秒读完——改设置、重新部署都会重新启动）", ctl.timing_line())
+        pair["seen_ms"] = NOW - 70_000  # found before this start (the record an earlier run's): counted as ever
+        self.assertIn("发现→挂上中位 70.0 秒（最长 70.0；1 场）", ctl.timing_line())
+        self.assertNotIn("另有", ctl.timing_line())
+        pair["seen_ms"], ctl.first_snapshot_ms = NOW - 1_200, 0
         # the account snapshot: dated when its read began, applied under the lock, the lock free during the read
         started = clock.ms
         async def slow_orders(status="OPEN"):

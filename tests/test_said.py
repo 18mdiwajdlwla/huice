@@ -130,12 +130,13 @@ class Said(unittest.TestCase):
         sent("main", "GET", "/v1/markets/1", 300)
         m.note_limit_headers(HOST, {"x-api-key": "pre"}, 200, answer(DRAFT), "GET", "/v1/markets/1")
         line = m.predict_buckets_line("pre", (0, 0))
-        self.assertIn("Predict 应答里报的限额：读取（市场）每分钟 2000 次——", line)
+        self.assertIn("Predict 应答里报的限额：General（市场）每分钟 2000 次——", line)
         self.assertIn("那次（市场）已算 168 次、剩 1832、42 秒后重置；同期这把 Key 发了 168 次读取、机器人所有 Key 468 次→只算这把 Key 自己的", line)
         self.assertTrue(line.endswith("。→ “Predict 限额”的 General 可以填 2000；Trading 等下单的应答带回来再看（下一次挂单后）"), line)
         m.note_limit_headers(HOST, {"x-api-key": "pre"}, 200, answer({"ratelimit-limit": "2000", "ratelimit-remaining": "1958", "ratelimit-reset": "40"}), "POST", "/v1/orders")
         line = m.predict_buckets_line("pre", (0, 0))
-        self.assertIn("；下单撤单每分钟 2000 次——", line)
+        self.assertIn("；Trading（下单撤单）每分钟 2000 次——", line)
+        self.assertIn("同期这把 Key 发了 42 次下单、撤单和读订单", line)
         self.assertTrue(line.endswith("。→ 控制台“开盘前预挂”里的“Predict 限额”两项可以照这个填：Trading 2000、General 2000"), line)
         # the figures set: compared, not suggested
         self.assertTrue(m.predict_buckets_line("pre", (5000, 1000)).endswith("。→ 填的 Trading 5000 比 Predict 报的 2000 大——会被拒；填的 General 1000 比 Predict 报的 2000 小，可以改大"))
@@ -146,10 +147,10 @@ class Said(unittest.TestCase):
         # reads of several groups at different limits: each said
         m.note_limit_headers(HOST, {"x-api-key": "pre"}, 200, answer({"ratelimit-limit": "120", "ratelimit-remaining": "100"}), "GET", "/v1/categories/x")
         line = m.predict_buckets_line("pre", (0, 0))
-        self.assertIn("读取：市场 每分钟 2000 次、分类 每分钟 120 次——", line)
+        self.assertIn("General：市场 每分钟 2000 次、分类 每分钟 120 次——", line)
         self.assertTrue(line.endswith("可以照这个填：Trading 2000、General 120"), line)
         # /diag's few words
-        self.assertEqual(m.predict_buckets_short("pre"), "Predict 报：读取每分钟 120 次（剩 100）、下单撤单每分钟 2000 次（剩 1958）")
+        self.assertEqual(m.predict_buckets_short("pre"), "Predict 报：General 每分钟 120 次（剩 100）、Trading（含读订单） 每分钟 2000 次（剩 1958）")
         # figures older than half an hour are not today's word
         for sample in m.PREDICT_BUCKETS_SAID["pre"].values():
             sample["at"] -= m.BUCKET_FRESH_S + 1

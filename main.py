@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.62"
+VERSION = "1.154.63"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -234,7 +234,8 @@ def preopen_rate_of(env: Mapping) -> float:
 PREOPEN_KEYS_MAX = 8  # PREOPEN_API_KEYS: more keys than this for the pre-open mode are a mistake in the variable, said at the start
 PREOPEN_APP_MIN, PREOPEN_APP_MAX = 240, 100_000  # PREOPEN_APP_*_PER_MIN: Predict's limits a minute for the app (0 = not given)
 PREOPEN_APP_SHARE = 0.8      # ...of which the bot's keys use this share together at the most: the rest is room for how Predict counts its minute
-PREOPEN_OTHERS_TRADE = 60    # ...and for each other key of the bot's this many orders and cancels a minute are kept (its reads: its whole pace)
+PREOPEN_OTHERS_TRADE = 120   # ...and for each other key of the bot's this many orders, cancels and order reads a minute are kept (its other reads: its
+#                              whole pace). 1.154.63: 60 — the Trading bucket holds the order reads too, and the model trader's sync reads its open orders every step
 # ...and Predict refusing a request all the same (a 429 on that key) says the figures given are not what it counts this key
 # by — another app's page (the user has two, 5,000 a minute and 1,000), a tier that moved with the volume of thirty days, a
 # limit the page does not name. The bucket refused is then paced to what Predict did let through (preopen_refused):
@@ -976,15 +977,16 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
      "3～1440：调小就只挂快开场的几场，少占资金、少读接口，但新场次要等进了范围才挂，排在先挂的人后面"),
     ("PREOPEN_BTC5_LEVELS", "BTC 5 分钟：整串价格档位（旧写法）", "1.154.37 的写法，留着兼容：价格x份数、逗号分隔、第一档在前，如 47x10,43x40，一次把 BTC 5 分钟的所有档写全；空 = 不用。"
      "1.154.56 起用“开盘前预挂 · BTC 5 分钟”那一组里的“第一档价格”“第一档每边份数”“更深的价格档位”分开填就行——那三项填了的，盖在这里的整串之上"),
-    ("PREOPEN_APP_TRADING_PER_MIN", "Predict 限额：Trading（每分钟）", "照抄 Predict 开发者后台 → 预挂那把 Key 所在的 App → Rate limits 页上 “Trading … requests per minute” 的数（比如 5000）；"
+    ("PREOPEN_APP_TRADING_PER_MIN", "Predict 限额：Trading（每分钟）", "照抄 Predict 开发者后台 → 预挂那把 Key 所在的 App → Rate limits 页上 “Trading … requests per minute” 的数（比如 5000、2000）；"
+     "这一类是下单、撤单，以及读订单（账户快照、撤单后核对成交）——1.154.63 按 Predict 应答里报的改过来的；"
      "/preopen 的“速度”行也会写出 Predict 应答里自己报的数和建议填多少（1.154.61）。"
      "0 = 不填（预挂的 Key 照原来的速度，每分钟 220 次）。和下面的 General 两项都填了才生效（各自点保存，先填哪项都行）。填了之后（1.154.60）：预挂的下单撤单和读取各按各的额度跑——Predict 本来就是分开算的——"
      "机器人只用到限额的八成，并先扣掉主 Key、规则吃单 Key 可能用的份额（/preopen 会写出实际用的两个数）；挂单、撤后核对、重读的并发跟着放大。"
      "原来按“每把 Key 每分钟 240 次”自己限速，一天的场次全撤后挂回要约 3 小时；$50K 档（5000 / 5000）填上后模拟约 8 分钟。"
      "交易量档位变了（后台的数变了）记得回来改。填的数不对（抄成了另一个 App 的、档位降了）会被 Predict 拒绝（429）：机器人这时自己把被拒的那一类降到 Predict 实际放行的量以下，"
      "发通知并写在 /preopen 里，一直保持到改这两项或重启"),
-    ("PREOPEN_APP_GENERAL_PER_MIN", "Predict 限额：General（每分钟）", "同一页上 “General … requests per minute” 的数（市场、盘口、账户读取等所有不是下单撤单的请求；比如 5000 或 1000）；0 = 不填。"
-     "和上面的 Trading 两项都填了才生效。这个额度是整个 App 共用的：盘口、原策略、规则吃单的读取也算在里面，所以这个数小的档位（比如 1000）撤后核对会比较慢——每张撤掉的单要读一次"),
+    ("PREOPEN_APP_GENERAL_PER_MIN", "Predict 限额：General（每分钟）", "同一页上 “General … requests per minute” 的数（读市场、分类、盘口、登录等——读订单不在这一类，算在 Trading 里；比如 5000 或 1000）；0 = 不填。"
+     "和上面的 Trading 两项都填了才生效。这个额度是整个 App 共用的：同一个 App 的别的 Key（盘口、原策略、规则吃单）的读取也算在里面"),
     ("PREOPEN_RATE_PER_MIN", "预挂专用 Key：每分钟请求数", "0 = 跟所有 Key 一样（PREDICT_RATE_PER_MIN，默认 220）；60～1000 = 只给预挂自己的 Key（PREOPEN_API_KEY，以及 PREOPEN_API_KEYS 里的每一把）单独定速，"
      "主 Key、盘口 Key 和规则吃单的 Key 不受影响（1.154.57）。超过 Predict 的限额会被拒绝（429）并让这把 Key 停约 20 秒"
      "（这 20 秒预挂不能下单也不能撤单，到了撤单时间的单靠签在单里的到期时间兜底）。"
@@ -1959,12 +1961,22 @@ class SendCount:
         return total
 
 
+def predict_tail(path: str) -> str:
+    """A request's path as the API names it: without the query and the version prefix (/v1/orders → /orders)."""
+    return re.sub(r"^/v\d+(?=/)", "", str(path or "").split("?", 1)[0]).rstrip("/") or "/"
+
+
+def predict_kind(method: str, path: str) -> str:
+    """"trade" for a request of Predict's Trading bucket (predict_trading: orders, cancels, order reads), "read" for the rest."""
+    return "trade" if predict_trading(str(method or "").upper(), predict_tail(path)) else "read"
+
+
 def predict_group(method: str, path: str) -> str:
     """The kind of a request to Predict, as its answers' limits may differ by it (1.154.61): 下单撤单 (an order's placement, a
     cancel: the Trading bucket — predict_trading), else the reads by what they read. ``path`` as sent (/v1/… too)."""
-    tail = re.sub(r"^/v\d+(?=/)", "", str(path or "").split("?", 1)[0]).rstrip("/") or "/"
+    tail = predict_tail(path)
     if predict_trading(str(method or "").upper(), tail):
-        return "下单撤单"
+        return "下单撤单" if str(method or "").upper() == "POST" else "订单"  # (1.154.63: both in the Trading bucket)
     if tail.endswith("/orderbook"):
         return "盘口"
     for prefix, name in (("/markets", "市场"), ("/categories", "分类"), ("/orders", "订单"), ("/positions", "持仓"), ("/auth", "登录")):
@@ -1978,7 +1990,7 @@ def note_predict_sent(host: str, sent: Mapping, method: str, path: str) -> None:
     try:
         if not host.endswith("predict.fun"):
             return
-        key = (str(sent.get("x-api-key") or ""), "trade" if predict_group(method, path) == "下单撤单" else "read")
+        key = (str(sent.get("x-api-key") or ""), predict_kind(method, path))
         count = PREDICT_SENT.get(key)
         if count is None:
             count = PREDICT_SENT.setdefault(key, SendCount())
@@ -2019,7 +2031,7 @@ def predict_bucket_sample(key: str, group: str, raw: Mapping[str, str], status: 
     last = groups.get(group)
     if last is not None and now - last["at"] < BUCKET_SAMPLE_S and status != 429:
         return
-    kind = "trade" if group == "下单撤单" else "read"
+    kind = "trade" if group in ("下单撤单", "订单") else "read"  # (1.154.63: the order reads are the Trading bucket's)
     window = float(numbers.get("window") or 60)
     began = now - now % window
     groups[group] = {"at": now, "status": status, "limit": numbers["limit"], "remaining": numbers["remaining"],
@@ -2053,10 +2065,10 @@ def predict_buckets_short(key: str) -> str:
     now = time.time()
     groups = [s for s in (PREDICT_BUCKETS_SAID.get(key) or {}).values() if now - s["at"] <= BUCKET_FRESH_S]
     words = []
-    for kind, title in (("read", "读取"), ("trade", "下单撤单")):
+    for kind, title in (("read", "General"), ("trade", "Trading（含读订单）")):
         seen = sorted((s for s in groups if s["kind"] == kind), key=lambda s: s["at"])
         if seen:
-            words.append(f"{title}每分钟 {seen[-1]['limit']} 次（剩 {seen[-1]['remaining']}）")
+            words.append(f"{title} 每分钟 {seen[-1]['limit']} 次（剩 {seen[-1]['remaining']}）")
     return ("Predict 报：" + "、".join(words)) if words else ""
 
 
@@ -2070,7 +2082,7 @@ def predict_buckets_line(key: str, app: tuple[int, int] | None = None) -> str:
         return ""
     hms = lambda at: dt.datetime.fromtimestamp(at, BEIJING).strftime("%H:%M:%S")
     parts = []
-    for kind, title in (("read", "读取"), ("trade", "下单撤单")):
+    for kind, title, count in (("read", "General", "读取"), ("trade", "Trading", "下单、撤单和读订单")):
         seen = sorted(((g, s) for g, s in groups.items() if s["kind"] == kind), key=lambda gs: gs[1]["at"])
         if not seen:
             continue
@@ -2078,9 +2090,10 @@ def predict_buckets_line(key: str, app: tuple[int, int] | None = None) -> str:
         group, last = seen[-1]
         used = int(last["limit"]) - int(last["remaining"])
         if len(limits) == 1:
-            head = f"{title}（{'、'.join(g for g, _ in seen)}）每分钟 {limits[0]} 次" if kind == "read" else f"{title}每分钟 {limits[0]} 次"
+            head = f"{title}（{'、'.join(g for g, _ in seen)}）每分钟 {limits[0]} 次"
         else:
             head = f"{title}：" + "、".join(f"{g} 每分钟 {s['limit']} 次" for g, s in seen)
+        title = count
         whose = predict_bucket_whose(last)
         mine_n = last["mine"] if abs(last["mine"] - used) <= abs(last["mine_clock"] - used) else last["mine_clock"]
         all_n = last["all"] if abs(last["all"] - used) <= abs(last["all_clock"] - used) else last["all_clock"]
@@ -6695,7 +6708,8 @@ def preopen_paces(config: Any, whole: bool = False) -> tuple[float, float]:
     trade = max(mine, math.floor(PREOPEN_APP_SHARE * trading - len(others) * min(every, PREOPEN_OTHERS_TRADE) - further))
     read = max(mine, math.floor(PREOPEN_APP_SHARE * general - len(others) * every - further))
     cut = {} if whole else PREOPEN_CUTS.get(preopen_cut_key(config)) or {}
-    return tuple(float(max(mine, math.floor(pace * float(cut.get(bucket, 1.0))))) for bucket, pace in (("trade", trade), ("read", read)))
+    # (+1e-6: a pace cut to 960 of 3,760 is 3,760 × 960 / 3,760 — 959.999… in floating point, not 960)
+    return tuple(float(max(mine, math.floor(pace * float(cut.get(bucket, 1.0)) + 1e-6))) for bucket, pace in (("trade", trade), ("read", read)))
 
 
 def preopen_refused(config: Any, bucket: str, sent: int = 0) -> tuple[float, float] | None:
@@ -6747,9 +6761,15 @@ def set_predict_rates(config: Any) -> None:
 
 
 def predict_trading(method: str, path: str) -> bool:
-    """Whether a request is one Predict counts in an app's Trading bucket — an order's placement, a cancel — not in its General
-    one (everything else: markets, orderbooks, the account's reads, the sign-in)."""
-    return method == "POST" and path.split("?", 1)[0].rstrip("/") in ("/orders", "/orders/remove")
+    """Whether a request is one Predict counts in an app's Trading bucket, not in its General one (markets, categories, the
+    sign-in, the rest): an order's placement, a cancel — and, since 1.154.63, a read of the orders (the open list, one by its
+    hash). 11-26 16:29–16:30, the first answers kept by kind (1.154.61) on the pre-open key: 登录、市场、分类 at 1,000 a
+    minute, 订单 (GET /orders) and 下单撤单 at 2,000 — the console's two limits for that app (Trading 2,000, General 1,000),
+    the order reads among the orders. 1.154.60 counted them as General, and at General 1,000 would have paced the account
+    snapshot's pages and every withdrawn order's final read to the 360 a minute General leaves the mode. ``path``
+    without the API's version (/v1)."""
+    tail = path.split("?", 1)[0].rstrip("/")
+    return tail == "/orders" or tail.startswith("/orders/")
 
 
 def predict_pacer(key: str, trade: bool = False) -> PredictPacer:

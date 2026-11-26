@@ -70,35 +70,41 @@ class Fast(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((half.preopen.app_trading + half.preopen.app_general, m.preopen_paces(half)), (5000, (0.0, 0.0)))
         with self.assertRaisesRegex(ValueError, "必须是整数"):
             m.Config.from_env({**BASE, **KEYS, **BIG, "PREOPEN_APP_GENERAL_PER_MIN": "5k"})
-        # the $50K tier (5,000 and 5,000) with the bot's key and the rule taker's beside the mode's: 80% of each limit, less 60
-        # orders a minute for each other key, and each other key's whole pace (220) off the reads
-        self.assertEqual(paces(**KEYS, **BIG), (4000 - 2 * 60, 4000 - 2 * 220))
-        self.assertEqual(paces(**KEYS, **BIG), (3880.0, 3560.0))
-        self.assertEqual(paces(**KEYS, **BIG, PREDICT_BOOK_API_KEY="book-key"), (3820.0, 3340.0), "the orderbook feed on a key of its own: a third to leave room for")
+        # the $50K tier (5,000 and 5,000) with the bot's key and the rule taker's beside the mode's: 80% of each limit, less 120
+        # of the Trading bucket a minute for each other key (1.154.63: its order reads too — 60, orders and cancels alone, before),
+        # and each other key's whole pace (220) off the General one
+        self.assertEqual(paces(**KEYS, **BIG), (4000 - 2 * 120, 4000 - 2 * 220))
+        self.assertEqual(paces(**KEYS, **BIG), (3760.0, 3560.0))
+        self.assertEqual(paces(**KEYS, **BIG, PREDICT_BOOK_API_KEY="book-key"), (3640.0, 3340.0), "the orderbook feed on a key of its own: a third to leave room for")
         self.assertEqual(paces(PREOPEN_API_KEY="pre-key", **BIG), (4000.0, 4000.0), "no other key: the whole share")
-        # the $15K tier (2,000 and 1,000): the reads are what is short — the General bucket is every key's
-        self.assertEqual(paces(**KEYS, **SMALL), (1480.0, 360.0))
+        # the $15K tier (2,000 and 1,000): General is what is short — and it now holds no order read (1.154.63)
+        self.assertEqual(paces(**KEYS, **SMALL), (1360.0, 360.0))
         # never under the pace the key has without them
-        self.assertEqual(paces(**KEYS, PREDICT_BOOK_API_KEY="book-key", PREOPEN_APP_TRADING_PER_MIN="1000", PREOPEN_APP_GENERAL_PER_MIN="1000"), (620.0, 220.0))
-        self.assertEqual(paces(**KEYS, **SMALL, PREOPEN_RATE_PER_MIN="500"), (1480.0, 500.0))
+        self.assertEqual(paces(**KEYS, PREDICT_BOOK_API_KEY="book-key", PREOPEN_APP_TRADING_PER_MIN="1000", PREOPEN_APP_GENERAL_PER_MIN="1000"), (440.0, 220.0))
+        self.assertEqual(paces(**KEYS, **SMALL, PREOPEN_RATE_PER_MIN="500"), (1360.0, 500.0))
         # the others not paced at all (PREDICT_RATE_PER_MIN=0): reckoned at the usual pace
-        self.assertEqual(paces(**KEYS, **BIG, PREDICT_RATE_PER_MIN="0"), (3880.0, 3560.0))
+        self.assertEqual(paces(**KEYS, **BIG, PREDICT_RATE_PER_MIN="0"), (3760.0, 3560.0))
         # a further key of the mode's (PREOPEN_API_KEYS) may send its whole pace of either kind
-        self.assertEqual(paces(**KEYS, **BIG, PREOPEN_API_KEYS="k2"), (3880.0 - 220, 3560.0 - 220))
+        self.assertEqual(paces(**KEYS, **BIG, PREOPEN_API_KEYS="k2"), (3760.0 - 220, 3560.0 - 220))
         # only a key that is the mode's alone
         self.assertEqual(paces(PREDICT_API_KEY="main-key", **BIG), (0.0, 0.0))
         self.assertEqual(paces(PREDICT_API_KEY="main-key", PREOPEN_API_KEY="main-key", **BIG), (0.0, 0.0))
 
     def test_the_keys_orders_have_a_bucket_of_their_own(self):
-        self.assertTrue(m.predict_trading("POST", "/orders") and m.predict_trading("POST", "/orders/remove") and m.predict_trading("POST", "/orders/"))
-        for method, path in (("GET", "/orders"), ("GET", "/orders/0xabc"), ("POST", "/auth"), ("GET", "/markets/1"), ("GET", "/categories/x"), ("POST", "/orders/0xabc")):
+        # Predict's Trading bucket: orders, cancels — and the order reads (1.154.63: 11-26 16:29–16:30 the answers to GET /orders
+        # said 2,000 a minute with the orders' own, the markets', categories' and the sign-in's 1,000)
+        for method, path in (("POST", "/orders"), ("POST", "/orders/remove"), ("POST", "/orders/"), ("GET", "/orders"), ("GET", "/orders/0xabc"),
+                             ("GET", "/orders?status=OPEN&first=100"), ("POST", "/orders/0xabc")):
+            self.assertTrue(m.predict_trading(method, path), (method, path))
+        for method, path in (("POST", "/auth"), ("GET", "/markets/1"), ("GET", "/categories/x"), ("GET", "/positions"), ("GET", "/ordersx"), ("GET", "/markets/1/orderbook")):
             self.assertFalse(m.predict_trading(method, path), (method, path))
+        self.assertEqual([m.predict_kind(meth, pth) for meth, pth in (("GET", "/v1/orders/0xab"), ("POST", "/v1/orders"), ("GET", "/v1/markets/3"))], ["trade", "trade", "read"])
         config = m.Config.from_env({**BASE, **KEYS, **BIG})
         m.set_predict_rates(config)
-        self.assertEqual((m.PREDICT_RATE_OF, m.PREDICT_TRADE_OF), ({"pre-key": 3560.0}, {"pre-key": 3880.0}))
+        self.assertEqual((m.PREDICT_RATE_OF, m.PREDICT_TRADE_OF), ({"pre-key": 3560.0}, {"pre-key": 3760.0}))
         reads, orders = m.predict_pacer("pre-key"), m.predict_pacer("pre-key", True)
         self.assertIsNot(reads, orders)
-        self.assertEqual((reads.per_min, orders.per_min), (3560.0, 3880.0))
+        self.assertEqual((reads.per_min, orders.per_min), (3560.0, 3760.0))
         self.assertIs(m.predict_pacer("pre-key", True), orders)
         # every other key: one bucket for both, as ever
         for key in ("main-key", "rule-key"):
@@ -125,7 +131,7 @@ class Fast(unittest.IsolatedAsyncioTestCase):
                 for method, path, priority in (("GET", "/markets/1", False), ("POST", "/orders", True), ("POST", "/orders/remove", True), ("POST", "/auth", False),
                                                ("GET", "/orders/0xabc", False)):
                     await client.call(method, path, {} if method == "POST" else None, priority=priority)
-            self.assertEqual((m.predict_pacer("pre-key").last_minute(), m.predict_pacer("pre-key", True).last_minute()), (3, 2), "its orders and cancels apart")
+            self.assertEqual((m.predict_pacer("pre-key").last_minute(), m.predict_pacer("pre-key", True).last_minute()), (2, 3), "its orders, cancels and order reads apart")
             self.assertEqual(m.predict_pacer("main-key").last_minute(), 5, "another key: all of them in its one bucket")
         finally:
             L.PredictApi.send = real
@@ -148,15 +154,15 @@ class Fast(unittest.IsolatedAsyncioTestCase):
     async def test_what_follows_the_paces_inside_the_mode(self):
         ctl, api, clock = T.controller(**KEYS, **BIG)
         self.assertTrue(ctl.fast())
-        self.assertEqual((ctl.trade_pace, ctl.read_pace), (3880.0, 3560.0))
-        self.assertEqual(ctl.place_workers(), 20, "a pair side by side for every 200 orders a minute")
-        self.assertEqual((ctl.fast_reads(), ctl.fast_verify()), (28, 15))
-        self.assertEqual(ctl.reconcile_gate._value, 15)
+        self.assertEqual((ctl.trade_pace, ctl.read_pace), (3760.0, 3560.0))
+        self.assertEqual(ctl.place_workers(), 19, "a pair side by side for every 200 of the Trading bucket a minute")
+        self.assertEqual((ctl.fast_reads(), ctl.fast_verify()), (29, 16), "(the final reads are order reads: by the Trading pace, 1.154.63)")
+        self.assertEqual(ctl.reconcile_gate._value, 16)
         for client in (ctl.api_made, ctl.first_api):  # the mode's low client and the fresh listings': as many reads in flight, and two orders a pair beside them
-            self.assertEqual((client.read_gate._value, client.gate._value), (28, 28 + 40), client)
+            self.assertEqual((client.read_gate._value, client.gate._value), (29, 29 + 38), client)
         self.assertEqual(ctl.cancel_made.gate._value, L.PredictApi.PARALLEL, "the cancels' client as it was")
         self.assertEqual(ctl.reread_batch(), int(3560 / 60 * 5 * 0.25))
-        self.assertEqual((ctl.reread_batch(), ctl.reread_queue_max()), (74, 800))
+        self.assertEqual((ctl.reread_batch(), ctl.reread_queue_max()), (74, 760))
         self.assertAlmostEqual(ctl.account_page_s(), 0.3)
         ctl.account_pages = 242
         self.assertAlmostEqual(ctl.account_interval_s(), 72.6, places=1)  # (24,000 open orders: every 73 s, not every six minutes)
@@ -165,10 +171,11 @@ class Fast(unittest.IsolatedAsyncioTestCase):
         await ctl.behind_placements()
         self.assertLess(time.monotonic() - began, 0.05, "the orders have a bucket of their own: a late final read stands behind nothing")
         await self.finish(ctl)
-        # the $15K tier: the orders faster, the reads about as before
+        # the $15K tier: the orders, the final reads and the snapshot by the Trading pace (1,360); the re-reads of the listings by the
+        # General one (360), as before
         small, _, _ = T.controller(**KEYS, **SMALL)
-        self.assertEqual((small.place_workers(), small.fast_reads(), small.fast_verify(), small.reread_batch(), small.reread_queue_max()), (8, 3, 2, 8, 320))
-        self.assertAlmostEqual(small.account_page_s(), 1.5 * 220 / 360)
+        self.assertEqual((small.place_workers(), small.fast_reads(), small.fast_verify(), small.reread_batch(), small.reread_queue_max()), (7, 11, 6, 8, 280))
+        self.assertAlmostEqual(small.account_page_s(), 0.3)
         await self.finish(small)
         # the limits not given — or the mode on the bot's own key: everything as it was
         for env in (KEYS, {"PREDICT_API_KEY": "main-key", **BIG}):
@@ -407,20 +414,21 @@ class Fast(unittest.IsolatedAsyncioTestCase):
         m.set_predict_rates(ctl.owner.config)
         self.assertTrue(ctl.pace_line().startswith(
             "用预挂自己的 API Key（PREOPEN_API_KEY），按 Predict 后台给这个 App 的限额跑（Trading 5000、General 5000 次/分钟，PREOPEN_APP_*）："
-            "下单撤单每分钟最多 3880 次、其他请求最多 3560 次——各用到限额的 80%，再扣掉机器人别的 Key 可能用的份额；同时挂 20 对、同时核对 15 对；"), ctl.pace_line())
+            "下单、撤单和读订单每分钟最多 3760 次，其他请求（市场、分类、登录）最多 3560 次——各用到限额的 80%，再扣掉机器人别的 Key 可能用的份额；同时挂 19 对、同时核对 16 对；"), ctl.pace_line())
         now = time.monotonic()
         m.predict_pacer("pre-key").sent.extend([now] * 3400)
         m.predict_pacer("pre-key", True).sent.extend([now] * 1200)
         m.predict_pacer("pre-key", True).note_429()
         line = ctl.speed_line()
-        self.assertIn("；预挂专用 Key 最近 1 分钟：下单撤单 1200 次（节拍每分钟 3880）、其他请求 3400 次（节拍 3560，跑满了）；被拒绝（429）：最近 10 分钟 1 次、24 小时 1 次", line)
-        self.assertIn("预挂已经按 Predict 后台的限额在跑（PREOPEN_APP_*：读取每分钟 3560 次、下单撤单 3880 次）", ctl.speed_refusal())
+        self.assertIn("；预挂专用 Key 最近 1 分钟：下单、撤单和读订单 1200 次（节拍每分钟 3760）、其他请求 3400 次（节拍 3560，跑满了）；被拒绝（429）：最近 10 分钟 1 次、24 小时 1 次", line)
+        self.assertIn("预挂已经按 Predict 后台的限额在跑（PREOPEN_APP_*：下单、撤单和读订单每分钟 3760 次，其他请求 3560 次）", ctl.speed_refusal())
         self.assertEqual(ctl.speed_start()[0], None)
         ns = types.SimpleNamespace(config=ctl.owner.config, KEY_SHARED_BELOW=L.LiveBot.KEY_SHARED_BELOW)
         ns.preopen_own_key = lambda: L.LiveBot.preopen_own_key(ns)
         ns.book_own_key = lambda: L.LiveBot.book_own_key(ns)
         load = L.LiveBot.live_key_load(ns)
-        self.assertIn("预挂专用 Key 3400 次（按 Predict 后台的限额：这是下单撤单以外的请求，节拍每分钟 3560 次；下单撤单另算，最近 60 秒 1200 次、节拍 3880 次", load)
+        self.assertIn("预挂专用 Key 3400 次（按 Predict 后台的限额：这是 General 一类（读市场、分类、登录等），节拍每分钟 3560 次；"
+                      "Trading 一类（下单、撤单、读订单）另算，最近 60 秒 1200 次、节拍 3760 次", load)
         await self.finish(ctl)
         # the limits given where the mode has no key of its own: said, and nothing changed
         shared, _, _ = T.controller(PREDICT_API_KEY="main-key", **BIG)
@@ -481,39 +489,39 @@ class Fast(unittest.IsolatedAsyncioTestCase):
         # the page of the 5,000 app copied for a key of the 1,000 one: the reads refused 15 seconds in, 875 of them let through —
         # to 80% of what Predict did accept, at once
         self.assertEqual(m.preopen_refused(config, "read", 875), (3560.0, 700.0))
-        self.assertEqual((m.PREDICT_RATE_OF, m.PREDICT_TRADE_OF), ({"pre-key": 700.0}, {"pre-key": 3880.0}), "the reads' pace cut and in force; the orders' as it was")
-        self.assertEqual((m.predict_pacer("pre-key").per_min, m.predict_pacer("pre-key", True).per_min), (700.0, 3880.0))
-        self.assertEqual((m.preopen_paces(config), m.preopen_paces(config, whole=True)), ((3880.0, 700.0), (3880.0, 3560.0)))
+        self.assertEqual((m.PREDICT_RATE_OF, m.PREDICT_TRADE_OF), ({"pre-key": 700.0}, {"pre-key": 3760.0}), "the reads' pace cut and in force; the orders' as it was")
+        self.assertEqual((m.predict_pacer("pre-key").per_min, m.predict_pacer("pre-key", True).per_min), (700.0, 3760.0))
+        self.assertEqual((m.preopen_paces(config), m.preopen_paces(config, whole=True)), ((3760.0, 700.0), (3760.0, 3560.0)))
         # Predict's minute is still full, and the requests already out meet it too: the same episode, one cut
         self.assertIsNone(m.preopen_refused(config, "read", 600))
-        self.assertEqual(m.preopen_paces(config), (3880.0, 700.0))
+        self.assertEqual(m.preopen_paces(config), (3760.0, 700.0))
         # still too fast a minute and a half on (700 and the other keys' 440 of a limit of 1,000): again by what did go through
         again("read")
         self.assertEqual(m.preopen_refused(config, "read", 600), (700.0, 480.0))
         # a setting saved — any of them — does not bring back what Predict refused
         m.set_predict_rates(m.Config.from_env({**BASE, **KEYS, **BIG, "PREOPEN_SHARES": "20"}))
-        self.assertEqual((m.PREDICT_RATE_OF, m.PREDICT_TRADE_OF), ({"pre-key": 480.0}, {"pre-key": 3880.0}))
+        self.assertEqual((m.PREDICT_RATE_OF, m.PREDICT_TRADE_OF), ({"pre-key": 480.0}, {"pre-key": 3760.0}))
         # a refusal with the bucket at its pace for a whole minute (no more let through than the pace): a fifth off, no less
-        self.assertEqual(m.preopen_refused(config, "trade", 3890), (3880.0, 3104.0))
+        self.assertEqual(m.preopen_refused(config, "trade", 3890), (3760.0, 3008.0))
         # a count that says little (a 429 in a quiet minute): a tenth of the pace at the least in one step
         quiet = m.Config.from_env({**BASE, **KEYS, "PREOPEN_APP_TRADING_PER_MIN": "6000", "PREOPEN_APP_GENERAL_PER_MIN": "6000"})
         self.assertEqual(m.preopen_refused(quiet, "read", 30), (4360.0, 436.0))
         self.assertEqual(list(m.PREOPEN_CUTS), [("pre-key", 6000, 6000)], "(other limits given: the cuts of the ones before are gone)")
         m.PREOPEN_CUTS.clear()
-        for bucket, sent, cut in (("read", 875, (3560.0, 700.0)), ("read", 600, (700.0, 480.0)), ("trade", 3890, (3880.0, 3104.0))):
+        for bucket, sent, cut in (("read", 875, (3560.0, 700.0)), ("read", 600, (700.0, 480.0)), ("trade", 3890, (3760.0, 3008.0))):
             self.assertEqual(m.preopen_refused(config, bucket, sent), cut)
             again(bucket)
         # down to the pace the key has without the limits, and no further
         for sent, cut in ((300, (480.0, 240.0)), (100, (240.0, 220.0)), (50, (220.0, 220.0)), (0, (220.0, 220.0))):
             again("read")
             self.assertEqual(m.preopen_refused(config, "read", sent), cut)
-        self.assertEqual(m.preopen_paces(config), (3104.0, 220.0))
+        self.assertEqual(m.preopen_paces(config), (3008.0, 220.0))
         # other limits given (the page read again): those, uncut — and a refusal at them forgets the old ones'
         small = m.Config.from_env({**BASE, **KEYS, **SMALL})
-        self.assertEqual(m.preopen_paces(small), (1480.0, 360.0))
+        self.assertEqual(m.preopen_paces(small), (1360.0, 360.0))
         self.assertEqual(m.preopen_refused(small, "read", 400), (360.0, 288.0))
         self.assertEqual(list(m.PREOPEN_CUTS), [("pre-key", 2000, 1000)])
-        self.assertEqual(m.preopen_paces(config), (3880.0, 3560.0), "the first limits given again: from their own figures")
+        self.assertEqual(m.preopen_paces(config), (3760.0, 3560.0), "the first limits given again: from their own figures")
         # no such paces in force (the limits not given; the mode on the bot's own key): nothing to cut
         for plain in (m.Config.from_env({**BASE, **KEYS}), m.Config.from_env({**BASE, "PREDICT_API_KEY": "main-key", **BIG})):
             self.assertIsNone(m.preopen_refused(plain, "read", 100))
@@ -533,12 +541,12 @@ class Fast(unittest.IsolatedAsyncioTestCase):
         reads.sent.extend([now] * 875)
         reads.note_429()
         ctl.fast_watch()
-        self.assertEqual((ctl.trade_pace, ctl.read_pace), (3880.0, 700.0))
-        self.assertEqual((m.PREDICT_RATE_OF, m.PREDICT_TRADE_OF), ({"pre-key": 700.0}, {"pre-key": 3880.0}))
+        self.assertEqual((ctl.trade_pace, ctl.read_pace), (3760.0, 700.0))
+        self.assertEqual((m.PREDICT_RATE_OF, m.PREDICT_TRADE_OF), ({"pre-key": 700.0}, {"pre-key": 3760.0}))
         self.assertEqual([key for key, _ in said], ["preopen:cut:read:700"])
-        self.assertIn("被 Predict 拒绝了（429）——读取等其他请求在被拒前的 60 秒发了 875 次，节拍已从每分钟 3560 次自动降到 700 次", said[0][1])
+        self.assertIn("被 Predict 拒绝了（429）——读市场、分类等其他请求在被拒前的 60 秒发了 875 次，节拍已从每分钟 3560 次自动降到 700 次", said[0][1])
         self.assertIn("填的限额（Trading 5000 / General 5000）可能不是预挂这把 Key 所在 App 的，或者交易量档位变了", said[0][1])
-        self.assertEqual((ctl.fast_reads(), ctl.fast_verify(), ctl.reread_batch()), (6, 3, 14), "what follows the reads' pace follows it down")
+        self.assertEqual((ctl.fast_reads(), ctl.fast_verify(), ctl.reread_batch()), (29, 16, 14), "the listings' re-reads follow the General pace down; the final reads go by the Trading one")
         # the 429s of the same episode (the client's requests already out, Predict's minute still full): looked at, not answered again
         reads.note_429(); reads.note_429()
         ctl.fast_watch()
@@ -550,9 +558,9 @@ class Fast(unittest.IsolatedAsyncioTestCase):
         ctl.fast_watch()
         self.assertEqual((ctl.trade_pace, ctl.read_pace), (960.0, 700.0))
         self.assertEqual([key for key, _ in said], ["preopen:cut:read:700", "preopen:cut:trade:960"])
-        self.assertIn("下单撤单在被拒前的 60 秒发了 1200 次，节拍已从每分钟 3880 次自动降到 960 次", said[1][1])
-        self.assertIn("同时核对 3 对；⚠️ 被 Predict 拒绝过（429），已自动降速：下单撤单从每分钟 3880 次降到 960 次、其他请求从每分钟 3560 次降到 700 次——", ctl.pace_line())
-        self.assertIn("下单撤单每分钟最多 960 次、其他请求最多 700 次", ctl.pace_line())
+        self.assertIn("下单、撤单和读订单在被拒前的 60 秒发了 1200 次，节拍已从每分钟 3760 次自动降到 960 次", said[1][1])
+        self.assertIn("同时核对 4 对；⚠️ 被 Predict 拒绝过（429），已自动降速：下单、撤单和读订单从每分钟 3760 次降到 960 次、其他请求从每分钟 3560 次降到 700 次——", ctl.pace_line())
+        self.assertIn("下单、撤单和读订单每分钟最多 960 次，其他请求（市场、分类、登录）最多 700 次", ctl.pace_line())
         await self.finish(ctl)
         # a setting saved builds the mode anew: at the paces as cut, and the 429s already answered are not answered again
         fresh, fresh_api, _ = T.controller(**KEYS, **BIG)
@@ -569,7 +577,7 @@ class Fast(unittest.IsolatedAsyncioTestCase):
             fresh.fast_watch()
         self.assertEqual(fresh.read_pace, 220.0)
         self.assertEqual([key for key, _ in said][2:], ["preopen:cut:read:240", "preopen:cut:read:220", "preopen:cut:read:floor"])
-        self.assertIn("读取等其他请求已经降到最低的每分钟 220 次，仍被 Predict 拒绝（429）", said[-1][1])
+        self.assertIn("读市场、分类等其他请求已经降到最低的每分钟 220 次，仍被 Predict 拒绝（429）", said[-1][1])
         self.assertIn("把“Predict 限额”那两项改成 0（不填），预挂就回到原来的方式", said[-1][1])
         await self.finish(fresh)
         # the look is never the loop's problem (that loop withdraws the orders at their time): a failure in it is logged, no more
@@ -606,7 +614,7 @@ class Fast(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((bot.config.preopen.app_trading, bot.config.preopen.app_general, m.PREDICT_TRADE_OF), (5000, 0, {}))
         answer = bot.control_set({"PREOPEN_APP_GENERAL_PER_MIN": "5000"})
         self.assertTrue(answer["ok"], answer)
-        self.assertEqual((m.PREDICT_RATE_OF, m.PREDICT_TRADE_OF), ({"pre-key": 3560.0}, {"pre-key": 3880.0}))
+        self.assertEqual((m.PREDICT_RATE_OF, m.PREDICT_TRADE_OF), ({"pre-key": 3560.0}, {"pre-key": 3760.0}))
         self.assertEqual(bot.config.preopen.app_trading, 5000)
         self.assertFalse(bot.control_set({"PREOPEN_APP_GENERAL_PER_MIN": "100"})["ok"], "under 240: refused, the value in force kept")
         self.assertEqual(bot.config.preopen.app_general, 5000)
