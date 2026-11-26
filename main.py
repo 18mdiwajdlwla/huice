@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.66"
+VERSION = "1.154.67"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -952,9 +952,9 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("LIVE_ORPHAN_CANCEL", "自动撤掉无记录的挂单", "开 = 账户上本机器人没有记录、却挂在本机器人做过的市场上的挂单（丢失跟踪的单：重启、改设置或撤单没撤成留下的，成交了也没人记账），连续 2 分钟还在就自动撤掉并通知；没做过的市场上的挂单当作手动单，只报不撤。关 = 只报不撤，/live cancel account 手动撤"),
     ("PREOPEN_15M", "开盘前预挂（15 分钟市场）", "开 = 15 分钟场次一发布就在涨跌两边各挂一张 post-only 买单，开场前撤掉（PREOPEN.md）；需要 LIVE=on。改动即时生效：开就启动，关就撤单停下，改参数先撤单再按新参数重启。预挂的预留计入持仓+挂单上限，当日盈亏计入日亏损停机线"),
     ("PREOPEN_APP_AUTO", "按 Predict 报的限额自动定速", "开（默认，1.154.64）：上面两项“Predict 限额”都没填时，照 Predict 每个应答里报的这把 Key 的限额自动定速——"
-     "预挂每次启动时取最新的（下单、撤单和读订单按 Trading，读市场、分类等按 General），交易量档位变了、换了新号都跟着变，不用手填；两项填了的以填的为准。"
+     "预挂每次启动时取最新的（下单、撤单和读订单按 Trading，读市场、分类等按 General），交易量档位变了、换了新号都跟着变，不用手填；两项填了的以填的为准（1.154.67：填的比 Predict 报的大时按报的）。"
      "关 = 没填就照原来每分钟 220 次。只在预挂有自己单独的 Key 时起作用"),
-    ("PREDICT_RATE_AUTO", "其他 Key 也按 Predict 报的限额定速", "开（默认，1.154.66）：主 Key、盘口 Key、规则吃单 Key 各按它自己应答里报的限额定速——两类里小的那个数的一半，"
+    ("PREDICT_RATE_AUTO", "其他 Key 也按 Predict 报的限额定速", "开（默认，1.154.66）：主 Key、盘口 Key、规则吃单 Key 各按它自己应答里报的限额定速——两类里小的那个数的一半（1.154.67：只报了读取那一类——比如规则吃单 Key 半小时没下单——就按那一类），"
      "每分钟最多 1000 次，不低于原来的 220；关 = 都按每分钟 220 次。11-26 主 Key 报的是 5000、规则吃单 Key 2000，却都按 220 跑：盘口读取在规则吃单 Key 上排队，一分钟里等了 182 秒"),
     ("PREOPEN_EXCLUSIVE", "预挂时原策略暂停开新仓", "开 = 本模式真实运行时普通模型策略不开新仓（原策略也在交易同一批 15 分钟市场时建议开）；关 = 两边同时跑，额度和日亏损合并计算"),
     ("PREOPEN_MARKETS", "预挂哪几张卡", "点亮要挂的卡，可多选，全选 = all（默认只挂 BTC）；BTC 5分、ETH 5分、BNB 5分 是每 5 分钟一场的卡（1.137.0，只给预挂用）；BTC 小时、ETH 小时、BNB 小时 是每小时一场（bitcoin-up-or-down-<日期>-<几点>-et，那一小时开始前撤单），BTC 日、ETH 日、BNB 日 是每天一场（<币>-up-or-down-on-<日期>，前一天 12:00 ET 开始，开始前撤单）（1.142.0，只给预挂用）；“一键全关”= none：一张都不挂、已挂的预挂单撤掉，本模式仍开着，再点亮一张就恢复；和“做哪些市场”互不影响：那边排除 15 分钟卡只管原策略，预挂只认这里"),
@@ -988,14 +988,15 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_APP_TRADING_PER_MIN", "Predict 限额：Trading（每分钟）", "照抄 Predict 开发者后台 → 预挂那把 Key 所在的 App → Rate limits 页上 “Trading … requests per minute” 的数（比如 5000、2000）；"
      "这一类是下单、撤单，以及读订单（账户快照、撤单后核对成交）——1.154.63 按 Predict 应答里报的改过来的；"
      "/preopen 的“速度”行也会写出 Predict 应答里自己报的数和建议填多少（1.154.61）。"
-     "0 = 不填——1.154.64 起不填就照 Predict 应答里报的这把 Key 的限额自动跑（见下面“按 Predict 报的限额自动定速”），一般不用填；填了以填的为准。"
+     "0 = 不填——1.154.64 起不填就照 Predict 应答里报的这把 Key 的限额自动跑（见下面“按 Predict 报的限额自动定速”），一般不用填；填了以填的为准——1.154.67 起填的比 Predict 应答里报的大时按报的（多填没用，只会被拒）。"
      "和下面的 General 两项都填了才生效（各自点保存，先填哪项都行）。填了之后（1.154.60）：预挂的下单撤单和读取各按各的额度跑——Predict 本来就是分开算的——"
      "机器人只用到限额的八成，并先扣掉主 Key、规则吃单 Key 可能用的份额（/preopen 会写出实际用的两个数）；挂单、撤后核对、重读的并发跟着放大。"
      "原来按“每把 Key 每分钟 240 次”自己限速，一天的场次全撤后挂回要约 3 小时；$50K 档（5000 / 5000）填上后模拟约 8 分钟。"
      "交易量档位变了（后台的数变了）记得回来改。填的数不对（抄成了另一个 App 的、档位降了）会被 Predict 拒绝（429）：机器人这时自己把被拒的那一类降到 Predict 实际放行的量以下，"
      "发通知并写在 /preopen 里，一直保持到改这两项或重启"),
     ("PREOPEN_APP_GENERAL_PER_MIN", "Predict 限额：General（每分钟）", "同一页上 “General … requests per minute” 的数（读市场、分类、盘口、登录等——读订单不在这一类，算在 Trading 里；比如 5000 或 1000）；0 = 不填（照 Predict 报的自动跑）。"
-     "和上面的 Trading 两项都填了才生效。这个额度是整个 App 共用的：同一个 App 的别的 Key（盘口、原策略、规则吃单）的读取也算在里面"),
+     "和上面的 Trading 两项都填了才生效。这个额度是整个 App 共用的：同一个 App 的别的 Key（盘口、原策略、规则吃单）的读取也算在里面。"
+     "1.154.67：填的比 Predict 应答里报的大时按报的（11-26 填了 2000，Predict 报 1000）"),
     ("PREOPEN_RATE_PER_MIN", "预挂专用 Key：每分钟请求数", "0 = 跟所有 Key 一样（PREDICT_RATE_PER_MIN，默认 220）；60～1000 = 只给预挂自己的 Key（PREOPEN_API_KEY，以及 PREOPEN_API_KEYS 里的每一把）单独定速，"
      "主 Key、盘口 Key 和规则吃单的 Key 不受影响（1.154.57）。超过 Predict 的限额会被拒绝（429）并让这把 Key 停约 20 秒"
      "（这 20 秒预挂不能下单也不能撤单，到了撤单时间的单靠签在单里的到期时间兜底）。"
@@ -2136,7 +2137,10 @@ def predict_buckets_line(key: str, app: tuple[int, int] | None = None) -> str:
                 text += f"。→ “Predict 限额”的 General 可以填 {said_read}；Trading 等下单的应答带回来再看（下一次挂单后）"
         else:
             notes = [(f"还没填 {name}（两项都填了才生效）" + (f"，Predict 报的是 {said}" if said else "") if not mine
-                      else f"填的 {name} {mine} 比 Predict 报的 {said} {'大——会被拒' if mine > said else '小，可以改大'}")
+                      # 1.154.67: one given above what the key said is not what the mode goes by (preopen_app_capped)
+                      else f"填的 {name} {mine} 比 Predict 报的 {said} "
+                      + ((f"大——按 Predict 报的 {said} 跑（两项都清成 0 就全照 Predict 报的自动跑）" if said >= PREOPEN_APP_MIN else "大——会被拒")
+                         if mine > said else "小，可以改大"))
                      for name, mine, said in (("Trading", app[0], said_trade), ("General", app[1], said_read)) if not mine or (said and mine != said)]
             if notes:
                 text += "。→ " + "；".join(notes)
@@ -6693,15 +6697,20 @@ def predict_rate(key: str) -> float:
     of the lower of the two limits the key's own answers say (predict_said_limits), KEY_AUTO_MAX at the most, never under
     every key's. 11-26 19:10: the bot's key said 5,000 and 5,000, the rule taker's 2,000 and 2,000 — each paced to 220,
     the orderbook feed's reads queued on the rule taker's key 182 seconds in a minute. One pacer for both kinds on such a
-    key (the pre-open key's are apart: PREDICT_TRADE_OF)."""
+    key (the pre-open key's are apart: PREDICT_TRADE_OF). 1.154.67: the General figure alone where no order of the key's said
+    the Trading one within half an hour (BUCKET_FRESH_S) — 11-26 20:28 the rule taker's key, lent to the orderbook feed all
+    day and placing orders at its moments alone, had said General 2,000 and no Trading since the start: back at 220, the
+    lent reads waiting 62 seconds in a minute. Every app seen says Trading at least General (5,000 / 5,000, 2,000 / 2,000,
+    2,000 / 1,000); the key's first order brings its Trading figure, and the lower of the two from then on."""
     fixed = PREDICT_RATE_TEST.get(key) or PREDICT_RATE_OF.get(key)
     if fixed:
         return float(fixed)
     base = float(PREDICT_RATE["per_min"])
     if PREDICT_RATE.get("auto") and base > 0:
         trading, general = predict_said_limits(key)
-        if trading and general:
-            return float(max(base, min(KEY_AUTO_MAX, math.floor(KEY_AUTO_SHARE * min(trading, general)))))
+        if general:
+            lower = min(trading, general) if trading else general
+            return float(max(base, min(KEY_AUTO_MAX, math.floor(KEY_AUTO_SHARE * lower))))
     return base
 
 
@@ -6742,13 +6751,15 @@ KEYS_APART: set[frozenset] = set()  # pairs of keys their answers showed to be t
 
 def predict_may_share(key: str, other: str) -> bool:
     """Whether two keys may be one app's tokens, and so count in the same buckets (1.154.66): not where both keys' answers said
-    their limits and those differ — an app's limits are every token's of it — once seen, for good (a key quiet for half an
-    hour has its figures forgotten, not its app). Unknown: they may."""
+    a kind's limit and those differ — an app's limits are every token's of it — once seen, for good (a key quiet for half an
+    hour has its figures forgotten, not its app). Unknown: they may. 1.154.67: one kind is enough (1.154.66 asked both of both
+    keys) — 11-26 20:28 the rule taker's key had said General 2,000 and no Trading (no order of its since the start), the
+    pre-open key General 1,000: the pre-open paces kept 120 orders and 220 reads a minute back for it."""
     pair = frozenset((key, other))
     if pair in KEYS_APART:
         return False
     mine, theirs = predict_said_limits(key), predict_said_limits(other)
-    if all(mine) and all(theirs) and mine != theirs:
+    if any(a and b and a != b for a, b in zip(mine, theirs)):
         KEYS_APART.add(pair)
         return False
     return True
@@ -6769,13 +6780,27 @@ def preopen_auto_freeze(config: Any) -> bool:
     return home in PREOPEN_AUTO_LIMITS
 
 
+def preopen_app_capped(config: Any) -> list[tuple[str, int, int]]:
+    """The PREOPEN_APP_* figures given above what the pre-open key's own answers said within half an hour — (name, given, said)
+    for each: those are what the mode goes by (preopen_app_limits). 1.154.67 — 11-26 20:28 General 2,000 given, Predict saying
+    1,000: the mode's reads paced to 1,380 a minute, a 429 waiting for the next re-read of the day's windows. A figure said
+    under PREOPEN_APP_MIN is no bucket the paces are made for (preopen_auto_freeze), and a figure given lower is kept."""
+    settings = getattr(config, "preopen", None)
+    given = (int(getattr(settings, "app_trading", 0) or 0), int(getattr(settings, "app_general", 0) or 0))
+    said = predict_said_limits(str(getattr(config, "preopen_api_key", "") or ""))
+    return [(name, mine, theirs) for name, mine, theirs in zip(("Trading", "General"), given, said)
+            if mine and theirs >= PREOPEN_APP_MIN and mine > theirs]
+
+
 def preopen_app_limits(config: Any) -> tuple[int, int, str]:
-    """(Trading, General, whose) — the pre-open key's app limits in force: PREOPEN_APP_* where both are given ("后台"); else, with
-    PREOPEN_APP_AUTO on, what Predict's answers said as the controller started ("自动"); else (0, 0, "")."""
+    """(Trading, General, whose) — the pre-open key's app limits in force: PREOPEN_APP_* where both are given ("后台"), each no
+    higher than the key's answers say it (preopen_app_capped, 1.154.67); else, with PREOPEN_APP_AUTO on, what Predict's
+    answers said as the controller started ("自动"); else (0, 0, "")."""
     settings = getattr(config, "preopen", None)
     trading, general = int(getattr(settings, "app_trading", 0) or 0), int(getattr(settings, "app_general", 0) or 0)
     if trading and general:
-        return trading, general, "后台"
+        capped = {name: said for name, _, said in preopen_app_capped(config)}
+        return capped.get("Trading", trading), capped.get("General", general), "后台"
     if trading or general or not getattr(settings, "app_auto", False):
         return 0, 0, ""  # (one given alone: neither in force, as 1.154.62 says it)
     auto = PREOPEN_AUTO_LIMITS.get(str(getattr(config, "preopen_api_key", "") or ""))

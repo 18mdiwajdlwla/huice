@@ -734,6 +734,67 @@ class Fast(unittest.IsolatedAsyncioTestCase):
         m.predict_pacer("main-key").sent.append(time.monotonic())
         self.assertIn("主 Key 1 次（按它自己报的限额定速：每分钟 1000 次（PREDICT_RATE_AUTO）", L.LiveBot.live_key_load(ns))
 
+    @staticmethod
+    def reads(key, general, at=None):
+        """What the key's answers said where none of them was an order's (1.154.67): a market read's alone."""
+        m.PREDICT_BUCKETS_SAID[key] = {"市场": {"at": time.time() if at is None else at, "limit": general, "remaining": general - 5, "kind": "read"}}
+
+    def test_a_key_that_said_its_reads_alone(self):
+        """1.154.67 — 11-26 20:28: the rule taker's key had said General 2,000 and no Trading (no order of its since the start):
+        paced at 220 again (its lent reads waited 62 seconds in a minute) and room kept for it in the pre-open key's paces."""
+        config = m.Config.from_env({**BASE, **KEYS})
+        m.set_predict_rates(config)
+        self.reads("rule-key", 2000)
+        self.assertEqual((m.predict_said_limits("rule-key"), m.predict_rate("rule-key")), ((0, 2000), 1000.0), "the reads' figure alone: half of it")
+        self.assertEqual(m.predict_pacer("rule-key").per_min, 1000.0)
+        self.reads("rule-key", 300)
+        self.assertEqual(m.predict_rate("rule-key"), 220.0, "never under the usual pace")
+        self.said("rule-key", trade=1200, general=2000)
+        self.assertEqual(m.predict_rate("rule-key"), 600.0, "its first order's figure: the lower of the two")
+        m.PREDICT_BUCKETS_SAID["rule-key"] = {"订单": {"at": time.time(), "limit": 2000, "remaining": 1990, "kind": "trade"}}
+        self.assertEqual(m.predict_rate("rule-key"), 220.0, "the orders' figure alone: the usual pace (nothing said of the reads)")
+        # one kind said by both keys and differing: two apps — no room kept for it
+        self.said("pre-key", 2000, 1000)
+        self.assertTrue(m.preopen_auto_freeze(config))
+        self.said("main-key", 5000, 5000)
+        self.reads("rule-key", 2000)
+        self.assertEqual((m.predict_may_share("pre-key", "rule-key"), m.preopen_paces(config)), (False, (1600.0, 800.0)))
+        # the same reads' figure, the orders' unknown: they may share — room for it at its own pace (half of 1,000)
+        m.KEYS_APART.clear()
+        self.reads("rule-key", 1000)
+        self.assertEqual((m.predict_may_share("pre-key", "rule-key"), m.preopen_paces(config)), (True, (1600.0 - 120, 800.0 - 500)))
+        # /diag: the rule taker's key at the pace its reads' figure gives
+        self.reads("rule-key", 2000)
+        ns = types.SimpleNamespace(config=config, KEY_SHARED_BELOW=L.LiveBot.KEY_SHARED_BELOW)
+        ns.preopen_own_key = lambda: L.LiveBot.preopen_own_key(ns)
+        ns.book_own_key = lambda: L.LiveBot.book_own_key(ns)
+        m.predict_pacer("rule-key").sent.append(time.monotonic())
+        self.assertIn("规则吃单专用 Key 1 次（按它自己报的限额定速：每分钟 1000 次（PREDICT_RATE_AUTO）", L.LiveBot.live_key_load(ns))
+
+    async def test_a_limit_given_above_what_the_key_said(self):
+        """1.154.67 — 11-26 20:28: General 2,000 given on the control page, Predict saying 1,000 — the mode's reads paced to 1,380
+        a minute; now the key's own figure, and the status says so."""
+        m.PREDICT_PACING = True
+        typed = {"PREOPEN_APP_TRADING_PER_MIN": "2000", "PREOPEN_APP_GENERAL_PER_MIN": "2000"}
+        config = m.Config.from_env({**BASE, **KEYS, **typed})
+        self.assertEqual((m.preopen_app_capped(config), m.preopen_app_limits(config)), ([], (2000, 2000, "后台")), "nothing said: as given")
+        self.said("pre-key", 2000, 1000)
+        self.assertEqual((m.preopen_app_capped(config), m.preopen_app_limits(config), m.preopen_cut_key(config)),
+                         ([("General", 2000, 1000)], (2000, 1000, "后台"), ("pre-key", 2000, 1000)))
+        # a figure given lower is kept; one said under 240 is no bucket the paces are made for: it caps nothing
+        lower = m.Config.from_env({**BASE, **KEYS, "PREOPEN_APP_TRADING_PER_MIN": "1500", "PREOPEN_APP_GENERAL_PER_MIN": "800"})
+        self.assertEqual((m.preopen_app_capped(lower), m.preopen_app_limits(lower)), ([], (1500, 800, "后台")))
+        self.said("pre-key", 2000, 120)
+        self.assertEqual(m.preopen_app_limits(config), (2000, 2000, "后台"))
+        # the controller at the key's own figures (the other keys two other apps'), and the status says why
+        self.said("pre-key", 2000, 1000)
+        self.said("main-key", 5000, 5000)
+        self.said("rule-key", 2000, 2000)
+        ctl, _, _ = T.controller(**KEYS, **typed)
+        self.assertEqual((ctl.trade_pace, ctl.read_pace), (1600.0, 800.0))
+        self.assertIn("按 Predict 后台给这个 App 的限额跑（Trading 2000、General 1000 次/分钟，PREOPEN_APP_*；填的 General 2000 比 Predict 报的大，按报的 1000）：", ctl.pace_line())
+        await self.finish(ctl)
+
     async def test_the_mode_takes_the_room_back_once_the_other_keys_have_said(self):
         m.PREDICT_PACING = True
         self.said("pre-key")
