@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.56"
+VERSION = "1.154.57"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -218,6 +218,17 @@ def parse_bounded(env: dict[str, str], key: str, default: str, low: float, high:
     if not (low <= value <= high and math.isfinite(value)):
         raise ValueError(f"{key} 必须在 {low:g}～{high:g} 之间")
     return value
+
+
+def preopen_rate_of(env: Mapping) -> float:
+    """PREOPEN_RATE_PER_MIN: 0 (the pre-open key is paced as every key: PREDICT_RATE_PER_MIN) or 60～1000 requests a minute."""
+    try:
+        rate = int(str(env.get("PREOPEN_RATE_PER_MIN", "0")).strip() or 0)
+    except ValueError:
+        raise ValueError("PREOPEN_RATE_PER_MIN 必须是整数") from None
+    if rate and not 60 <= rate <= 1000:
+        raise ValueError("PREOPEN_RATE_PER_MIN 是 0（跟所有 Key 一样，按 PREDICT_RATE_PER_MIN）或 60～1000（预挂专用 Key 每分钟最多发多少个请求）")
+    return float(rate)
 
 
 def bounded_int(env: dict[str, str], key: str, default: int, low: int, high: int) -> int:
@@ -917,6 +928,11 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
      "3～1440：调小就只挂快开场的几场，少占资金、少读接口，但新场次要等进了范围才挂，排在先挂的人后面"),
     ("PREOPEN_BTC5_LEVELS", "BTC 5 分钟：整串价格档位（旧写法）", "1.154.37 的写法，留着兼容：价格x份数、逗号分隔、第一档在前，如 47x10,43x40，一次把 BTC 5 分钟的所有档写全；空 = 不用。"
      "1.154.56 起用“开盘前预挂 · BTC 5 分钟”那一组里的“第一档价格”“第一档每边份数”“更深的价格档位”分开填就行——那三项填了的，盖在这里的整串之上"),
+    ("PREOPEN_RATE_PER_MIN", "预挂专用 Key：每分钟请求数", "0 = 跟所有 Key 一样（PREDICT_RATE_PER_MIN，默认 220）；60～1000 = 只给预挂自己那把 Key（PREOPEN_API_KEY）单独定速，"
+     "主 Key、盘口 Key 和规则吃单的 Key 不受影响（1.154.57）。Predict 给每把 Key 的上限默认是每分钟 240 次，超了会拒绝（429）并让这把 Key 停约 20 秒"
+     "（这 20 秒预挂不能下单也不能撤单，到了撤单时间的单靠签在单里的到期时间兜底）。"
+     "测上限的办法：有一批单在补挂时（/preopen 有“已发布未挂”，“速度”一行写“用满了”），从 220 起每次加 20，每档看两三分钟 /preopen 的“速度”一行——“被拒绝（429）0 次”就再加，"
+     "一出现被拒绝（同时会收到“限流冷却中”的通知）就退回上一档，那就是这把 Key 实际能跑的速度。平时单都挂着、这把 Key 没用满，调它看不出区别。没有专用 Key 时这一项不起作用"),
     ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "0～1000000，0 = 不限（默认）：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金，成交时才扣款；余额够一场双边就挂）；设了上限时每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放，/preopen 会算出把已发布的全部挂上需要多少"),
     # 1.153.0: 规则吃单 (rules.py) — the gold / oil windows the backtest found mispriced (README「规则吃单」)
     ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段，开场前吃：Predict 撮合开启后到开场前 15 秒（最后 130 秒的单见下面“开场前最后 2 分钟也吃”；关掉它就到开场前 130 秒为止），盘口一出现规则价以内的指定方向就立即买"
@@ -1153,6 +1169,8 @@ class Config:
     live_orders_page: int = 50         # LIVE_ORDERS_PAGE: orders per page when the account's open list is read (a page is a round trip; 1.112.1)
     predict_rate_per_min: float = 220.0  # PREDICT_RATE_PER_MIN: every API key's requests paced to this many a minute (PredictPacer, 1.154.0); 0 = no pacing
     preopen_api_key: str = ""          # PREOPEN_API_KEY: a second Predict API key for the pre-open mode alone — its own request budget (1.154.0)
+    preopen_rate_per_min: float = 0.0  # PREOPEN_RATE_PER_MIN (1.154.57): that key's own pace, 0 = PREDICT_RATE_PER_MIN — raised a step at a time to
+    #                                    see where Predict's limit for a key lies (/preopen's 速度 line counts its 429s), the other keys left alone
     rule_key_lend: bool = True         # RULE_KEY_LEND: on = while the rule taker is idle its own key (RULE_API_KEY) also carries the orderbook feed's
     #                                    reads and the pre-open mode's overflow — never from five minutes before the rule taker needs it
     #                                    (preopen.KeyLending, 1.154.21); off = that key is the rule taker's alone
@@ -1386,6 +1404,7 @@ class Config:
             live_orders_page=bounded_int(e, "LIVE_ORDERS_PAGE", 50, 10, 500),
             predict_rate_per_min=float(bounded_int(e, "PREDICT_RATE_PER_MIN", 220, 0, 100_000)),
             preopen_api_key=str(e.get("PREOPEN_API_KEY", "")).strip(),
+            preopen_rate_per_min=preopen_rate_of(e),
             rule_key_lend=not off(e.get("RULE_KEY_LEND", "on")),
             live_read_lend=not off(e.get("LIVE_READ_LEND", "on")),
             predict_book_api_key=str(e.get("PREDICT_BOOK_API_KEY", "")).strip(),
@@ -1794,6 +1813,61 @@ HTTP_STATS = {"new": 0, "reused": 0, "retried": 0}  # connections opened / reuse
 HTTP_NET: dict[str, dict] = {}
 
 
+# 1.154.57: what Predict's own answers say of a key's limit, when they say it — the headers many an API sends with every answer
+# (X-RateLimit-Limit / -Remaining / -Reset, RateLimit-Policy, a 429's Retry-After). Whether Predict sends any was never looked
+# at: _http_get hands back the body alone, and its documentation cannot be read from where this is written. API key ->
+# {"answers": how many were looked at, "seen": {header: value} of the last answer that carried any, "at": when (time.time()),
+# "refused": the same of the last 429, "refused_at"}. Written from the pool's threads (one assignment each), read by the status
+PREDICT_LIMITS_SAID: dict[str, dict] = {}
+LIMIT_HEADERS_KEPT = 8
+_HEADER_UNSAFE = re.compile(r"[^0-9A-Za-z .,;=:_/+-]")
+
+
+def note_limit_headers(host: str, sent: Mapping, status: int, answer: Any) -> None:
+    """An answer of Predict's, looked at for what it says of the key's request limit (PREDICT_LIMITS_SAID). ``answer``: the
+    response, or the HTTP error, its headers under .headers. Never raises — whatever the answer is: it stands in every
+    request's way."""
+    try:
+        if not host.endswith("predict.fun"):
+            return
+        key = str(sent.get("x-api-key") or "")
+        said = PREDICT_LIMITS_SAID.get(key)
+        if said is None:
+            said = PREDICT_LIMITS_SAID.setdefault(key, {"answers": 0, "seen": {}, "at": 0.0, "refused": {}, "refused_at": 0.0})
+        said["answers"] += 1
+        found = {}
+        for name, value in (answer.headers.items() if getattr(answer, "headers", None) is not None else ()):
+            low = str(name).lower()
+            if "ratelimit" in low.replace("-", "") or (low == "retry-after" and status == 429):
+                found[_HEADER_UNSAFE.sub("?", low)[:40]] = _HEADER_UNSAFE.sub("?", str(value))[:60]
+                if len(found) >= LIMIT_HEADERS_KEPT:
+                    break
+        if limits := {name: value for name, value in found.items() if name != "retry-after"}:
+            said["seen"], said["at"] = limits, time.time()
+        if status == 429:
+            said["refused"], said["refused_at"] = found, time.time()
+    except Exception:
+        pass
+
+
+def predict_limits_said(key: str) -> str:
+    """What Predict's answers on an API key said of its limit, for the status: the headers as they came (the last answer that
+    carried any; a 429's own beside them) — or that none of the answers looked at carried any; "" before the first answer."""
+    said = PREDICT_LIMITS_SAID.get(key)
+    if not said or not said.get("answers"):
+        return ""
+    words = lambda found: "、".join(f"{name} {value}" for name, value in found.items())
+    if not said.get("seen") and not said.get("refused_at"):
+        return f"Predict 的应答里没有带限额信息（看了 {said['answers']} 个应答）"
+    hms = lambda at: dt.datetime.fromtimestamp(at, BEIJING).strftime("%H:%M:%S")
+    parts = []
+    if said.get("seen"):
+        parts.append(f"Predict 应答里自己报的限额（{hms(said['at'])} 的应答，原样）：{words(said['seen'])}")
+    if said.get("refused_at"):
+        parts.append(f"上次被拒绝（429，{hms(said['refused_at'])}）的应答" + (f"带的是：{words(said['refused'])}" if said.get("refused") else "没有带限额信息"))
+    return "；".join(parts)
+
+
 def http_net(host: str) -> dict:
     return HTTP_NET.setdefault(host, {"connect": collections.deque(maxlen=40), "edge": ""})
 
@@ -1922,9 +1996,11 @@ def _http_urllib(url: str, data: bytes | None, hdrs: dict[str, str], timeout: in
             req.add_unredirected_header(name, value)  # with this request alone: urllib's redirect handler does not carry these on
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT) as response:
+            note_limit_headers(host, hdrs, getattr(response, "status", 200), response)  # 1.154.57 (never raises)
             raw = _read_body(response, timeout)
             return _inflate(raw, response.headers.get("Content-Encoding", ""))
     except urllib.error.HTTPError as error:
+        note_limit_headers(host, hdrs, error.code, error)
         raw = b""
         with contextlib.suppress(Exception):
             raw = error.read(4096)
@@ -1973,6 +2049,7 @@ def _http_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str, st
         status = response.status
         if edge := (response.getheader("cf-ray") or response.getheader("server")):
             http_net(host)["edge"] = str(edge)[:40]
+        note_limit_headers(host, hdrs, status, response)  # 1.154.57: what the answer says of the key's limit (never raises)
         try:
             if status >= 400:
                 raw = b""
@@ -6280,14 +6357,40 @@ class LentBack(RemoteError):
 
 PREDICT_PACERS: dict[str, PredictPacer] = {}
 PREDICT_RATE = {"per_min": 220.0}  # PREDICT_RATE_PER_MIN, set by Config (Bot.apply_config): every key's pace
+# ...but a key with a figure of its own (1.154.57): the pre-open mode's key, PREOPEN_RATE_PER_MIN — the user: "怎么测试速度，看看最多可以挂
+# 多少". Where Predict's limit for a key really lies is found by raising that key's pace alone and watching for its 429s: the
+# one setting for every key would have tried it on the rule taker's key too, whose cooldown falls in a race's seconds
+PREDICT_RATE_OF: dict[str, float] = {}
+
+
+def predict_rate(key: str) -> float:
+    """The requests a minute an API key is paced to: its own figure where it has one (PREDICT_RATE_OF), else every key's."""
+    return float(PREDICT_RATE_OF.get(key) or PREDICT_RATE["per_min"])
+
+
+def preopen_own_rate(config: Any) -> float:
+    """PREOPEN_RATE_PER_MIN where it is in force — the pre-open key's own pace: 0 when not set, and when that key is not the
+    mode's alone (none given, or the same as the bot's, the orderbook feed's or the rule taker's: their pace is every key's)."""
+    own, rate = str(getattr(config, "preopen_api_key", "") or ""), float(getattr(config, "preopen_rate_per_min", 0) or 0)
+    others = {str(getattr(config, name, "") or "") for name in ("predict_api_key", "predict_book_api_key", "rule_api_key")}
+    return rate if own and own not in others and rate > 0 else 0.0
+
+
+def set_predict_rates(config: Any) -> None:
+    """The keys' paces as the configuration says them: PREDICT_RATE_PER_MIN for every key, and PREOPEN_RATE_PER_MIN (0 = the same) for
+    the pre-open mode's key where that is in force (preopen_own_rate)."""
+    PREDICT_RATE["per_min"] = float(getattr(config, "predict_rate_per_min", 220.0))
+    PREDICT_RATE_OF.clear()
+    if rate := preopen_own_rate(config):
+        PREDICT_RATE_OF[str(config.preopen_api_key)] = rate
 
 
 def predict_pacer(key: str) -> PredictPacer:
-    """The pacer of an API key (one for every client on it); its pace follows PREDICT_RATE_PER_MIN."""
+    """The pacer of an API key (one for every client on it); its pace follows PREDICT_RATE_PER_MIN — or the key's own (predict_rate)."""
     pacer = PREDICT_PACERS.get(key)
     if pacer is None:
-        pacer = PREDICT_PACERS[key] = PredictPacer(PREDICT_RATE["per_min"])
-    pacer.per_min = PREDICT_RATE["per_min"]
+        pacer = PREDICT_PACERS[key] = PredictPacer(predict_rate(key))
+    pacer.per_min = predict_rate(key)
     return pacer
 PREDICT_BACKOFF_SECONDS = 20    # after a 429 without retry_after: how long every Predict request waits
 PREDICT_META_SECONDS = 600     # outcome names / status of a ladder market are re-read this often
@@ -6819,7 +6922,7 @@ class PredictFeed:
 
     def __init__(self, config: Config):
         self.config = config
-        PREDICT_RATE["per_min"] = float(getattr(config, "predict_rate_per_min", 220.0))  # the key's pace (PredictPacer, 1.154.0)
+        set_predict_rates(config)  # the keys' pace (PredictPacer, 1.154.0; the pre-open key's own, 1.154.57)
         self.markets: dict[str, tuple[dict | None, float]] = {}  # slug -> (market or None = not listed, when)
         self.book_keys: dict[str, str] = {}                      # market id -> id/conditionId that answered
         self.books: dict[str, PredictBook] = {}                  # item key -> latest book
@@ -13076,6 +13179,7 @@ CONTROL_FORMS: dict[str, dict] = {
                                    "captions": {"1440": "挂满：一发布就挂"}},  # 1.152.2: every listed window, each placed the moment it is listed
     "PREOPEN_BTC5_LEVELS": {"kind": "text", "group": "高级", "presets": ["", "47x10", "47x10,43x40", "47x20,43x80,40x80", "47x30,43x160,40x160,37x160"], "unit": "",
                             "empty": "不用"},  # 1.154.37; 1.154.56: the older way, among the advanced ones
+    "PREOPEN_RATE_PER_MIN": {"kind": "number", "group": "预挂", "presets": ["0", "220", "240", "260", "280", "300"], "unit": "次/分钟", "zero": "跟所有 Key 一样"},  # 1.154.57
     "PREOPEN_MAX_OPEN_USD": {"kind": "number", "group": "预挂", "presets": ["0", "1000", "5000", "7000", "20000"], "unit": "$", "zero": "不限"},
     "RULE_TAKER": {"kind": "choice", "group": "规则", "options": [["off", "off 关"], ["paper", "paper 只记录不下单"], ["on", "on 真实吃单（需要 LIVE=on）"]]},
     "RULE_GOLD_SHUT_CENTS": {"kind": "number", "group": "规则", "presets": ["0", "55", "58", "60", "65"], "unit": "¢", "zero": "不做"},
@@ -27221,7 +27325,7 @@ class Bot:
         before = self.config
         self.config = config
         self.predict.config = config  # the orderbook feed keeps its own reference (PREDICT_POLL_SECONDS)
-        PREDICT_RATE["per_min"] = float(config.predict_rate_per_min)  # PREDICT_RATE_PER_MIN as saved (1.154.0)
+        set_predict_rates(config)  # PREDICT_RATE_PER_MIN as saved (1.154.0), and the pre-open key's own pace (PREOPEN_RATE_PER_MIN, 1.154.57)
         SOURCE_HEALTH.off = config.sources_off  # the quote feeds read the switch from here
         # 1.150.0 (audit CTRL-CONFIG-RUNTIME): three more things were built from the start-up configuration and kept it until
         # the next restart. PREOPEN_15M / PREOPEN_MARKETS add the exchange ticker of a stock card the pre-open mode quotes
@@ -27294,7 +27398,8 @@ class Bot:
                   "PREOPEN_BTC5_PRICE_CENTS": f"{float(c.preopen.btc5_price) * 100:g}", "PREOPEN_BTC5_SHARES": plain(float(c.preopen.btc5_shares)),
                   "PREOPEN_BTC5_DEEP_LEVELS": ("" if c.preopen.btc5_deep is None else "none" if not c.preopen.btc5_deep
                                                else ",".join(f"{float(p) * 100:g}x{float(s):g}" for p, s in c.preopen.btc5_deep)),
-                  "PREOPEN_MAX_OPEN_USD": plain(c.preopen.max_open_usd), "PREOPEN_EXCLUSIVE": flag(c.preopen.exclusive),
+                  "PREOPEN_MAX_OPEN_USD": plain(c.preopen.max_open_usd), "PREOPEN_RATE_PER_MIN": plain(c.preopen_rate_per_min),
+                  "PREOPEN_EXCLUSIVE": flag(c.preopen.exclusive),
                   "RULE_TAKER": c.rules.mode, "RULE_MAX_DAY_USD": plain(c.rules.max_day_usd), **{name: str(c.rules.price(key)) for key, name in RULE_SETTING_KEYS.items()},
                   **{switch: flag(c.rules.on(mk)) for mk, (switch, _) in RULE_MARKET_KEYS.items()},
                   **{size: str(c.rules.shares_of(mk)) for mk, (_, size) in RULE_MARKET_KEYS.items()},

@@ -4118,6 +4118,8 @@ class LiveBot(core.Bot):
             # the rule taker's key while that one was idle (preopen.Controller.lender)
             waited, seconds = pacer.waited_last() if hasattr(pacer, "waited_last") else (0, 0.0)
             notes = [f"等节拍 {waited} 次共 {seconds:.0f} 秒"] if waited else []
+            if core.PREDICT_RATE_OF.get(key):  # 1.154.57: the pre-open key at a pace of its own (PREOPEN_RATE_PER_MIN)
+                notes.insert(0, f"单独节流每分钟 {core.PREDICT_RATE_OF[key]:g} 次：PREOPEN_RATE_PER_MIN")
             if key == rule:
                 lent = self.preopen.lent_last() if getattr(self, "preopen", None) is not None and callable(getattr(self.preopen, "lent_last", None)) else 0
                 book = self.predict.lent_last() if callable(getattr(getattr(self, "predict", None), "lent_last", None)) else 0
