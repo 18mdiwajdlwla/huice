@@ -42,9 +42,10 @@ class Fast(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.kept = (m.PREDICT_PACING, m.PREDICT_RATE["per_min"], dict(m.PREDICT_PACERS), dict(m.PREDICT_RATE_OF), dict(m.PREDICT_TRADE_OF), dict(m.PREDICT_TRADE_PACERS))
         m.PREDICT_PACERS.clear(); m.PREDICT_TRADE_PACERS.clear(); m.PREDICT_RATE_OF.clear(); m.PREDICT_TRADE_OF.clear(); m.PREOPEN_CUTS.clear()
+        m.PREOPEN_AUTO_LIMITS.clear(); m.PREDICT_BUCKETS_SAID.clear()
 
     def tearDown(self):
-        m.PREOPEN_CUTS.clear()
+        m.PREOPEN_CUTS.clear(); m.PREOPEN_AUTO_LIMITS.clear(); m.PREDICT_BUCKETS_SAID.clear()
         m.PREDICT_PACING, m.PREDICT_RATE["per_min"] = self.kept[0], self.kept[1]
         for table, was in ((m.PREDICT_PACERS, self.kept[2]), (m.PREDICT_RATE_OF, self.kept[3]), (m.PREDICT_TRADE_OF, self.kept[4]), (m.PREDICT_TRADE_PACERS, self.kept[5])):
             table.clear(); table.update(was)
@@ -597,6 +598,98 @@ class Fast(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((len(said), plain.cut_line(), list(m.PREOPEN_CUTS)), (5, "", [("pre-key", 5000, 5000)]), "nothing said, nothing cut (the table as the limits' controller left it)")
         await self.finish(plain)
 
+    @staticmethod
+    def said(key, trade=2000, general=1000, at=None):
+        """What the key's answers said, as note_limit_headers keeps it (1.154.61): an order read's and a market read's."""
+        at = time.time() if at is None else at
+        m.PREDICT_BUCKETS_SAID[key] = {"订单": {"at": at, "limit": trade, "remaining": trade - 10, "kind": "trade"},
+                                       "市场": {"at": at, "limit": general, "remaining": general - 5, "kind": "read"}}
+
+    def test_predicts_own_limits_by_default(self):
+        """1.154.64 — "默认这个速度": neither limit given, the ones Predict's answers on the key say."""
+        config = m.Config.from_env({**BASE, **KEYS})
+        self.assertTrue(config.preopen.app_auto)
+        self.assertEqual((m.preopen_app_limits(config), m.preopen_auto_freeze(config), m.preopen_paces(config)), ((0, 0, ""), False, (0.0, 0.0)), "nothing said yet")
+        self.said("pre-key")
+        self.assertEqual(m.predict_said_limits("pre-key"), (2000, 1000))
+        self.assertTrue(m.preopen_auto_freeze(config))
+        self.assertEqual((m.preopen_app_limits(config), m.preopen_paces(config)), ((2000, 1000, "自动"), (1360.0, 360.0)))
+        # taken as the controller starts, and held: the answers saying more later change nothing until the next start
+        self.said("pre-key", trade=5000, general=5000)
+        self.assertEqual(m.preopen_app_limits(config)[:2], (2000, 1000))
+        self.assertTrue(m.preopen_auto_freeze(config))
+        self.assertEqual(m.preopen_app_limits(config)[:2], (5000, 5000))
+        # the figures given win; one alone, nothing; the switch off, nothing
+        self.assertEqual(m.preopen_app_limits(m.Config.from_env({**BASE, **KEYS, **SMALL})), (2000, 1000, "后台"))
+        self.assertEqual(m.preopen_app_limits(m.Config.from_env({**BASE, **KEYS, "PREOPEN_APP_TRADING_PER_MIN": "2000"})), (0, 0, ""))
+        off = m.Config.from_env({**BASE, **KEYS, "PREOPEN_APP_AUTO": "off"})
+        self.assertEqual((off.preopen.app_auto, m.preopen_app_limits(off), m.preopen_auto_freeze(off)), (False, (0, 0, ""), False))
+        # a kind said under 240 (a bucket the paces are not made for), said half an hour ago, or not the mode's own key: not taken
+        m.PREOPEN_AUTO_LIMITS.clear()
+        self.said("pre-key", general=120)
+        self.assertFalse(m.preopen_auto_freeze(config))
+        self.said("pre-key", at=time.time() - m.BUCKET_FRESH_S - 1)
+        self.assertEqual((m.predict_said_limits("pre-key"), m.preopen_auto_freeze(config)), ((0, 0), False))
+        self.said("main-key")
+        self.assertFalse(m.preopen_auto_freeze(m.Config.from_env({**BASE, "PREDICT_API_KEY": "main-key", "PREOPEN_API_KEY": "main-key"})))
+        # the cuts belong to the limits in force
+        self.said("pre-key")
+        m.preopen_auto_freeze(config)
+        self.assertEqual(m.preopen_cut_key(config), ("pre-key", 2000, 1000))
+
+    async def test_the_mode_takes_predicts_limits_as_they_come(self):
+        m.PREDICT_PACING = True
+        # said before the controller starts (a settings change, the process running): at them from the start
+        self.said("pre-key")
+        ready, _, _ = T.controller(**KEYS)
+        self.assertTrue(ready.fast())
+        self.assertEqual((ready.trade_pace, ready.read_pace, m.PREDICT_TRADE_OF), (1360.0, 360.0, {"pre-key": 1360.0}))
+        self.assertIn("按 Predict 应答里报的这把 Key 的限额自动跑（Trading 2000、General 1000 次/分钟；“Predict 限额”两项没填，PREOPEN_APP_AUTO）："
+                      "下单、撤单和读订单每分钟最多 1360 次，其他请求（市场、分类、登录）最多 360 次", ready.pace_line())
+        self.assertFalse(ready.auto_pending())
+        await self.finish(ready)
+        # a fresh process: nothing said yet — the usual pace, the four workers; the first answers say them and the mode goes fast
+        m.PREDICT_BUCKETS_SAID.clear(); m.PREOPEN_AUTO_LIMITS.clear()
+        ctl, api, clock = T.controller(**KEYS)
+        m.set_predict_rates(ctl.owner.config)
+        self.assertEqual((ctl.fast(), ctl.auto_pending(), m.PREDICT_TRADE_OF), (False, True, {}))
+        ctl.workers_started = ctl.place_workers()
+        self.assertEqual(ctl.workers_started, p.PLACE_WORKERS)
+        gates = (ctl.api_made.read_gate, ctl.api_made.gate, ctl.first_api.gate, ctl.reconcile_gate)
+        ctl.auto_task = asyncio.ensure_future(ctl.auto_limits())
+        await asyncio.sleep(0.05)
+        self.assertIn("——等 Predict 的应答报出这把 Key 的限额（启动后几秒），之后自动提速；", ctl.pace_line())
+        self.said("pre-key")
+        await asyncio.wait_for(ctl.auto_task, 3)
+        self.assertTrue(ctl.fast())
+        self.assertEqual((ctl.trade_pace, ctl.read_pace, m.PREDICT_TRADE_OF, m.PREDICT_RATE_OF), (1360.0, 360.0, {"pre-key": 1360.0}, {"pre-key": 360.0}))
+        self.assertEqual((ctl.workers_started, len(ctl.extra_workers)), (7, 3), "seven pairs side by side at 1,360: three more workers")
+        self.assertEqual((ctl.api_made.read_gate._value, ctl.api_made.gate._value, ctl.reconcile_gate._value), (11, 11 + 14, 6))
+        self.assertTrue(all(new is not old for new, old in zip((ctl.api_made.read_gate, ctl.api_made.gate, ctl.first_api.gate, ctl.reconcile_gate), gates)))
+        self.assertIn("自动跑（Trading 2000、General 1000 次/分钟", ctl.pace_line())
+        for task in ctl.extra_workers:
+            task.cancel()
+        await asyncio.gather(*ctl.extra_workers, return_exceptions=True)
+        await self.finish(ctl)
+        # nothing said within the wait: the usual pace, and the status says why
+        m.PREDICT_BUCKETS_SAID.clear(); m.PREOPEN_AUTO_LIMITS.clear(); m.PREDICT_TRADE_OF.clear(); m.PREDICT_RATE_OF.clear()
+        kept, p.AUTO_WAIT_S = p.AUTO_WAIT_S, 0.2
+        try:
+            quiet, _, _ = T.controller(**KEYS)
+            with self.assertLogs(p.LOG, "WARNING"):
+                await quiet.auto_limits()
+            self.assertEqual((quiet.fast(), quiet.auto_missed), (False, True))
+            self.assertIn("——Predict 的应答没有报出这把 Key 的限额，照原来的速度；", quiet.pace_line())
+            await self.finish(quiet)
+        finally:
+            p.AUTO_WAIT_S = kept
+        # the figures given on the control page: those, whatever the answers say — and no waiting
+        self.said("pre-key", trade=5000, general=5000)
+        given, _, _ = T.controller(**KEYS, **SMALL)
+        self.assertEqual((given.trade_pace, given.read_pace, given.auto_pending()), (1360.0, 360.0, False))
+        self.assertIn("按 Predict 后台给这个 App 的限额跑（Trading 2000、General 1000 次/分钟，PREOPEN_APP_*）", given.pace_line())
+        await self.finish(given)
+
     def test_the_control_page(self):
         class FM:
             def __init__(self, now): self.now, self.config = now, None
@@ -604,9 +697,13 @@ class Fast(unittest.IsolatedAsyncioTestCase):
         for key in ("PREOPEN_APP_TRADING_PER_MIN", "PREOPEN_APP_GENERAL_PER_MIN"):
             self.assertEqual((m.CONTROL_FORMS[key]["kind"], m.CONTROL_FORMS[key]["group"]), ("number", "预挂"))
             self.assertIn(key, m.CONTROL_KEY_SET)
+        self.assertEqual((m.CONTROL_FORMS["PREOPEN_APP_AUTO"]["kind"], "PREOPEN_APP_AUTO" in m.CONTROL_KEY_SET), ("choice", True))  # (1.154.64)
         env = {"TELEGRAM_BOT_TOKEN": "1:x", "SYMBOLS": "UNITREEUSDT", "HSI_FUTURES": "off", "KOSPI_INDEX": "off", "PREOPEN_15M": "on", **KEYS}
         bot = m.Bot(m.Config.from_env(env), m.Store(":memory:"), FM(T.NOW), None)
-        self.assertEqual((bot.control_value("PREOPEN_APP_TRADING_PER_MIN"), bot.control_value("PREOPEN_APP_GENERAL_PER_MIN")), ("0", "0"))
+        self.assertEqual((bot.control_value("PREOPEN_APP_TRADING_PER_MIN"), bot.control_value("PREOPEN_APP_GENERAL_PER_MIN"), bot.control_value("PREOPEN_APP_AUTO")), ("0", "0", "on"))
+        self.assertTrue(bot.control_set({"PREOPEN_APP_AUTO": "off"})["ok"])
+        self.assertEqual((bot.config.preopen.app_auto, bot.control_value("PREOPEN_APP_AUTO")), (False, "off"))
+        self.assertTrue(bot.control_set({"PREOPEN_APP_AUTO": "on"})["ok"])
         # 1.154.62: one at a time, as the page saves them (each box its own 保存) — the first kept and not in force, the second
         # puts both in force. They were refused one at a time ("要一起填") and could never be saved from the page at all
         answer = bot.control_set({"PREOPEN_APP_TRADING_PER_MIN": "5000"})
