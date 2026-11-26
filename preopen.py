@@ -2012,6 +2012,10 @@ DISCOVER_READS = 8              # listed windows with a level still to quote rea
 FINALS_SAID = 20                # 1.154.54: /preopen says how many withdrawn pairs wait for their final reads once there are this many (finals_line)
 REREAD_WAIT_S = 5.0             # 1.154.54: ...and a re-read that has no answer by then ends the pass (the next one asks again): the same loop probes the
 #                                 listings, and on 11-26 it stood for an hour and a half in one re-read waiting for a token of the key's (read_final)
+SPEED_SPAN_MS = 600_000         # 1.154.57: /preopen's 速度 line — the orders Predict accepted in the last minute and over this long (speed_line)
+SPEED_KEPT = 16384              #   ...that many of them kept (ten minutes at 1,600 a minute)
+SPEED_FULL = 0.9                #   a key that let through this share of its pace in the last minute is at its pace: only then does the pace bound the speed
+SPEED_EPISODE_S = 120.0         #   a 429 with none in this long before it began an episode: its minute's count is where the limit was met (those after a cooldown are not)
 FINALS_YIELD_S = 5.0            # 1.154.54: a withdrawn order's late final read waits while a pair is being placed or a known window re-read — this long
 FINALS_YIELD_STEP_S = 0.05      #   at the most, looking again this often (Controller.behind_placements)
 ALLOWANCE_MS = 60_000           # the exchange allowance is read again this often, not before every pair
@@ -2113,6 +2117,8 @@ class Controller:
         self.full_scan_ms = 0  # discover: when the last full scan ran (FULL_SCAN_MS)
         self.keep_on_stop = False  # the owner's stop for a settings change: the orders stay on the book, the next controller takes them over
         self.resumed = self.requoted = 0  # pairs taken over at this start; windows quoted again (superseded records) since
+        self.placed_at: collections.deque = collections.deque(maxlen=SPEED_KEPT)  # (ms, window) of each order Predict accepted (place_pair): the status's 速度 (1.154.57)
+        self.fastest = (0, 0)  # ...and the most of them in any one minute since the start, with when (note_speed)
         self.released_at: collections.deque = collections.deque(maxlen=4096)  # when a withdrawn pair was released (accounted, nothing filled: bookkeep) — the status's pace of the final reads (1.154.54)
         self.rereading = False  # a known window's re-read is out (reread_known): the late final reads wait for it (behind_placements, 1.154.54)
         self.card_holds: dict[str, str] = {}  # card key -> why its windows are not quoted now (card_hold: near the day's limit, halted)
@@ -3289,6 +3295,7 @@ class Controller:
                 # refusal — unprocessed — sends the order on the mode's own; the signed order is the same on either)
                 result = await self.through(home, lambda api: api.create_order(order["body"]))
                 order.update(id=result["order_id"], state="open", api_hash=str(result.get("hash") or "").lower())
+                self.placed_at.append((self.now(), pair["window"]))  # 1.154.57: one more order on the book (speed_line)
             except NotSent as error:
                 order.update(state="not_sent", error=core.clean_error(error))
                 pair["phase"] = "closing"
@@ -3951,11 +3958,85 @@ class Controller:
         return min(LISTING_PROBE_S, float(self.settings.poll))  # the listings probed every LISTING_PROBE_S; the older windows re-read at the poll's pace (discovery_loop)
 
     def pace_line(self) -> str:
-        """The key this mode's requests go out on and its pace (1.154.0): what /preopen says of the budget it shares or has alone."""
+        """The key this mode's requests go out on and its pace (1.154.0): what /preopen says of the budget it shares or has alone.
+        1.154.57: the key's own pace where it has one (PREOPEN_RATE_PER_MIN) — and that the setting does nothing where the
+        mode has no key to itself."""
         own = bool(getattr(self.owner.config, "preopen_api_key", ""))
         per_min = float(getattr(self.owner.config, "predict_rate_per_min", 0) or 0)
-        pace = (f"每分钟最多 {per_min:g} 次（PREDICT_RATE_PER_MIN，读等节拍、下单撤单优先）" if per_min and core.PREDICT_PACING else "不节流")
+        mine, asked = core.preopen_own_rate(self.owner.config), float(getattr(self.owner.config, "preopen_rate_per_min", 0) or 0)
+        pace = ("不节流" if not ((mine or per_min) and core.PREDICT_PACING)
+                else f"每分钟最多 {mine:g} 次（PREOPEN_RATE_PER_MIN：只管预挂这把 Key，别的 Key {f'仍是 {per_min:g}' if per_min else '不节流'}；读等节拍、下单撤单优先）" if mine
+                else f"每分钟最多 {per_min:g} 次（PREDICT_RATE_PER_MIN，读等节拍、下单撤单优先）"
+                + (f"——PREOPEN_RATE_PER_MIN={asked:g} 没起作用：预挂没有自己单独的 Key（PREOPEN_API_KEY 没填，或和主 Key、盘口 Key、规则吃单 Key 是同一把）" if asked else ""))
         return ("用预挂自己的 API Key（PREOPEN_API_KEY），" if own else "和原策略、盘口共用一个 API Key，") + f"请求{pace}；" + self.borrow_line()
+
+    def placed_since(self, since_ms: int) -> list[str]:
+        """The windows of the orders Predict accepted since ``since_ms`` — one entry an order, the newest first."""
+        out = []
+        for at, window in reversed(self.placed_at):
+            if at < since_ms:
+                break
+            out.append(window)
+        return out
+
+    def note_speed(self, now: int) -> None:
+        """The fastest minute since the start, kept (speed_line): the orders accepted in the last 60 seconds, looked at as the
+        loop goes round."""
+        count = len(self.placed_since(now - 60_000))
+        if count > self.fastest[0]:
+            self.fastest = (count, now)
+
+    def speed_line(self, pairs_left: int = 0) -> str:
+        """The status's line on how fast the mode quotes (1.154.57 — "怎么测试速度，看看最多可以挂多少"): the orders Predict
+        accepted in the last minute and the last ten (the windows they were for), and the fastest minute since the start;
+        how much of its key's pace the last minute used — only a key at its pace is bounded by it, and only then does a
+        higher pace show anything (PREOPEN_RATE_PER_MIN, a step at a time); the 429s on the key, and how many requests the
+        key had let through in the minute before the one that began the last run of them (where Predict's limit was met:
+        those right after a cooldown say nothing of it); what Predict's own answers say of the limit (core.note_limit_headers);
+        and how long the listed levels not quoted yet take at the last minute's speed (``pairs_left``: unplaced's)."""
+        now = self.now()
+        self.note_speed(now)
+        span = min(SPEED_SPAN_MS, max(60_000, now - self.started_ms))
+        minute, lately = self.placed_since(now - 60_000), self.placed_since(now - span)
+        minutes = span / 60_000
+        parts = [f"最近 1 分钟挂上 {len(minute)} 张单"]
+        if lately and minutes >= 1.5:
+            parts.append(f"最近 {minutes:.0f} 分钟 {len(lately)} 张、{len(set(lately))} 场（每分钟 {len(lately) / minutes:.0f} 张 ≈ {len(set(lately)) / minutes:.1f} 场）")
+        if self.fastest[0]:
+            parts.append(f"本次启动后最快的一分钟 {self.fastest[0]} 张（{hms(self.fastest[1])}）")
+        key = str(getattr(self.api, "api_key", "") or "")
+        pacer = core.PREDICT_PACERS.get(key)
+        own = bool(key) and key != str(getattr(self.owner.config, "predict_api_key", "") or "")
+        name = "预挂专用 Key " if own else "主 Key（和原策略共用）"
+        if pacer is not None:
+            used, pace = pacer.last_minute(), float(pacer.per_min) if core.PREDICT_PACING else 0.0
+            waited, seconds = pacer.waited_last()
+            if pace <= 0:
+                usage = f"{name}最近 1 分钟发出 {used} 次请求（不节流）"
+            elif used >= SPEED_FULL * pace:
+                usage = (f"{name}最近 1 分钟发出 {used} 次请求、节拍每分钟 {pace:g} 次——用满了" + (f"（{waited} 次请求排队等节拍，共等 {seconds:.0f} 秒）" if waited else "")
+                         + "：现在的速度就是这个节拍下的上限")
+            else:
+                usage = (f"{name}最近 1 分钟发出 {used} 次请求、节拍每分钟 {pace:g} 次——没用满（{used / pace:.0%}）：现在没有那么多要发的，"
+                         "这时调高节拍看不出区别，要测上限得等有一批单在补挂的时候")
+            if lent := self.lent_last():
+                usage += f"；另借规则吃单的 Key 走了 {lent} 次"
+            parts.append(usage)
+            mono, hits = time.monotonic(), list(pacer.limits)
+            # (the list full: its first entry may be from the middle of a run whose beginning was dropped — not taken for one)
+            firsts, before = [], hits[0][0] if hits and len(hits) == pacer.limits.maxlen else float("-inf")
+            for at, count in hits:
+                if at - before > SPEED_EPISODE_S:
+                    firsts.append(count)
+                before = at
+            day = [count for at, count in hits if at >= mono - 86400]
+            parts.append(f"被拒绝（429）：最近 10 分钟 {sum(1 for at, _ in hits if at >= mono - 600)} 次、24 小时 {len(day)} 次"
+                         + (f"，最近一轮是这把 Key 一分钟内发到第 {firsts[-1]} 次请求时开始被拒的——Predict 给它的上限就在这附近，节拍要设得比它低" if day and firsts else ""))
+        if said := core.predict_limits_said(key):
+            parts.append(said)
+        if pairs_left and minute:
+            parts.append(f"照最近一分钟的速度，已发布未挂的 {pairs_left} 档（{2 * pairs_left} 张单）还要约 {max(1, round(2 * pairs_left / len(minute)))} 分钟")
+        return "\n速度：" + "；".join(parts)
 
     def borrow_line(self) -> str:
         """What /preopen says of the rule taker's key (1.154.21): borrowed now and how much went out on it, or why not."""
@@ -4010,6 +4091,7 @@ class Controller:
             self.first_keep_warm()
             if not self.rate_samples or now - self.rate_samples[-1][0] >= 500:
                 self.rate_samples.append((now, calls))
+            self.note_speed(now)
             await self.check_cards(now)
             self.note_cooldown()
             yielding = self.yielding() > 0  # 1.154.23: the housekeeping after the rule taker's seconds (the cancels at their time go on)
@@ -4286,6 +4368,7 @@ class Controller:
                 f"预留 {reserved:.2f}U{f' / 限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '，不设上限'}（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉的场次在撤单 {LATE_FILL_MS // 1000} 秒后读到一份没成交才释放）"
                 + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {reserved + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，新发布的先挂，其余按开场先后补挂中") if pairs_left else "")
                 + self.finals_line()
+                + self.speed_line(pairs_left)
                 + (f"\n请求约 {self.request_rate():.1f} 次/秒（最近一分钟）；" if self.request_rate() is not None else "\n")
                 + self.pace_line()
                 + f"账户快照每 {self.account_interval_s():.0f} 秒（{self.account_pages} 页挂单" + self.page_rows_note()
