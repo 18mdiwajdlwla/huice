@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.61"
+VERSION = "1.154.62"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -659,9 +659,13 @@ class PreopenSettings:
             app = [int(str(e.get(name, "0")).strip() or 0) for name in ("PREOPEN_APP_TRADING_PER_MIN", "PREOPEN_APP_GENERAL_PER_MIN")]
         except ValueError:
             raise ValueError("PREOPEN_APP_TRADING_PER_MIN / PREOPEN_APP_GENERAL_PER_MIN 必须是整数") from None
-        if any(app) and not all(PREOPEN_APP_MIN <= n <= PREOPEN_APP_MAX for n in app):
-            raise ValueError(f"PREOPEN_APP_TRADING_PER_MIN 和 PREOPEN_APP_GENERAL_PER_MIN 要一起填（Predict 后台 Rate limits 页上 Trading、General 两个每分钟的数，"
-                             f"{PREOPEN_APP_MIN}～{PREOPEN_APP_MAX}），或者都留 0（不用：预挂的 Key 照原来的速度）；现在是 {app[0]} 和 {app[1]}")
+        # 1.154.62: each on its own — 0, or PREOPEN_APP_MIN～PREOPEN_APP_MAX. They were "both or neither": the control page saves
+        # one setting at a time, so the first of the two saved was refused ("要一起填"), and the second too — neither could
+        # ever be saved there (11-26 16:05, the user with 2000 typed in both). One given alone is kept and does nothing
+        # (core.preopen_paces wants both); /preopen says which is missing
+        for name, n in zip(("PREOPEN_APP_TRADING_PER_MIN", "PREOPEN_APP_GENERAL_PER_MIN"), app):
+            if n and not PREOPEN_APP_MIN <= n <= PREOPEN_APP_MAX:
+                raise ValueError(f"{name} 要么填 0（不用），要么填 Predict 后台 Rate limits 页上的每分钟次数（{PREOPEN_APP_MIN}～{PREOPEN_APP_MAX}）；现在是 {n}")
         def ladder(name: str, example: str) -> list[tuple[int, int]]:  # "价格x份数, …" as (cents, shares) (PREOPEN_LEVELS; PREOPEN_BTC5_LEVELS, 1.154.37)
             out = []
             for part in [x.strip() for x in str(e.get(name, "")).replace("，", ",").split(",") if x.strip()]:
@@ -973,18 +977,19 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_BTC5_LEVELS", "BTC 5 分钟：整串价格档位（旧写法）", "1.154.37 的写法，留着兼容：价格x份数、逗号分隔、第一档在前，如 47x10,43x40，一次把 BTC 5 分钟的所有档写全；空 = 不用。"
      "1.154.56 起用“开盘前预挂 · BTC 5 分钟”那一组里的“第一档价格”“第一档每边份数”“更深的价格档位”分开填就行——那三项填了的，盖在这里的整串之上"),
     ("PREOPEN_APP_TRADING_PER_MIN", "Predict 限额：Trading（每分钟）", "照抄 Predict 开发者后台 → 预挂那把 Key 所在的 App → Rate limits 页上 “Trading … requests per minute” 的数（比如 5000）；"
-     "0 = 不填（预挂的 Key 照原来的速度，每分钟 220 次）。和下面的 General 要一起填。填了之后（1.154.60）：预挂的下单撤单和读取各按各的额度跑——Predict 本来就是分开算的——"
+     "/preopen 的“速度”行也会写出 Predict 应答里自己报的数和建议填多少（1.154.61）。"
+     "0 = 不填（预挂的 Key 照原来的速度，每分钟 220 次）。和下面的 General 两项都填了才生效（各自点保存，先填哪项都行）。填了之后（1.154.60）：预挂的下单撤单和读取各按各的额度跑——Predict 本来就是分开算的——"
      "机器人只用到限额的八成，并先扣掉主 Key、规则吃单 Key 可能用的份额（/preopen 会写出实际用的两个数）；挂单、撤后核对、重读的并发跟着放大。"
      "原来按“每把 Key 每分钟 240 次”自己限速，一天的场次全撤后挂回要约 3 小时；$50K 档（5000 / 5000）填上后模拟约 8 分钟。"
      "交易量档位变了（后台的数变了）记得回来改。填的数不对（抄成了另一个 App 的、档位降了）会被 Predict 拒绝（429）：机器人这时自己把被拒的那一类降到 Predict 实际放行的量以下，"
      "发通知并写在 /preopen 里，一直保持到改这两项或重启"),
     ("PREOPEN_APP_GENERAL_PER_MIN", "Predict 限额：General（每分钟）", "同一页上 “General … requests per minute” 的数（市场、盘口、账户读取等所有不是下单撤单的请求；比如 5000 或 1000）；0 = 不填。"
-     "和上面的 Trading 要一起填。这个额度是整个 App 共用的：盘口、原策略、规则吃单的读取也算在里面，所以这个数小的档位（比如 1000）撤后核对会比较慢——每张撤掉的单要读一次"),
+     "和上面的 Trading 两项都填了才生效。这个额度是整个 App 共用的：盘口、原策略、规则吃单的读取也算在里面，所以这个数小的档位（比如 1000）撤后核对会比较慢——每张撤掉的单要读一次"),
     ("PREOPEN_RATE_PER_MIN", "预挂专用 Key：每分钟请求数", "0 = 跟所有 Key 一样（PREDICT_RATE_PER_MIN，默认 220）；60～1000 = 只给预挂自己的 Key（PREOPEN_API_KEY，以及 PREOPEN_API_KEYS 里的每一把）单独定速，"
      "主 Key、盘口 Key 和规则吃单的 Key 不受影响（1.154.57）。超过 Predict 的限额会被拒绝（429）并让这把 Key 停约 20 秒"
      "（这 20 秒预挂不能下单也不能撤单，到了撤单时间的单靠签在单里的到期时间兜底）。"
      "1.154.60：Predict 的限额是按 App、按交易量档位给的，后台 Rate limits 页上写着（不是原来以为的每把 Key 每分钟 240 次）——"
-     "把那一页的两个数填进上面“Predict 限额”两项就行，不用再靠这一项一档一档试；填了那两项之后，这一项只是预挂那把 Key 的最低速度。"
+     "把那一页的两个数填进上面“Predict 限额”两项就行，不用再靠这一项一档一档试；填了那两项之后，这一项只是预挂那把 Key 的最低速度，一般留 0。"
      "该设多少：在 Telegram 发 /preopen 测速（1.154.58），机器人自己一档一档往上试，把这把 Key 的实际上限和建议值发给你——"
      "节拍要比上限低 20 左右，因为撤单可以预支名额、一分钟里最多会多出 16 次。平时单都挂着、这把 Key 没用满，调它看不出区别。没有专用 Key 时这一项不起作用"),
     ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "0～1000000，0 = 不限（默认）：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金，成交时才扣款；余额够一场双边就挂）；设了上限时每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放，/preopen 会算出把已发布的全部挂上需要多少"),
@@ -2093,8 +2098,9 @@ def predict_buckets_line(key: str, app: tuple[int, int] | None = None) -> str:
             elif said_read:
                 text += f"。→ “Predict 限额”的 General 可以填 {said_read}；Trading 等下单的应答带回来再看（下一次挂单后）"
         else:
-            notes = [f"填的 {name} {mine} 比 Predict 报的 {said} {'大——会被拒' if mine > said else '小，可以改大'}"
-                     for name, mine, said in (("Trading", app[0], said_trade), ("General", app[1], said_read)) if said and mine != said]
+            notes = [(f"还没填 {name}（两项都填了才生效）" + (f"，Predict 报的是 {said}" if said else "") if not mine
+                      else f"填的 {name} {mine} 比 Predict 报的 {said} {'大——会被拒' if mine > said else '小，可以改大'}")
+                     for name, mine, said in (("Trading", app[0], said_trade), ("General", app[1], said_read)) if not mine or (said and mine != said)]
             if notes:
                 text += "。→ " + "；".join(notes)
     return text
