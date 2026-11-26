@@ -8306,12 +8306,28 @@ class LiveBot(core.Bot):
             return "开盘前预挂模式未启用（PREOPEN_15M=off）；/preopen probe 只读探测市场列表的字段和现在会挂的场次，/preopen on 开启（也可在控制台改）"
         if action == "check":  # what is wrong now, in one message (1.130.1)
             return self.preopen.check()
+        if action in {"测速", "speed", "speedtest"}:  # 1.154.58: where Predict's limit for the mode's key really lies (preopen.Controller.speed_run)
+            word = req.args[1].lower() if len(req.args) > 1 else ""
+            if word in {"停", "停止", "stop", "off"}:
+                return self.preopen.speed_stop()
+            if word and not word.isdigit():
+                return "用法：/preopen 测速（测到每分钟 400 次为止）｜/preopen 测速 600（测到 600，最多 1000）｜/preopen 测速 停"
+            task, words = self.preopen.speed_start(int(word) if word else 0)
+            if task is not None:
+                async def told() -> None:  # the test takes minutes: its report when it is over, as the probe's is
+                    await asyncio.wait({task})
+                    from preopen import SPEED_LAST
+                    text = (task.result() if not task.cancelled() and task.exception() is None
+                            else str(SPEED_LAST.get("text") or "测速中止了，没有结果"))
+                    await self.reply(req, text)
+                self.preopen.speed_told = asyncio.create_task(told(), name="preopen-speed-told")  # (held: the loop keeps no task alive by itself)
+            return words
         if action in {"pause", "resume"}:
             self.preopen.manual_pause = self.preopen.ledger.pause(action == "pause")
             if action == "pause" and (line := await self.preopen.withdraw_all("管理员暂停开盘前模式")):
                 return line + "\n" + self.preopen.status()
         elif action:
-            return "用法：/preopen｜/preopen check｜/preopen on｜/preopen off｜/preopen pause｜/preopen resume｜/preopen probe"
+            return "用法：/preopen｜/preopen check｜/preopen on｜/preopen off｜/preopen pause｜/preopen resume｜/preopen probe｜/preopen 测速"
         return self.preopen.status() + self.preopen_share_line()
 
     async def run(self) -> int:

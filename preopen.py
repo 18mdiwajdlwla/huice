@@ -2016,6 +2016,28 @@ SPEED_SPAN_MS = 600_000         # 1.154.57: /preopen's 速度 line — the order
 SPEED_KEPT = 16384              #   ...that many of them kept (ten minutes at 1,600 a minute)
 SPEED_FULL = 0.9                #   a key that let through this share of its pace in the last minute is at its pace: only then does the pace bound the speed
 SPEED_EPISODE_S = 120.0         #   a 429 with none in this long before it began an episode: its minute's count is where the limit was met (those after a cooldown are not)
+# 1.154.58 — /preopen 测速 (Controller.speed_run): where Predict's limit for the mode's key really lies. The user, told Predict allows a
+# key 240 requests a minute: "这个加个测速的，检查下最大上限". The key's whole traffic — the mode's own requests and, filling what
+# they leave, reads made for the test — is paced a step at a time above what it runs at, each step held long enough for Predict's
+# minute to fill, until Predict answers the first 429 or the top is reached
+SPEED_TEST_STEPS = (240, 260, 280, 300, 330, 360, 400, 450, 500, 550, 600, 700, 800, 900, 1000)  # requests a minute: the key's pace, a step each
+SPEED_TEST_TOP = 400            # ...up to this one unless the command names another
+SPEED_TEST_STEP_S = 120.0       # a step holds its pace this long: any two minutes hold one whole minute of Predict's, however it cuts its minutes
+SPEED_TEST_STEP_MIN_S = 75.0    # ...or, where the mode's moments leave no stretch that long, as long as they do leave — this at the least (a minute and a
+#                                 quarter: what a limit counted over the last sixty seconds needs; one counted by the clock's minutes may let such a step pass)
+SPEED_TEST_WINDOW_S = 60.0      # the stretch a count is taken over (Predict's limit is a minute's)
+SPEED_TEST_CLEAR_S = 45.0       # a step ends this long, at least, before the mode's next cancel time, its next expected listing and the rule taker's next
+#                                 seconds: a 429 stops a client for twenty seconds, and Predict may refuse on to the end of its minute
+SPEED_TEST_AFTER_S = 20.0       # ...and begins this long after one of them
+SPEED_TEST_WAIT_S = 900.0       # no such stretch in this long: the test ends, saying what it waited for
+SPEED_TEST_TOTAL_S = 3600.0     # the whole test, at the most
+SPEED_TEST_WORKERS = 8          # the test's reads in flight at the most (its client's own gate: 1,000 a minute at a third of a second each need six)
+SPEED_TEST_LEAVE = 2.0          # tokens its reads leave in the key's bucket beyond a low read's (PredictApi.leave): every request of the mode's own goes first
+SPEED_TEST_REACHED = 0.95       # a step is held when the key let through this share of its pace over its last minute; less, and the pace was not reached
+SPEED_TEST_FAILS = 20           # reads of a step that failed otherwise than by a 429 (timeouts, a 5xx): the test ends
+SPEED_TEST_MARGIN = 20          # the pace advised lies this far under the limit found: a cancel may borrow ahead (PredictPacer.BURST), a minute then holds up to 16 more (the bucket from +8 down to −8)
+SPEED_TEST_TICK_S = 0.25        # a step looks for a 429 on the key this often
+SPEED_LAST: dict = {}           # the last test's outcome — {"at": ms, "line": ..., "text": ...} — kept across the controller's restarts (a changed setting makes a new one)
 FINALS_YIELD_S = 5.0            # 1.154.54: a withdrawn order's late final read waits while a pair is being placed or a known window re-read — this long
 FINALS_YIELD_STEP_S = 0.05      #   at the most, looking again this often (Controller.behind_placements)
 ALLOWANCE_MS = 60_000           # the exchange allowance is read again this often, not before every pair
@@ -2119,6 +2141,10 @@ class Controller:
         self.resumed = self.requoted = 0  # pairs taken over at this start; windows quoted again (superseded records) since
         self.placed_at: collections.deque = collections.deque(maxlen=SPEED_KEPT)  # (ms, window) of each order Predict accepted (place_pair): the status's 速度 (1.154.57)
         self.fastest = (0, 0)  # ...and the most of them in any one minute since the start, with when (note_speed)
+        self.speed_task: asyncio.Task | None = None  # /preopen 测速 under way (speed_run, 1.154.58)
+        self.speed_state: dict = {}  # ...what it has done so far: its steps' outcomes, what it does now (speed_progress)
+        self.speed_api: Any = None  # ...and the client its reads go out on (speed_client: made at the first test; the tests put their own in)
+        self.speed_told: Any = None  # ...and the task that hands its report to whoever asked (LiveBot.cmd_preopen)
         self.released_at: collections.deque = collections.deque(maxlen=4096)  # when a withdrawn pair was released (accounted, nothing filled: bookkeep) — the status's pace of the final reads (1.154.54)
         self.rereading = False  # a known window's re-read is out (reread_known): the late final reads wait for it (behind_placements, 1.154.54)
         self.card_holds: dict[str, str] = {}  # card key -> why its windows are not quoted now (card_hold: near the day's limit, halted)
@@ -3946,16 +3972,23 @@ class Controller:
     def poll_wait(self) -> float:
         """Seconds to the next discovery: FAST_POLL_S while a card's next listing is expected — a cycle after its last one
         seen, LISTING_EARLY_MS before to LISTING_LATE_MS after (or until it is seen) — else the poll setting."""
+        if self.sprinting():
+            return FAST_POLL_S
+        return min(LISTING_PROBE_S, float(self.settings.poll))  # the listings probed every LISTING_PROBE_S; the older windows re-read at the poll's pace (discovery_loop)
+
+    def sprinting(self) -> bool:
+        """Whether a card's next listing is expected about now (poll_wait: the discovery probes every FAST_POLL_S; the speed test
+        begins no step meanwhile)."""
         now = self.now()
         for key, at in self.listed_at.items():
             due = at + cycle_ms(key)
             if due - LISTING_EARLY_MS <= now <= due + LISTING_LATE_MS:
-                return FAST_POLL_S
+                return True
         lead = self.sprint_lead_ms()
         for entered in self.awaiting.values():  # 1.133.1: a card's next window in the range and not listed yet — Predict lists it about a minute after it enters (11-06: 85 s), whatever the last listing's time
             if lead <= now - entered <= lead + LISTING_LATE_MS:  # 1.154.0: from SPRINT_EARLY_MS before the soonest recent listing delay
-                return FAST_POLL_S
-        return min(LISTING_PROBE_S, float(self.settings.poll))  # the listings probed every LISTING_PROBE_S; the older windows re-read at the poll's pace (discovery_loop)
+                return True
+        return False
 
     def pace_line(self) -> str:
         """The key this mode's requests go out on and its pace (1.154.0): what /preopen says of the budget it shares or has alone.
@@ -4019,6 +4052,8 @@ class Controller:
             else:
                 usage = (f"{name}最近 1 分钟发出 {used} 次请求、节拍每分钟 {pace:g} 次——没用满（{used / pace:.0%}）：现在没有那么多要发的，"
                          "这时调高节拍看不出区别，要测上限得等有一批单在补挂的时候")
+            if self.speed_task is not None and not self.speed_task.done():
+                usage += "（正在测速：里面有测速的读请求）"
             if lent := self.lent_last():
                 usage += f"；另借规则吃单的 Key 走了 {lent} 次"
             parts.append(usage)
@@ -4037,6 +4072,408 @@ class Controller:
         if pairs_left and minute:
             parts.append(f"照最近一分钟的速度，已发布未挂的 {pairs_left} 档（{2 * pairs_left} 张单）还要约 {max(1, round(2 * pairs_left / len(minute)))} 分钟")
         return "\n速度：" + "；".join(parts)
+
+    # --- /preopen 测速 (1.154.58): where Predict's limit for the mode's key really lies ---------------------------------------
+    def speed_key(self) -> str:
+        return str(getattr(self.api, "api_key", "") or "")
+
+    def speed_refusal(self) -> str:
+        """Why the speed test cannot run now ("" when it can): it drives a key until Predict refuses a request, so only a key
+        that is the mode's alone; it sets each step's speed by the pacer; and it needs something to read."""
+        if self.stopped() or not self.alive:
+            return "预挂模式正在停止"
+        if self.winding:
+            return f"预挂在收尾中（{self.winding}）"
+        key, c = self.speed_key(), self.owner.config
+        if not key or key in {str(getattr(c, name, "") or "") for name in ("predict_api_key", "predict_book_api_key", "rule_api_key")}:
+            return ("预挂没有自己单独的 Key（PREOPEN_API_KEY 没填，或和主 Key、盘口 Key、规则吃单 Key 是同一把）——测速要把一把 Key 顶到被 Predict 拒绝一次，"
+                    "和原策略、盘口或规则吃单共用的 Key 不测")
+        if not core.PREDICT_PACING:
+            return "请求节流关着（PREDICT_PACING=off）——测速靠节流来定每一档的速度"
+        if self.speed_target() is None:
+            return "预挂现在没有挂着的单、也没读过市场，没有可以拿来读的东西；等挂上单再测"
+        return ""
+
+    def speed_target(self) -> tuple[bool, str] | None:
+        """What the test's reads ask for, (signed, path): one of the mode's own resting orders — the kind of read its final reads
+        are (GET /orders/{hash}), of the window farthest ahead, which rests longest — else a market it has read
+        (GET /markets/{id}); None with neither."""
+        best = None
+        for pair in self.ledger.pending():
+            if pair["phase"] == "active" and (best is None or pair["start_ms"] > best["start_ms"]) \
+                    and any(o.get("hash") and o["state"] == "open" for o in pair["orders"].values()):
+                best = pair
+        if best is not None:
+            digest = next(o["hash"] for o in best["orders"].values() if o.get("hash") and o["state"] == "open")
+            return True, f"/orders/{core.urllib.parse.quote(str(digest))}"
+        mid = next(reversed(self.details), None) if self.details else None
+        return (False, f"/markets/{core.urllib.parse.quote(str(mid))}") if mid else None
+
+    def speed_client(self) -> Any:
+        """The client the test's reads go out on: the mode's key; a cooldown of its own — Predict's refusal of one of its
+        reads stops no request of the mode's; the mode's sign-in; and, on the key's pace, behind every request of the mode's
+        (low, and SPEED_TEST_LEAVE more left in the bucket)."""
+        if self.speed_api is None:
+            import live
+            client = safe_api(live.API_BASES[self.owner.config.live_chain], self.speed_key(), self.owner.live.wallet)
+            client.low, client.leave = True, SPEED_TEST_LEAVE
+            client.read_gate, client.gate = asyncio.Semaphore(SPEED_TEST_WORKERS), asyncio.Semaphore(SPEED_TEST_WORKERS + 2)
+            client.jwt, client.jwt_exp, client.jwt_at = (getattr(self.api, "jwt", "") or "", getattr(self.api, "jwt_exp", 0) or 0,
+                                                         getattr(self.api, "jwt_at", 0.0) or 0.0)
+            self.speed_api = client
+        return self.speed_api
+
+    def speed_moments(self, now: int, ahead_ms: int) -> list[int]:
+        """The mode's moments a refusal's cooldown must not meet, from SPEED_TEST_AFTER_S ago to ``ahead_ms`` on, in order: the
+        cancel time of each pair that rests, each card's last listing seen, and its coming ones — a cycle after that, and on
+        by cycles (a card whose listing is overdue is not listing now: the discovery does not sprint for it either)."""
+        since, until = now - int(SPEED_TEST_AFTER_S * 1000), now + ahead_ms
+        out = {int(p.get("cancel_ms") or 0) for p in self.ledger.pending() if p["phase"] == "active" and since <= int(p.get("cancel_ms") or 0) <= until}
+        for key, at in self.listed_at.items():
+            if key not in self.settings.markets:
+                continue
+            if at >= since:
+                out.add(int(at))  # (the listing just seen: its orders are going out)
+            cycle = max(60_000, cycle_ms(key))
+            due = at + cycle
+            if due >= since:
+                while due <= until:
+                    out.add(due)
+                    due += cycle
+        return sorted(out)
+
+    def speed_free_at(self, now: int, need_s: float) -> int:
+        """The soonest ms, from ``now``, at which a step of ``need_s`` can begin: none of the mode's moments (speed_moments)
+        from SPEED_TEST_AFTER_S before it to SPEED_TEST_CLEAR_S after its end."""
+        after, need = int(SPEED_TEST_AFTER_S * 1000), int((need_s + SPEED_TEST_CLEAR_S) * 1000)
+        start = now
+        for moment in self.speed_moments(now, int(SPEED_TEST_WAIT_S * 1000) + need):
+            if moment < start - after:
+                continue
+            if moment > start + need:
+                break
+            start = moment + after + 1
+        return start
+
+    def speed_room(self, now: int) -> float:
+        """Seconds the longest stretch between the mode's moments of the next SPEED_TEST_WAIT_S leaves for a step, its margins
+        taken off (SPEED_TEST_AFTER_S after a moment, SPEED_TEST_CLEAR_S before the next): what a step can last at the most."""
+        after, clear, end = int(SPEED_TEST_AFTER_S * 1000), int(SPEED_TEST_CLEAR_S * 1000), now + int(SPEED_TEST_WAIT_S * 1000)
+        best, start = 0, now
+        for moment in self.speed_moments(now, end - now):
+            best = max(best, moment - clear - start)
+            start = max(start, moment + after)
+        return max(best, end - start) / 1000.0
+
+    async def speed_wait(self, need_s: float) -> str:
+        """Waits for a stretch a step fits in: none of the mode's moments near (speed_free_at), no listing expected about now
+        (sprinting), no cooldown, and the rule taker neither at its seconds nor due within the step (the bot's rules_clear).
+        "" when one begins now; else why none came in SPEED_TEST_WAIT_S, or that the mode is stopping."""
+        began = time.monotonic()
+        clear = getattr(self.owner, "rules_clear", None)
+        while not self.stopped():
+            now = self.now()
+            at = self.speed_free_at(now, need_s)
+            rules = not callable(clear) or bool(clear(need_s + SPEED_TEST_CLEAR_S))
+            what = ("" if at > now else "新场次正要发布" if self.sprinting() else "这把 Key 在限流冷却中" if self.cooldown()
+                    else "" if rules else "规则吃单在抢单时段")
+            if at <= now and not what:
+                return ""
+            what = what or "撤单 / 新场次发布的时刻"
+            if time.monotonic() - began >= SPEED_TEST_WAIT_S:
+                return f"等了 {SPEED_TEST_WAIT_S / 60:.0f} 分钟都没有等到能跑一档的空档（一直碰上：{what}），先停在这里；过了这段时间再发 /preopen 测速"
+            self.speed_state["note"] = (f"等空档——避开{what}" + (f"，约 {max(1, round((at - now) / 1000))} 秒后开始" if at > now else "")
+                                        + f"；下一档每分钟 {self.speed_state.get('next', 0)} 次")
+            await asyncio.sleep(max(0.05, min(2.0, (at - now) / 1000 if at > now else 2.0, SPEED_TEST_TICK_S * 8)))
+        return "预挂模式停止了"
+
+    async def speed_reader(self, client: Any, signed: bool, path: str, run: dict) -> None:
+        """One of a step's readers: the read again and again while the step runs, each one taking the key's token behind the
+        mode's own requests. A 429 ends the step (and says it was a read of the test's that met it), as does this client's
+        cooldown after one; a read that fails otherwise is counted — SPEED_TEST_FAILS of them end the step."""
+        import live
+        while run["on"]:
+            try:
+                await (client.authed("GET", path) if signed else client.call("GET", path))
+                run["sent"] += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                status, text = live.http_status(error), core.clean_error(error) or type(error).__name__
+                if status == 429 or "限流冷却中" in text:
+                    run["by"] = run["by"] or "测速的读请求"
+                    run["on"] = False
+                elif status == 404 or (not status and "应答不是已确认成功" in text):  # (Predict no longer knows that order, or says no to the
+                    run["sent"] += 1                                             #  read: answered all the same, and counted by its limiter)
+                else:
+                    run["fails"] += 1
+                    run["fail"] = text
+                    if run["fails"] >= SPEED_TEST_FAILS:
+                        run["on"] = False
+                    await asyncio.sleep(0.2)
+
+    def speed_others(self, pacer: Any) -> list[tuple[str, Any]]:
+        """The bot's other keys by name, each with its pacer — the bot's own, the orderbook feed's, the rule taker's: those
+        configured, that have sent anything, and are not the key under test (a key under two names once)."""
+        c, out, seen = self.owner.config, [], {id(pacer)}
+        for name, attr in (("主 Key", "predict_api_key"), ("盘口 Key", "predict_book_api_key"), ("规则吃单 Key", "rule_api_key")):
+            other = core.PREDICT_PACERS.get(str(getattr(c, attr, "") or "")) if getattr(c, attr, "") else None
+            if other is not None and id(other) not in seen:
+                seen.add(id(other))
+                out.append((name, other))
+        return out
+
+    def speed_counts(self, pacer: Any, moment: float) -> dict:
+        """What the key had let through when a request was refused (``moment``, monotonic: when that request went out): in the
+        minute before it, the sixth and the sixtieth of one, and since the clock's minute began (a limit counted by the
+        clock's minutes shows there) — every client's on the key — and the other keys' minute beside it."""
+        sent = [t for t in pacer.sent if t <= moment + 1e-6]
+        into = (time.time() - (time.monotonic() - moment)) % 60.0
+        count = lambda span: sum(1 for t in sent if t > moment - span)
+        others = [(name, sum(1 for t in other.sent if moment - SPEED_TEST_WINDOW_S < t <= moment + 1e-6)) for name, other in self.speed_others(pacer)]
+        return {"minute": count(SPEED_TEST_WINDOW_S), "sixth": count(SPEED_TEST_WINDOW_S / 6), "sixtieth": count(SPEED_TEST_WINDOW_S / 60),
+                "clock": count(into), "into": into, "others": others}
+
+    async def speed_step(self, pace: int, client: Any, signed: bool, path: str) -> dict:
+        """One step: the key paced to ``pace`` for the test's step length, the readers filling what the mode's own requests leave,
+        and over at the first 429 on the key — whoever met it (the pacer notes each: PredictPacer.limits). Over, too, at a 429
+        on another of the bot's keys: Predict's limit may not be a key's alone (an address's, the account's), and the model
+        trader's key and the rule taker's are not to be driven into theirs — the test ends there. The key's pace is the
+        configured one again when this returns, however it ends.
+        → {"pace", "verdict": held | short | refused | elsewhere | failed | stopped, "seconds", ...}"""
+        import live
+        key = self.speed_key()
+        pacer = core.predict_pacer(key)
+        run = {"on": True, "sent": 0, "fails": 0, "fail": "", "by": "", "went": 0.0, "noted": 0.0}
+        hold = float(self.speed_state.get("step_s") or SPEED_TEST_STEP_S)
+        real_send = client.send
+
+        async def send(method: str, path_: str, payload: Any, timeout: int) -> Any:
+            """The client's own send, and of the first read of the test's that was refused: when it went out, and which of the
+            pacer's notes is its (the client's send has just made it)."""
+            went = time.monotonic()
+            try:
+                return await real_send(method, path_, payload, timeout)
+            except Exception as error:
+                if live.http_status(error) == 429 and not run["went"]:
+                    run["went"], run["noted"] = went, pacer.limits[-1][0] if pacer.limits else 0.0
+                raise
+        mark = pacer.limits[-1][0] if pacer.limits else float("-inf")
+        last_429 = lambda other: other.limits[-1][0] if other.limits else float("-inf")
+        elsewhere = lambda: next(((name, other) for name, other in self.speed_others(pacer) if last_429(other) > began), None)
+        said_before = float((core.PREDICT_LIMITS_SAID.get(key) or {}).get("refused_at") or 0.0)
+        out = {"pace": pace, "verdict": "", "seconds": 0.0, "mine": 0}
+        began = time.monotonic()
+        readers: list[asyncio.Task] = []
+        try:
+            client.send = send
+            core.PREDICT_RATE_TEST[key] = float(pace)
+            core.predict_pacer(key)  # (the pacer takes its pace when asked for: in force from here)
+            readers = [asyncio.create_task(self.speed_reader(client, signed, path, run), name=f"preopen-speed-{i}") for i in range(SPEED_TEST_WORKERS)]
+            while run["on"] and time.monotonic() - began < hold and not self.stopped():
+                self.speed_state["note"] = (f"第 {len(self.speed_state.get('steps', ())) + 1} 档，每分钟 {pace} 次：已保持 {time.monotonic() - began:.0f} / "
+                                            f"{hold:.0f} 秒，没被拒绝")
+                await asyncio.sleep(SPEED_TEST_TICK_S)
+                if (pacer.limits and pacer.limits[-1][0] > mark) or elsewhere() is not None:
+                    break
+        finally:
+            run["on"] = False
+            core.PREDICT_RATE_TEST.pop(key, None)
+            core.predict_pacer(key)
+            for task in readers:
+                task.cancel()
+            await asyncio.gather(*readers, return_exceptions=True)
+            client.__dict__.pop("send", None)
+        ended = time.monotonic()
+        out.update(seconds=ended - began, mine=run["sent"])
+        first = next((at for at, _ in pacer.limits if at > mark), None)
+        if first is not None:
+            mine = bool(run["went"]) and run["noted"] == first  # the key's first 429 of the step was a read of the test's — else a request of the mode's own
+            moment = run["went"] if mine else first
+            said = core.PREDICT_LIMITS_SAID.get(key) or {}
+            out.update(verdict="refused", seconds=moment - began, by="测速的读请求" if mine else "预挂自己的请求", **self.speed_counts(pacer, moment),
+                       said=dict(said.get("refused") or {}) if float(said.get("refused_at") or 0.0) > said_before else None)
+        elif (hit := elsewhere()) is not None:
+            at = last_429(hit[1])
+            out.update(verdict="elsewhere", seconds=at - began, where=hit[0], theirs=sum(1 for t in hit[1].sent if at - SPEED_TEST_WINDOW_S < t <= at + 1e-6),
+                       minute=sum(1 for t in pacer.sent if at - SPEED_TEST_WINDOW_S < t <= at + 1e-6))
+        elif run["fails"] >= SPEED_TEST_FAILS:
+            out.update(verdict="failed", why=run["fail"])
+        elif self.stopped():
+            out.update(verdict="stopped")
+        else:
+            span = min(SPEED_TEST_WINDOW_S, ended - began)
+            got = sum(1 for t in pacer.sent if t > ended - span)
+            out.update(verdict="held" if got >= SPEED_TEST_REACHED * pace * span / 60.0 else "short", got=got, span=span,
+                       rate=got * 60.0 / span if span > 0 else 0.0)
+        return out
+
+    async def speed_run(self, steps: list[int]) -> str:
+        """/preopen 测速: the steps one after another, each in a stretch free of the mode's moments (speed_wait), to the first
+        one that is not held — refused by Predict, the pace not reached, reads failing — or the top. The report (speed_report);
+        the last test's is kept (SPEED_LAST) whether this returns or is cancelled (a stop, the mode restarting)."""
+        state, key, why = self.speed_state, self.speed_key(), ""
+        began = time.monotonic()
+        try:
+            client, target = self.speed_client(), self.speed_target()
+            if target is None:
+                why = "没有可以拿来读的东西了（挂着的单都撤了）"
+            else:
+                state["reads"] = "预挂自己的一张挂单" if target[0] else "一个市场的详情"
+                for pace in steps:
+                    state["next"] = pace
+                    if time.monotonic() - began > SPEED_TEST_TOTAL_S:
+                        why = f"已经测了 {SPEED_TEST_TOTAL_S / 60:.0f} 分钟，先停在这里"
+                        break
+                    if why := await self.speed_wait(float(state.get("step_s") or SPEED_TEST_STEP_S)):
+                        break
+                    step = await self.speed_step(pace, client, *target)
+                    state["steps"].append(step)
+                    if step["verdict"] != "held":
+                        break
+        except asyncio.CancelledError:
+            why = state.get("ended") or "中止了（预挂模式重启，或部署）"
+            raise
+        except Exception as error:
+            why = f"出错中止：{core.clean_error(error) or type(error).__name__}"
+            LOG.warning("开盘前预挂测速：%s", why)
+        finally:
+            core.PREDICT_RATE_TEST.pop(key, None)
+            core.predict_pacer(key)
+            state.update(running=False, ended=why, took=time.monotonic() - began, note="")
+            try:
+                text, line = self.speed_report(state)
+            except Exception as error:  # (the report is words about what is over: its failure ends nothing, and hides no cancellation)
+                text = line = f"测速结束了，但报告没有写出来：{core.clean_error(error) or type(error).__name__}"
+                LOG.warning("开盘前预挂测速：%s", text)
+            SPEED_LAST.clear()
+            SPEED_LAST.update(at=self.now(), text=text, line=line)
+        return text
+
+    def speed_report(self, state: dict) -> tuple[str, str]:
+        """(the test's report, its conclusion in a line for the status): each step's outcome in order, then what it says of
+        the limit — at most one less than the key's minute when Predict refused, at least what the last step held — and the
+        pace that leaves a cancel's borrowing room under it (SPEED_TEST_MARGIN), against the pace in force."""
+        key = self.speed_key()
+        now_pace = core.predict_rate(key)
+        steps, marks = state.get("steps") or [], "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮"
+        lines = [f"🧪 预挂专用 Key 测速（{hms(int(state.get('began_ms') or self.now()))} 开始，用时 {max(1, round(float(state.get('took') or 0) / 60))} 分钟；"
+                 f"读的是{state.get('reads') or '——'}，排在预挂自己的请求后面）"]
+        held = [s for s in steps if s["verdict"] == "held"]
+        refused = next((s for s in steps if s["verdict"] == "refused"), None)
+        for i, s in enumerate(steps):
+            head = f"{marks[i] if i < len(marks) else str(i + 1) + '.'} 每分钟 {s['pace']} 次："
+            if s["verdict"] == "held":
+                lines.append(head + f"保持了 {s['seconds']:.0f} 秒，没被拒绝（最后 {s['span']:.0f} 秒这把 Key 实发 {s['got']} 次，合每分钟 {s['rate']:.0f} 次）")
+            elif s["verdict"] == "short":
+                lines.append(head + f"没被拒绝，但没发到这个速度——最后 {s['span']:.0f} 秒这把 Key 只发了 {s['got']} 次（合每分钟 {s['rate']:.0f} 次）：请求往返太慢，再往上这次测不出来")
+            elif s["verdict"] == "refused":
+                others = "；同一分钟" + "、".join(f"{name} {n} 次" for name, n in s["others"]) if s.get("others") else ""
+                said = ("；Predict 这次拒绝的应答" + ("带的是：" + "、".join(f"{k} {v}" for k, v in s["said"].items()) if s["said"] else "没有带限额信息")
+                        if s.get("said") is not None else "")
+                lines.append(head + f"第 {max(0.0, s['seconds']):.0f} 秒被拒绝（429），被拒的是{s['by']}——那一刻这把 Key 最近 {SPEED_TEST_WINDOW_S:.0f} 秒发了 {s['minute']} 次"
+                             f"（含被拒的这一次），最近 {SPEED_TEST_WINDOW_S / 6:.0f} 秒 {s['sixth']} 次、最近 {SPEED_TEST_WINDOW_S / 60:.0f} 秒 {s['sixtieth']} 次；"
+                             f"按钟表上的整分钟算，这一分钟（已过 {s['into']:.0f} 秒）发了 {s['clock']} 次" + others + said)
+            elif s["verdict"] == "elsewhere":
+                lines.append(head + f"第 {max(0.0, s['seconds']):.0f} 秒，{s['where']}（不是在测的这一把）被 Predict 拒绝了一次（429），测速马上停了——那一刻在测的这把 Key 最近 "
+                             f"{SPEED_TEST_WINDOW_S:.0f} 秒发了 {s['minute']} 次、没被拒绝，{s['where']}自己最近 {SPEED_TEST_WINDOW_S:.0f} 秒发了 {s['theirs']} 次。"
+                             f"可能是巧合（{s['where']}自己发到了上限），也可能 Predict 的限额不只按 Key 算（比如还按 IP 或按账户）：先别再往上测，发 /diag 看各把 Key 的 429")
+            elif s["verdict"] == "failed":
+                lines.append(head + f"读请求连续失败（不是被拒绝）：{s.get('why') or '原因不明'}——没测成")
+            else:
+                lines.append(head + "中途停了")
+        if state.get("ended"):
+            lines.append("中途结束：" + str(state["ended"]))
+        best = max((s["rate"] for s in held), default=0.0)
+        if refused is not None:
+            scale = 60.0 / SPEED_TEST_WINDOW_S  # (a count over the window as a minute's: the same figure, the window being the minute)
+            top = max(1, round((int(refused["minute"]) - 1) * scale))
+            # Predict may count the last sixty seconds, or the clock's minutes — the refused request then was one past the limit
+            # in the minute under way, which is fewer than in the last sixty seconds. That reading stands only where it does
+            # not contradict what was held (a step held two minutes had one whole clock minute at its pace; with none held,
+            # the pace the key has long run at): then the limit lies between the two, and the lower one is what to go by
+            floor = best if held else now_pace
+            clock = int(refused.get("clock") or 0) - 1
+            limit = clock if SPEED_TEST_WINDOW_S == 60.0 and floor * 0.98 <= clock < top else top
+            advised = (limit - SPEED_TEST_MARGIN) // 5 * 5
+            odd = bool(held) and refused["minute"] * scale < best * 0.9
+            line = ((f"这把 Key 一分钟最多约 {limit} 次" if limit == top else
+                     f"这把 Key 一分钟最多 {limit}～{top} 次（Predict 要是按钟表上的整分钟计数，就是 {limit}：被拒的是那一分钟里的第 {clock + 1} 次；按 {limit} 算）")
+                    + (f"（每分钟 {held[-1]['pace']} 次那一档整整保持住了）" if held else "（第一档就被拒绝了）"))
+            lines.append("结论：" + line + "。"
+                         + ("但被拒绝时一分钟里的请求数比上一档保持住的还少：Predict 的限额可能不只按每分钟算（比如还按更短的时间），或者这把 Key 还有别处在用——这个数只能当参考。" if odd else ""))
+            if advised > now_pace + 1e-9:
+                lines.append(f"建议：把控制台“预挂专用 Key：每分钟请求数”设成 {advised}（比上限低 {SPEED_TEST_MARGIN}：撤单可以预支名额，一分钟里最多会多出 16 次）。"
+                             f"现在是 {now_pace:g}，能快约 {(advised / now_pace - 1) * 100:.0f}%。" if now_pace > 0 else
+                             f"建议：把控制台“预挂专用 Key：每分钟请求数”设成 {advised}（比上限低 {SPEED_TEST_MARGIN}）。")
+            else:
+                lines.append(f"建议：不用改。现在的节拍每分钟 {now_pace:g} 次已经是贴着上限的安全值（撤单可以预支名额，一分钟里最多会多出 16 次，所以要比上限低 {SPEED_TEST_MARGIN} 左右）"
+                             "——单靠这一把 Key 没有再提速的余地，要更快只能再加一把预挂用的 Key，或者减少每场要发的请求。")
+        elif held:
+            top = held[-1]["pace"]
+            line = f"到每分钟 {top} 次都没被拒绝，上限不低于 {best:.0f}"
+            more = next((p for p in SPEED_TEST_STEPS if p > top), 0)
+            lines.append("结论：" + line + f"（每档保持 {float(state.get('step_s') or SPEED_TEST_STEP_S):.0f} 秒）。"
+                         + (f"想知道到底多高，发 /preopen 测速 {min(SPEED_TEST_STEPS[-1], max(more, top * 3 // 2 // 50 * 50))}。" if more and steps[-1]["verdict"] == "held" and not state.get("ended") else "")
+                         + (f"想先用上，把控制台“预挂专用 Key：每分钟请求数”设成 {int(top) - SPEED_TEST_MARGIN}。"
+                            if top - SPEED_TEST_MARGIN > now_pace and steps[-1]["verdict"] != "elsewhere" else ""))
+        else:
+            line = "没有测出结果" + (f"（{state['ended']}）" if state.get("ended") else "")
+            lines.append("结论：" + line + "。")
+        lines.append(f"测速已结束，这把 Key 的节拍是每分钟 {now_pace:g} 次（和测之前一样）。说明：量的是读请求；下单请求如果另有单独的限额，这个测不出来。")
+        return "\n".join(lines), line
+
+    def speed_progress(self) -> str:
+        """What the test under way has done and does now, in a line (the status, and the command asked again meanwhile)."""
+        state = self.speed_state
+        done = "、".join(f"{s['pace']} {'通过' if s['verdict'] == 'held' else '被拒绝' if s['verdict'] == 'refused' else '别的 Key 被拒绝' if s['verdict'] == 'elsewhere' else '没测成'}"
+                        for s in state.get("steps") or ())
+        return (f"{hms(int(state.get('began_ms') or self.now()))} 开始，要测每分钟 " + "、".join(str(p) for p in state.get("paces") or ()) + " 次这几档"
+                + (f"；已完成：{done}" if done else "") + (f"；现在：{state['note']}" if state.get("note") else ""))
+
+    def speed_start(self, top: int = 0) -> tuple[Any, str]:
+        """/preopen 测速 [top]: (the test's task, what to say now); (None, why) when none starts — one is under way, or
+        speed_refusal."""
+        if self.speed_task is not None and not self.speed_task.done():
+            return None, "测速已经在跑（/preopen 测速 停 可以中止）：" + self.speed_progress()
+        if why := self.speed_refusal():
+            return None, "❌ 现在不能测速：" + why
+        # how long a step lasts: SPEED_TEST_STEP_S, or what the mode's moments leave room for where that is less (no shorter than the least)
+        room = self.speed_room(self.now())
+        hold = SPEED_TEST_STEP_S if room >= SPEED_TEST_STEP_S else float(int(room // 5) * 5)
+        if hold < min(SPEED_TEST_STEP_MIN_S, SPEED_TEST_STEP_S):
+            return None, (f"❌ 现在不能测速：撤单 / 新场次发布的时刻排得太密——接下来 {SPEED_TEST_WAIT_S / 60:.0f} 分钟里最长的空档只够一档跑 {max(0.0, room):.0f} 秒，"
+                          f"至少要 {SPEED_TEST_STEP_MIN_S:.0f} 秒（每档前后还要各留 {SPEED_TEST_AFTER_S:.0f} 和 {SPEED_TEST_CLEAR_S:.0f} 秒）")
+        top = min(SPEED_TEST_STEPS[-1], max(SPEED_TEST_STEPS[0], int(top or SPEED_TEST_TOP)))
+        steps = [pace for pace in SPEED_TEST_STEPS if pace <= top]
+        self.speed_state = {"running": True, "began_ms": self.now(), "paces": steps, "steps": [], "note": "", "ended": "", "next": steps[0], "step_s": hold}
+        self.speed_task = asyncio.create_task(self.speed_run(steps), name="preopen-speed")
+        return self.speed_task, (
+            f"🧪 开始测速：把预挂专用 Key 的请求一档一档往上顶——每分钟 {'、'.join(str(p) for p in steps)} 次，每档保持 {hold:.0f} 秒"
+            + (f"（空档不够 {SPEED_TEST_STEP_S:.0f} 秒，这次缩短了）" if hold < SPEED_TEST_STEP_S else "") + "，"
+            "到 Predict 第一次拒绝（429）或到顶为止。\n"
+            "· 用的是只读请求（反复读预挂自己的一张挂单），排在预挂自己的请求后面，挂单、撤单照常。\n"
+            "· 每一档只在“撤单 / 新场次发布 / 规则吃单抢单”之间的空档里跑，所以有 5 分钟卡时大约每 5 分钟才跑一档；等不到空档会说明原因后停下。\n"
+            "· 被拒绝的那一下，这把 Key 上预挂自己的请求也可能被拒绝一次、停约 20 秒——已经避开撤单和发布的时刻。\n"
+            "· 测的过程中如果别的 Key（主 Key、盘口、规则吃单）被 Predict 拒绝，测速马上停并说明：那说明限额可能不只按 Key 算。\n"
+            f"· 测完节拍自动回到现在的每分钟 {core.predict_rate(self.speed_key()):g} 次，结果发给你；/preopen 能看进度，/preopen 测速 停 可以中止。")
+
+    def speed_stop(self) -> str:
+        """/preopen 测速 停: the test under way ended, the key's pace as configured at once."""
+        task = self.speed_task
+        if task is None or task.done():
+            return "现在没有在跑的测速。" + (f"上次（{hms(int(SPEED_LAST['at']))}）：{SPEED_LAST['line']}" if SPEED_LAST.get("line") else "")
+        self.speed_state["ended"] = "手动停止"
+        core.PREDICT_RATE_TEST.pop(self.speed_key(), None)
+        core.predict_pacer(self.speed_key())
+        task.cancel()
+        return f"测速已中止，这把 Key 的节拍回到每分钟 {core.predict_rate(self.speed_key()):g} 次。"
+
+    def speed_test_line(self) -> str:
+        """The status's line on the speed test: the one under way, else the last one's conclusion."""
+        if self.speed_task is not None and not self.speed_task.done():
+            return "\n测速：进行中——" + self.speed_progress() + "（/preopen 测速 停 可以中止）"
+        return f"\n上次测速（{when(int(SPEED_LAST['at']), self.now())}）：{SPEED_LAST['line']}（重新测：/preopen 测速）" if SPEED_LAST.get("line") else ""
 
     def borrow_line(self) -> str:
         """What /preopen says of the rule taker's key (1.154.21): borrowed now and how much went out on it, or why not."""
@@ -4194,7 +4631,7 @@ class Controller:
                     if job.done() and not job.cancelled() and job.exception():
                         raise job.exception()
             finally:
-                bulk = [task for task in (self.bulk_task, self.lent_warm, self.first_warm) if task is not None]  # (first_warm: 1.154.33)
+                bulk = [task for task in (self.bulk_task, self.lent_warm, self.first_warm, self.speed_task) if task is not None]  # (first_warm: 1.154.33; the speed test: 1.154.58)
                 for job in [*stops, *jobs, *bulk]:
                     job.cancel()
                 await asyncio.gather(*stops, *jobs, *bulk, return_exceptions=True)
@@ -4369,6 +4806,7 @@ class Controller:
                 + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {reserved + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，新发布的先挂，其余按开场先后补挂中") if pairs_left else "")
                 + self.finals_line()
                 + self.speed_line(pairs_left)
+                + self.speed_test_line()
                 + (f"\n请求约 {self.request_rate():.1f} 次/秒（最近一分钟）；" if self.request_rate() is not None else "\n")
                 + self.pace_line()
                 + f"账户快照每 {self.account_interval_s():.0f} 秒（{self.account_pages} 页挂单" + self.page_rows_note()
