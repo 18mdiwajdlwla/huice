@@ -3010,6 +3010,43 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((up["state"], up.get("refused"), pair.get("accounted"), ctl.supersedable(pair), pair["phase"]), ("removed", True, None, False, "closed"))
         await self.read_finals(ctl, clock, pair)
         self.assertEqual((up["state"], up.get("refused"), pair["accounted"], ctl.supersedable(pair)), ("final", True, True, False))
+        # 1.154.65: why, as its record said it; and quoted again REFUSED_RETRY_MS after the refusal while the window is far enough
+        # ahead (a refused post-only bid fills nothing: the book may have moved). It was never quoted again
+        self.assertEqual((up.get("refused_why"), pair["refused_ms"]), ("REJECTED", NOW + 10_000))
+        self.assertEqual(p.refusal_words(pair), "挂上后被 Predict 作废（REJECTED，多半是 post-only 会吃单）")
+        self.assertIn("\n被拒后等重挂：1 档——按原因：挂上后被 Predict 作废（REJECTED，多半是 post-only 会吃单） 1 档；被拒 10 分钟后再挂一次（每档最多 3 次）", ctl.status())
+        self.assertNotIn("不再报价", ctl.status())
+        unplaced_with = lambda refused: (up.__setitem__("refused", refused), ctl.unplaced()[1])[1]
+        self.assertEqual(unplaced_with(True), unplaced_with(False), "to be quoted again: among the levels still to place, as any other")
+        up["refused"] = True
+        refused_at = clock.ms
+        # ...not within REFUSED_RETRY_AHEAD_MS of the start: refused for good, said so — and not counted among the levels to place
+        clock.ms = pair["start_ms"] - p.REFUSED_RETRY_AHEAD_MS + 1
+        self.assertFalse(ctl.supersedable(pair))
+        self.assertIn("\n不再报价：1 档被 Predict 拒绝——按原因：挂上后被 Predict 作废（REJECTED，多半是 post-only 会吃单） 1 档；如 ", ctl.status())
+        self.assertIn("（开场前 30 分钟内的、或这一档已经试满 3 次的不再重挂）", ctl.status())
+        self.assertEqual(unplaced_with(True), unplaced_with(False) - 1, "refused for good: not among the levels still to place")
+        up["refused"] = True
+        # the window far enough ahead and the wait over: quoted again
+        clock.ms = pair["refused_ms"] + p.REFUSED_RETRY_MS
+        self.assertTrue(ctl.supersedable(pair))
+        ctl.full_scan_ms = 0
+        await ctl.discover()
+        queued = ctl.queue.get_nowait()[2]
+        self.assertEqual((queued["slug"], queued["attempt"]), (c["slug"], 1), "quoted again under a salt of its own")
+        ctl.queued.discard(c["slug"])
+        clock.ms = refused_at
+        # an outright refusal: Predict's answer, in words where it is a known kind, as it came where it is not
+        self.assertEqual(p.refusal_kind("下单被拒绝：HTTP 400: post-only order would cross"), "post-only 会吃单（挂价碰到了对面已有的卖价）")
+        for text, words in (("HTTP 400: insufficient balance", "余额不足"), ("HTTP 400: allowance too low", "授权额度不足"),
+                            ("HTTP 400: expiration must be at least 120s", "到期时间不合规"), ("HTTP 400: market is closed", "市场现在不接受下单"),
+                            ("HTTP 400: invalid tick size for price", "价格不合规"), ("HTTP 400: bad signature", "订单签名或字段被拒"),
+                            ("HTTP 400: something new", "HTTP 400: something new"), ("", "没说原因")):
+            self.assertEqual(p.refusal_kind(text), words, text)
+        rejected = {**pair, "orders": {"up": {"state": "rejected", "error": "下单被拒绝：HTTP 400: post-only order would cross"},
+                                       "down": {"state": "rejected", "error": "HTTP 429", "limited": True}}}
+        self.assertEqual((p.refused_pair(rejected), p.refusal_words(rejected)), (True, "post-only 会吃单（挂价碰到了对面已有的卖价）"))
+        self.assertFalse(p.refused_pair({**pair, "orders": {"up": {"state": "rejected", "limited": True}}}), "the rate limiter's: no refusal of Predict's")
         # a record Predict still shows open past the give-up: final as known
         stuck = {**pair, "slug": "btc-updown-15m-stuck", "phase": "closing", "accounted": False,
                  "orders": {"up": {"hash": "0xstuck", "id": "77", "state": "removed", "filled": 0.0}}}

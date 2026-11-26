@@ -104,7 +104,14 @@ SKIP_RETRY_MS = 60_000    # a listed window that is no candidate (a missing fiel
 MONITOR_MS = 5_000        # an active pair's orders are looked at this often (monitor_pair), the first look 10 s after the placement
 SEND_MIN_LEFT_MS = 60_000  # an order is not sent with less than this left to its expiry
 DUPLICATE_WORDS = ("already exist", "already placed", "duplicate", "exists")  # Predict has the order: not a refusal
-REFUSED_STATUSES = {"REJECTED", "INVALIDATED", "FAILED"}  # an order's record ending so with nothing filled: Predict's deferred refusal (not quoted again)
+REFUSED_STATUSES = {"REJECTED", "INVALIDATED", "FAILED"}  # an order's record ending so with nothing filled: Predict's deferred refusal
+# 1.154.65 — a level Predict refused is quoted again this long after the refusal, while its window starts this far ahead or more (and
+# within MAX_ATTEMPTS: a refusal counts as one). It never was: "the same order would be refused again" — but the commonest refusal,
+# a post-only bid that would cross, is a book's state, and books move (11-26, another deployment: 645 levels "不再报价" after a
+# backlog was placed soonest first, the examples all starting within minutes). A refused order fills nothing: the cost is requests
+REFUSED_RETRY_MS = 10 * 60_000
+REFUSED_RETRY_AHEAD_MS = 30 * 60_000
+REFUSAL_FIELDS = ("statusReason", "reason", "rejectReason", "rejectionReason", "cancelReason", "message")  # where an ended order's record may say why
 FILLED_STATUSES = {"FILLED", "COMPLETED", "DONE", "MATCHED"}  # a record that says so without an amount filled: the whole order, by its own word
 ERRORS_KEPT = 20          # the last problems kept with their time (/preopen check)
 STUCK_MS = 15 * 60_000    # a withdrawn pair not cleared this long past its cancel time is announced (check_stuck)
@@ -1249,6 +1256,47 @@ def awaiting_finals(pair: dict, now_ms: int, days: int = 3) -> int:
     end = int(pair.get("expires") or 0) * 1000 or int(pair.get("start_ms") or 0)  # (resting_orders' own end)
     return sum(1 for o in (pair.get("orders") or {}).values()
                if o.get("state") == "removed" or (now_ms >= end and o.get("state") in {"open", "placing", "unknown"}))
+
+
+def refused_pair(pair: dict) -> bool:
+    """Whether Predict refused one of the pair's orders — outright (rejected: not the rate limiter's) or once on the book (a
+    deferred refusal: refused)."""
+    return any(o["state"] == "rejected" and not o.get("limited") or o.get("refused") for o in pair["orders"].values())
+
+
+def refusal_words(pair: dict) -> str:
+    """Why Predict refused the pair, in a few words for the status (1.154.65): the first refused order's — a deferred refusal by
+    its record's status, an outright one by Predict's answer, named where it is one of the known kinds, else as it came."""
+    for o in pair["orders"].values():
+        if o.get("refused"):
+            why = str(o.get("refused_why") or "")
+            return f"挂上后被 Predict 作废（{why or '没说原因'}，多半是 post-only 会吃单）"
+    for o in pair["orders"].values():
+        if o["state"] == "rejected" and not o.get("limited"):
+            return refusal_kind(str(o.get("error") or ""))
+    return ""
+
+
+def refusal_kind(text: str) -> str:
+    """Predict's refusal of an order in words: post-only would cross, the balance, the allowance, the expiry, the market not
+    taking orders, the price, the signature — else the answer as it came (its first 60 characters)."""
+    low = text.lower()
+    if ("post" in low and "only" in low) or "cross" in low or "would match" in low or "would take" in low:
+        return "post-only 会吃单（挂价碰到了对面已有的卖价）"
+    if "insufficient" in low or "balance" in low or "collateral" in low or "fund" in low:
+        return "余额不足"
+    if "allowance" in low or "approv" in low:
+        return "授权额度不足"
+    if "expir" in low:
+        return "到期时间不合规"
+    if any(w in low for w in ("not open", "closed", "paused", "halt", "resolved", "not active", "inactive", "not tradable", "trading is", "trading not",
+                              "not trading", "trading disabled")):
+        return "市场现在不接受下单"
+    if "tick" in low or "price" in low:
+        return "价格不合规"
+    if "signature" in low or "nonce" in low or "salt" in low:
+        return "订单签名或字段被拒"
+    return (text.strip() or "没说原因")[:60]
 
 
 def counts_against(pair: dict) -> bool:
@@ -3133,11 +3181,18 @@ class Controller:
             return False
         if pair["start_ms"] - self.now() < self.settings.timing(str(pair.get("key") or "")).entry_seconds * 1000:
             return False
-        if any(o["state"] == "rejected" and not o.get("limited") or o.get("refused") for o in pair["orders"].values()):
-            return False  # Predict's refusal, outright or deferred (monitor_pair): the same order would be refused again
+        if refused_pair(pair) and not self.refused_retry_due(pair):
+            return False  # Predict's refusal, outright or deferred (monitor_pair): quoted again once refused_retry_due (1.154.65)
         if strikes is None:
             strikes = self.ledger.strikes().get(record_key(pair), 0)
         return strikes < MAX_ATTEMPTS
+
+    def refused_retry_due(self, pair: dict) -> bool:
+        """Whether a pair Predict refused is to be quoted again now (1.154.65): REFUSED_RETRY_MS since the refusal (an older
+        record's: since it was made), its window starting REFUSED_RETRY_AHEAD_MS or more on. The failures' cap (a refusal is
+        one) is supersedable's, as for every withdrawal."""
+        since = int(pair.get("refused_ms") or pair.get("created_ms") or 0)
+        return self.now() - since >= REFUSED_RETRY_MS and int(pair["start_ms"]) - self.now() >= REFUSED_RETRY_AHEAD_MS
 
     async def on_stop(self) -> None:
         """The way out: the orders are withdrawn when the mode is switched off or crashed; they stay on the book when the
@@ -3600,6 +3655,7 @@ class Controller:
                     # 1.154.26 (the audit of 11-18, 3): ...but not a bare 409 Conflict — Predict, or a gateway before it, holding
                     # that hash (the model trader's reading since 1.150.0): unknown below, its hash and its money kept
                     order.update(state="rejected", error=text)
+                    pair["refused_ms"] = self.now()  # (1.154.65: quoted again REFUSED_RETRY_MS on, supersedable)
                 else:
                     # A timeout, malformed answer or duplicate response does not prove
                     # no order exists. Keep its hash and full reservation; do not retry.
@@ -3964,7 +4020,12 @@ class Controller:
                 if order["filled"] <= 0:
                     rejected = True
                     if str(row.get("status") or "").upper() in REFUSED_STATUSES:
-                        order["refused"] = True  # Predict's deferred refusal (a post-only order that would cross): the window is not quoted again
+                        # Predict's deferred refusal (a post-only order that would cross) — what its record says of it, and when
+                        # (1.154.65: the status's reasons; quoted again REFUSED_RETRY_MS on, supersedable)
+                        order["refused"] = True
+                        why = next((str(row.get(f)) for f in REFUSAL_FIELDS if row.get(f)), "")
+                        order["refused_why"] = (str(row.get("status") or "").upper() + (f"：{why}" if why else ""))[:120]
+                        pair["refused_ms"] = self.now()
         if read:
             # Audit PRE-MONITOR-SAVES: saved only when a record was read (a fill or a final state may have changed). checked_ms
             # is pacing only (the same dict sits in ledger.rows, so the next look is paced from memory; after a restart a
@@ -5197,10 +5258,12 @@ class Controller:
         return (f"\n撤后待核对：{waiting} 条（撤掉的单要在撤后 {LATE_FILL_MS // 1000} 秒逐张读一次成交，确认没成交才释放、才能重新挂；"
                 f"离开场近的先读，读完一场重挂一场，新发布的场次不受影响；{pace}）")
 
-    def unquotable(self) -> tuple[list[dict], list[dict]]:
-        """The coming windows' levels (start beyond the new-order cutoff) this mode will not quote again, the soonest first:
-        (their failures at MAX_ATTEMPTS, refused by Predict) — each level's latest record (1.131.6: /preopen says so; a
-        window that went missing used to say nothing)."""
+    def unquotable(self) -> tuple[list[dict], list[dict], list[dict]]:
+        """The coming windows' levels (start beyond the new-order cutoff) this mode does not quote now, the soonest first: (their
+        failures at MAX_ATTEMPTS, refused by Predict for good, refused and to be quoted again) — each level's latest record
+        (1.131.6: /preopen says so; a window that went missing used to say nothing). 1.154.65: a refused level is quoted again
+        REFUSED_RETRY_MS after the refusal while its window starts REFUSED_RETRY_AHEAD_MS or more on and its failures are
+        under the cap (refused_retry_due); the rest are refused for good."""
         strikes = self.ledger.strikes()
         latest: dict[str, dict] = {}
         now = self.now()
@@ -5210,17 +5273,18 @@ class Controller:
             k = record_key(p)
             if k not in latest or int(p.get("attempt") or 0) > int(latest[k].get("attempt") or 0):
                 latest[k] = p
-        spent, refused = [], []
+        spent, refused, again = [], [], []
         for k, p in latest.items():
             cutoff = self.now() + self.settings.timing(str(p.get("key") or "")).entry_seconds * 1000  # (1.152.0: BTC 5-minute's own)
             if p["phase"] == "active" or not p.get("accounted") or int(p.get("start_ms") or 0) <= cutoff:
                 continue
-            if any(o["state"] == "rejected" and not o.get("limited") or o.get("refused") for o in p["orders"].values()):
-                refused.append(p)
+            if refused_pair(p):
+                later = strikes.get(k, 0) < MAX_ATTEMPTS and int(p["start_ms"]) - self.now() >= REFUSED_RETRY_AHEAD_MS
+                (again if later else refused).append(p)
             elif strikes.get(k, 0) >= MAX_ATTEMPTS:
                 spent.append(p)
         soonest = lambda ps: sorted(ps, key=lambda p: int(p.get("start_ms") or 0))
-        return soonest(spent), soonest(refused)
+        return soonest(spent), soonest(refused), soonest(again)
 
     def unplaced(self) -> tuple[int, int, float]:
         """The listed windows' levels not quoted now — (windows, level-pairs, the reservation they would take): what the cap
@@ -5241,6 +5305,8 @@ class Controller:
                 key = slug if level == 0 else f"{slug}#{level}"
                 if key in active or strikes.get(key, 0) >= MAX_ATTEMPTS:
                     continue
+                if key in self.ledger.rows and refused_pair(self.ledger.rows[key]) and start - now < REFUSED_RETRY_AHEAD_MS:
+                    continue  # (1.154.65: refused, and not to be quoted again — it was counted here as waiting for a placement that never came)
                 windows.add(slug)
                 pairs += 1
                 usd += 2 * float(price) * float(shares)
@@ -5252,7 +5318,7 @@ class Controller:
         total, resting = len(self.ledger.rows), 0
         cleared = total - sum(1 for p in self.ledger.pending() if not p.get("accounted"))
         reserved = self.risk()
-        spent, refused = self.unquotable()
+        spent, refused, again = self.unquotable()
         quoted_to: dict[str, int] = {}  # card -> the latest window with a quote resting (the first level's, the deeper ones wait for the start)
         early = 0  # ...and those signed, before a setting changed, to leave the book earlier than the settings say now (resumable, 1.154.54)
         expiry_of = {"BTC-5M": self.settings.timing("BTC-5M").expiry_seconds}
@@ -5268,6 +5334,8 @@ class Controller:
         quiet = open_quiet_ms(self.settings) // 60_000  # 1.151.1: the minutes in force (the first window after an open always)
         cme_next = next(iter(core.cme_shuts(self.now(), self.now() + 5 * core.DAY_MS)), None) if shut_cards["cme"] else None  # CME's shut now in force, or the next
         named = lambda ps: "、".join(str(p.get("name") or window_of(p)) + (f" 第 {int(p['level']) + 1} 档" if p.get("level") else "") for p in ps[:3]) + ("…" if len(ps) > 3 else "")
+        # (1.154.65: why Predict refused them, by kind, the most first — it said "post-only 会吃单等" whatever the answers were)
+        reasons = lambda ps: "按原因：" + "、".join(f"{why} {n} 档" for why, n in collections.Counter(refusal_words(p) or "没说原因" for p in ps).most_common(4))
         why = (self.hold() or self.budget_problem()) if self.alive else ""
         state = ("已停止" if not self.alive else f"收尾中（{self.winding}）：不再新挂，挂着的单分批撤完、成交核对完、已成交的场次都出结果结算完就自动停止" if self.winding
                  else f"暂停，{why}" if self.blocked() else "运行")
@@ -5327,5 +5395,8 @@ class Controller:
                    if self.listed_at else "")
                 + (f"\n没挂的已发布场次：" + "；".join(f"{k.rsplit('-', 1)[-1]} {v}" for k, v in list(self.skipped.items())[-3:]) if self.skipped else "")
                 + (f"\n不再报价：{len(spent)} 档失败满 {MAX_ATTEMPTS} 次（单边没确认、一边被撤或过期），如 {named(spent)}" if spent else "")
-                + (f"\n不再报价：{len(refused)} 档被 Predict 拒绝（post-only 会吃单等），如 {named(refused)}" if refused else "") + "\n"
+                + (f"\n不再报价：{len(refused)} 档被 Predict 拒绝——{reasons(refused)}；如 {named(refused)}"
+                   f"（开场前 {REFUSED_RETRY_AHEAD_MS // 60_000} 分钟内的、或这一档已经试满 {MAX_ATTEMPTS} 次的不再重挂）" if refused else "")
+                + (f"\n被拒后等重挂：{len(again)} 档——{reasons(again)}；被拒 {REFUSED_RETRY_MS // 60_000} 分钟后再挂一次（每档最多 {MAX_ATTEMPTS} 次），如 {named(again)}"
+                   if again else "") + "\n"
                 f"实测：{self.timing_line()}" + ("" if busy else "\n" + bulk))
