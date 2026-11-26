@@ -234,7 +234,7 @@ async def the_speed_line() -> None:
         # 1.154.61: with a limit and what is left, read by the kind of request, beside the bot's own count
         m.note_limit_headers("api.predict.fun", {"x-api-key": "pre-key"}, 200,
                              types.SimpleNamespace(headers={"X-RateLimit-Limit": "240", "X-RateLimit-Remaining": "37", "Content-Type": "application/json"}), "GET", "/v1/markets/1")
-        assert "；Predict 应答里报的限额：读取（市场）每分钟 240 次——" in ctl.speed_line() and "已算 203 次、剩 37；" in ctl.speed_line(), ctl.speed_line()
+        assert "；Predict 应答里报的限额：General（市场）每分钟 240 次——" in ctl.speed_line() and "已算 203 次、剩 37；" in ctl.speed_line(), ctl.speed_line()
         assert "→ “Predict 限额”的 General 可以填 240；Trading 等下单的应答带回来再看" in ctl.speed_line(), ctl.speed_line()
         # the key shared with the model trader: named so
         shared, shared_api, _ = controller(rows, PREOPEN_MARKETS="btc", PREDICT_API_KEY="main-key")

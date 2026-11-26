@@ -831,7 +831,7 @@ class PredictApi:
             # 1.154.45: a read that has another key to go to (relieved) waits for this one's token only so long — given up
             # before anything is sent, never once it is on its way
             try:
-                await asyncio.wait_for(core.predict_pacer(self.api_key).take(False, low=self.low, leave=self.leave), wait)
+                await asyncio.wait_for(core.predict_pacer(self.api_key, core.predict_trading(method, path)).take(False, low=self.low, leave=self.leave), wait)
             except asyncio.TimeoutError:
                 raise NoToken(f"这把 Key {wait:g} 秒内没有轮到这次读取（额度被下单撤单占着）") from None
         self.calls += 1
@@ -4125,8 +4125,8 @@ class LiveBot(core.Bot):
             notes = [f"等节拍 {waited} 次共 {seconds:.0f} 秒"] if waited else []
             if core.PREDICT_TRADE_OF.get(key):  # 1.154.60: the pre-open key by Predict's two buckets (PREOPEN_APP_*): this figure is its reads', the orders' said beside
                 trade = core.PREDICT_TRADE_PACERS.get(key)
-                notes.insert(0, f"按 Predict 后台的限额：这是下单撤单以外的请求，节拍每分钟 {core.PREDICT_RATE_OF.get(key, 0):g} 次；"
-                                f"下单撤单另算，最近 60 秒 {trade.last_minute() if trade is not None else 0} 次、节拍 {core.PREDICT_TRADE_OF[key]:g} 次")
+                notes.insert(0, f"按 Predict 后台的限额：这是 General 一类（读市场、分类、登录等），节拍每分钟 {core.PREDICT_RATE_OF.get(key, 0):g} 次；"
+                                f"Trading 一类（下单、撤单、读订单）另算，最近 60 秒 {trade.last_minute() if trade is not None else 0} 次、节拍 {core.PREDICT_TRADE_OF[key]:g} 次")
             elif core.PREDICT_RATE_OF.get(key):  # 1.154.57: the pre-open key at a pace of its own (PREOPEN_RATE_PER_MIN)
                 notes.insert(0, f"单独节流每分钟 {core.PREDICT_RATE_OF[key]:g} 次：PREOPEN_RATE_PER_MIN")
             if key == rule:

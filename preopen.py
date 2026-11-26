@@ -3009,6 +3009,8 @@ class Controller:
             raise
         self.account_read_s, self.account_failed = (self.now() - fetched) / 1000, ""
         self.snapshots_done += 1  # 1.154.8: first_snapshot_pending
+        if self.snapshots_done == 1:
+            self.first_snapshot_ms = self.now()  # 1.154.63: the listings found before this waited for it (the status's 发现→挂上)
         async with self.account_lock:
             self.unmanaged, self.open_reserved, self.balance, self.unmanaged_detail = unmanaged, reserved, balance, detail
             self.listed_ids = {str(r.get("id")) for r in rows}
@@ -3761,7 +3763,7 @@ class Controller:
         if late:
             await self.behind_placements()
         if late and self.api is getattr(self, "api_made", None):  # (the tests' own api stands for every client: read there as before)
-            row = await self.through(self.api, lambda api: api.order(order.get("id", ""), order.get("api_hash") or order["hash"]))
+            row = await self.through(self.api, lambda api: api.order(order.get("id", ""), order.get("api_hash") or order["hash"]), trade=True)  # (an order read: Trading, 1.154.63)
         else:
             row = await self.cancel_api.order(order.get("id", ""), order.get("api_hash") or order["hash"])
         if row:
@@ -3943,7 +3945,7 @@ class Controller:
                 continue
             if order.get("id") in self.listed_ids and self.now() - self.account_at <= self.account_stale_ms():
                 continue  # one paginated account snapshot covers every healthy resting order
-            row = await self.through(self.api, lambda api: api.order(order["id"], order.get("api_hash") or order["hash"]))
+            row = await self.through(self.api, lambda api: api.order(order["id"], order.get("api_hash") or order["hash"]), trade=True)
             if row is None:
                 continue  # replication lag is not a zero-fill rejection
             read = True
@@ -4241,12 +4243,14 @@ class Controller:
         return bool(getattr(self, "trade_pace", 0) and getattr(self, "read_pace", 0))
 
     def fast_reads(self) -> int:
-        """Reads in flight at once on the mode's low client and the fresh listings' (PredictApi.READ_PARALLEL where not fast)."""
-        return min(FAST_READS_MAX, max(3, math.ceil(self.read_pace / FAST_READS_PER))) if self.fast() else 3
+        """Reads in flight at once on the mode's low client and the fresh listings' (PredictApi.READ_PARALLEL where not fast) — by
+        the larger of the two paces (1.154.63: the order reads among them go by the Trading one)."""
+        return min(FAST_READS_MAX, max(3, math.ceil(max(self.read_pace, self.trade_pace) / FAST_READS_PER))) if self.fast() else 3
 
     def fast_verify(self) -> int:
-        """Withdrawn pairs whose final fills are read side by side (reconcile_gate): two, or what the reads' pace carries."""
-        return min(FAST_VERIFY_MAX, max(2, math.ceil(self.read_pace / FAST_VERIFY_PER))) if self.fast() else 2
+        """Withdrawn pairs whose final fills are read side by side (reconcile_gate): two, or what the pace of those reads carries
+        — the Trading bucket's (1.154.63: an order read is Predict's Trading, core.predict_trading)."""
+        return min(FAST_VERIFY_MAX, max(2, math.ceil(self.trade_pace / FAST_VERIFY_PER))) if self.fast() else 2
 
     def reread_batch(self) -> int:
         """Known windows re-read in a discovery pass (reread_known): DISCOVER_READS, or FAST_REREAD_SHARE of what the reads'
@@ -4259,9 +4263,10 @@ class Controller:
         return max(REREAD_QUEUE_MAX, FAST_QUEUE_PER_WORKER * self.place_workers()) if self.fast() else REREAD_QUEUE_MAX
 
     def account_page_s(self) -> float:
-        """The account snapshot's pace a page: ACCOUNT_PAGE_S — less where the reads have a pace of thousands (FAST_PAGE_S at
-        the least): the fills the snapshot shows, and what the placements are held against, are that much fresher."""
-        return max(FAST_PAGE_S, ACCOUNT_PAGE_S * 220.0 / self.read_pace) if self.fast() and self.read_pace > 220.0 else ACCOUNT_PAGE_S
+        """The account snapshot's pace a page: ACCOUNT_PAGE_S — less where its pages' pace is a thousand and more (FAST_PAGE_S at
+        the least): the fills the snapshot shows, and what the placements are held against, are that much fresher. Its pages
+        are order reads: the Trading bucket's pace (1.154.63)."""
+        return max(FAST_PAGE_S, ACCOUNT_PAGE_S * 220.0 / self.trade_pace) if self.fast() and self.trade_pace > 220.0 else ACCOUNT_PAGE_S
 
     def refusal_last(self, bucket: str) -> tuple[float, int]:
         """(when, what the bucket had let through in the minute before) of the latest 429 on the mode's first key in ``bucket``
@@ -4279,7 +4284,7 @@ class Controller:
         if not self.fast():
             return
         try:  # (never the cancellation loop's problem — that loop withdraws the orders at their time: a failure here is logged, no more)
-            for bucket, name in (("read", "读取等其他请求"), ("trade", "下单撤单")):
+            for bucket, name in (("read", "读市场、分类等其他请求"), ("trade", "下单、撤单和读订单")):
                 at, sent = self.refusal_last(bucket)
                 if at <= self.refusals_seen.get(bucket, 0.0):
                     continue
@@ -4307,7 +4312,7 @@ class Controller:
         if not self.fast():
             return ""
         whole = core.preopen_paces(self.owner.config, whole=True)
-        cut = [f"{name}从每分钟 {full:g} 次降到 {now:g} 次" for name, full, now in (("下单撤单", whole[0], self.trade_pace), ("其他请求", whole[1], self.read_pace)) if now < full]
+        cut = [f"{name}从每分钟 {full:g} 次降到 {now:g} 次" for name, full, now in (("下单、撤单和读订单", whole[0], self.trade_pace), ("其他请求", whole[1], self.read_pace)) if now < full]
         return ("⚠️ 被 Predict 拒绝过（429），已自动降速：" + "、".join(cut) + "——填的限额可能不是这把 Key 所在 App 的，或档位变了；核对后改那两项，或重启后恢复；") if cut else ""
 
     async def placement_worker(self) -> None:
@@ -4393,7 +4398,7 @@ class Controller:
         if self.fast() and core.PREDICT_PACING:  # 1.154.60: by Predict's own two buckets
             return ("用预挂自己的 API Key（PREOPEN_API_KEY），按 Predict 后台给这个 App 的限额跑"
                     f"（Trading {self.settings.app_trading}、General {self.settings.app_general} 次/分钟，PREOPEN_APP_*）："
-                    f"下单撤单每分钟最多 {self.trade_pace:g} 次、其他请求最多 {self.read_pace:g} 次——各用到限额的 {core.PREOPEN_APP_SHARE:.0%}，再扣掉机器人别的 Key 可能用的份额；"
+                    f"下单、撤单和读订单每分钟最多 {self.trade_pace:g} 次，其他请求（市场、分类、登录）最多 {self.read_pace:g} 次——各用到限额的 {core.PREOPEN_APP_SHARE:.0%}，再扣掉机器人别的 Key 可能用的份额；"
                     f"同时挂 {self.place_workers()} 对、同时核对 {self.fast_verify()} 对；" + self.cut_line() + self.borrow_line())
         trading, general = int(self.settings.app_trading), int(self.settings.app_general)
         limits = ("" if not (trading or general) or self.fast()
@@ -4454,7 +4459,7 @@ class Controller:
             if self.fast() and pace > 0:  # 1.154.60: Predict's two buckets, each against its own pace
                 sent = trade.last_minute() if trade is not None else 0
                 full = lambda n, most: "，跑满了" if n >= SPEED_FULL * most else ""
-                usage = (f"{name}最近 1 分钟：下单撤单 {sent} 次（节拍每分钟 {self.trade_pace:g}{full(sent, self.trade_pace)}）、"
+                usage = (f"{name}最近 1 分钟：下单、撤单和读订单 {sent} 次（节拍每分钟 {self.trade_pace:g}{full(sent, self.trade_pace)}）、"
                          f"其他请求 {used} 次（节拍 {pace:g}{full(used, pace)}）")
             elif pace <= 0:
                 usage = f"{name}最近 1 分钟发出 {used} 次请求（不节流）"
@@ -4507,7 +4512,7 @@ class Controller:
         if not core.PREDICT_PACING:
             return "请求节流关着（PREDICT_PACING=off）——测速靠节流来定每一档的速度"
         if self.fast():
-            return (f"预挂已经按 Predict 后台的限额在跑（PREOPEN_APP_*：读取每分钟 {self.read_pace:g} 次、下单撤单 {self.trade_pace:g} 次）——上限后台写着，"
+            return (f"预挂已经按 Predict 后台的限额在跑（PREOPEN_APP_*：下单、撤单和读订单每分钟 {self.trade_pace:g} 次，其他请求 {self.read_pace:g} 次）——上限后台写着，"
                     f"测速只测到每分钟 {SPEED_TEST_STEPS[-1]} 次读取，用不上了")
         if self.speed_target() is None:
             return "预挂现在没有挂着的单、也没读过市场，没有可以拿来读的东西；等挂上单再测"
@@ -5093,9 +5098,19 @@ class Controller:
                          + ("，贴着提前范围：Predict 可能发布得更早，可调大 PREOPEN_AHEAD_MINUTES"
                             if self.settings.ahead_minutes < 1440 and leads[-1] >= self.settings.ahead_minutes - 15 else ""))
         quick = [p for p in rows if p.get("seen_ms") and p.get("placed_ms") and p.get("created_ms")][-20:]
-        if quick:  # from the discovery's read of the listing to both orders answered: the bot's own share of the queue position (1.133.0)
-            spans = sorted((int(p["placed_ms"]) - int(p["seen_ms"])) / 1000 for p in quick)
-            parts.append(f"发现→挂上中位 {spans[len(spans) // 2]:.1f} 秒（最长 {spans[-1]:.1f}；{len(quick)} 场）")
+        # 1.154.63: a listing found while this start's first account snapshot was still being read waited for it (hold) — 11-26
+        # 16:25:54, the settings saved twice and the bot deployed within minutes, each a start and a first read of 188 pages
+        # (52 s): 发现→挂上 read 27.1 s for the listing that fell in one, the first after 2.5 s ones. Said apart, not in the median
+        first_done = int(getattr(self, "first_snapshot_ms", 0) or 0)
+        waited = [p for p in quick if first_done and int(self.started_ms) <= int(p["seen_ms"]) < first_done]
+        normal = [p for p in quick if not any(p is w for w in waited)]
+        if normal:  # from the discovery's read of the listing to both orders answered: the bot's own share of the queue position (1.133.0)
+            spans = sorted((int(p["placed_ms"]) - int(p["seen_ms"])) / 1000 for p in normal)
+            parts.append(f"发现→挂上中位 {spans[len(spans) // 2]:.1f} 秒（最长 {spans[-1]:.1f}；{len(normal)} 场）")
+        if waited:
+            spans = sorted((int(p["placed_ms"]) - int(p["seen_ms"])) / 1000 for p in waited)
+            parts.append(f"另有 {len(waited)} 场是本次启动后等第一次账户快照读完才挂上的（发现→挂上 {spans[0]:.0f}～{spans[-1]:.0f} 秒；"
+                         f"启动后 {(first_done - int(self.started_ms)) / 1000:.0f} 秒读完——改设置、重新部署都会重新启动）")
         if self.listing_deltas:  # each new listing against the moment expected (the last one a cycle on): how well the fast poll is aimed
             deltas = sorted(d / 1000 for d in self.listing_deltas)
             parts.append(f"发布比预计中位 {deltas[len(deltas) // 2]:+.0f} 秒（最早 {deltas[0]:+.0f}、最晚 {deltas[-1]:+.0f}；{len(deltas)} 次）")
