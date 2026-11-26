@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.51"
+VERSION = "1.154.52"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -880,7 +880,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
      "BTC 5 分钟每场每边就挂这几档（第一档也按这里的价格和份数）；空 = 跟上面所有卡的一样（预挂价格 × 每次份数，加更深的价格档位）。改了只撤、重挂 BTC 5 分钟的单"),
     ("PREOPEN_MAX_OPEN_USD", "预挂资金上限（$）", "0～1000000，0 = 不限（默认）：本模式自己的预留上限，和原策略的持仓+挂单上限各算各的（Predict 不锁定挂单资金，成交时才扣款；余额够一场双边就挂）；设了上限时每场双边预留价格 × 份数 × 2，撤掉且没成交的场次立即释放，/preopen 会算出把已发布的全部挂上需要多少"),
     # 1.153.0: 规则吃单 (rules.py) — the gold / oil windows the backtest found mispriced (README「规则吃单」)
-    ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段，开场前吃：Predict 撮合开启后到开场前 15 秒，盘口一出现规则价以内的指定方向就立即买"
+    ("RULE_TAKER", "规则吃单", "黄金、原油 15 分钟的几个固定时段，开场前吃：Predict 撮合开启后到开场前 130 秒（订单签到开场前 5 秒到期，Predict 不收有效期不足 2 分钟的单），盘口一出现规则价以内的指定方向就立即买"
      "（盘口变化由推送送来，不等下一次读）；黄金休市 4 档、开盘第一档另设了盘中价格时，开场后规则方向领先也接着吃（1.154.14）。off 关；paper 只记录不下单：按当时盘口记下会买到多少、按 Predict 的结果结算，先看几天再开；"
      "on 真实吃单（需要 LIVE=on；真实交易暂停、今日亏损停机、接口限流冷却时都不下单）"),
     ("RULE_GOLD", "规则吃单：黄金", "on = 做黄金的规则（下面价格设为 0 的那条不做）；off = 黄金一条都不做"),
@@ -889,7 +889,7 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
      "规则吃单的单不再受 LIVE_MAX_ORDER_USD 限制——想每场少买就把这个数改小；账户里 USDT 不够时按买得起的份数下"),
     ("RULE_GOLD_SHUT_CENTS", "黄金休市 4 档：买涨不高于（¢）", "纽约 17:00–17:45、周一至周四 CME 每天休市的 4 个 15 分钟（北京冬令时 06:00–06:45，夏令时 05:00–05:45）："
      "2025-12 至 2026-11 涨占 90%，每月最低 76%（到 2026-05 休市时指数不动、终点等于起点按涨结算；6 月起指数也在动，涨占 84%）。0 = 不做"),
-    ("RULE_GOLD_SHUT_LIVE_CENTS", "黄金休市 4 档·盘中：买涨不高于（¢）", "开场后也吃（1.154.14）：这一场开始后到结束前 15 秒，币安指数比这一场的起点高 0.005% 以上"
+    ("RULE_GOLD_SHUT_LIVE_CENTS", "黄金休市 4 档·盘中：买涨不高于（¢）", "开场后也吃（1.154.14）：这一场开始后到结束前 130 秒（Predict 不收有效期不足 2 分钟的单），币安指数比这一场的起点高 0.005% 以上"
      "（涨已经领先）时，盘口有不高于这个价的涨就买；没领先不买——开场后价格本身已经反映涨跌，只看价格会买到正在输的一边。2026-06 起休市时指数也在动"
      "（整体涨 84%）：这 380 场里开场 2 分钟后涨领先的，最后涨占 98%（10 月最差，80%～92%）；只是不低于起点的 93%。开场后第 1 分钟最高按盘前的价格买。"
      "和盘前共用“每场最多买多少份”；单子在这一场结束前 5 秒到期。0 = 盘中不做。"
@@ -16966,7 +16966,7 @@ function rulesSection(ru){  // 规则吃单 (1.153.0): each rule's totals, the r
       r.watch.offer_lead==null?"—":"中位 "+Math.round(r.watch.offer_lead)+" 分钟",  // 1.154.13: the makers' lead, and the offers a faster taker had
       r.watch.lost?num(r.watch.lost)+" 场"+(r.watch.life==null?"":"（存活中位 "+(r.watch.life/1000).toFixed(1)+" 秒）"):"—",
       r.watch.won?num(r.watch.won)+" 场"+(r.watch.won_life==null?"":"（出现到被吃掉中位 "+(r.watch.won_life/1000).toFixed(1)+" 秒）"):"—"])));
-  const rc=ru.races||[],sec=v=>v==null?"—":(v/1000).toFixed(2)+" 秒",ord=o=>o.error||["rejected","not_sent","not_found"].includes(o.state)?"要 "+num(o.shares)+"：没下成"+(o.error?"（"+o.error+"）":""):"要 "+num(o.shares)+" 成交 "+num(o.filled)+(o.after==null?"":"，出现后 "+o.after+" ms 发出")
+  const rc=ru.races||[],sec=v=>v==null?"—":(v/1000).toFixed(2)+" 秒",ord=o=>o.error||["rejected","not_sent","not_found"].includes(o.state)?"要 "+num(o.shares)+"：没下成"+(o.error?"（"+o.error+"）":""):"要 "+num(o.shares)+" 成交 "+num(o.filled)+(o.after==null?"":"，出现后 "+o.after+" ms 发出"+(o.later?"（卖单第一次出现 "+(o.later>=3600e3?(o.later/3600e3).toFixed(1)+" 小时":o.later>=60e3?(o.later/60e3).toFixed(1)+" 分钟":(o.later/1000).toFixed(1)+" 秒")+"后又有的，从它出现算）":""))
     +(o.lag==null?"":"，推送 "+o.lag+" ms")+(o.own==null?"":"，到达→发出 "+o.own+" ms"+(o.fresh===false?"（不是盘口一到就下的）":""))+(o.trip==null?"":"，往返 "+o.trip+" ms");
   // 1.154.16: each window's race — when the offer at the rule's price showed, how soon it was first taken from and gone (Predict's own stamps), what was bought, each order against the clock
   if(rc.length)kids.push(...bigTable("抢单记录（北京时间；开始被吃 / 被吃光 = 卖单出现之后多久，按 Predict 盘口的时间戳）",table(["场次","规则","卖单出现","开场前","最多份数","开始被吃","被吃光","买到","我们的单"],
