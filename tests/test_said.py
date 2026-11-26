@@ -144,7 +144,9 @@ class Said(unittest.TestCase):
         self.assertIn("同期这把 Key 发了 42 次下单、撤单和读订单", line)
         self.assertTrue(line.endswith("。→ 控制台“开盘前预挂”里的“Predict 限额”两项可以照这个填：Trading 2000、General 2000"), line)
         # the figures set: compared, not suggested
-        self.assertTrue(m.predict_buckets_line("pre", (5000, 1000)).endswith("。→ 填的 Trading 5000 比 Predict 报的 2000 大——会被拒；填的 General 1000 比 Predict 报的 2000 小，可以改大"))
+        # (1.154.67: one given above what the key said is not what the mode goes by — preopen_app_capped)
+        self.assertTrue(m.predict_buckets_line("pre", (5000, 1000)).endswith(
+            "。→ 填的 Trading 5000 比 Predict 报的 2000 大——按 Predict 报的 2000 跑（两项都清成 0 就全照 Predict 报的自动跑）；填的 General 1000 比 Predict 报的 2000 小，可以改大"))
         self.assertNotIn("。→ ", m.predict_buckets_line("pre", (2000, 2000)), "the figures set are Predict's: nothing to say")
         # one of the two set (1.154.62): the other said missing, with Predict's figure
         self.assertTrue(m.predict_buckets_line("pre", (2000, 0)).endswith("。→ 还没填 General（两项都填了才生效），Predict 报的是 2000"), m.predict_buckets_line("pre", (2000, 0)))
@@ -154,6 +156,8 @@ class Said(unittest.TestCase):
         line = m.predict_buckets_line("pre", (0, 0))
         self.assertIn("General：市场 每分钟 2000 次、分类 每分钟 120 次——", line)
         self.assertTrue(line.endswith("可以照这个填：Trading 2000、General 120"), line)
+        # a figure said under 240 is no bucket the mode's paces are made for: one given above it is not capped — said as refused
+        self.assertTrue(m.predict_buckets_line("pre", (2000, 1000)).endswith("。→ 填的 General 1000 比 Predict 报的 120 大——会被拒"), m.predict_buckets_line("pre", (2000, 1000)))
         # keys of other apps (their answers said other limits): never "together", whatever the counts
         m.PREDICT_SENT.clear(); m.KEYS_APART.clear()
         sent("pre", "POST", "/v1/orders", 42)

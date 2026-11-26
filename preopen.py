@@ -4534,7 +4534,10 @@ class Controller:
         if self.fast() and core.PREDICT_PACING:  # 1.154.60: by Predict's own two buckets
             return ("用预挂自己的 API Key（PREOPEN_API_KEY），"
                     + (f"按 Predict 应答里报的这把 Key 的限额自动跑（Trading {trading}、General {general} 次/分钟；“Predict 限额”两项没填，PREOPEN_APP_AUTO）："
-                       if whose == "自动" else f"按 Predict 后台给这个 App 的限额跑（Trading {trading}、General {general} 次/分钟，PREOPEN_APP_*）：")
+                       if whose == "自动" else f"按 Predict 后台给这个 App 的限额跑（Trading {trading}、General {general} 次/分钟，PREOPEN_APP_*"
+                       # 1.154.67: a figure given above what the key's answers say goes by theirs (core.preopen_app_capped)
+                       + "".join(f"；填的 {name} {mine} 比 Predict 报的大，按报的 {said}" for name, mine, said in core.preopen_app_capped(self.owner.config))
+                       + "）：")
                     + f"下单、撤单和读订单每分钟最多 {self.trade_pace:g} 次，其他请求（市场、分类、登录）最多 {self.read_pace:g} 次——各用到限额的 {core.PREOPEN_APP_SHARE:.0%}，再扣掉机器人别的 Key 可能用的份额；"
                     f"同时挂 {self.place_workers()} 对、同时核对 {self.fast_verify()} 对；" + self.cut_line() + self.borrow_line())
         trading, general = int(self.settings.app_trading), int(self.settings.app_general)
