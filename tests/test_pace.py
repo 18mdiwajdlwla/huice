@@ -155,7 +155,7 @@ async def the_speed_line() -> None:
                                  PREDICT_API_KEY="main-key", PREOPEN_API_KEY="pre-key")
     api.api_key = "pre-key"  # (the tests' stand-in for the mode's client: on the mode's own key, as the real one is)
     try:
-        m.PREDICT_PACERS.clear(); m.PREDICT_LIMITS_SAID.clear()
+        m.PREDICT_PACERS.clear(); m.PREDICT_LIMITS_SAID.clear(); m.PREDICT_BUCKETS_SAID.clear(); m.PREDICT_SENT.clear()
         assert ctl.speed_line() == "\n速度：最近 1 分钟挂上 0 张单", ctl.speed_line()  # nothing placed, no request on the key yet: nothing more to say
         for mk in rows[:3]:
             await place(ctl, mk, NOW)
@@ -229,9 +229,13 @@ async def the_speed_line() -> None:
         # what Predict's own answers say of the limit, as they came
         m.note_limit_headers("api.predict.fun", {"x-api-key": "pre-key"}, 200, types.SimpleNamespace(headers={"Content-Type": "application/json"}))
         assert ctl.speed_line().endswith("24 小时 0 次；Predict 的应答里没有带限额信息（看了 1 个应答）"), ctl.speed_line()
+        m.note_limit_headers("api.predict.fun", {"x-api-key": "pre-key"}, 200, types.SimpleNamespace(headers={"X-RateLimit-Policy": "240;w=60", "Content-Type": "application/json"}))
+        assert "的应答，原样）：x-ratelimit-policy 240;w=60" in ctl.speed_line(), ctl.speed_line()  # (no count to read: the headers as they came)
+        # 1.154.61: with a limit and what is left, read by the kind of request, beside the bot's own count
         m.note_limit_headers("api.predict.fun", {"x-api-key": "pre-key"}, 200,
-                             types.SimpleNamespace(headers={"X-RateLimit-Limit": "240", "X-RateLimit-Remaining": "37", "Content-Type": "application/json"}))
-        assert "的应答，原样）：x-ratelimit-limit 240、x-ratelimit-remaining 37" in ctl.speed_line(), ctl.speed_line()
+                             types.SimpleNamespace(headers={"X-RateLimit-Limit": "240", "X-RateLimit-Remaining": "37", "Content-Type": "application/json"}), "GET", "/v1/markets/1")
+        assert "；Predict 应答里报的限额：读取（市场）每分钟 240 次——" in ctl.speed_line() and "已算 203 次、剩 37；" in ctl.speed_line(), ctl.speed_line()
+        assert "→ “Predict 限额”的 General 可以填 240；Trading 等下单的应答带回来再看" in ctl.speed_line(), ctl.speed_line()
         # the key shared with the model trader: named so
         shared, shared_api, _ = controller(rows, PREOPEN_MARKETS="btc", PREDICT_API_KEY="main-key")
         shared_api.api_key = "main-key"
@@ -260,6 +264,7 @@ async def the_speed_line() -> None:
         m.PREDICT_RATE_OF.clear(); m.PREDICT_RATE_OF.update(kept[2])
         m.PREDICT_PACERS.clear(); m.PREDICT_PACERS.update(kept[3])
         m.PREDICT_LIMITS_SAID.clear(); m.PREDICT_LIMITS_SAID.update(kept[4])
+        m.PREDICT_BUCKETS_SAID.clear(); m.PREDICT_SENT.clear()
         for task in ctl.settling.values():
             task.cancel()
         await asyncio.gather(*ctl.settling.values(), return_exceptions=True)

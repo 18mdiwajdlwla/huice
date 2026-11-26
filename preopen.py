@@ -4477,7 +4477,9 @@ class Controller:
             day = [count for at, count in hits if at >= mono - 86400]
             parts.append(f"被拒绝（429）：最近 10 分钟 {sum(1 for at, _ in hits if at >= mono - 600)} 次、24 小时 {len(day)} 次"
                          + (f"，最近一轮是这把 Key 一分钟内发到第 {firsts[-1]} 次请求时开始被拒的——Predict 给它的上限就在这附近，节拍要设得比它低" if day and firsts else ""))
-        if said := core.predict_limits_said(key):
+        # 1.154.61: by the kind of request, beside the bot's own counts — and, for the mode's own key, what to set (PREOPEN_APP_*);
+        # the headers as they came where none carried the figures
+        if said := core.predict_buckets_line(key, (int(self.settings.app_trading), int(self.settings.app_general)) if own else None) or core.predict_limits_said(key):
             parts.append(said)
         if pairs_left and minute:
             parts.append(f"照最近一分钟的速度，已发布未挂的 {pairs_left} 档（{2 * pairs_left} 张单）还要约 {max(1, round(2 * pairs_left / len(minute)))} 分钟")

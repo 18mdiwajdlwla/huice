@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.60"
+VERSION = "1.154.61"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -1878,13 +1878,14 @@ HTTP_NET: dict[str, dict] = {}
 # "refused": the same of the last 429, "refused_at"}. Written from the pool's threads (one assignment each), read by the status
 PREDICT_LIMITS_SAID: dict[str, dict] = {}
 LIMIT_HEADERS_KEPT = 8
-_HEADER_UNSAFE = re.compile(r"[^0-9A-Za-z .,;=:_/+-]")
+_HEADER_UNSAFE = re.compile(r"[^0-9A-Za-z .,;=:_/+\"-]")  # (1.154.61: quotes too — the draft's "rpm" was shown ?rpm?)
 
 
-def note_limit_headers(host: str, sent: Mapping, status: int, answer: Any) -> None:
+def note_limit_headers(host: str, sent: Mapping, status: int, answer: Any, method: str = "", path: str = "") -> None:
     """An answer of Predict's, looked at for what it says of the key's request limit (PREDICT_LIMITS_SAID). ``answer``: the
     response, or the HTTP error, its headers under .headers. Never raises — whatever the answer is: it stands in every
-    request's way."""
+    request's way. 1.154.61: with the request's ``method`` and ``path``, the figures are also kept by its kind
+    (predict_bucket_sample)."""
     try:
         if not host.endswith("predict.fun"):
             return
@@ -1893,10 +1894,11 @@ def note_limit_headers(host: str, sent: Mapping, status: int, answer: Any) -> No
         if said is None:
             said = PREDICT_LIMITS_SAID.setdefault(key, {"answers": 0, "seen": {}, "at": 0.0, "refused": {}, "refused_at": 0.0})
         said["answers"] += 1
-        found = {}
+        found, raw = {}, {}
         for name, value in (answer.headers.items() if getattr(answer, "headers", None) is not None else ()):
             low = str(name).lower()
             if "ratelimit" in low.replace("-", "") or (low == "retry-after" and status == 429):
+                raw.setdefault(low, str(value))
                 found[_HEADER_UNSAFE.sub("?", low)[:40]] = _HEADER_UNSAFE.sub("?", str(value))[:60]
                 if len(found) >= LIMIT_HEADERS_KEPT:
                     break
@@ -1904,8 +1906,198 @@ def note_limit_headers(host: str, sent: Mapping, status: int, answer: Any) -> No
             said["seen"], said["at"] = limits, time.time()
         if status == 429:
             said["refused"], said["refused_at"] = found, time.time()
+        if raw:
+            predict_bucket_sample(key, predict_group(method, path), raw, status)
     except Exception:
         pass
+
+
+# 1.154.61 — what Predict's answers say of each of its buckets, by the kind of request, beside what the bot itself had sent then.
+# 11-26 15:11, the first report after 1.154.60: the pre-open key's answer said "ratelimit-limit 2000, remaining 1832, reset 42"
+# — the last answer's alone (PREDICT_LIMITS_SAID), whatever it answered: a read's (General) and an order's (Trading) could not be
+# told apart, nor whether the bot's other keys count in the same 2,000 (the console's two apps say 5,000 and 1,000 for reads).
+# Every request to Predict is counted as it leaves (note_predict_sent: by its key, and as an order or a read), and an answer's
+# figures are kept by its key and its group (predict_group), the bot's own count of that kind in the minute before beside them
+PREDICT_SENT: dict[tuple[str, str], "SendCount"] = {}   # (key, "trade" / "read") -> its requests, by the second
+PREDICT_BUCKETS_SAID: dict[str, dict[str, dict]] = {}   # key -> group -> the latest answer's figures (predict_bucket_sample)
+BUCKET_SAMPLE_S = 1.0     # a group's figures are taken at most this often (the counts beside them are sums over a minute)
+BUCKET_FRESH_S = 1800.0   # ...and said for half an hour after (a group not asked since: its last figures are not today's word)
+_RATELIMIT_FIELD = re.compile(r"(?:^|[;,\s])([qrtw])=(\d+)")  # the IETF draft's fields: q (limit), w (window), r (remaining), t (reset)
+
+
+class SendCount:
+    """Requests sent, by the wall clock's second (note_predict_sent): how many since a moment — the last minute, the clock's
+    minute — as a sum over at most three minutes of seconds, whatever the rate. A lock of its own: the HTTP threads add."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.seconds: collections.deque = collections.deque()  # [second, count], oldest first
+
+    def add(self, now: float) -> None:
+        second = int(now)
+        with self.lock:
+            if self.seconds and self.seconds[-1][0] == second:
+                self.seconds[-1][1] += 1
+                return
+            self.seconds.append([second, 1])
+            while self.seconds and self.seconds[0][0] < second - 180:
+                self.seconds.popleft()
+
+    def since(self, moment: float) -> int:
+        cut = math.floor(moment)
+        total = 0
+        with self.lock:
+            for second, count in reversed(self.seconds):
+                if second < cut:
+                    break
+                total += count
+        return total
+
+
+def predict_group(method: str, path: str) -> str:
+    """The kind of a request to Predict, as its answers' limits may differ by it (1.154.61): 下单撤单 (an order's placement, a
+    cancel: the Trading bucket — predict_trading), else the reads by what they read. ``path`` as sent (/v1/… too)."""
+    tail = re.sub(r"^/v\d+(?=/)", "", str(path or "").split("?", 1)[0]).rstrip("/") or "/"
+    if predict_trading(str(method or "").upper(), tail):
+        return "下单撤单"
+    if tail.endswith("/orderbook"):
+        return "盘口"
+    for prefix, name in (("/markets", "市场"), ("/categories", "分类"), ("/orders", "订单"), ("/positions", "持仓"), ("/auth", "登录")):
+        if tail.startswith(prefix):
+            return name
+    return "其他"
+
+
+def note_predict_sent(host: str, sent: Mapping, method: str, path: str) -> None:
+    """A request to Predict leaving (_http_get): counted by its key, as an order or a read (PREDICT_SENT). Never raises."""
+    try:
+        if not host.endswith("predict.fun"):
+            return
+        key = (str(sent.get("x-api-key") or ""), "trade" if predict_group(method, path) == "下单撤单" else "read")
+        count = PREDICT_SENT.get(key)
+        if count is None:
+            count = PREDICT_SENT.setdefault(key, SendCount())
+        count.add(time.time())
+    except Exception:
+        pass
+
+
+def predict_sent_since(moment: float, kind: str, key: str | None = None) -> int:
+    """The requests of ``kind`` ("trade" / "read") sent since ``moment`` (wall clock): on ``key``, or on every key."""
+    return sum(count.since(moment) for (k, what), count in list(PREDICT_SENT.items()) if what == kind and (key is None or k == key))
+
+
+def predict_bucket_sample(key: str, group: str, raw: Mapping[str, str], status: int) -> None:
+    """An answer's figures for its bucket (limit, remaining, reset, window) — "ratelimit-limit" / "-remaining" / "-reset" (an
+    "x-" before them too), or the draft's "ratelimit-policy: q=…;w=…" and "ratelimit: r=…;t=…" — kept by key and group,
+    with what the bot had sent of that kind (an order or a read) since the window would have begun: on this key and on all
+    of them, over the last window and since the clock's window began (a limiter counting by the clock's minutes). At most
+    one a group every BUCKET_SAMPLE_S."""
+    numbers: dict[str, int] = {}
+    for name, value in raw.items():
+        text = str(value)
+        if name.endswith("ratelimit-limit") and text.strip().isdigit():
+            numbers.setdefault("limit", int(text))
+        elif name.endswith("ratelimit-remaining") and text.strip().isdigit():
+            numbers.setdefault("remaining", int(text))
+        elif name.endswith("ratelimit-reset") and text.strip().isdigit():
+            numbers.setdefault("reset", int(text))
+        elif name.endswith("ratelimit-policy") or name.endswith("ratelimit"):
+            for field, digits in _RATELIMIT_FIELD.findall(text):
+                numbers.setdefault({"q": "limit", "w": "window", "r": "remaining", "t": "reset"}[field], int(digits))
+    if "limit" not in numbers or "remaining" not in numbers:
+        return
+    now = time.time()
+    if numbers.get("reset", 0) > 10 ** 6:  # (an epoch second, as some APIs give it: the seconds left)
+        numbers["reset"] = max(0, int(numbers["reset"] - now))
+    groups = PREDICT_BUCKETS_SAID.setdefault(key, {})
+    last = groups.get(group)
+    if last is not None and now - last["at"] < BUCKET_SAMPLE_S and status != 429:
+        return
+    kind = "trade" if group == "下单撤单" else "read"
+    window = float(numbers.get("window") or 60)
+    began = now - now % window
+    groups[group] = {"at": now, "status": status, "limit": numbers["limit"], "remaining": numbers["remaining"],
+                     "reset": numbers.get("reset"), "window": window, "kind": kind,
+                     "mine": predict_sent_since(now - window, kind, key), "mine_clock": predict_sent_since(began, kind, key),
+                     "all": predict_sent_since(now - window, kind), "all_clock": predict_sent_since(began, kind),
+                     "mine_any": predict_sent_since(now - window, "trade", key) + predict_sent_since(now - window, "read", key)}
+
+
+def predict_bucket_whose(sample: Mapping) -> str:
+    """Whose requests an answer's count (limit − remaining) is, by the bot's own counts beside it: this key's of the kind, the
+    bot's every key's (one app), more than all of them (someone else's too) — or "" where they cannot be told apart (the
+    other keys sent next to nothing of the kind) or nothing fits."""
+    used = int(sample["limit"]) - int(sample["remaining"])
+    near = lambda a, b: abs(a - b) <= max(15, 0.2 * max(a, b))
+    mine = min((sample["mine"], sample["mine_clock"]), key=lambda n: abs(n - used))
+    every = min((sample["all"], sample["all_clock"]), key=lambda n: abs(n - used))
+    if used > 1.25 * max(sample["all"], sample["all_clock"]) + 20:
+        return "比机器人所有 Key 同期发的还多——还有别的程序在用同一个 App 或 Key"
+    if near(sample["all"], sample["mine"]):
+        return "和这把 Key 同期发的对得上" if near(used, mine) else ""
+    if near(used, mine) and abs(used - mine) <= abs(used - every):
+        return "只算这把 Key 自己的"
+    if near(used, every):
+        return "机器人几把 Key 合在一起算（同一个 App）"
+    return ""
+
+
+def predict_buckets_short(key: str) -> str:
+    """predict_buckets_line in a few words, for /diag's line on each key: the latest limit and what was left, by kind."""
+    now = time.time()
+    groups = [s for s in (PREDICT_BUCKETS_SAID.get(key) or {}).values() if now - s["at"] <= BUCKET_FRESH_S]
+    words = []
+    for kind, title in (("read", "读取"), ("trade", "下单撤单")):
+        seen = sorted((s for s in groups if s["kind"] == kind), key=lambda s: s["at"])
+        if seen:
+            words.append(f"{title}每分钟 {seen[-1]['limit']} 次（剩 {seen[-1]['remaining']}）")
+    return ("Predict 报：" + "、".join(words)) if words else ""
+
+
+def predict_buckets_line(key: str, app: tuple[int, int] | None = None) -> str:
+    """What Predict's answers on ``key`` said of its buckets (1.154.61), for the status: the reads' and the orders' limits,
+    the last answer's count beside the bot's own, whose requests that count is (predict_bucket_whose); with ``app`` (the
+    PREOPEN_APP_* figures as set: 0, 0 = not set), the figures to set — or how those set compare. "" with none said."""
+    now = time.time()
+    groups = {g: s for g, s in (PREDICT_BUCKETS_SAID.get(key) or {}).items() if now - s["at"] <= BUCKET_FRESH_S}
+    if not groups:
+        return ""
+    hms = lambda at: dt.datetime.fromtimestamp(at, BEIJING).strftime("%H:%M:%S")
+    parts = []
+    for kind, title in (("read", "读取"), ("trade", "下单撤单")):
+        seen = sorted(((g, s) for g, s in groups.items() if s["kind"] == kind), key=lambda gs: gs[1]["at"])
+        if not seen:
+            continue
+        limits = sorted({int(s["limit"]) for _, s in seen})
+        group, last = seen[-1]
+        used = int(last["limit"]) - int(last["remaining"])
+        if len(limits) == 1:
+            head = f"{title}（{'、'.join(g for g, _ in seen)}）每分钟 {limits[0]} 次" if kind == "read" else f"{title}每分钟 {limits[0]} 次"
+        else:
+            head = f"{title}：" + "、".join(f"{g} 每分钟 {s['limit']} 次" for g, s in seen)
+        whose = predict_bucket_whose(last)
+        mine_n = last["mine"] if abs(last["mine"] - used) <= abs(last["mine_clock"] - used) else last["mine_clock"]
+        all_n = last["all"] if abs(last["all"] - used) <= abs(last["all_clock"] - used) else last["all_clock"]
+        parts.append(f"{head}——{hms(last['at'])} 那次（{group}）已算 {used} 次、剩 {last['remaining']}"
+                     + (f"、{last['reset']} 秒后重置" if last.get("reset") is not None else "")
+                     + f"；同期这把 Key 发了 {mine_n} 次{title}、机器人所有 Key {all_n} 次" + (f"→{whose}" if whose else ""))
+    text = "Predict 应答里报的限额：" + "；".join(parts)
+    if app is not None:
+        trade = [int(s["limit"]) for s in groups.values() if s["kind"] == "trade"]
+        read = [int(s["limit"]) for s in groups.values() if s["kind"] == "read"]
+        said_trade, said_read = (min(trade) if trade else 0), (min(read) if read else 0)
+        if not any(app):
+            if said_trade and said_read:
+                text += f"。→ 控制台“开盘前预挂”里的“Predict 限额”两项可以照这个填：Trading {said_trade}、General {said_read}"
+            elif said_read:
+                text += f"。→ “Predict 限额”的 General 可以填 {said_read}；Trading 等下单的应答带回来再看（下一次挂单后）"
+        else:
+            notes = [f"填的 {name} {mine} 比 Predict 报的 {said} {'大——会被拒' if mine > said else '小，可以改大'}"
+                     for name, mine, said in (("Trading", app[0], said_trade), ("General", app[1], said_read)) if said and mine != said]
+            if notes:
+                text += "。→ " + "；".join(notes)
+    return text
 
 
 def predict_limits_said(key: str) -> str:
@@ -2033,6 +2225,7 @@ def _http_get(url: str, payload: dict | None = None, timeout: int = 15,
             **({"Content-Type": "application/json"} if data is not None else {}), **(headers or {})}
     split = urllib.parse.urlsplit(url)
     host = split.hostname or ""
+    note_predict_sent(host, hdrs, "POST" if data is not None else "GET", split.path)  # 1.154.61 (never raises)
     if split.scheme != "https" or not host or _proxied(host):
         return _http_urllib(url, data, hdrs, timeout, host)
     return _http_keepalive(url, split, data, hdrs, timeout)
@@ -2054,11 +2247,11 @@ def _http_urllib(url: str, data: bytes | None, hdrs: dict[str, str], timeout: in
             req.add_unredirected_header(name, value)  # with this request alone: urllib's redirect handler does not carry these on
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT) as response:
-            note_limit_headers(host, hdrs, getattr(response, "status", 200), response)  # 1.154.57 (never raises)
+            note_limit_headers(host, hdrs, getattr(response, "status", 200), response, req.get_method(), urllib.parse.urlsplit(url).path)  # 1.154.57 (never raises)
             raw = _read_body(response, timeout)
             return _inflate(raw, response.headers.get("Content-Encoding", ""))
     except urllib.error.HTTPError as error:
-        note_limit_headers(host, hdrs, error.code, error)
+        note_limit_headers(host, hdrs, error.code, error, req.get_method(), urllib.parse.urlsplit(url).path)
         raw = b""
         with contextlib.suppress(Exception):
             raw = error.read(4096)
@@ -2107,7 +2300,7 @@ def _http_keepalive(url: str, split: Any, data: bytes | None, hdrs: dict[str, st
         status = response.status
         if edge := (response.getheader("cf-ray") or response.getheader("server")):
             http_net(host)["edge"] = str(edge)[:40]
-        note_limit_headers(host, hdrs, status, response)  # 1.154.57: what the answer says of the key's limit (never raises)
+        note_limit_headers(host, hdrs, status, response, method, path)  # 1.154.57: what the answer says of the key's limit (never raises)
         try:
             if status >= 400:
                 raw = b""
