@@ -2405,7 +2405,13 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         ctl.owner.live_notify = lambda text, key="": notes.append((key, text))
         self.assertIn("：正常", ctl.check())
         ctl.error = "HTTP 500: boom"
-        self.assertEqual((ctl.errors[-1][1], notes[-1][0]), ("HTTP 500: boom", "preopen:error:HTTP 500: boom"))
+        self.assertEqual((ctl.errors[-1][1], notes[-1][0]), ("HTTP 500: boom", "preopen:error:HTTP #: boom"))  # (1.154.60: the key without the figures)
+        ctl.error = "Predict 接口限流冷却中（20 秒后重试）"
+        ctl.error = "Predict 接口限流冷却中（19 秒后重试）"
+        self.assertEqual([key for key, _ in notes[-2:]], ["preopen:error:Predict 接口限流冷却中（# 秒后重试）"] * 2, "a countdown: one key, so one notice in ten minutes (live_notify)")
+        self.assertEqual(notes[-1][1], "⚠️ 开盘前预挂：Predict 接口限流冷却中（19 秒后重试）")
+        ctl.errors.pop(); ctl.errors.pop()
+        ctl._error = "HTTP 500: boom"
         ctl.error = "HTTP 500: boom"
         self.assertEqual(len(ctl.errors), 1, "the same problem again: kept once")
         api.blocked_until = time.monotonic() + 30
@@ -3787,7 +3793,7 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
                     seen.append(("lent", "signature" in body["data"]["order"]))
                     raise m.RemoteError("HTTP 429: Too Many Requests", 20)
             lent = Lent()
-            ctl.lent_api, ctl.lane = lent, (lambda home: lent)
+            ctl.lent_api, ctl.lane = lent, (lambda home, trade=False: lent)  # (1.154.60: the lane is told when the request is an order)
             plain = api.create_order
 
             async def create(body):

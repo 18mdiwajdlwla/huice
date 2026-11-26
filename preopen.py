@@ -49,6 +49,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -618,6 +619,7 @@ class KeyLending:
         c = self.owner.config
         key = str(getattr(c, "rule_api_key", "") or "")
         others = {str(getattr(c, name, "") or "") for name in ("predict_api_key", "preopen_api_key", "predict_book_api_key")}
+        others |= {str(extra or "") for extra in getattr(c, "preopen_api_keys", ()) or ()}  # (1.154.59: the pre-open mode's further keys)
         return key if key and getattr(c, "rule_key_lend", True) and key not in others else ""
 
     def busy_in(self) -> int | None:
@@ -2002,6 +2004,32 @@ LISTING_LAGS, MIN_LAGS = 40, 5
 FAST_POLL_S = 0.5               # the fast poll's cadence (the queue position: the bid goes in within a second of the listing; 1.133.0: was 1 s)
 LISTING_PROBE_S = 2.0           # ...and each card's next listing is probed this often the rest of the time (was the poll setting, 5 s); the older windows keep the poll's pace
 PLACE_WORKERS = 4               # pairs placed side by side (three cards list at once, four levels each: twelve pairs — two workers took seconds)
+PLACE_WORKERS_MORE = 2          # 1.154.59: ...and this many more for each further key of the mode's (PREOPEN_API_KEYS): four pairs at a time are
+PLACE_WORKERS_MAX = 12          #   some 27 orders a second at a third of a second each, one key's eight tokens and 3.7 a second — up to this many
+MORE_OFF_S = 600.0              # 1.154.59: a further key that refused a request outright (a 401 / 403) is left alone this long, then tried again
+LANE_WAIT_MIN_S, LANE_WAIT_MAX_S = 0.005, 0.25  # ...and a request no key has a token for looks at the keys again no sooner and no later than this (lane_wait)
+# 1.154.60 — the mode at Predict's real limits (PREOPEN_APP_TRADING_PER_MIN / PREOPEN_APP_GENERAL_PER_MIN: core.preopen_paces). 11-26 the user sent
+# the Rate limits page of Predict's developer console: the limits are an app's, thousands of requests a minute, orders and cancels
+# (Trading) counted apart from everything else (General) — where the bot paced each key to 220 a minute of both. With the pace
+# out of the way the mode's own structure bounds it (a simulation of the deployed code, the key at 5,000 a minute or at 1,000
+# alike: a full re-quote went at 19 windows a minute, a fresh account's first fill at 70): two withdrawn pairs verified at a
+# time, each order read after the other and saved four times; four pairs placed at a time; five requests in flight a client,
+# three of them reads; eight known windows re-read a pass, one after the other. These follow the paces now:
+FAST_WORKERS_PER = 200          # a pair placed side by side for every this many orders a minute (20 at 3,880) ...
+FAST_WORKERS_MAX = 32           #   ...at the most
+FAST_READS_PER = 130            # a read in flight on the mode's low client, and on the fresh listings', for every this many reads a minute (28 at 3,560)
+FAST_READS_MAX = 48
+FAST_VERIFY_PER = 240           # a withdrawn pair verified side by side (its orders read together) for every this many reads a minute (15 at 3,560)
+FAST_VERIFY_MAX = 32
+FAST_REREAD_SHARE = 0.25        # the known windows re-read in a pass: this share of what the reads' pace gives in a poll's time (74 at 3,560, the poll five seconds)
+FAST_REREAD_SIDE = 16           #   ...this many asked at a time
+FAST_QUEUE_PER_WORKER = 40      # ...and they are re-read while fewer levels than this a worker wait in the queue (REREAD_QUEUE_MAX at the least)
+FAST_PAGE_S = 0.3               # the account snapshot's pace a page, at the least (ACCOUNT_PAGE_S × 220 / the reads' pace: 242 pages in 73 s, not six minutes)
+NOTICE_FIGURES = re.compile(r"\d+(?:\.\d+)?")  # the figures in a problem's text: not part of its notice's key (Controller.error)
+COOL_WAIT_S = 45.0              # a withdrawn pair's final reads wait out a cooldown of the mode's client this long at the most (Controller.cooled)
+FAST_BORROW_BELOW = 1000.0      # the rule taker's idle key is still borrowed — for reads — where the reads' own pace is under this a minute (borrow_why)
+FIRST_PARALLEL = 8              # ...and a fresh listing's client, and each further key's, lets this many requests be in flight at once: a full bucket's
+#                                 worth of orders (PredictPacer.BURST) goes out together — with five (PredictApi.PARALLEL) three of them stood a round trip behind
 MARKET_FRESH_MS = 15_000        # a window's details read by the discovery this recently are placed on, not read again
 MARKET_REUSE_MS = 600_000       # 1.154.2: ...and this recently, for a window starting more than REUSE_NEAR_MS on — one read for all its levels
 REUSE_NEAR_MS = 30 * 60_000     #   (its tokens never change; a fee or a status changed meanwhile has the order refused, nothing placed). With
@@ -2154,6 +2182,7 @@ class Controller:
         self.listed_at: dict[str, int] = {}  # card key -> when its latest window was first seen listed: the next listing is expected LISTING_CYCLE_MS on (poll_wait)
         self.allowance_cache: dict[str, tuple[int, int]] = {}  # exchange key -> (read at, allowance in wei)
         self.details: dict[str, tuple[int, dict]] = {}  # market id -> (read at, its details): one read for every level of a window (1.154.2)
+        self.detail_reads: dict[str, asyncio.Future] = {}  # market id -> the read of its details under way: the levels asking meanwhile share it (details_read, 1.154.60)
         for p in self.ledger.rows.values():
             self.listed_by_card[str(p.get("key") or "")] = max(self.listed_by_card.get(str(p.get("key") or ""), 0), int(p.get("start_ms") or 0))
         self.account_lock = asyncio.Lock()
@@ -2185,6 +2214,7 @@ class Controller:
         # position; first(): this one, unless the tests put their own client in as the api
         self.first_api = safe_api(live.API_BASES[owner.config.live_chain], key, owner.live.wallet, self.before_send, shared)
         self.first_api.patient = True
+        self.first_api.gate = asyncio.Semaphore(FIRST_PARALLEL)  # (1.154.59: the key's whole bucket of orders at a listing, side by side)
         # ...and the rule taker's own key, borrowed while that taker is idle (lender): a second budget for this mode's reads, its
         # snapshot and its placements. Only a key that is the rule taker's alone (not this mode's, not the bot's)
         self.lending = getattr(owner, "key_lending", None) or KeyLending(owner)  # the bot's (the orderbook feed borrows by it too); a stand-in owner: this mode's own
@@ -2198,6 +2228,38 @@ class Controller:
             self.lent_snap_api.patient = self.lent_snap_api.low = True
             self.lent_snap_api.leave = LEND_SNAPSHOT_LEAVE
         self.lent_made = self.lent_api  # (the tests put their own in: used whatever the api)
+        # 1.154.59: PREOPEN_API_KEYS — further keys for this mode alone (the user: "预挂有几把 key 可以用，然后看怎么用可以性能最高"). Predict
+        # limits each key by itself, so each is another budget: what goes "through" (the listings' probes, the placements, the
+        # re-reads, the final reads) goes out on one of them when the mode's first key has no token this instant — before the
+        # rule taker's, which is only lent while that taker idles. A client a key, its cooldown its own (a 429 there stops
+        # nothing on the others), its orders patient: within the key's pace, never borrowed ahead
+        self.more: list[Any] = []
+        self.more_cancel: dict[int, Any] = {}  # id(a further key's client) -> that key's client for a cancel (cancel_now): not patient, the same cooldown
+        for extra in getattr(owner.config, "preopen_api_keys", ()) or ():
+            extra = str(extra or "")
+            if not extra or extra in (key, lend_key, str(owner.config.predict_api_key or "")) or any(extra == other.api_key for other in self.more):
+                continue
+            client = safe_api(live.API_BASES[owner.config.live_chain], extra, owner.live.wallet, self.before_send)
+            client.patient = True
+            client.gate = asyncio.Semaphore(FIRST_PARALLEL)
+            self.more.append(client)
+            self.more_cancel[id(client)] = safe_api(live.API_BASES[owner.config.live_chain], extra, owner.live.wallet, None, client)
+        self.more_made = list(self.more)  # (the tests put their own in: used whatever the api)
+        self.more_off: dict[int, tuple[float, str]] = {}  # id(client) -> (monotonic until, why): a key that refused a request outright (more_refused)
+        self.more_warm: asyncio.Task | None = None  # those clients' sign-ins, kept fresh (more_keep_warm)
+        self.more_warmed = -1e9
+        self.more_warm_error = ""
+        self.firsts_waiting = 0  # fresh listings' first-level orders waiting for a token on the mode's keys: the other requests let them go first (lane_wait)
+        # 1.154.60: Predict's limits for the key's app given (core.preopen_paces): the mode's orders and its reads each at their own
+        # pace on its first key — and its own concurrency by them (fast_*). Not given: (0, 0), everything as it was
+        self.trade_pace, self.read_pace = core.preopen_paces(owner.config) if own_key else (0.0, 0.0)
+        # ...and Predict's refusals at those paces (fast_watch): the latest 429 of each bucket already looked at — those from
+        # before this controller are not its own to answer (the cut they made, if any, is in the paces above)
+        self.refusals_seen: dict[str, float] = {bucket: self.refusal_last(bucket)[0] for bucket in ("trade", "read")} if self.fast() else {}
+        if self.fast():
+            for client in (self.api, self.first_api):  # (the mode's low client and the fresh listings': their gates as wide as the paces need)
+                reads = self.fast_reads()
+                client.read_gate, client.gate = asyncio.Semaphore(reads), asyncio.Semaphore(reads + self.place_workers() * 2)
         self.lent_at: collections.deque = collections.deque(maxlen=4096)  # monotonic times of the requests that went out on the borrowed key (lent_last)
         self.lent_snapshot_slow = -1e9  # monotonic: when a snapshot begun on the borrowed key was last given up as too slow there (snapshot_lane)
         self.snapshot_where = ""        # where the last snapshot was read, and why there (the status)
@@ -2211,7 +2273,9 @@ class Controller:
                 client.ORDERS_PAGE = int(getattr(owner.config, "live_orders_page", 50) or 50)  # LIVE_ORDERS_PAGE: fewer pages a snapshot (1.136.1)
         self.settling: dict[str, asyncio.Task] = {}
         self.settle_gate = asyncio.Semaphore(2)
-        self.reconcile_gate = asyncio.Semaphore(2)  # the withdrawn pairs' final reads (launch_reconcile) have their own two: thousands of them never starve the monitors and settlements (1.141.0)
+        # the withdrawn pairs' final reads (launch_reconcile) have their own two: thousands of them never starve the monitors and settlements (1.141.0);
+        # 1.154.60: as many as the reads' pace carries where Predict's limits are given (fast_verify)
+        self.reconcile_gate = asyncio.Semaphore(self.fast_verify())
         self.bulk_slugs: set[str] = set()  # pairs a batch withdrawal holds: the loop leaves them to it (1.141.0)
         self.bulk_task: asyncio.Task | None = None  # the closing pairs' withdrawal in batches (a settings change: many at once), beside the loop
         self.bulk_progress: dict = {}  # the batch withdrawal under way (live.remove_in_batches), for the status
@@ -2237,7 +2301,10 @@ class Controller:
         self._error = text
         if fresh:
             self.errors.append((self.now(), text))
-            self.notify(f"⚠️ 开盘前预挂：{text}", key="preopen:error:" + text[:40])
+            # 1.154.60: one notice a kind of problem, whatever figures it carries — keyed by the text with its numbers taken out. A
+            # cooldown's "（20 秒后重试）", "（19 秒后重试）" … and "扫描 <window>：…" were each a key of their own, so each went
+            # out: a 429 made a dozen messages in its twenty seconds (a simulation of the limits given too high: 130 in ten minutes)
+            self.notify(f"⚠️ 开盘前预挂：{text}", key="preopen:error:" + NOTICE_FIGURES.sub("#", text)[:40])
 
     def notify(self, text: str, key: str = "") -> None:
         """A line to the administrator's chats (LiveBot.live_notify: a keyed notice repeats at most every LIVE_NOTE_SECONDS)."""
@@ -2368,7 +2435,7 @@ class Controller:
         if self.now() - self.account_at > self.account_stale_ms():
             return (f"账户快照过期（{(self.now() - self.account_at) // 1000} 秒前读到，每 {self.account_interval_s():.0f} 秒读一次"
                     + (f"，上次读了 {self.account_read_s:.0f} 秒" if self.account_read_s >= 1 else "") + "）")
-        return self.cooldown()
+        return "" if self.more_ready() else self.cooldown()  # (1.154.59: the first key cooling down, another of the mode's keys carries the pairs — lane)
 
     def yielding(self) -> float:
         """Seconds left in which the rule taker has the event loop to itself (the bot's rules_quiet, 1.154.23); 0.0 otherwise."""
@@ -2402,6 +2469,11 @@ class Controller:
         lent = self.lent_api
         if lent is None or (lent is self.lent_made and self.api is not getattr(self, "api_made", None)):
             return "没有可借的 Key"
+        if self.fast() and self.read_pace >= FAST_BORROW_BELOW:
+            # 1.154.60: that key is left to its taker (and to the orderbook feed's reads, which go there when the bot's key is short).
+            # Not where the app's General limit leaves the mode few reads (the 1,000 tier: 360 a minute): the idle key's share
+            # of that limit — kept for it in the mode's own pace (core.preopen_paces) — is then used through it, as before
+            return "预挂自己的 Key 已经按 Predict 后台的限额在跑，用不着借"
         if why := self.lending.why(spare_ms):
             return why
         if getattr(lent, "blocked_until", 0.0) - time.monotonic() > 0:
@@ -2414,32 +2486,159 @@ class Controller:
         """The client on the rule taker's key, while this mode may use that key (borrow_why); else None."""
         return self.lent_api if not self.borrow_why() else None
 
-    def lane(self, home: Any) -> Any:
-        """The client a request goes out on: ``home`` (one of this mode's own key) when that key has a token for it this
-        instant, or when nothing can be borrowed; else the borrowed key's client when that key has one to spare (1.154.21).
-        Both keys short: home — it waits there, as it always did."""
-        if self.lent_api is None or core.predict_pacer(str(getattr(home, "api_key", "") or "")).spare(low=bool(getattr(home, "low", False))):
+    def more_ready(self) -> list[Any]:
+        """The mode's further keys' clients a request can go out on now (1.154.59), in their order: signed in, not in a 429's
+        cooldown, not left alone after a refusal (more_off). None of the made ones while a client put in from outside stands
+        for the mode's own (the tests: as with the borrowed key, borrow_why)."""
+        if not self.more:
+            return []
+        now, stand_in = time.monotonic(), self.api is not getattr(self, "api_made", None)
+        return [client for client in self.more
+                if not (stand_in and any(client is made for made in self.more_made))
+                and getattr(client, "blocked_until", 0.0) - now <= 0 and getattr(client, "jwt", "signed")
+                and self.more_off.get(id(client), (0.0, ""))[0] <= now]
+
+    def lane(self, home: Any, trade: bool = False) -> Any:
+        """The client a request goes out on: ``home`` (one of this mode's first key) when that key has a token for it this
+        instant, or when there is no other key; else the first of the mode's further keys with a token to spare (1.154.59);
+        else the borrowed key's client when that key has one (1.154.21). Every key short: home — it waits there, as it always
+        did. While the first key waits out a 429's cooldown (home would refuse the request itself) a further key takes it
+        even without a token this instant — it waits for one there."""
+        cooling = getattr(home, "blocked_until", 0.0) - time.monotonic() > 0
+        # (``trade``, 1.154.60: an order — the bucket its key counts orders in, where that is not the key's one bucket: core.predict_pacer)
+        if (self.lent_api is None and not self.more) or (not cooling and core.predict_pacer(str(getattr(home, "api_key", "") or ""), trade).spare(low=bool(getattr(home, "low", False)))):
             return home
+        ready = self.more_ready()
+        for client in ready:
+            if core.predict_pacer(str(getattr(client, "api_key", "") or "")).spare():
+                return client
+        if cooling and ready:
+            return ready[0]
+        if trade and self.fast():
+            return home  # (1.154.60: at Predict's limits the orders' bucket is thousands a minute — nothing is borrowed for an order)
         lent = self.lender()
         if lent is None or not core.predict_pacer(str(getattr(lent, "api_key", "") or "")).spare(low=True):
             return home
         self.lent_at.append(time.monotonic())
         return lent
 
-    async def through(self, home: Any, call: Any) -> Any:
+    async def through(self, home: Any, call: Any, first: bool = False, trade: bool = False) -> Any:
         """``call(client)`` on the lane's client. The borrowed key refusing the request before anything is done with it — a
         429 or its cooldown, a 401 / 403 — is no answer about the request: it goes out once more on this mode's own key, and
         nothing more is borrowed for LEND_OFF_S (lent_refused). Any other failure is the request's own, raised as it is — a
         timeout, above all, is never sent again (an order may have been placed)."""
-        client = self.lane(home)
+        client = await self.lane_wait(home, first, trade) if self.more else self.lane(home, trade)
         if client is home:
             return await call(home)
         try:
             return await call(client)
         except Exception as error:
-            if not self.lent_refused(error):
+            if not (self.more_refused(client, error) if any(client is other for other in self.more) else self.lent_refused(error)):
                 raise
         return await call(home)
+
+    async def lane_wait(self, home: Any, first: bool = False, trade: bool = False) -> Any:
+        """lane() — and, where none of the mode's keys has a token for the request this instant, the first of them to have one
+        (1.154.59). Sent to wait on its first key's pacer, as with one key, a request sat there while the further keys' tokens
+        came and went unused (only a request that asked at the right instant took one): a listing's 126 orders on four keys
+        took 9.0 s where the keys together let them through in 6.4. So it looks again when the soonest of them is due
+        (PredictPacer.wait_for). The borrowed key is taken as before — when it has a token at one of these looks, never
+        waited for: how much of the rule taker's key this mode fills is not changed by this. What the request waited is
+        written to its first key's pacer, as a wait there would have been (/diag: 等节拍).
+
+        ``first``: a fresh listing's first-level order (place_pair). While one of those waits for a token, no other request
+        takes one: with more pairs placed side by side than a listing has first levels, the workers left over began the
+        deeper levels at once and their orders took the tokens the last first levels were waiting for (nine windows on two
+        keys: the first levels all resting after 2.5 s, where the tokens were there for them in under one)."""
+        began = 0.0
+        own = core.predict_pacer(str(getattr(home, "api_key", "") or ""), trade)
+        low = bool(getattr(home, "low", False))
+        if first:
+            self.firsts_waiting += 1
+        try:
+            while True:
+                if not first and self.firsts_waiting and not self.stopped():
+                    began = began or time.monotonic()
+                    await asyncio.sleep(LANE_WAIT_MIN_S)
+                    continue
+                client = self.lane(home, trade)
+                ready = self.more_ready()
+                if client is not home or not ready or own.spare(low=low) or self.stopped():
+                    break
+                waits = [own.wait_for(low=low), *(core.predict_pacer(str(getattr(other, "api_key", "") or "")).wait_for() for other in ready)]
+                began = began or time.monotonic()
+                await asyncio.sleep(min(LANE_WAIT_MAX_S, max(LANE_WAIT_MIN_S, min(waits))))
+        finally:
+            if first:
+                self.firsts_waiting -= 1
+        if began:
+            waited = time.monotonic() - began
+            own.waited += waited
+            own.waits.append((time.monotonic(), waited))
+        return client
+
+    def more_refused(self, client: Any, error: BaseException) -> bool:
+        """Whether a failure on one of the mode's further keys is that key's refusal of the request, unprocessed (through: it
+        then goes out on the mode's first key). A 429 has put that client in its own cooldown, and the lane passes it by
+        meanwhile; a 401 / 403 — a key withdrawn, or not this account's — leaves the key alone for MORE_OFF_S, and says so."""
+        import live
+        status, text = live.http_status(error), core.clean_error(error) or type(error).__name__
+        if status not in (401, 403, 429) and "限流冷却中" not in text:
+            return False
+        if status in (401, 403):
+            n = next((i for i, other in enumerate(self.more) if other is client), 0) + 2
+            self.more_off[id(client)] = (time.monotonic() + MORE_OFF_S, f"拒绝了请求（HTTP {status}）")
+            LOG.warning("开盘前预挂：第 %d 把 Key 拒绝了请求（HTTP %d），%d 分钟内不用它", n, status, int(MORE_OFF_S // 60))
+            self.notify(f"⚠️ 开盘前预挂：第 {n} 把 Key（PREOPEN_API_KEYS 里的第 {n - 1} 把）拒绝了请求（HTTP {status}）——这把 Key 可能填错了、被收回了或不是这个账户的；"
+                        f"{MORE_OFF_S / 60:.0f} 分钟内不用它，请求照常走其他 Key", key=f"preopen:key:{n}")
+        return True
+
+    def cancel_now(self) -> Any:
+        """The client a window's cancel at its time goes out on: the mode's own (cancel_api) — or, while that key waits out a
+        429's cooldown, one of its further keys' (1.154.59): a cancel does not stand twenty seconds for one key when another
+        can carry it (the orders are the account's, whichever key asks). The tests' own cancel client: that one."""
+        home = self.cancel_api
+        if home is not self.cancel_made or getattr(home, "blocked_until", 0.0) - time.monotonic() <= 0:
+            return home
+        for client in self.more_ready():
+            if (other := self.more_cancel.get(id(client))) is not None:
+                return other
+        return home
+
+    def more_keep_warm(self) -> None:
+        """The further keys' clients signed in, and their tokens renewed before they expire, beside the loop (as the fresh
+        listings' client: first_keep_warm) — the lane takes a key only once it is signed in, so no order waits for a sign-in.
+        Every FIRST_WARM_S; a sign-in that fails is said in the status and tried again then."""
+        if not self.more or time.monotonic() - self.more_warmed < FIRST_WARM_S or (self.more_warm is not None and not self.more_warm.done()):
+            return
+        if self.api is not getattr(self, "api_made", None) and all(any(client is made for made in self.more_made) for client in self.more):
+            return  # (a stand-in for the mode's client, and none of the further ones put in with it: nothing to sign in)
+        self.more_warmed = time.monotonic()
+        clients = [c for client in self.more for c in (client, self.more_cancel.get(id(client))) if c is not None and callable(getattr(c, "ensure_auth", None))]
+
+        async def warm() -> None:
+            failed = ""
+            for client in clients:
+                try:
+                    await client.ensure_auth()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # (tried again FIRST_WARM_S on; until then the lane passes that key by)
+                    failed = core.clean_error(error) or type(error).__name__
+            self.more_warm_error = failed
+        self.more_warm = asyncio.create_task(warm(), name="preopen-more-warm")
+
+    def more_usage(self) -> list[str]:
+        """What each of the mode's further keys carried in the last minute, and what keeps one from being used, for the status."""
+        out, now = [], time.monotonic()
+        for i, client in enumerate(self.more):
+            pacer = core.PREDICT_PACERS.get(str(getattr(client, "api_key", "") or ""))
+            off = self.more_off.get(id(client), (0.0, ""))
+            hits = sum(1 for at, _ in pacer.limits if at >= now - 600) if pacer is not None else 0
+            note = (f"{off[1]}，停用中" if off[0] > now else "限流冷却中" if getattr(client, "blocked_until", 0.0) - now > 0
+                    else "还没登录上" + (f"：{self.more_warm_error}" if self.more_warm_error else "") if not getattr(client, "jwt", "signed") else "")
+            out.append(f"第 {i + 2} 把 {pacer.last_minute() if pacer is not None else 0} 次" + (f"（{note}）" if note else "") + (f"（10 分钟内 429 {hits} 次）" if hits else ""))
+        return out
 
     def lent_refused(self, error: BaseException) -> bool:
         """Whether a failure on the borrowed key is that key's refusal of the request, unprocessed (through): if so, the
@@ -2558,7 +2757,7 @@ class Controller:
     def account_interval_s(self) -> float:
         """How often the account snapshot is read: the poll, or ACCOUNT_PAGE_S a page when the open orders fill more pages
         than that allows (1.134.1: 23 pages every five seconds was most of the request volume)."""
-        return max(float(self.settings.poll), self.account_pages * ACCOUNT_PAGE_S)
+        return max(float(self.settings.poll), self.account_pages * self.account_page_s())
 
     def account_stale_ms(self) -> int:
         """How old a snapshot may be before nothing new is placed on it: twice its pace, the last read's own duration (the
@@ -2739,14 +2938,14 @@ class Controller:
             # most: a backlog's placements borrowing without end must not keep the snapshot from ever finishing)
             yielding, lent = None, client if client is not self.snapshot_client() else None
             if lent is not None and getattr(lent, "leave", 0.0):
-                yielding = asyncio.get_running_loop().call_later(max(LEND_YIELD_MIN_S, self.account_pages * ACCOUNT_PAGE_S / 2), lambda: setattr(lent, "leave", 0.0))
+                yielding = asyncio.get_running_loop().call_later(max(LEND_YIELD_MIN_S, self.account_pages * self.account_page_s() / 2), lambda: setattr(lent, "leave", 0.0))
             try:
                 if lent is None:
                     rows = await client.orders("OPEN")
                 else:
                     # 1.154.48: on the borrowed key for half the snapshot's own pace at the most — its pages wait there behind
                     # everyone else's, and a read that does not end leaves every placement held
-                    rows = await asyncio.wait_for(client.orders("OPEN"), max(LEND_SNAPSHOT_MIN_S, self.account_pages * ACCOUNT_PAGE_S / 2))
+                    rows = await asyncio.wait_for(client.orders("OPEN"), max(LEND_SNAPSHOT_MIN_S, self.account_pages * self.account_page_s() / 2))
             except asyncio.TimeoutError:
                 if lent is None:
                     raise
@@ -3008,7 +3207,7 @@ class Controller:
         sprint = self.sprinting()  # judged as the pass begins: a pass that started for a listing stays with the listings (the next tick re-reads)
         try:
             await self.probe_listings(known_before, full, attempts, strikes, st)
-            if (not probe_only and not st["stopped"] and not sprint and len(self.queued) <= REREAD_QUEUE_MAX  # 1.154.2: not while a long queue waits
+            if (not probe_only and not st["stopped"] and not sprint and len(self.queued) <= self.reread_queue_max()  # 1.154.2: not while a long queue waits
                     and not self.first_snapshot_pending()):  # 1.154.8: nor before the first snapshot (it holds every placement: its pages first)
                 self.rescan_ms = self.now()
                 await self.reread_known(known_before, attempts, strikes, st)
@@ -3109,6 +3308,8 @@ class Controller:
     async def reread_known(self, known_before: dict, attempts: dict, strikes: dict, st: dict) -> None:
         """The known-listed windows with a level still to quote (a withdrawn pair's, a level the cap held back, a deeper
         level now near its start), the soonest first, DISCOVER_READS a pass: the rest the next pass."""
+        if self.fast():
+            return await self.reread_known_fast(known_before, strikes, attempts, st)
         for rolling, start in window_starts(self.now(), self.owner.config, self.settings):
             if start > known_before.get(rolling.key, 0) or (self.card_holds.get(rolling.key) and start - self.now() <= CARD_HOLD_NEAR_MS):
                 continue
@@ -3146,6 +3347,57 @@ class Controller:
                 self.skipped[slug], self.skipped_at[slug] = "已发布的场次读不到（404）", self.now()
                 continue
             self.enqueue(market, slug, wanted, attempts, st)
+
+    async def reread_known_fast(self, known_before: dict, strikes: dict, attempts: dict, st: dict) -> None:
+        """reread_known where the reads have a pace of thousands a minute (1.154.60): as many windows a pass as a share of that
+        pace gives (reread_batch), FAST_REREAD_SIDE of them asked at a time — eight a pass, one after the other, were 96
+        windows a minute: a day's 1,400 took a quarter of an hour to come back into the queue however fast the orders went.
+        The same windows in the same order, each judged as reread_known judges it; a group that has no answer in
+        REREAD_WAIT_S, or a read that fails, ends the pass as there (what was answered before it is queued)."""
+        todo: list[tuple[str, list]] = []
+        batch = self.reread_batch()
+        for rolling, start in window_starts(self.now(), self.owner.config, self.settings):
+            if start > known_before.get(rolling.key, 0) or (self.card_holds.get(rolling.key) and start - self.now() <= CARD_HOLD_NEAR_MS):
+                continue
+            slug = window_slug(rolling, start)
+            if self.now() - self.skipped_at.get(slug, 0) < SKIP_RETRY_MS:
+                continue
+            wanted = self.wanted_levels(slug, start, strikes, st, rolling.key)
+            if not wanted:
+                continue
+            if len(todo) >= batch:
+                st["deferred"] += 1
+                continue
+            todo.append((slug, wanted))
+        for at in range(0, len(todo), FAST_REREAD_SIDE):
+            group = todo[at:at + FAST_REREAD_SIDE]
+            asked = [asyncio.ensure_future(self.through(self.api, lambda api, slug=slug: category_market(api, slug))) for slug, _ in group]
+            st["reads"] += len(group)
+            st["asked"] += len(group)
+            self.rereading = True
+            try:
+                await asyncio.wait(asked, timeout=REREAD_WAIT_S)
+            finally:
+                self.rereading = False
+                for task in asked:
+                    if not task.done():
+                        task.cancel()
+            for (slug, wanted), task in zip(group, asked):
+                if not task.done() or task.cancelled():
+                    st["stopped"] = st["stopped"] or f"{slug.rsplit('-', 1)[-1]}：{REREAD_WAIT_S:g} 秒没等到（请求额度紧），下次再读"
+                    continue
+                if task.exception() is not None:
+                    if not st["stopped"]:
+                        st["stopped"] = f"{slug.rsplit('-', 1)[-1]}：{core.clean_error(task.exception()) or type(task.exception()).__name__}"
+                        self.error = f"扫描 {st['stopped']}"
+                    continue
+                market = task.result()
+                if market is None:  # a window known listed answers 404: not asked again for a minute
+                    self.skipped[slug], self.skipped_at[slug] = "已发布的场次读不到（404）", self.now()
+                    continue
+                self.enqueue(market, slug, wanted, attempts, st)
+            if st["stopped"]:
+                return
 
     def note_listing(self, rolling: Any, start: int, known_before: dict) -> None:
         """A window read listed: the card's listing horizon, and — a new listing beyond the known — the rhythm's anchor
@@ -3246,8 +3498,7 @@ class Controller:
             fresh = kept if kept is not None and self.now() - read_ms <= ttl else None
         home = self.first() if c.get("fresh") else self.api  # 1.154.21: a fresh listing's requests ahead of the mode's low traffic on its key
         if fresh is None:
-            fresh = await self.through(home, lambda api: api.market(c["market_id"]))
-            self.keep_details(str(c["market_id"]), fresh)
+            fresh = await self.details_read(home, str(c["market_id"]))
         market = {**fresh, "categorySlug": c.get("window", c["slug"])}  # the window the category named: the details' own slug may differ
         current = candidate(market, self.now(), self.owner.config, self.settings)
         if current is None or current["slug"] != c.get("window", c["slug"]):
@@ -3319,7 +3570,7 @@ class Controller:
             try:
                 # 1.154.21: on the mode's key when it has a token now, else on the rule taker's idle one (through: that key's
                 # refusal — unprocessed — sends the order on the mode's own; the signed order is the same on either)
-                result = await self.through(home, lambda api: api.create_order(order["body"]))
+                result = await self.through(home, lambda api: api.create_order(order["body"]), first=bool(c.get("fresh")) and not c.get("level"), trade=True)
                 order.update(id=result["order_id"], state="open", api_hash=str(result.get("hash") or "").lower())
                 self.placed_at.append((self.now(), pair["window"]))  # 1.154.57: one more order on the book (speed_line)
             except NotSent as error:
@@ -3533,6 +3784,8 @@ class Controller:
         turns (core.PredictPacer: whoever asks at the right instant has the token), so the order is kept here: the
         listings' probes and orders (ahead of all low traffic at the pacer), the placements and the re-reads that feed
         them, and these reads when none of those is out — which is whenever nothing released is left to quote."""
+        if self.fast():
+            return  # 1.154.60: the orders take their tokens from a bucket of their own, and the reads' pace is thousands a minute: nothing to stand behind
         began = time.monotonic()
         while (self.placing or self.rereading) and time.monotonic() - began < FINALS_YIELD_S and not self.stopped():
             await asyncio.sleep(FINALS_YIELD_STEP_S)
@@ -3542,6 +3795,22 @@ class Controller:
             return
         self.cancelling.add(pair["slug"])
         try:
+            if self.fast() and self.finals_only(pair):
+                await self.cooled()  # (...not into a cooldown: see there)
+            if self.fast() and self.finals_only(pair):
+                # 1.154.60: nothing left of the pair but its withdrawn orders' final reads, now due — the thousands a mass withdrawal
+                # leaves. Both orders read together, and the pair saved once when both are in (bookkeep): a read changes nothing
+                # at Predict, so a pair not saved after a crash is simply read again. One after the other, with a save at the
+                # start, after each read and at the end, a pair took two round trips and four waits for the disk
+                if pair.get("reason") != reason:
+                    pair["reason"] = reason
+                answers = await asyncio.gather(*(self.read_final(order, pair, late=True) for order in pair["orders"].values() if order["state"] == "removed"),
+                                               return_exceptions=True)
+                for answer in answers:
+                    if isinstance(answer, BaseException):
+                        raise answer  # (the next try is booked already — book_due — and reads them again)
+                self.bookkeep(pair)
+                return
             pair.update(phase="closing" if pair["phase"] != "closed" else "closed", reason=reason)
             self.ledger.save(pair)
             for order in pair["orders"].values():
@@ -3570,7 +3839,7 @@ class Controller:
                     else:
                         continue
                 pair.setdefault("cancel_sent_ms", self.now())
-                result = await self.cancel_api.remove_orders([order["id"]])
+                result = await self.cancel_now().remove_orders([order["id"]])
                 if order["id"] in result["removed"]:
                     self.off_book(order)
                     pair.setdefault("cancel_done_ms", self.now())
@@ -3582,6 +3851,32 @@ class Controller:
             self.bookkeep(pair)
         finally:
             self.cancelling.discard(pair["slug"])
+
+    async def cooled(self) -> None:
+        """Waits out a cooldown of the mode's client (a 429: twenty seconds), COOL_WAIT_S at the most, before a withdrawn
+        pair's final reads (cancel_pair, at Predict's real limits). Such a read met the cooldown at once, unsent — and so did
+        the next pair's, and the next: in a cooldown's twenty seconds every one of the thousands of withdrawn pairs waiting
+        went through its try, each booked for its next a quarter, a half, one, two minutes on (bookkeep), and when the
+        cooldown ended there was nothing due to read (a simulation of the limits given too high: the reads stood for a
+        minute after each 429). A pair waits here instead, its turn kept."""
+        began = time.monotonic()
+        while not self.stopped() and time.monotonic() - began < COOL_WAIT_S:
+            left = getattr(self.api, "blocked_until", 0.0) - time.monotonic()
+            if left <= 0:
+                return
+            await asyncio.sleep(min(left, 0.5) + 0.01)
+
+    def finals_only(self, pair: dict) -> bool:
+        """Whether all that is left to do for a withdrawn pair is to read its orders' final fills, and those reads are due:
+        withdrawn (closing — or closed already: bookkeep closes a pair once nothing of it is left to cancel) and not
+        accounted, the window not long over (the give-up has its own words for a record), every order off the book for
+        good — "removed" with its final read's time come (final_read_ms), or in a state that needs nothing more — and one
+        of them "removed" at least."""
+        if pair["phase"] not in ("closing", "closed") or pair.get("accounted") or self.gave_up(pair):
+            return False
+        orders = list(pair["orders"].values())
+        removed = [o for o in orders if o["state"] == "removed"]
+        return bool(removed) and all(o["state"] in TERMINAL for o in orders) and all(self.now() >= self.final_read_ms(o, pair) for o in removed)
 
     async def settle_pair(self, pair: dict) -> None:
         """Official resolution + fresh final fills; never settle on a local candle."""
@@ -3781,7 +4076,7 @@ class Controller:
         try:
             if by_id:
                 result = await live.remove_in_batches(
-                    self.bulk_client() if patient else self.cancel_api, list(by_id), limit, workers=BULK_WORKERS, patient=patient,
+                    self.bulk_client() if patient else self.cancel_now(), list(by_id), limit, workers=BULK_WORKERS, patient=patient,
                     deadline=time.monotonic() + deadline_s if deadline_s else None, stop=self.owner.stopping.is_set,
                     on_answer=answered, progress=progress, now_ms=self.now)
         finally:
@@ -3917,6 +4212,104 @@ class Controller:
                 out.append(p)
         return sorted(out, key=lambda p: p["cancel_ms"])
 
+    async def details_read(self, home: Any, market_id: str) -> dict:
+        """A market's details read for a pair about to be placed, and kept (keep_details) — one read for every level of the window
+        that asks while it is out (1.154.60). The levels of a window stand next to each other in the queue, so the workers took
+        them up together, each found nothing kept yet, and each read the same market: a new account's first fill, twenty pairs
+        at a time, made a read for every second pair where one a window serves (four at a time did the same on a smaller scale).
+        A read that fails fails for each of them, as each one's own would have."""
+        pending = self.detail_reads.get(market_id)
+        if pending is None:
+            async def read() -> dict:
+                fresh = await self.through(home, lambda api: api.market(market_id))
+                self.keep_details(market_id, fresh)
+                return fresh
+            pending = self.detail_reads[market_id] = asyncio.ensure_future(read())
+            pending.add_done_callback(lambda done, key=market_id: (self.detail_reads.pop(key, None), done.cancelled() or done.exception()))
+        return await asyncio.shield(pending)  # (one asker cancelled — a stop — does not take the read from the others)
+
+    def place_workers(self) -> int:
+        """How many pairs are placed side by side: PLACE_WORKERS, and PLACE_WORKERS_MORE for each further key of the mode's
+        (1.154.59: more tokens at once than four pairs' requests can take up), PLACE_WORKERS_MAX at the most. 1.154.60: one for
+        every FAST_WORKERS_PER orders a minute where the orders have a pace of their own (FAST_WORKERS_MAX at the most)."""
+        usual = min(PLACE_WORKERS_MAX, PLACE_WORKERS + PLACE_WORKERS_MORE * len(self.more))
+        return max(usual, min(FAST_WORKERS_MAX, math.ceil(self.trade_pace / FAST_WORKERS_PER))) if self.fast() else usual
+
+    def fast(self) -> bool:
+        """Whether the mode runs at Predict's real limits (1.154.60): its orders and its reads each paced by themselves on its
+        first key (core.preopen_paces — PREOPEN_APP_TRADING_PER_MIN and PREOPEN_APP_GENERAL_PER_MIN given, the key its own)."""
+        return bool(getattr(self, "trade_pace", 0) and getattr(self, "read_pace", 0))
+
+    def fast_reads(self) -> int:
+        """Reads in flight at once on the mode's low client and the fresh listings' (PredictApi.READ_PARALLEL where not fast)."""
+        return min(FAST_READS_MAX, max(3, math.ceil(self.read_pace / FAST_READS_PER))) if self.fast() else 3
+
+    def fast_verify(self) -> int:
+        """Withdrawn pairs whose final fills are read side by side (reconcile_gate): two, or what the reads' pace carries."""
+        return min(FAST_VERIFY_MAX, max(2, math.ceil(self.read_pace / FAST_VERIFY_PER))) if self.fast() else 2
+
+    def reread_batch(self) -> int:
+        """Known windows re-read in a discovery pass (reread_known): DISCOVER_READS, or FAST_REREAD_SHARE of what the reads'
+        pace gives in a poll's time."""
+        return max(DISCOVER_READS, int(self.read_pace / 60.0 * float(self.settings.poll) * FAST_REREAD_SHARE)) if self.fast() else DISCOVER_READS
+
+    def reread_queue_max(self) -> int:
+        """The levels waiting in the queue up to which the known windows are still re-read (REREAD_QUEUE_MAX, 1.154.2): more
+        where more pairs are placed side by side — the queue empties that much faster."""
+        return max(REREAD_QUEUE_MAX, FAST_QUEUE_PER_WORKER * self.place_workers()) if self.fast() else REREAD_QUEUE_MAX
+
+    def account_page_s(self) -> float:
+        """The account snapshot's pace a page: ACCOUNT_PAGE_S — less where the reads have a pace of thousands (FAST_PAGE_S at
+        the least): the fills the snapshot shows, and what the placements are held against, are that much fresher."""
+        return max(FAST_PAGE_S, ACCOUNT_PAGE_S * 220.0 / self.read_pace) if self.fast() and self.read_pace > 220.0 else ACCOUNT_PAGE_S
+
+    def refusal_last(self, bucket: str) -> tuple[float, int]:
+        """(when, what the bucket had let through in the minute before) of the latest 429 on the mode's first key in ``bucket``
+        ("trade": its orders and cancels; "read": everything else) — core.PredictPacer.note_429; (0.0, 0) with none."""
+        key = str(getattr(self.api, "api_key", "") or "")
+        pacer = (core.PREDICT_TRADE_PACERS if bucket == "trade" else core.PREDICT_PACERS).get(key) if key else None
+        return (float(pacer.limits[-1][0]), int(pacer.limits[-1][1])) if pacer is not None and pacer.limits else (0.0, 0)
+
+    def fast_watch(self) -> None:
+        """Predict refusing a request while the mode runs at the limits given (1.154.60), looked for as the loop goes round:
+        that bucket's pace is cut to what Predict did let through (core.preopen_refused) and the cut is said. The limits are
+        an app's and the bot's other keys count in them: a mode that went on at figures Predict does not go by — another
+        app's page, a tier that moved — would keep the app's minute full, and the model trader's and the rule taker's
+        requests would be refused with its own."""
+        if not self.fast():
+            return
+        try:  # (never the cancellation loop's problem — that loop withdraws the orders at their time: a failure here is logged, no more)
+            for bucket, name in (("read", "读取等其他请求"), ("trade", "下单撤单")):
+                at, sent = self.refusal_last(bucket)
+                if at <= self.refusals_seen.get(bucket, 0.0):
+                    continue
+                self.refusals_seen[bucket] = at
+                cut = core.preopen_refused(self.owner.config, bucket, sent)
+                if cut is None:
+                    continue  # (the same episode as the last cut: Predict's minute still full)
+                before, after = cut
+                self.trade_pace, self.read_pace = core.preopen_paces(self.owner.config)
+                limits = f"Trading {self.settings.app_trading} / General {self.settings.app_general}"
+                if after < before:
+                    LOG.warning("开盘前预挂：Predict 拒绝了请求（429），%s的节拍从每分钟 %g 次降到 %g 次（被拒前 60 秒放行 %d 次）", name, before, after, sent)
+                    self.notify(f"⚠️ 开盘前预挂：按后台限额跑时被 Predict 拒绝了（429）——{name}在被拒前的 60 秒发了 {sent} 次，节拍已从每分钟 {before:g} 次自动降到 {after:g} 次。"
+                                f"填的限额（{limits}）可能不是预挂这把 Key 所在 App 的，或者交易量档位变了：到 Predict 后台的 Rate limits 页核对一下，"
+                                f"改“Predict 限额”那两项。降下来的速度会一直保持到改这两项或重启", key=f"preopen:cut:{bucket}:{after:g}")
+                else:
+                    LOG.warning("开盘前预挂：Predict 拒绝了请求（429），%s的节拍已经是最低的每分钟 %g 次", name, after)
+                    self.notify(f"⚠️ 开盘前预挂：{name}已经降到最低的每分钟 {after:g} 次，仍被 Predict 拒绝（429）——填的限额（{limits}）对这把 Key 不成立。"
+                                f"把“Predict 限额”那两项改成 0（不填），预挂就回到原来的方式", key=f"preopen:cut:{bucket}:floor")
+        except Exception as error:
+            LOG.warning("开盘前预挂：被拒绝后的降速没做成：%s", core.clean_error(error) or type(error).__name__)
+
+    def cut_line(self) -> str:
+        """The status's words on paces Predict's refusals have cut (fast_watch), "" with none."""
+        if not self.fast():
+            return ""
+        whole = core.preopen_paces(self.owner.config, whole=True)
+        cut = [f"{name}从每分钟 {full:g} 次降到 {now:g} 次" for name, full, now in (("下单撤单", whole[0], self.trade_pace), ("其他请求", whole[1], self.read_pace)) if now < full]
+        return ("⚠️ 被 Predict 拒绝过（429），已自动降速：" + "、".join(cut) + "——填的限额可能不是这把 Key 所在 App 的，或档位变了；核对后改那两项，或重启后恢复；") if cut else ""
+
     async def placement_worker(self) -> None:
         while not self.stopped():
             _, _, c = await self.queue.get()
@@ -3997,11 +4390,20 @@ class Controller:
         own = bool(getattr(self.owner.config, "preopen_api_key", ""))
         per_min = float(getattr(self.owner.config, "predict_rate_per_min", 0) or 0)
         mine, asked = core.preopen_own_rate(self.owner.config), float(getattr(self.owner.config, "preopen_rate_per_min", 0) or 0)
+        if self.fast() and core.PREDICT_PACING:  # 1.154.60: by Predict's own two buckets
+            return ("用预挂自己的 API Key（PREOPEN_API_KEY），按 Predict 后台给这个 App 的限额跑"
+                    f"（Trading {self.settings.app_trading}、General {self.settings.app_general} 次/分钟，PREOPEN_APP_*）："
+                    f"下单撤单每分钟最多 {self.trade_pace:g} 次、其他请求最多 {self.read_pace:g} 次——各用到限额的 {core.PREOPEN_APP_SHARE:.0%}，再扣掉机器人别的 Key 可能用的份额；"
+                    f"同时挂 {self.place_workers()} 对、同时核对 {self.fast_verify()} 对；" + self.cut_line() + self.borrow_line())
+        limits = (f"——PREOPEN_APP_*（Predict 后台的限额）填了但没起作用：预挂没有自己单独的 Key" if (self.settings.app_trading or self.settings.app_general) and not self.fast() else "")
         pace = ("不节流" if not ((mine or per_min) and core.PREDICT_PACING)
                 else f"每分钟最多 {mine:g} 次（PREOPEN_RATE_PER_MIN：只管预挂这把 Key，别的 Key {f'仍是 {per_min:g}' if per_min else '不节流'}；读等节拍、下单撤单优先）" if mine
                 else f"每分钟最多 {per_min:g} 次（PREDICT_RATE_PER_MIN，读等节拍、下单撤单优先）"
                 + (f"——PREOPEN_RATE_PER_MIN={asked:g} 没起作用：预挂没有自己单独的 Key（PREOPEN_API_KEY 没填，或和主 Key、盘口 Key、规则吃单 Key 是同一把）" if asked else ""))
-        return ("用预挂自己的 API Key（PREOPEN_API_KEY），" if own else "和原策略、盘口共用一个 API Key，") + f"请求{pace}；" + self.borrow_line()
+        keys = (f"用预挂自己的 {1 + len(self.more)} 把 API Key（PREOPEN_API_KEY 和 PREOPEN_API_KEYS 的 {len(self.more)} 把：第一把没有名额时依次用后面的，各有各的额度），" if own and self.more
+                else "用预挂自己的 API Key（PREOPEN_API_KEY），" if own
+                else f"和原策略、盘口共用一个 API Key，另有 PREOPEN_API_KEYS 的 {len(self.more)} 把，" if self.more else "和原策略、盘口共用一个 API Key，")
+        return keys + f"请求{pace}{limits}；" + self.borrow_line()
 
     def placed_since(self, since_ms: int) -> list[str]:
         """The windows of the orders Predict accepted since ``since_ms`` — one entry an order, the newest first."""
@@ -4044,7 +4446,13 @@ class Controller:
         if pacer is not None:
             used, pace = pacer.last_minute(), float(pacer.per_min) if core.PREDICT_PACING else 0.0
             waited, seconds = pacer.waited_last()
-            if pace <= 0:
+            trade = core.PREDICT_TRADE_PACERS.get(key) if self.fast() else None
+            if self.fast() and pace > 0:  # 1.154.60: Predict's two buckets, each against its own pace
+                sent = trade.last_minute() if trade is not None else 0
+                full = lambda n, most: "，跑满了" if n >= SPEED_FULL * most else ""
+                usage = (f"{name}最近 1 分钟：下单撤单 {sent} 次（节拍每分钟 {self.trade_pace:g}{full(sent, self.trade_pace)}）、"
+                         f"其他请求 {used} 次（节拍 {pace:g}{full(used, pace)}）")
+            elif pace <= 0:
                 usage = f"{name}最近 1 分钟发出 {used} 次请求（不节流）"
             elif used >= SPEED_FULL * pace:
                 usage = (f"{name}最近 1 分钟发出 {used} 次请求、节拍每分钟 {pace:g} 次——用满了" + (f"（{waited} 次请求排队等节拍，共等 {seconds:.0f} 秒）" if waited else "")
@@ -4054,10 +4462,12 @@ class Controller:
                          "这时调高节拍看不出区别，要测上限得等有一批单在补挂的时候")
             if self.speed_task is not None and not self.speed_task.done():
                 usage += "（正在测速：里面有测速的读请求）"
+            if self.more:
+                usage += "；预挂另外的 Key：" + "、".join(self.more_usage())
             if lent := self.lent_last():
                 usage += f"；另借规则吃单的 Key 走了 {lent} 次"
             parts.append(usage)
-            mono, hits = time.monotonic(), list(pacer.limits)
+            mono, hits = time.monotonic(), sorted([*pacer.limits, *(trade.limits if trade is not None else ())])  # (the orders' bucket's too)
             # (the list full: its first entry may be from the middle of a run whose beginning was dropped — not taken for one)
             firsts, before = [], hits[0][0] if hits and len(hits) == pacer.limits.maxlen else float("-inf")
             for at, count in hits:
@@ -4090,6 +4500,9 @@ class Controller:
                     "和原策略、盘口或规则吃单共用的 Key 不测")
         if not core.PREDICT_PACING:
             return "请求节流关着（PREDICT_PACING=off）——测速靠节流来定每一档的速度"
+        if self.fast():
+            return (f"预挂已经按 Predict 后台的限额在跑（PREOPEN_APP_*：读取每分钟 {self.read_pace:g} 次、下单撤单 {self.trade_pace:g} 次）——上限后台写着，"
+                    f"测速只测到每分钟 {SPEED_TEST_STEPS[-1]} 次读取，用不上了")
         if self.speed_target() is None:
             return "预挂现在没有挂着的单、也没读过市场，没有可以拿来读的东西；等挂上单再测"
         return ""
@@ -4216,8 +4629,10 @@ class Controller:
         """The bot's other keys by name, each with its pacer — the bot's own, the orderbook feed's, the rule taker's: those
         configured, that have sent anything, and are not the key under test (a key under two names once)."""
         c, out, seen = self.owner.config, [], {id(pacer)}
-        for name, attr in (("主 Key", "predict_api_key"), ("盘口 Key", "predict_book_api_key"), ("规则吃单 Key", "rule_api_key")):
-            other = core.PREDICT_PACERS.get(str(getattr(c, attr, "") or "")) if getattr(c, attr, "") else None
+        named = [(name, str(getattr(c, attr, "") or "")) for name, attr in (("主 Key", "predict_api_key"), ("盘口 Key", "predict_book_api_key"), ("规则吃单 Key", "rule_api_key"))]
+        named += [(f"预挂第 {i + 2} 把 Key", str(getattr(client, "api_key", "") or "")) for i, client in enumerate(self.more)]  # (1.154.59)
+        for name, key in named:
+            other = core.PREDICT_PACERS.get(key) if key else None
             if other is not None and id(other) not in seen:
                 seen.add(id(other))
                 out.append((name, other))
@@ -4523,12 +4938,14 @@ class Controller:
                 made = getattr(client, "calls", 0)
                 return len(made) if isinstance(made, list) else int(made or 0)
             calls = sum(count(client) for client in {id(x): x for x in (self.api, self.cancel_api, self.bulk_client(), self.snapshot_client(), self.first(),
-                                                                        self.lent_api, self.lent_snap_api) if x is not None}.values())
+                                                                        self.lent_api, self.lent_snap_api, *self.more, *self.more_cancel.values()) if x is not None}.values())
             self.lent_keep_warm()
             self.first_keep_warm()
+            self.more_keep_warm()
             if not self.rate_samples or now - self.rate_samples[-1][0] >= 500:
                 self.rate_samples.append((now, calls))
             self.note_speed(now)
+            self.fast_watch()
             await self.check_cards(now)
             self.note_cooldown()
             yielding = self.yielding() > 0  # 1.154.23: the housekeeping after the rule taker's seconds (the cancels at their time go on)
@@ -4624,7 +5041,7 @@ class Controller:
                         asyncio.create_task(self.discovery_loop(), name="preopen-discovery"),
                         asyncio.create_task(self.refresh_loop(), name="preopen-refresh"),
                         asyncio.create_task(self.cancellation_loop(), name="preopen-cancel"),
-                        *(asyncio.create_task(self.placement_worker(), name=f"preopen-place-{i}") for i in range(PLACE_WORKERS))]
+                        *(asyncio.create_task(self.placement_worker(), name=f"preopen-place-{i}") for i in range(self.place_workers()))]
                 stops = [asyncio.create_task(self.owner.stopping.wait()), asyncio.create_task(self.stop.wait())]
                 await asyncio.wait([*stops, *jobs], return_when=asyncio.FIRST_COMPLETED)
                 for job in jobs:
