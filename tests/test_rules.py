@@ -3928,6 +3928,7 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         clock.ms = GOLD_0600 - 60_000
         api.fill[1] = 100.0
         await t.tick()
+        api.books["901"] = {"bids": [], "asks": []}  # (taken: by this order, and by somebody else's)
         order, signed = t.record(slug)["orders"][0], api.sent[0]["data"]["order"]
         self.assertEqual((int(signed["expiration"]), order["expires"], order.get("tail")), (clock.ms // 1000 + 125, clock.ms // 1000 + 125, True))
         self.assertEqual(int(signed["expiration"]) * 1000, GOLD_0600 + 65_000)
@@ -3992,6 +3993,38 @@ class RuleTests(unittest.IsolatedAsyncioTestCase):
         cleared = [n for n in x.notes if n.startswith("✅ 规则吃单")]
         self.assertEqual((len(cleared), order["state"]), (1, "closing"), x.notes)
         self.assertIn("那张单已经不在簿上（共成交 0/130 份）", cleared[0])
+        # the taker's key cooling down as the window starts (no read of the order then: they are the key's): told all the same, the
+        # withdrawal asked on the bot's own client each second; its signature run out, told that too
+        t, api, clock, x = ready()
+        clock.ms = GOLD_0600 - 60_000
+        api.remove_orders = noop
+        del asked[:]
+        await t.tick()
+        order = t.record(slug)["orders"][0]
+        api.books["901"] = {"bids": [], "asks": []}
+        clock.ms += R.FILL_READ_MS
+        await t.tick()
+        spare_asked = []
+
+        async def spare_noop(ids):
+            spare_asked.append(clock.ms)
+            return {"removed": [], "noop": list(ids)}
+        x.owner.live.api.remove_orders = spare_noop
+        api.blocked_until = time.monotonic() + 300
+        clock.ms = GOLD_0600 + 100
+        await t.tick()
+        clock.ms += R.TAIL_AGAIN_MS
+        await t.tick()
+        clock.ms += R.TAIL_AGAIN_MS
+        await t.tick()
+        warned = [n for n in x.notes if n.startswith("⚠️ 规则吃单")]
+        self.assertEqual((len(warned), [b - a for a, b in zip(spare_asked, spare_asked[1:])]), (1, [R.TAIL_AGAIN_MS] * 2), (x.notes, spare_asked))
+        clock.ms = order["expires"] * 1000
+        await t.tick()
+        cleared = [n for n in x.notes if n.startswith("✅ 规则吃单")]
+        self.assertEqual(len(cleared), 1, x.notes)
+        self.assertIn("那张单的签名已到期，不会再成交（共成交 0/130 份）", cleared[0])
+        api.blocked_until = 0.0
         # past its signed expiry an order of the last two minutes is asked as any other (it can fill no more)
         late = {"tail": True, "expires": GOLD_0600 // 1000, "noops": 3, "noop_ms": 0, "id": "9"}
         self.assertEqual((R.RuleTaker.noop_wait(late, GOLD_0600 - 1), R.RuleTaker.noop_wait(late, GOLD_0600), R.RuleTaker.noop_wait({**late, "tail": False}, GOLD_0600 - 1)),

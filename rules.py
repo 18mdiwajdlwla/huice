@@ -2619,7 +2619,14 @@ class RuleTaker:
             if rec.get("mode") != "on" or not in_flight(rec):
                 continue
             for order in rec["orders"]:
-                if order.get("paper") or order.get("state") in FINAL_STATES or now < int(order.get("next_ms") or 0):
+                if order.get("paper"):
+                    continue
+                due = order.get("state") not in FINAL_STATES and now >= int(order.get("next_ms") or 0)
+                # (1.154.55: an order of the start's last two minutes still out as its window starts is told in a pass that does not
+                # read it too — its read not due yet, the key cooling down — on what is known of it; read, it is told after the read)
+                if (not due or self.cooling() > 0) and self.tail_alarm(rec, order, now):
+                    self.save(rec)
+                if not due:
                     continue
                 if self.cooling() > 0:
                     if await self.withdraw_cooling(order, now):
@@ -2630,7 +2637,7 @@ class RuleTaker:
                 except Exception as error:
                     order["error"] = core.clean_error(error) or type(error).__name__
                     order["next_ms"] = now + self.again(order, now, UNKNOWN_EVERY_MS)
-                self.tail_alarm(rec, order, now)
+                self.tail_alarm(rec, order, now)  # (...and when this read found it off the book)
                 self.save(rec)
 
     async def follow_order(self, rec: dict, order: dict, now: int) -> None:
@@ -2772,12 +2779,13 @@ class RuleTaker:
         return (bool(order.get("id")) and not order.get("removed")
                 and now - int(order.get("noop_ms") or 0) >= max(cls.again(order, now, again_ms), cls.noop_wait(order, now)))
 
-    def tail_alarm(self, rec: dict, order: dict, now: int) -> None:
+    def tail_alarm(self, rec: dict, order: dict, now: int) -> bool:
         """An order of the start's last two minutes not known off the book when its window starts (1.154.55): told at once —
         what of it may still be taken, at what price, until when — and told again when it is off the book or its signature
-        has run out. The withdrawals go on every TAIL_AGAIN_MS meanwhile (follow)."""
+        has run out. The withdrawals go on every TAIL_AGAIN_MS meanwhile (follow). True when something was told (the order's
+        record changed: to be saved)."""
         if not order.get("tail") or order.get("paper"):
-            return
+            return False
         rest = max(float(order.get("shares") or 0) - float(order.get("filled") or 0), 0.0)
         out = order.get("state") in REST_STATES and not order.get("removed") and rest > DUST
         name = rec.get("name") or rec.get("slug")
@@ -2787,10 +2795,13 @@ class RuleTaker:
             self.notify(f"⚠️ 规则吃单：{name} 已经开场，开场前最后 2 分钟下的一张单还没确认撤掉——可能还挂着 {rest:g} 份、买价 ≤{round(float(order.get('limit') or 0) * 100)}¢，"
                         f"签名 {until} 到期。机器人每秒在重试撤单；到期前有人按这个价卖过来就会成交。也可以到 Predict 上手动撤。",
                         key=f"rule-tail:{order.get('hash')}")
-        elif order.get("tail_told") and not order.get("tail_clear") and (not out or now >= int(order.get("expires") or 0) * 1000):
+            return True
+        if order.get("tail_told") and not order.get("tail_clear") and (not out or now >= int(order.get("expires") or 0) * 1000):
             order["tail_clear"] = now
             self.notify(f"✅ 规则吃单：{name} 那张单" + ("已经不在簿上" if not out else "的签名已到期，不会再成交")
                         + f"（共成交 {float(order.get('filled') or 0):g}/{float(order.get('shares') or 0):g} 份）", key=f"rule-tail-clear:{order.get('hash')}")
+            return True
+        return False
 
     async def withdraw_rest(self, order: dict, now: int, clients: list | None = None) -> None:
         """An order's rest asked to be withdrawn by its id (remove_ids): off the book on Predict's word that it removed it — final

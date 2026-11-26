@@ -2013,7 +2013,8 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(m.Config.from_env({**base, "PREOPEN_BTC5_EXPIRY_SECONDS": "5", "PREOPEN_BTC5_CANCEL_SECONDS": "10"}).preopen.btc5_entry_seconds, 0)
         keys = {"PREOPEN_BTC5_CANCEL_SECONDS", "PREOPEN_BTC5_EXPIRY_SECONDS", "PREOPEN_BTC5_ENTRY_SECONDS", "PREOPEN_BTC5_AHEAD_MINUTES"}
         self.assertTrue(keys <= m.CONTROL_KEY_SET)
-        self.assertEqual({k for k in keys if m.CONTROL_FORMS[k]["group"] == "预挂" and m.CONTROL_FORMS[k]["zero"] == "跟所有卡一样"}, keys)
+        # (1.154.56: on the page BTC 5-minute's own settings are a group of their own)
+        self.assertEqual({k for k in keys if m.CONTROL_FORMS[k]["group"] == "预挂5" and m.CONTROL_FORMS[k]["zero"] == "跟所有卡一样"}, keys)
         # 1.152.2: 挂满 — BTC 5-minute quotes every listed window, the one Predict lists just now included (the front of the 49¢ queue),
         # while the other cards keep their 120 minutes; the control page names the preset
         form = m.CONTROL_FORMS["PREOPEN_BTC5_AHEAD_MINUTES"]
@@ -2085,9 +2086,108 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(m.Config.from_env({**base, "PREOPEN_BTC5_LEVELS": ""}).preopen.btc5_levels, ())
         self.assertIn("PREOPEN_BTC5_LEVELS", m.CONTROL_KEY_SET)
         form = m.CONTROL_FORMS["PREOPEN_BTC5_LEVELS"]
-        self.assertEqual((form["group"], form["kind"], form["empty"], form["presets"][0]), ("预挂", "text", "跟所有卡一样", ""))
+        self.assertEqual((form["group"], form["kind"], form["empty"], form["presets"][0]), ("高级", "text", "不用", ""))  # (1.154.56: the older way, among the advanced ones)
         bot = m.Bot(m.Config.from_env({**base, "PREOPEN_BTC5_LEVELS": "47x10,43x40"}), m.Store(":memory:"), types.SimpleNamespace(now_ms=lambda: NOW, config=None), None)
         self.assertEqual(bot.control_value("PREOPEN_BTC5_LEVELS"), "47x10,43x40")
+
+    async def test_btc_five_minute_first_level_by_itself(self):
+        """1.154.56 (the user: "BTC 5 分钟也可以设置第一个档预挂的"; "优化下单独设置 BTC 5 分钟的功能"): BTC 5-minute's first level set
+        by itself — its price, its shares, each 0 = every card's — and its deeper levels by themselves (empty = every card's, none
+        = none), where 1.154.37 wanted the whole ladder typed out. Its windows are quoted at what comes of them, every other
+        card's as before; a change of the first level withdraws BTC 5-minute's first-level pairs alone; the page has the three in
+        a group of BTC 5-minute's own, with its timing; the whole ladder of 1.154.37 still stands under them."""
+        D = m.D
+        base = {"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64,
+                "PREOPEN_PRICE_CENTS": "47", "PREOPEN_SHARES": "30", "PREOPEN_LEVELS": "43x160,40x160"}
+        ladder = lambda **env: m.Config.from_env({**base, **env}).preopen
+        general = ((D("0.47"), D("30")), (D("0.43"), D("160")), (D("0.40"), D("160")))
+        self.assertEqual((ladder().btc5_levels, ladder().levels_for("BTC-5M")), ((), general))
+        # the shares alone, the price alone, both: the deeper levels as every card's
+        self.assertEqual(ladder(PREOPEN_BTC5_SHARES="60").levels_for("BTC-5M"), ((D("0.47"), D("60")), *general[1:]))
+        self.assertEqual(ladder(PREOPEN_BTC5_PRICE_CENTS="45").levels_for("BTC-5M"), ((D("0.45"), D("30")), *general[1:]))
+        both = ladder(PREOPEN_BTC5_PRICE_CENTS="48", PREOPEN_BTC5_SHARES="10")
+        self.assertEqual((both.levels_for("BTC-5M"), both.levels_for("BTC-15M"), both.levels_for("ETH-5M")), (((D("0.48"), D("10")), *general[1:]), general, general))
+        # its deeper levels alone; none of them; with its first level
+        self.assertEqual(ladder(PREOPEN_BTC5_DEEP_LEVELS="44x20").levels_for("BTC-5M"), (general[0], (D("0.44"), D("20"))))
+        for none in ("none", "无", " None "):
+            self.assertEqual(ladder(PREOPEN_BTC5_DEEP_LEVELS=none).levels_for("BTC-5M"), (general[0],), none)
+        self.assertEqual(ladder(PREOPEN_BTC5_PRICE_CENTS="40", PREOPEN_BTC5_SHARES="50", PREOPEN_BTC5_DEEP_LEVELS="35x100，30×100").levels_for("BTC-5M"),
+                         ((D("0.40"), D("50")), (D("0.35"), D("100")), (D("0.30"), D("100"))))
+        # what comes to every card's ladder is nothing of its own (no line in the status, nothing to withdraw)
+        self.assertEqual(ladder(PREOPEN_BTC5_PRICE_CENTS="47", PREOPEN_BTC5_SHARES="30").btc5_levels, ())
+        # the whole ladder of 1.154.37 still stands — and the three, where set, over it
+        whole = ladder(PREOPEN_BTC5_LEVELS="46x10,42x40")
+        self.assertEqual((whole.levels_for("BTC-5M"), whole.btc5_whole), (((D("0.46"), D("10")), (D("0.42"), D("40"))),) * 2)
+        self.assertEqual(ladder(PREOPEN_BTC5_LEVELS="46x10,42x40", PREOPEN_BTC5_SHARES="25").levels_for("BTC-5M"), ((D("0.46"), D("25")), (D("0.42"), D("40"))))
+        self.assertEqual(ladder(PREOPEN_BTC5_LEVELS="46x10,42x40", PREOPEN_BTC5_DEEP_LEVELS="none").levels_for("BTC-5M"), ((D("0.46"), D("10")),))
+        # checked together, and said in the settings' own words: a first level not above the level after it, a side under Predict's
+        # minimum, a price or a size out of range, too many levels
+        for bad in ({"PREOPEN_BTC5_PRICE_CENTS": "43"}, {"PREOPEN_BTC5_PRICE_CENTS": "40"}, {"PREOPEN_BTC5_PRICE_CENTS": "51"}, {"PREOPEN_BTC5_PRICE_CENTS": "-1"},
+                    {"PREOPEN_BTC5_SHARES": "501"}, {"PREOPEN_BTC5_SHARES": "2"}, {"PREOPEN_BTC5_DEEP_LEVELS": "47x10"}, {"PREOPEN_BTC5_DEEP_LEVELS": "43"},
+                    {"PREOPEN_BTC5_DEEP_LEVELS": ",".join(f"{46 - i}x10" for i in range(8))}):
+            with self.assertRaises(ValueError, msg=str(bad)) as caught:
+                m.Config.from_env({**base, **bad})
+            if "PREOPEN_BTC5_DEEP_LEVELS" not in bad or bad["PREOPEN_BTC5_DEEP_LEVELS"] != "43":
+                self.assertIn("BTC 5 分钟的价格档位合起来是 ", str(caught.exception), bad)
+        self.assertIn("合起来是 43x30,43x160,40x160", str(self.assert_bad(base, PREOPEN_BTC5_PRICE_CENTS="43")))
+        self.assertIn("把“更深的价格档位”也单独填上", str(self.assert_bad(base, PREOPEN_BTC5_PRICE_CENTS="40")))
+        self.assertEqual(ladder(PREOPEN_BTC5_PRICE_CENTS="40", PREOPEN_BTC5_DEEP_LEVELS="35x100").levels_for("BTC-5M"), ((D("0.40"), D("30")), (D("0.35"), D("100"))))
+        # the control page: a group of BTC 5-minute's own, the first level at its head; what is in force goes back to it as typed
+        keys = [k for k, _, _ in m.CONTROL_KEYS if m.CONTROL_FORMS.get(k, {}).get("group") == "预挂5"]
+        self.assertEqual(keys, ["PREOPEN_BTC5_PRICE_CENTS", "PREOPEN_BTC5_SHARES", "PREOPEN_BTC5_DEEP_LEVELS", "PREOPEN_BTC5_CANCEL_SECONDS",
+                                "PREOPEN_BTC5_EXPIRY_SECONDS", "PREOPEN_BTC5_ENTRY_SECONDS", "PREOPEN_BTC5_AHEAD_MINUTES"])
+        self.assertIn('["预挂","开盘前预挂（15 分钟市场）"],["预挂5","开盘前预挂 · BTC 5 分钟单独设置（留 0 / 留空 = 跟上面所有卡一样）"],["规则",', m.CONTROL_PAGE)
+        self.assertEqual((m.CONTROL_FORMS["PREOPEN_BTC5_PRICE_CENTS"]["zero"], m.CONTROL_FORMS["PREOPEN_BTC5_SHARES"]["zero"], m.CONTROL_FORMS["PREOPEN_BTC5_DEEP_LEVELS"]["empty"],
+                          m.CONTROL_FORMS["PREOPEN_BTC5_DEEP_LEVELS"]["captions"]), ("跟所有卡一样",) * 3 + ({"none": "只挂第一档"},))
+        clock = types.SimpleNamespace(now_ms=lambda: NOW, config=None)
+        bot = m.Bot(m.Config.from_env({**base, "PREOPEN_BTC5_PRICE_CENTS": "48", "PREOPEN_BTC5_SHARES": "10", "PREOPEN_BTC5_DEEP_LEVELS": "44x20,41x20"}), m.Store(":memory:"), clock, None)
+        self.assertEqual([bot.control_value(k) for k in keys[:3]] + [bot.control_value("PREOPEN_BTC5_LEVELS")], ["48", "10", "44x20,41x20", ""])
+        bot = m.Bot(m.Config.from_env({**base, "PREOPEN_BTC5_DEEP_LEVELS": "none"}), m.Store(":memory:"), clock, None)
+        self.assertEqual([bot.control_value(k) for k in keys[:3]], ["0", "0", "none"])
+        bot = m.Bot(m.Config.from_env(base), m.Store(":memory:"), clock, None)
+        self.assertEqual([bot.control_value(k) for k in keys[:3]], ["0", "0", ""])
+        # ...and saved from it: what does not make a ladder is refused in the page's own words, nothing saved; what does is in force
+        answer = bot.control_set({"PREOPEN_BTC5_PRICE_CENTS": "40"})
+        self.assertEqual((answer["ok"], bot.config.preopen.btc5_levels), (False, ()))
+        self.assertTrue(answer["message"].startswith("BTC 5 分钟的价格档位合起来是 40x30,43x160,40x160（") and "把“更深的价格档位”也单独填上" in answer["message"], answer)
+        answer = bot.control_set({"PREOPEN_BTC5_PRICE_CENTS": "45", "PREOPEN_BTC5_SHARES": "60"})
+        self.assertEqual((answer["ok"], bot.config.preopen.levels_for("BTC-5M")), (True, ((D("0.45"), D("60")), *general[1:])))
+        self.assertEqual((bot.control_set({"PREOPEN_BTC5_DEEP_LEVELS": "none"})["ok"], bot.config.preopen.levels_for("BTC-5M")), (True, ((D("0.45"), D("60")),)))
+        bot.control_set({"PREOPEN_BTC5_PRICE_CENTS": "0", "PREOPEN_BTC5_SHARES": "0", "PREOPEN_BTC5_DEEP_LEVELS": ""})
+        self.assertEqual((bot.config.preopen.btc5_levels, bot.config.preopen.levels_for("BTC-5M")), ((), general))
+        # quoted so: BTC 5-minute's windows at its own first level, the deeper ones and every other card's as every card's
+        rows = [market(at=NOW + 10 * 60_000, mid=7, minutes=5), market(at=NOW + 15 * 60_000, mid=8)]
+        env = {"PREOPEN_MARKETS": "btc5,btc", "PREOPEN_AHEAD_MINUTES": "120", "PREOPEN_PRICE_CENTS": "47", "PREOPEN_SHARES": "30", "PREOPEN_LEVELS": "43x160"}
+        ctl, api, clock = controller(rows, **env, PREOPEN_BTC5_SHARES="60")
+        await ctl.discover()
+        queued = sorted((c["slug"].split("-")[2], c["level"], c["price"], c["shares"]) for c in (ctl.queue.get_nowait()[2] for _ in range(ctl.queue.qsize())))
+        self.assertEqual(queued, [("15m", 0, "0.47", "30"), ("15m", 1, "0.43", "160"), ("5m", 0, "0.47", "60"), ("5m", 1, "0.43", "160")])
+        self.assertIn("BTC 5 分钟自己的档位：两边各 47.0¢×60 份、43.0¢×160 份", ctl.status())
+        await self.finish(ctl)
+        # a change of its first level alone: BTC 5-minute's first-level pair is withdrawn at the takeover — its deeper one and BTC
+        # 15-minute's two rest on
+        with tempfile.TemporaryDirectory() as folder:
+            db = {"STATE_DB": str(Path(folder) / "state.sqlite3")}
+            ctl, api, clock = controller(rows, **env, **db)
+            for mk in rows:
+                c = p.candidate(mk, NOW, ctl.owner.config, ctl.settings)
+                for level, (price, shares) in enumerate(ctl.settings.levels):
+                    await ctl.place_pair({**c, "slug": c["slug"] if level == 0 else f"{c['slug']}#{level}", "window": c["slug"], "level": level,
+                                          "price": str(price), "shares": str(shares), "attempt": 0, "market": mk, "read_ms": NOW})
+            ctl.keep_on_stop = True
+            await ctl.on_stop()
+            ctl.ledger.close()
+            again, _, _ = controller(rows, **env, **db, PREOPEN_BTC5_SHARES="60")
+            again.api = again.cancel_api = api; api.ctl = again
+            again.adopt()
+            states = sorted((x["key"], int(x.get("level") or 0), x["phase"]) for x in again.ledger.rows.values())
+            self.assertEqual(states, [("BTC-15M", 0, "active"), ("BTC-15M", 1, "active"), ("BTC-5M", 0, "closing"), ("BTC-5M", 1, "active")])
+            await self.finish(again)
+
+    def assert_bad(self, base, **env):
+        with self.assertRaises(ValueError) as caught:
+            m.Config.from_env({**base, **env})
+        return caught.exception
 
     async def test_five_minute_cards_are_quoted_on_their_own_rhythm(self):
         """1.137.0: btc5 / eth5 / bnb5 name the 5-minute cards (btc-updown-5m-<start>): a window every five minutes, the
