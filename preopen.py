@@ -2028,6 +2028,7 @@ FAST_PAGE_S = 0.3               # the account snapshot's pace a page, at the lea
 NOTICE_FIGURES = re.compile(r"\d+(?:\.\d+)?")  # the figures in a problem's text: not part of its notice's key (Controller.error)
 COOL_WAIT_S = 45.0              # a withdrawn pair's final reads wait out a cooldown of the mode's client this long at the most (Controller.cooled)
 FAST_BORROW_BELOW = 1000.0      # the rule taker's idle key is still borrowed — for reads — where the reads' own pace is under this a minute (borrow_why)
+AUTO_WAIT_S, AUTO_LOOK_S = 120.0, 0.5  # 1.154.64: the first answers waited for to say the key's limits (auto_limits): this long at most, looked at this often
 FIRST_PARALLEL = 8              # ...and a fresh listing's client, and each further key's, lets this many requests be in flight at once: a full bucket's
 #                                 worth of orders (PredictPacer.BURST) goes out together — with five (PredictApi.PARALLEL) three of them stood a round trip behind
 MARKET_FRESH_MS = 15_000        # a window's details read by the discovery this recently are placed on, not read again
@@ -2252,7 +2253,15 @@ class Controller:
         self.firsts_waiting = 0  # fresh listings' first-level orders waiting for a token on the mode's keys: the other requests let them go first (lane_wait)
         # 1.154.60: Predict's limits for the key's app given (core.preopen_paces): the mode's orders and its reads each at their own
         # pace on its first key — and its own concurrency by them (fast_*). Not given: (0, 0), everything as it was
+        # 1.154.64: neither limit given — Predict's own, as its answers on the key said them by now (the controller before this one,
+        # in this process); none yet (a fresh start): taken a few seconds on, from the first answers (auto_limits, run)
+        if own_key and core.preopen_auto_freeze(owner.config):
+            core.set_predict_rates(owner.config)
         self.trade_pace, self.read_pace = core.preopen_paces(owner.config) if own_key else (0.0, 0.0)
+        self.auto_task: asyncio.Task | None = None
+        self.auto_missed = False  # the first answers did not say the limits within AUTO_WAIT_S (auto_limits)
+        self.extra_workers: list[asyncio.Task] = []  # placement workers started once the limits were known (go_fast)
+        self.workers_started = 0
         # ...and Predict's refusals at those paces (fast_watch): the latest 429 of each bucket already looked at — those from
         # before this controller are not its own to answer (the cut they made, if any, is in the paces above)
         self.refusals_seen: dict[str, float] = {bucket: self.refusal_last(bucket)[0] for bucket in ("trade", "read")} if self.fast() else {}
@@ -4237,6 +4246,49 @@ class Controller:
         usual = min(PLACE_WORKERS_MAX, PLACE_WORKERS + PLACE_WORKERS_MORE * len(self.more))
         return max(usual, min(FAST_WORKERS_MAX, math.ceil(self.trade_pace / FAST_WORKERS_PER))) if self.fast() else usual
 
+    def auto_pending(self) -> bool:
+        """Whether the mode waits for Predict's answers to say its key's limits (1.154.64): neither PREOPEN_APP_* given,
+        PREOPEN_APP_AUTO on, the key the mode's own — and not at those limits yet."""
+        settings = self.settings
+        return (not self.fast() and bool(getattr(settings, "app_auto", False)) and not int(settings.app_trading) and not int(settings.app_general)
+                and str(getattr(self.owner.config, "preopen_api_key", "") or "") in core.preopen_own_keys(self.owner.config))
+
+    async def auto_limits(self) -> None:
+        """Waits for Predict's answers on the mode's key to say both of its limits — the account snapshot's first page (an order
+        read: Trading) and a listing's probe (General), within the first seconds — AUTO_WAIT_S at the most, then runs at
+        them (go_fast). Placements wait for the first snapshot all the while (hold), so the mode places nothing before it
+        knows its pace. Said by neither in that time: the mode stays at its usual pace (the status says so)."""
+        began = time.monotonic()
+        while not self.stopped() and time.monotonic() - began < AUTO_WAIT_S:
+            if core.preopen_auto_freeze(self.owner.config):
+                core.set_predict_rates(self.owner.config)
+                self.go_fast()
+                return
+            await asyncio.sleep(AUTO_LOOK_S)
+        self.auto_missed = True
+        LOG.warning("开盘前预挂：Predict 的应答 %d 秒内没有报出这把 Key 的限额，照原来的速度跑", int(AUTO_WAIT_S))
+
+    def go_fast(self) -> None:
+        """The mode at the limits now in force (core.preopen_paces), as its constructor would have made it had they been known
+        then: the paces, the clients' gates, the withdrawn pairs verified side by side, and the placement workers — those
+        beyond the ones started (run) started now. The gates are new objects: a request holding the old one's slot
+        releases it there."""
+        self.trade_pace, self.read_pace = core.preopen_paces(self.owner.config)
+        if not self.fast():
+            return
+        for client in (getattr(self, "api_made", None), self.first_api):
+            if client is not None and hasattr(client, "read_gate") and hasattr(client, "gate"):
+                reads = self.fast_reads()
+                client.read_gate, client.gate = asyncio.Semaphore(reads), asyncio.Semaphore(reads + self.place_workers() * 2)
+        self.reconcile_gate = asyncio.Semaphore(self.fast_verify())
+        more = self.place_workers() - self.workers_started
+        for i in range(max(0, more)):
+            self.extra_workers.append(asyncio.create_task(self.placement_worker(), name=f"preopen-place-{self.workers_started + i}"))
+        self.workers_started += max(0, more)
+        trading, general, _ = core.preopen_app_limits(self.owner.config)
+        LOG.info("开盘前预挂：按 Predict 应答里报的限额跑（Trading %d、General %d 次/分钟）：下单撤单和读订单每分钟 %g 次、其他请求 %g 次、同时挂 %d 对",
+                 trading, general, self.trade_pace, self.read_pace, self.place_workers())
+
     def fast(self) -> bool:
         """Whether the mode runs at Predict's real limits (1.154.60): its orders and its reads each paced by themselves on its
         first key (core.preopen_paces — PREOPEN_APP_TRADING_PER_MIN and PREOPEN_APP_GENERAL_PER_MIN given, the key its own)."""
@@ -4395,13 +4447,18 @@ class Controller:
         own = bool(getattr(self.owner.config, "preopen_api_key", ""))
         per_min = float(getattr(self.owner.config, "predict_rate_per_min", 0) or 0)
         mine, asked = core.preopen_own_rate(self.owner.config), float(getattr(self.owner.config, "preopen_rate_per_min", 0) or 0)
+        trading, general, whose = core.preopen_app_limits(self.owner.config)
         if self.fast() and core.PREDICT_PACING:  # 1.154.60: by Predict's own two buckets
-            return ("用预挂自己的 API Key（PREOPEN_API_KEY），按 Predict 后台给这个 App 的限额跑"
-                    f"（Trading {self.settings.app_trading}、General {self.settings.app_general} 次/分钟，PREOPEN_APP_*）："
-                    f"下单、撤单和读订单每分钟最多 {self.trade_pace:g} 次，其他请求（市场、分类、登录）最多 {self.read_pace:g} 次——各用到限额的 {core.PREOPEN_APP_SHARE:.0%}，再扣掉机器人别的 Key 可能用的份额；"
+            return ("用预挂自己的 API Key（PREOPEN_API_KEY），"
+                    + (f"按 Predict 应答里报的这把 Key 的限额自动跑（Trading {trading}、General {general} 次/分钟；“Predict 限额”两项没填，PREOPEN_APP_AUTO）："
+                       if whose == "自动" else f"按 Predict 后台给这个 App 的限额跑（Trading {trading}、General {general} 次/分钟，PREOPEN_APP_*）：")
+                    + f"下单、撤单和读订单每分钟最多 {self.trade_pace:g} 次，其他请求（市场、分类、登录）最多 {self.read_pace:g} 次——各用到限额的 {core.PREOPEN_APP_SHARE:.0%}，再扣掉机器人别的 Key 可能用的份额；"
                     f"同时挂 {self.place_workers()} 对、同时核对 {self.fast_verify()} 对；" + self.cut_line() + self.borrow_line())
         trading, general = int(self.settings.app_trading), int(self.settings.app_general)
-        limits = ("" if not (trading or general) or self.fast()
+        waiting = self.auto_task is not None and not self.auto_task.done()  # (auto_limits under way: run started it)
+        limits = ((("——Predict 的应答没有报出这把 Key 的限额，照原来的速度" if self.auto_missed
+                    else "——等 Predict 的应答报出这把 Key 的限额（启动后几秒），之后自动提速") if (waiting or self.auto_missed) and self.auto_pending() and core.PREDICT_PACING else "")
+                  if not (trading or general) or self.fast()
                   # (1.154.62: one of the two saved alone — kept, not in force)
                   else f"——“Predict 限额”只填了 {'Trading' if trading else 'General'}，还差 {'General' if trading else 'Trading'}：两项都填了才生效" if not (trading and general)
                   else "——PREOPEN_APP_*（Predict 后台的限额）填了但没起作用：预挂没有自己单独的 Key")
@@ -4488,7 +4545,9 @@ class Controller:
                          + (f"，最近一轮是这把 Key 一分钟内发到第 {firsts[-1]} 次请求时开始被拒的——Predict 给它的上限就在这附近，节拍要设得比它低" if day and firsts else ""))
         # 1.154.61: by the kind of request, beside the bot's own counts — and, for the mode's own key, what to set (PREOPEN_APP_*);
         # the headers as they came where none carried the figures
-        if said := core.predict_buckets_line(key, (int(self.settings.app_trading), int(self.settings.app_general)) if own else None) or core.predict_limits_said(key):
+        # (1.154.64: running at Predict's own, or waiting for them — nothing to suggest)
+        auto = core.preopen_app_limits(self.owner.config)[2] == "自动" or self.auto_pending()
+        if said := core.predict_buckets_line(key, (int(self.settings.app_trading), int(self.settings.app_general)) if own and not auto else None) or core.predict_limits_said(key):
             parts.append(said)
         if pairs_left and minute:
             parts.append(f"照最近一分钟的速度，已发布未挂的 {pairs_left} 档（{2 * pairs_left} 张单）还要约 {max(1, round(2 * pairs_left / len(minute)))} 分钟")
@@ -5048,18 +5107,22 @@ class Controller:
                 # it cannot write) ended the mode with the orders it had just taken over left resting, unmonitored, while
                 # the crash notice said they were withdrawn; now it withdraws them like any crash.
                 self.adopt()  # the last run's pairs: taken over as they are, or withdrawn and reconciled
+                self.workers_started = self.place_workers()
                 jobs = [asyncio.create_task(self.account_loop(), name="preopen-account"),
                         asyncio.create_task(self.discovery_loop(), name="preopen-discovery"),
                         asyncio.create_task(self.refresh_loop(), name="preopen-refresh"),
                         asyncio.create_task(self.cancellation_loop(), name="preopen-cancel"),
-                        *(asyncio.create_task(self.placement_worker(), name=f"preopen-place-{i}") for i in range(self.place_workers()))]
+                        *(asyncio.create_task(self.placement_worker(), name=f"preopen-place-{i}") for i in range(self.workers_started))]
+                if self.auto_pending():  # 1.154.64: Predict's limits from the first answers (the snapshot's first page, a probe)
+                    self.auto_task = asyncio.create_task(self.auto_limits(), name="preopen-auto-limits")
                 stops = [asyncio.create_task(self.owner.stopping.wait()), asyncio.create_task(self.stop.wait())]
                 await asyncio.wait([*stops, *jobs], return_when=asyncio.FIRST_COMPLETED)
                 for job in jobs:
                     if job.done() and not job.cancelled() and job.exception():
                         raise job.exception()
             finally:
-                bulk = [task for task in (self.bulk_task, self.lent_warm, self.first_warm, self.speed_task) if task is not None]  # (first_warm: 1.154.33; the speed test: 1.154.58)
+                bulk = [task for task in (self.bulk_task, self.lent_warm, self.first_warm, self.speed_task, self.auto_task, *self.extra_workers)
+                        if task is not None]  # (first_warm: 1.154.33; the speed test: 1.154.58; the limits' wait and the workers it started: 1.154.64)
                 for job in [*stops, *jobs, *bulk]:
                     job.cancel()
                 await asyncio.gather(*stops, *jobs, *bulk, return_exceptions=True)

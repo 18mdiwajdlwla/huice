@@ -235,7 +235,19 @@ async def the_speed_line() -> None:
         m.note_limit_headers("api.predict.fun", {"x-api-key": "pre-key"}, 200,
                              types.SimpleNamespace(headers={"X-RateLimit-Limit": "240", "X-RateLimit-Remaining": "37", "Content-Type": "application/json"}), "GET", "/v1/markets/1")
         assert "；Predict 应答里报的限额：General（市场）每分钟 240 次——" in ctl.speed_line() and "已算 203 次、剩 37；" in ctl.speed_line(), ctl.speed_line()
+        # 1.154.64: PREOPEN_APP_AUTO on (the default) — the mode takes them itself once both kinds are said: nothing to suggest;
+        # it waits for them, and says so. Off: the figures to set, as 1.154.61 said them
+        assert "可以填" not in ctl.speed_line() and "自动提速" not in ctl.pace_line(), (ctl.speed_line(), ctl.pace_line())
+        ctl.auto_missed = True  # (the wait over and nothing said: the usual pace, and why)
+        assert "——Predict 的应答没有报出这把 Key 的限额，照原来的速度；" in ctl.pace_line(), ctl.pace_line()
+        ctl.auto_missed = False
+        settings = ctl.settings
+        ctl.settings = dataclasses.replace(settings, app_auto=False)
+        ctl.owner.config = dataclasses.replace(ctl.owner.config, preopen=ctl.settings)
         assert "→ “Predict 限额”的 General 可以填 240；Trading 等下单的应答带回来再看" in ctl.speed_line(), ctl.speed_line()
+        assert "自动提速" not in ctl.pace_line(), ctl.pace_line()
+        ctl.settings = settings
+        ctl.owner.config = dataclasses.replace(ctl.owner.config, preopen=settings)
         # the key shared with the model trader: named so
         shared, shared_api, _ = controller(rows, PREOPEN_MARKETS="btc", PREDICT_API_KEY="main-key")
         shared_api.api_key = "main-key"
