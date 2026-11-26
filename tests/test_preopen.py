@@ -1974,7 +1974,10 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(plain.settings.timing("BTC-5M"), plain.settings)
         self.assertNotIn("BTC 5 分钟自己的时间", plain.status(), "nothing of its own: no line")
         await self.finish(plain)
-        # a change of BTC 5-minute's timing: its resting pair is withdrawn at the takeover (signed to expire otherwise), BTC 15-minute's stays
+        # a change of BTC 5-minute's timing. 1.154.54: its expiry moved nearer the start (10 → 5 s) — the pair signed for the old one
+        # rests on (it leaves the book earlier than the settings now say), withdrawn at the new cancel time, here its own signed
+        # expiry; its expiry moved away from the start (10 → 20 s) — withdrawn at the takeover, as before (signed to stay longer
+        # than the settings say). BTC 15-minute's stays either way
         with tempfile.TemporaryDirectory() as folder:
             db = {"STATE_DB": str(Path(folder) / "state.sqlite3")}
             rows = [market(at=NOW + 10 * 60_000, mid=7, minutes=5), market(at=NOW + 15 * 60_000, mid=8)]
@@ -1988,9 +1991,19 @@ class PreopenTests(unittest.IsolatedAsyncioTestCase):
             again.api = again.cancel_api = api; api.ctl = again
             again.adopt()
             by_key = {pair["key"]: pair for pair in again.ledger.rows.values()}
-            self.assertEqual((by_key["BTC-5M"]["phase"], by_key["BTC-5M"].get("free"), by_key["BTC-15M"]["phase"], again.resumed), ("closing", True, "active", 1))
-            self.assertEqual(by_key["BTC-15M"]["start_ms"] - by_key["BTC-15M"]["cancel_ms"], 20_000)
+            self.assertEqual((by_key["BTC-5M"]["phase"], by_key["BTC-5M"].get("free"), by_key["BTC-15M"]["phase"], again.resumed), ("active", None, "active", 2))
+            self.assertEqual((by_key["BTC-5M"]["start_ms"] - by_key["BTC-5M"]["cancel_ms"], by_key["BTC-5M"]["start_ms"] // 1000 - by_key["BTC-5M"]["expires"]), (10_000, 10))
+            self.assertEqual((by_key["BTC-15M"]["start_ms"] - by_key["BTC-15M"]["cancel_ms"], api.removed), (20_000, []))
+            again.keep_on_stop = True
+            await again.on_stop()
             await self.finish(again)
+            third, _, _ = controller(rows, PREOPEN_MARKETS="btc5,btc", PREOPEN_AHEAD_MINUTES="120", PREOPEN_BTC5_EXPIRY_SECONDS="20", PREOPEN_BTC5_CANCEL_SECONDS="30", **db)
+            third.api = third.cancel_api = api; api.ctl = third
+            third.adopt()
+            by_key = {pair["key"]: pair for pair in third.ledger.rows.values()}
+            self.assertEqual((by_key["BTC-5M"]["phase"], by_key["BTC-5M"].get("free"), by_key["BTC-15M"]["phase"], third.resumed), ("closing", True, "active", 1))
+            self.assertEqual(by_key["BTC-15M"]["start_ms"] - by_key["BTC-15M"]["cancel_ms"], 20_000)
+            await self.finish(third)
         # the combination is checked as the general one is (0 = the general one, counted in)
         base = {"TELEGRAM_BOT_TOKEN": "offline", "PREOPEN_15M": "on", "LIVE": "on", "PREDICT_PRIVATE_KEY": "a" * 64}
         for bad in ({"PREOPEN_BTC5_CANCEL_SECONDS": "12"}, {"PREOPEN_BTC5_EXPIRY_SECONDS": "3"}, {"PREOPEN_BTC5_AHEAD_MINUTES": "2000"},

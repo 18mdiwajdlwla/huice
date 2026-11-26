@@ -2009,6 +2009,11 @@ REUSE_NEAR_MS = 30 * 60_000     #   (its tokens never change; a fee or a status 
 REREAD_QUEUE_MAX = 200          # 1.154.2: the known windows are not read again while this many levels already wait in the queue — read
 #                                 now, their details would be stale by their turn (11-17: 4,229 queued, 8 more read a pass, every one wasted)
 DISCOVER_READS = 8              # listed windows with a level still to quote read in one discovery pass, the soonest first (the rest the next pass); each card's next listing is read besides (1.132.2)
+FINALS_SAID = 20                # 1.154.54: /preopen says how many withdrawn pairs wait for their final reads once there are this many (finals_line)
+REREAD_WAIT_S = 5.0             # 1.154.54: ...and a re-read that has no answer by then ends the pass (the next one asks again): the same loop probes the
+#                                 listings, and on 11-26 it stood for an hour and a half in one re-read waiting for a token of the key's (read_final)
+FINALS_YIELD_S = 5.0            # 1.154.54: a withdrawn order's late final read waits while a pair is being placed or a known window re-read — this long
+FINALS_YIELD_STEP_S = 0.05      #   at the most, looking again this often (Controller.behind_placements)
 ALLOWANCE_MS = 60_000           # the exchange allowance is read again this often, not before every pair
 PROBE_HOURS = 2.0      # /preopen probe: the quarters of the next this many hours, each card's at most PROBE_PER_CARD — five cards over a day
 PROBE_PER_CARD = 8     # were hundreds of reads, and the commands are answered one after another (1.130.6)
@@ -2108,6 +2113,8 @@ class Controller:
         self.full_scan_ms = 0  # discover: when the last full scan ran (FULL_SCAN_MS)
         self.keep_on_stop = False  # the owner's stop for a settings change: the orders stay on the book, the next controller takes them over
         self.resumed = self.requoted = 0  # pairs taken over at this start; windows quoted again (superseded records) since
+        self.released_at: collections.deque = collections.deque(maxlen=4096)  # when a withdrawn pair was released (accounted, nothing filled: bookkeep) — the status's pace of the final reads (1.154.54)
+        self.rereading = False  # a known window's re-read is out (reread_known): the late final reads wait for it (behind_placements, 1.154.54)
         self.card_holds: dict[str, str] = {}  # card key -> why its windows are not quoted now (card_hold: near the day's limit, halted)
         self.card_checked_ms = 0
         self.listed_until_ms = max((int(p.get("start_ms") or 0) for p in self.ledger.rows.values()), default=0)  # the latest window seen listed
@@ -2794,8 +2801,18 @@ class Controller:
 
     def resumable(self, pair: dict) -> bool:
         """An active pair found at the start (a restart, a settings change) that keeps resting, its queue position with it:
-        every order open with an id, the card still quoted, the size, price and signed expiry as the settings say (the
-        cancel time is derived again), the start still ahead. Anything else is withdrawn."""
+        every order open with an id, the card still quoted, the size and price as the settings say, signed to expire no
+        later than they say (the cancel time is derived again: adopt), the start still ahead. Anything else is withdrawn.
+
+        1.154.54 — "no later", not "exactly when". 11-26 09:03: the cancel time set from 20 to 10 seconds before the start,
+        and with it (the expiry must be 5 seconds nearer the start than the cancel) the expiry from 10 to 5. The expiry is in
+        an order's signature, so not one resting pair was "as the settings say": 9,400 of them — every listed window of the
+        next day at seven levels, each placed at its listing, first in the queue at its price — were withdrawn to be signed
+        again, and the book was empty for hours (their final reads, 18,700 at the key's 220 a minute, then as many orders
+        again). An order signed to leave the book EARLIER than the settings now say is the more careful one: it rests on,
+        withdrawn at the new cancel time or at its own signed expiry, whichever is first (adopt), and the windows quoted
+        from now on are signed as the settings say. One signed to stay LONGER than they say is withdrawn as before: the
+        expiry moved away from the start is the operator asking for an earlier backstop."""
         import live
         if pair.get("key") not in self.settings.markets or self.now() >= pair["start_ms"]:
             return False
@@ -2809,8 +2826,9 @@ class Controller:
             return False  # 1.154.19: a window with a known lean (gold's 05:15 New York), quoted before the rule: withdrawn
         if not self.settings.weekend and on_weekend(int(pair["start_ms"])):
             return False  # 1.136.0: the weekend switched off since it was quoted: withdrawn
-        if int(pair.get("expires") or 0) != pair["start_ms"] // 1000 - self.settings.timing(str(pair.get("key") or "")).expiry_seconds:
-            return False  # signed to expire otherwise than the card's expiry says now (1.152.0: BTC 5-minute's own)
+        expires = int(pair.get("expires") or 0)
+        if not expires or expires > pair["start_ms"] // 1000 - self.settings.timing(str(pair.get("key") or "")).expiry_seconds:
+            return False  # signed to stay on the book longer than the card's expiry says now (1.152.0: BTC 5-minute's own); 1.154.54: an earlier one rests on
         price, shares = pair_quote(pair)
         index = int(pair.get("level") or 0)
         ladder = self.settings.levels_for(str(pair.get("key") or ""))  # (1.154.37: BTC 5-minute's own, where set)
@@ -2843,7 +2861,9 @@ class Controller:
                         pair.update(price=str(price), shares=str(int(shares) if shares == int(shares) else shares))
                         changed[pair["slug"]] = pair
                 if pair["phase"] == "active" and self.resumable(pair):
-                    cancel_ms = pair["start_ms"] - self.settings.timing(str(pair.get("key") or "")).cancel_seconds * 1000
+                    # (1.154.54: ...or at its own signed expiry, for a pair signed to leave the book before the cancel time the
+                    # settings say now — resumable: nothing rests past its signature, and nothing is asked of it after)
+                    cancel_ms = min(pair["start_ms"] - self.settings.timing(str(pair.get("key") or "")).cancel_seconds * 1000, int(pair["expires"]) * 1000)
                     if pair.get("cancel_ms") != cancel_ms:
                         # 1.154.20: saved only when its cancel time changes (the setting did). A restart with the same settings took
                         # over 12,000 resting pairs with a committed write each (synchronous=FULL: an fsync a pair, on the event loop)
@@ -3071,8 +3091,21 @@ class Controller:
                 continue
             st["reads"] += 1
             st["asked"] += 1
+            # 1.154.54: REREAD_WAIT_S at the most — this is the mode's low traffic, and the loop it holds is the one that probes the
+            # listings. A read given up (still waiting for its token, or for its answer) is a GET: nothing to undo
+            asked = asyncio.ensure_future(self.through(self.api, lambda api: category_market(api, slug)))
+            self.rereading = True  # (the withdrawn orders' late final reads wait for it: behind_placements)
             try:
-                market = await self.through(self.api, lambda api: category_market(api, slug))
+                done, _ = await asyncio.wait({asked}, timeout=REREAD_WAIT_S)
+            finally:
+                self.rereading = False
+                if not asked.done():
+                    asked.cancel()
+            if not done:
+                st["stopped"] = f"{slug.rsplit('-', 1)[-1]}：{REREAD_WAIT_S:g} 秒没等到（请求额度紧），下次再读"
+                return
+            try:
+                market = asked.result()
             except Exception as error:
                 st["stopped"] = f"{slug.rsplit('-', 1)[-1]}：{core.clean_error(error) or type(error).__name__}"
                 self.error = f"扫描 {st['stopped']}"
@@ -3421,14 +3454,32 @@ class Controller:
         if (not pair.get("accounted") and all(order_verified(o) for o in pair["orders"].values())
                 and all(float(o.get("filled") or 0) <= 0 for o in pair["orders"].values())):
             pair.update(accounted=True, accounted_day=dt.datetime.fromtimestamp(self.now() / 1000, core.BEIJING).date().isoformat(), pnl=0.0)
+            self.released_at.append(self.now())
         if save:
             self.ledger.save(pair)
 
-    async def read_final(self, order: dict, pair: dict) -> None:
+    async def read_final(self, order: dict, pair: dict, late: bool = False) -> None:
         """An order's own record, for its final fills: final → "final" once that record is its last word (ended: "removed",
         to be read again, till then); none, past the give-up — never placed (no id) or final as known (an id Predict no
-        longer answers to)."""
-        row = await self.cancel_api.order(order.get("id", ""), order.get("api_hash") or order["hash"])
+        longer answers to).
+
+        ``late`` (1.154.54): the read LATE_FILL_MS after a withdrawal, of an order already off the book (cancel_pair) —
+        nothing waits on it but the pair's release and its window's next quote. 11-26: a changed setting withdrew 9,400
+        pairs, and their 18,700 such reads — two at a time on the cancel client, each taking the key's next token the
+        moment it came — left the mode's low traffic none for an hour and a half: the discovery stood in a re-read that
+        never got its token (no listing was probed: 扫描 stayed at 09:06:14), the four placement workers in theirs, and not
+        one window was quoted, the new listings included. So such a read is the last in the mode's line: it waits while a
+        pair is being placed or a known window re-read (behind_placements), and goes out as the mode's low traffic does
+        (the api: behind the listings' probes and orders; on the borrowed key when this one is short — through). The
+        soonest windows' reads come first (due), so each window is read, released and quoted again in turn — the book
+        comes back from the near end within minutes, not all of it hours on — and the listings go on being found and
+        placed at once."""
+        if late:
+            await self.behind_placements()
+        if late and self.api is getattr(self, "api_made", None):  # (the tests' own api stands for every client: read there as before)
+            row = await self.through(self.api, lambda api: api.order(order.get("id", ""), order.get("api_hash") or order["hash"]))
+        else:
+            row = await self.cancel_api.order(order.get("id", ""), order.get("api_hash") or order["hash"])
         if row:
             if not order.get("id") and row.get("id") is not None:
                 order["id"] = str(row["id"])
@@ -3442,6 +3493,16 @@ class Controller:
                 order.update(state="final", note="撤单后按编号查不到记录，按已知成交记账")
             else:
                 order.update(state="not_found", note="按哈希查不到，签名已过期：视为从未下单")
+
+    async def behind_placements(self) -> None:
+        """Before a withdrawn order's late final read (read_final): waits while a pair is being placed or a known window
+        re-read — FINALS_YIELD_S at the most, so the reads go on whatever holds a placement up. The key's pace gives no
+        turns (core.PredictPacer: whoever asks at the right instant has the token), so the order is kept here: the
+        listings' probes and orders (ahead of all low traffic at the pacer), the placements and the re-reads that feed
+        them, and these reads when none of those is out — which is whenever nothing released is left to quote."""
+        began = time.monotonic()
+        while (self.placing or self.rereading) and time.monotonic() - began < FINALS_YIELD_S and not self.stopped():
+            await asyncio.sleep(FINALS_YIELD_STEP_S)
 
     async def cancel_pair(self, pair: dict, reason: str) -> None:
         if pair["slug"] in self.cancelling:
@@ -3460,7 +3521,7 @@ class Controller:
                     continue
                 if order["state"] == "removed":  # removed: its final fills, read once more (nothing is left to cancel)
                     if self.now() >= self.final_read_ms(order, pair):  # ...once that read can end it (ended), not before
-                        await self.read_final(order, pair)
+                        await self.read_final(order, pair, late=not self.gave_up(pair))  # (1.154.54: behind the placements — not once its window is long over: the result's booking waits on it)
                         self.ledger.save(pair)
                     continue
                 # Unknown submissions are reconciled by their original hash.
@@ -3795,6 +3856,14 @@ class Controller:
             for pair in pairs:
                 if self.now() < self.finals_wait(pair):
                     continue  # withdrawn this very pass, every order off the book: nothing to do before their final reads, which its bookkeep booked (ended)
+                waiting = self.settling.get("cancel:" + pair["slug"])
+                if waiting is not None and not waiting.done():
+                    # 1.154.54: its reconcile, started at an earlier try, still waits for its turn (thousands withdrawn at once go
+                    # two at a time: reconcile_gate) — nothing of the pair has changed, and launch_reconcile would start nothing.
+                    # It used to be booked and written again at every try all the same: 9,000 waiting pairs, each a record in
+                    # the pass's transaction every RETRY_MAX_MS. Looked at again that long on; the wait is not a save's worth
+                    pair["retry_ms"] = self.now() + RETRY_MAX_MS
+                    continue
                 self.bookkeep(pair, save=False)
                 booked.append(pair)
                 self.launch_reconcile(pair)  # (a task: it runs after this pass's write)
@@ -4094,6 +4163,20 @@ class Controller:
                          + (f"进入范围 {self.sprint_lead_ms() / 1000:.0f} 秒后开始每 {FAST_POLL_S:g} 秒探测" if self.sprint_lead_ms() else "进入范围就开始快速探测（样本还不够）"))
         return "；".join(parts)
 
+    def finals_line(self) -> str:
+        """The status's line on the withdrawn pairs whose orders' final fills are still to read (1.154.54): how many, how many
+        were released in the last minute, and how long the rest takes at that pace — a changed setting or a stop withdraws
+        thousands at once, each order read once LATE_FILL_MS after it left the book, at the key's pace. 11-26: "it has been
+        twenty minutes and nothing is placed again" — and nothing in /preopen said why, or for how long. "" with few waiting."""
+        waiting = sum(1 for p in self.ledger.pending()
+                      if not p.get("accounted") and p["phase"] != "active" and any(o["state"] == "removed" for o in p["orders"].values()))
+        if waiting < FINALS_SAID:
+            return ""
+        last = sum(1 for at in self.released_at if at >= self.now() - 60_000)
+        pace = f"最近一分钟核对完 {last} 条，照这个速度还要约 {max(1, round(waiting / last))} 分钟" if last else "最近一分钟还没有核对完的"
+        return (f"\n撤后待核对：{waiting} 条（撤掉的单要在撤后 {LATE_FILL_MS // 1000} 秒逐张读一次成交，确认没成交才释放、才能重新挂；"
+                f"离开场近的先读，读完一场重挂一场，新发布的场次不受影响；{pace}）")
+
     def unquotable(self) -> tuple[list[dict], list[dict]]:
         """The coming windows' levels (start beyond the new-order cutoff) this mode will not quote again, the soonest first:
         (their failures at MAX_ATTEMPTS, refused by Predict) — each level's latest record (1.131.6: /preopen says so; a
@@ -4151,11 +4234,15 @@ class Controller:
         reserved = self.risk()
         spent, refused = self.unquotable()
         quoted_to: dict[str, int] = {}  # card -> the latest window with a quote resting (the first level's, the deeper ones wait for the start)
+        early = 0  # ...and those signed, before a setting changed, to leave the book earlier than the settings say now (resumable, 1.154.54)
+        expiry_of = {"BTC-5M": self.settings.timing("BTC-5M").expiry_seconds}
         for p in self.ledger.rows.values():  # (one pass for the resting ones: their count, and each card's latest)
             if p["phase"] == "active":
                 resting += 1
                 if p.get("key"):
                     quoted_to[p["key"]] = max(quoted_to.get(p["key"], 0), int(p.get("start_ms") or 0))
+                if 0 < int(p.get("expires") or 0) < int(p.get("start_ms") or 0) // 1000 - expiry_of.get(p.get("key"), self.settings.expiry_seconds):
+                    early += 1
         windows_left, pairs_left, usd_left = self.unplaced()
         shut_cards = {h: "、".join(r.coin for r in core.preopen_cards() if getattr(r, "hours", "") == h and r.key in self.settings.markets) for h in SHUT_TEXT}  # 1.150.1: the cards a shut keeps back
         quiet = open_quiet_ms(self.settings) // 60_000  # 1.151.1: the minutes in force (the first window after an open always)
@@ -4192,11 +4279,13 @@ class Controller:
                 (f"BTC 5 分钟自己的档位：两边各 {'、'.join(f'{core.cents(float(lp))}×{float(ls):g} 份' for lp, ls in self.settings.btc5_levels)}\n"
                  if "BTC-5M" in self.settings.markets and self.settings.btc5_levels else "") +  # 1.154.37
                 f"已记录 {len(self.ledger.windows)} 场、{total} 条（{resting} 条挂着，{cleared} 条已结清）"
+                + (f"；挂着的里面 {early} 条是改设置前签的，到期时间签在单里改不了：它们最晚在原来签的到期时间离场（比现在的设置早），排队位置保留，新挂的按现在的设置" if early else "")
                 + (f"，另有 {self.ledger.archived_count} 条已归档（结束超过 {ARCHIVE_AFTER_MS // core.DAY_MS} 天、已撤且没成交的；复盘页照常统计）" if self.ledger.archived_count else "") + "，"
                 f"队列 {self.queue.qsize() + len(self.parked)} 场" + (f"（{len(self.parked)} 场在等，见暂不新挂）" if self.parked else "") + f"；{listed}"
                 + (f"；本次启动接管 {self.resumed} 场" if self.resumed else "") + (f"；重新报价 {self.requoted} 场" if self.requoted else "") + "\n"
                 f"预留 {reserved:.2f}U{f' / 限额 {self.settings.max_open_usd:g}U' if self.settings.max_open_usd else '，不设上限'}（本模式自己的账：Predict 不锁定挂单资金，和原策略的持仓+挂单上限各算各的；撤掉的场次在撤单 {LATE_FILL_MS // 1000} 秒后读到一份没成交才释放）"
                 + (f"\n已发布未挂：{windows_left} 场 {pairs_left} 档，约 {usd_left:.0f}U" + (f"；预挂资金上限调到 {reserved + usd_left:.0f}U 以上可全部挂上" if self.settings.max_open_usd else "，新发布的先挂，其余按开场先后补挂中") if pairs_left else "")
+                + self.finals_line()
                 + (f"\n请求约 {self.request_rate():.1f} 次/秒（最近一分钟）；" if self.request_rate() is not None else "\n")
                 + self.pace_line()
                 + f"账户快照每 {self.account_interval_s():.0f} 秒（{self.account_pages} 页挂单" + self.page_rows_note()

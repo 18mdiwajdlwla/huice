@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.53"
+VERSION = "1.154.54"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -867,8 +867,11 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_OPEN_QUIET_MINUTES", "开盘后几分钟内开始的场次不挂", "15～120：海力士、宇树、智谱每个交易时段（开盘、午后）开始后，黄金、原油休市后重新开盘（纽约时间 18:00，周末和节假日之后也算）后，美股卡 09:30 开盘后，这么多分钟内开始的场次不挂。集合竞价的参考价（韩交所 08:30 起、港交所 09:00 起、上交所 09:15 起）、午休和休市期间的消息在指数动之前就已公开，这几场的方向不是五五开，49¢ 的买单正好给知道方向的人接。1.151.1 起开盘后第一场（15 分钟）固定不挂，这里只能再加长，填 0 也按 15 算；默认 15"),
     ("PREOPEN_LIMIT_GAP_PCT", "股票卡距涨跌停不足几 % 时不挂", "0～20：海力士、宇树（智谱在港交所没有涨跌停，只看临停）的交易所现价离当日涨停或跌停（按前收盘价算：科创板 ±20%、韩交所 ±30%）不到这么多时不新挂、撤掉已挂的；交易时段里成交时间 3 分钟没动（临停、VI）同样处理；0 = 不管（默认 2）"),
     ("PREOPEN_AHEAD_MINUTES", "只挂几分钟内开始的场次", "3～1440：默认 1440 = 24 小时内已发布的全部场次，发布一场挂一场、最近的先；想少占资金就调小"),
-    ("PREOPEN_CANCEL_SECONDS", "开场前几秒撤单", "至少比到期多 5 秒、至多 900：撤单发出后到到期前每 2 秒催一次（默认 20）"),
-    ("PREOPEN_EXPIRY_SECONDS", "签名开场前几秒到期", "5～600：撤单发不出去时的兜底，到期后不再撮合（默认 10）"),
+    ("PREOPEN_CANCEL_SECONDS", "开场前几秒撤单", "至少比到期多 5 秒、至多 900：撤单发出后到到期前每 2 秒催一次（默认 20）。改了不撤已挂的单：它们在新的撤单时间、"
+     "或自己签名的到期时间（哪个早按哪个）离场"),
+    ("PREOPEN_EXPIRY_SECONDS", "签名开场前几秒到期", "5～600：撤单发不出去时的兜底，到期后不再撮合（默认 10）。到期时间签在订单里、改不了："
+     "把它改小（更靠近开场）不撤已挂的单，它们按原来签的时间到期，新挂的才按新值（1.154.54）；把它改大（离开场更远）会把已挂的单全部撤掉重签重挂——"
+     "排队位置会丢，一天的场次全部挂回要几个小时（/preopen 的“撤后待核对”写着进度）"),
     ("PREOPEN_ENTRY_SECONDS", "距开场不足几秒不再新挂", "至少比撤单时间多 60 秒、至多 3600（默认 180）"),
     ("PREOPEN_BTC5_CANCEL_SECONDS", "BTC 5 分钟：开场前几秒撤单", "只管 BTC 5 分钟卡（1.152.0）；0 = 跟上面所有卡的一样。至少比它自己的到期多 5 秒、至多 900"),
     ("PREOPEN_BTC5_EXPIRY_SECONDS", "BTC 5 分钟：签名开场前几秒到期", "只管 BTC 5 分钟卡；0 = 跟上面所有卡的一样。5～600：撤单发不出去时的兜底，到期后不再撮合"),
