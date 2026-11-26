@@ -103,6 +103,17 @@ EXPIRY_BEFORE_S = 5           # an order's signed expiry: this long before the s
 #                               nothing matchable once the window runs (1.153.3: an order sent in the last 70 s was signed for 65 s,
 #                               valid up to a minute into the window)
 SEND_MIN_LEFT_MS = 5_000      # ...and none is sent with less than this left to it
+# 1.154.52: Predict takes no order whose signed expiry is nearer than two minutes — HTTP 400 "expiry is too soon (minimum 2 minutes
+# from now)". 11-24, the 18:15 window: an offer showed 34 s before the start, the order (signed to expire 5 s before it) was refused,
+# the offer stood to the start. So was every order of a window's last two minutes — before its start, and in its course before its
+# end — each a request, a refusal on the record (MAX_REJECTS) and half a minute's pause, while /rules said "到开场前 15 秒". An
+# order's life is not lengthened for it (EXPIRY_BEFORE_S stands: nothing matchable once the window runs, or once it is over); none
+# is decided where Predict would refuse it — nor in the five seconds before that, where one sent at once still went through (the spare):
+PREDICT_MIN_LIFE_MS = 120_000  # what Predict wants left to an order's expiry...
+LIFE_SPARE_MS = 5_000          # ...none is decided with less than this over it (its way to Predict; this clock and Predict's)...
+LIFE_SEND_SPARE_MS = 1_000     # ...and none sent with less than this over it (before_send: an order whose way took long)
+ORDER_BEFORE_MS = EXPIRY_BEFORE_S * 1000 + PREDICT_MIN_LIFE_MS + LIFE_SPARE_MS  # so: no order nearer than this (130 s) to the start — in a window's course, to its end
+LIFE_WORD = "距订单到期不足 2 分钟"  # before_send's word for it
 FILL_READ_MS = 1_500          # an order is read this long after its answer; what has not filled then is withdrawn
 LATE_FILL_MS = 60_000         # an order off the book is final only by a read this long after it left: an earlier one may not show its
 #                               last matches yet (the pre-open mode's LATE_FILL_MS; 1.153.3 — the first read after the cancel ended it,
@@ -160,7 +171,7 @@ VERIFY_HOT_S = 1.0
 ALLOWANCE_MS = 60_000         # the exchange allowance read again this often
 ALLOWANCE_UNLIMITED, ALLOWANCE_LONG_MS = 10 ** 40, 3_600_000  # ...one this large (an unlimited approval: 2^256 − 1) only this often
 STOP_WORD = f"开场前 {STOP_MS // 1000} 秒内不再发单"  # (1.154.33, R18: before_send's word for an order whose way ran into STOP_MS)
-RECHECKED = ("规则吃单的设置刚改过", "盘中：", STOP_WORD)  # before_send's words for an order held back on what its look had judged (send: no pause for these)
+RECHECKED = ("规则吃单的设置刚改过", "盘中：", STOP_WORD, LIFE_WORD)  # before_send's words for an order held back on what its look had judged (send: no pause for these)
 HELD_BACK_MAX = 3             # ...up to this many in a row a window: then it pauses like a refusal (a record of them, one a look, helps nobody)
 CONFLICT_GRACE_MS = 90_000    # an order Predict answered 409 for and then cannot show by its hash is given up as never placed after this long...
 CONFLICT_MISSES = 6           # ...and this many reads that found nothing (an answer gone missing waits for its expiry, as before: GIVE_UP_MS)
@@ -537,6 +548,28 @@ def watch_stats(recs: dict[str, dict], rule: str, mode: str, since_ms: int) -> d
 RACES_SHOWN = 8  # /rules lists this many of the latest windows' races
 
 
+RACE_SAME_MS = 5_000  # an order sized on a book this long after the window's offers first showed answers a later showing of them (order_clock)
+
+
+def order_clock(o: dict, shown: int) -> tuple[int | None, int | None]:
+    """An order against the clock of its window's race (races): (how long after the offer showed it left, None) — or, when the
+    book it was sized on came RACE_SAME_MS or more after the window's offers FIRST showed, (how long after that book — Predict's
+    stamp on it — it left, how long after the first showing that was). 1.154.52: a window's offers may show, be taken and show
+    again hours later (11-24 07:00: listed a day ahead, an order 19 hours on) — counted from the first showing that order "left
+    68404348 ms after the offer", in /rules and in the month's median of this taker's speed."""
+    sent = int(o.get("sent_wall") or 0)
+    since = sent - shown if sent and shown else None
+    react = sent - int(o["book_ts"]) if sent and o.get("book_ts") else None
+    if since is not None and react is not None and since - react >= RACE_SAME_MS:
+        return react, since
+    return since, None
+
+
+def span_text(ms: int) -> str:
+    """19.0 小时 / 12.5 分钟 / 8.3 秒."""
+    return f"{ms / 3_600_000:.1f} 小时" if ms >= 3_600_000 else f"{ms / 60_000:.1f} 分钟" if ms >= 60_000 else f"{ms / 1000:.1f} 秒"
+
+
 def races(recs: dict[str, dict], mode: str, since_ms: int) -> list[dict]:
     """The windows' races since ``since_ms``, the latest start first (1.154.16: /rules and the review page, a line a window): each
     window whose watch saw an offer at the rule's price or that an order went out for before its start — when the offer showed
@@ -578,7 +611,7 @@ def races(recs: dict[str, dict], mode: str, since_ms: int) -> list[dict]:
             "orders": [{"shares": float(o.get("shares") or 0), "filled": float(o.get("filled") or 0), "paper": bool(o.get("paper")),
                         "seen": o.get("seen"), "fresh": o.get("fresh"), "state": o.get("state"),
                         "error": str(o.get("error") or "") if o.get("state") in NEVER_PLACED else "",  # (1.154.18: never placed — said so, not "bought nothing")
-                        "after": int(o["sent_wall"]) - shown if o.get("sent_wall") and shown else None,
+                        "after": order_clock(o, shown)[0], "later": order_clock(o, shown)[1],  # (1.154.52: of a later showing — order_clock)
                         "lag": int(o["seen_wall"]) - int(o["book_ts"]) if o.get("book_ts") and o.get("seen_wall") else None,
                         "own": int(o["sent_wall"]) - int(o["seen_wall"]) if o.get("sent_wall") and o.get("seen_wall") else None,
                         # 1.154.22: the taker's own time in its parts — the book's arrival to the look that placed the order, that
@@ -621,7 +654,8 @@ def race_text(row: dict) -> str:
         if o.get("state") in NEVER_PLACED:
             text += f"｜第 {i} 张 要 {o['shares']:g}：没下成" + (f"（{o['error']}）" if o.get("error") else "")
             continue
-        parts = ([f"出现后 {o['after']} ms 发出"] if o["after"] is not None else []) + ([f"推送 {o['lag']} ms"] if o["lag"] is not None else [])
+        parts = (([f"出现后 {o['after']} ms 发出" + (f"（这是卖单第一次出现 {span_text(o['later'])}后又有的卖单，从它出现算）" if o.get("later") else "")]
+                  if o["after"] is not None else []) + ([f"推送 {o['lag']} ms"] if o["lag"] is not None else []))
         if o["own"] is not None:  # (an order that waited for something else than its book — the one before it — is told apart)
             split = [f"{name} {o[key]} ms" for name, key in (("到达→开始处理", "wake"), ("处理→签好", "prep"), ("签好→发出", "out")) if o.get(key) is not None]
             if o.get("open_wait") is not None:
@@ -1211,6 +1245,12 @@ class RuleTaker:
         order = next((o for o in rec.get("orders") or [] if o.get("hash") == digest), None)
         if order is None:
             return "订单记录不见了"
+        if int(order.get("expires") or 0) * 1000 - self.now() < PREDICT_MIN_LIFE_MS + LIFE_SEND_SPARE_MS:
+            # 1.154.52: Predict would refuse it ("expiry is too soon"): decided with ORDER_BEFORE_MS in hand (look), its way — the
+            # sign-in, the allowance's read, a token of the key's pace — took the spare. Held back as the look's own judgment
+            # (RECHECKED: no refusal, no pause); the two checks below stand behind this one
+            return (LIFE_WORD + f"（Predict 不收；开场前的单签到开场前 {EXPIRY_BEFORE_S} 秒到期，盘中的单签到这一场结束前 {EXPIRY_BEFORE_S} 秒），不再发送"
+                    "（这张单在那之前决定，发出时已到这段时间）")
         if int(order.get("expires") or 0) * 1000 - self.now() < SEND_MIN_LEFT_MS:
             return "距订单到期不足 5 秒（开场前 5 秒到期；盘中的单在这一场结束前 5 秒到期），不再发送"
         # 1.154.33 (an outside review, R18): nothing is placed within STOP_MS of the start (in a window's course, LIVE_STOP_MS of its
@@ -2032,6 +2072,13 @@ class RuleTaker:
             self.save_watch(slug, w, rule)
         if not levels:
             w["word"] = ("盘中：" if course else "") + f"盘口没有 ≤{int(limit * 100)}¢ 的{rule.word}" + (f"（最低 {float(best[0][0]) * 100:g}¢）" if best else "（没人卖）")
+            return
+        if (self.end_of(w) if course else w["start"]) - now < ORDER_BEFORE_MS:
+            # 1.154.52: Predict takes no order with under two minutes to its expiry, and this one would be signed to expire
+            # EXPIRY_BEFORE_S before the start (in the course: the end). Not sent to be refused; the offer is still watched (above)
+            w["word"] = (("盘中：" if course else "") + f"盘口有 ≤{int(limit * 100)}¢ 的{rule.word} {sum(q for _, q in levels):g} 份，但离"
+                         + ("这一场结束" if course else "开场") + f"不足 {ORDER_BEFORE_MS // 1000} 秒，不下单：订单签到" + ("结束" if course else "开场")
+                         + f"前 {EXPIRY_BEFORE_S} 秒到期，Predict 不收有效期不足 2 分钟的单")
             return
         if not w["open_ms"]:
             near = w["start"] - now <= NEAR_MS
@@ -3044,8 +3091,9 @@ class RuleTaker:
         now, s = self.now(), self.settings
         recs = self.recs
         in_course = any(self.live_cents(r) > 0 for r in RULES)
-        lines = [f"规则吃单：{MODES.get(s.mode, s.mode)}（RULE_TAKER={s.mode}）｜{'开场前吃' if in_course else '只在开场前吃'}，盘口一有就买，到开场前 {STOP_MS // 1000} 秒"
-                 + (f"；设了盘中价格的规则开场后接着买（开场 {LIVE_START_MS // 1000} 秒后到结束前 {LIVE_STOP_MS // 1000} 秒，"
+        lines = [f"规则吃单：{MODES.get(s.mode, s.mode)}（RULE_TAKER={s.mode}）｜{'开场前吃' if in_course else '只在开场前吃'}，盘口一有就买，到开场前 {ORDER_BEFORE_MS // 1000} 秒"
+                 f"（订单签到开场前 {EXPIRY_BEFORE_S} 秒到期，Predict 不收有效期不足 2 分钟的单）"
+                 + (f"；设了盘中价格的规则开场后接着买（开场 {LIVE_START_MS // 1000} 秒后到结束前 {ORDER_BEFORE_MS // 1000} 秒，"
                     f"第 1 分钟最高按盘前的价格）" if in_course else "")
                  + (f"｜每天最多花 ${s.max_day_usd:g}（今天已花 ${spent_on(recs, day_of(now), s.mode):,.2f}）" if s.max_day_usd else "")
                  + f"｜推送 {'已连接' if self.stream.ws is not None else '未连接' + ('（' + self.stream.error + '）' if self.stream.error else '')}"]
