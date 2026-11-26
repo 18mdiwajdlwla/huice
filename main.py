@@ -56,7 +56,7 @@ D = decimal.Decimal
 UTC = dt.timezone.utc
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 DAY_MS = 86_400_000
-VERSION = "1.154.52"
+VERSION = "1.154.53"
 if __name__ == "__main__":
     # 1.122.0: live.py imports this module as "main" — under `python main.py` that used to be a second copy of it (its own
     # CALENDAR with the default special days, not the configured ones; its own classes): the running module is "main" too
@@ -16909,6 +16909,7 @@ function preopenSection(po){  // 开盘前预挂 (1.128.0): the mode's own ledge
   p("有成交",t.filled_windows+" 场 · "+num(t.filled)+" 份 · "+usd(t.volume)+(t.pending?" · 待结算 "+t.pending+" 场":""));
   p("已结算",t.settled?[t.settled+" 场（赢 "+t.wins+" 输 "+t.losses+(t.ties?" 平 "+t.ties:"")+"）盈亏 ",poPn(t.pnl)," · 平均每场 ",poPn(t.pnl/t.settled)]:"还没有结算的场次");
   poEvRows(po.ev,t.pnl).forEach(([k,v])=>p(k,v));  // 1.154.34: the settled fills against a coin toss, and where the gap came from
+  if(po.archive_note)el.append($("p","small warn","⚠️ "+po.archive_note));  // 1.154.53: the archive's records not counted in yet (being counted in the background)
   el.append(d,...bigTable("按日期",poTable(po.days||[]),(po.days||[]).length),$("div","sub","按标的"),poTable(po.cards||[]));
   if((po.levels||[]).length)el.append($("p","small mut","按价格档位的预期对实际在上面“按市场”下方，跟着那里选的日期（全部日子选“全部”）。"));  // 1.154.35: moved up
   el.append(...bigTable("按开始时间",poTable(po.hours||[]),(po.hours||[]).length));
@@ -18661,6 +18662,10 @@ class Document:
     mime: str = "text/csv"
 
 
+# /export 全部 (1.154.53): what its files share — the pre-open review, made by the first that asks and handed to the others —
+# for the length of that one command, in its own task alone (a page built meanwhile makes its own: Bot.review_held). Held as
+# [the dict]: [None] once the command is over, so that nothing begun under it and still running finds anything kept
+REVIEW_SHARED: contextvars.ContextVar = contextvars.ContextVar("review_shared", default=None)
 DOCUMENT_GZIP_BYTES = 20_000_000  # a file larger than this is sent gzipped (Telegram takes 50 MB from a bot; an upload has DOCUMENT_TIMEOUT_S)
 DOCUMENT_MAX_BYTES = 49_000_000   # ...and one still larger than this once compressed is not sent
 DOCUMENT_TIMEOUT_S = 120
@@ -20195,8 +20200,9 @@ class Bot:
         if not n:
             return f"没有符合的记录（筛选：{journal_filter_text(flt)}）" if flt else "还没有交易记录"
         scope = f"筛选：{journal_filter_text(flt)}" if flt else "全部"
-        return Document(self.export_name("journal", flt), self.journal_csv(flt).encode("utf-8"),
-                        f"交易日记 {n} 笔（{scope}）；一笔一行，列的含义见 README")
+        with self.review_scope():  # (1.154.53: one build — the pre-open review and each record's figures once, as the page's builds)
+            data = self.journal_csv(flt).encode("utf-8")
+        return Document(self.export_name("journal", flt), data, f"交易日记 {n} 笔（{scope}）；一笔一行，列的含义见 README")
 
     async def cmd_summary(self, req: Request) -> Any:
         """/summary [筛选词]: the review page's summary and analysis tables (journal_summary_csv — its 导出汇总 CSV) as a
@@ -20207,9 +20213,12 @@ class Bot:
         if not self.sim_trades():
             return "还没有交易记录"
         scope = f"筛选：{journal_filter_text(flt)}" if flt else "全部记录"
-        return Document(self.export_name("summary", flt), self.journal_summary_csv(flt).encode("utf-8"),
+        with self.review_scope():  # (1.154.53: the daily summary and the analysis both ask for the pre-open review: once)
+            data = self.journal_summary_csv(flt).encode("utf-8")
+            note = "" if flt else self.archive_note()  # (the pre-open mode's quotes are counted in without a filter: summary_rows)
+        return Document(self.export_name("summary", flt), data,
                         f"复盘汇总（{scope}）：每日汇总、今日按市场、按标的 / 净优势 / 公平价 / 时段、按设置版本、15 分钟表、"
-                        "挂单效率与撤单原因、被拦下的机会；第一列是表名")
+                        "挂单效率与撤单原因、被拦下的机会；第一列是表名" + (f"｜⚠️ 其中开盘前预挂的部分：{note}" if note else ""))
 
     # --- 1.154.51: everything the review page holds, by Telegram (/export, /tally) --------------------------------------------------
     EXPORT_BUSY = "规则吃单正在优先时段（抢单时刻前后、开场前 15 分钟和盘中），导出和统计这段时间不做——做一次要占住机器人几秒；过一会儿再发"
@@ -20219,6 +20228,7 @@ class Bot:
     EXPORT_KINDS = {"日记": "journal", "journal": "journal", "汇总": "summary", "summary": "summary", "样本": "samples", "samples": "samples", "json": "json",
                     "预挂": "preopen", "preopen": "preopen", "规则": "rules", "rules": "rules", "涨跌": "tally", "连涨": "tally", "tally": "tally",
                     "全部": "all", "所有": "all", "all": "all"}
+    EXPORT_BREATH_S = 1.0  # /export 全部: this long between two files — each is a second or more of the loop in one piece: the trader catches up
     TALLY_WAIT_S = 90.0   # /tally: a card's candles are waited for this long at the most
     TALLY_PACE_S = 0.5    # /tally over several cards: this long a chunk of candles just read before the next card's are asked for — Binance futures'
     #                       index candles are 5 of the IP's 2,400 a minute a read: every card over a month is 750 reads
@@ -20313,16 +20323,26 @@ class Bot:
             return await self.export_json(words[1:])
         parts: list = []
         nothing: list[str] = []
-        for name, made in (("日记", self.cmd_journal), ("汇总", self.cmd_summary), ("样本", self.cmd_samples)):
-            answer = await made(dataclasses.replace(req, args=[]))
-            (parts if isinstance(answer, Document) else nothing).append(answer if isinstance(answer, Document) else name)
-            await asyncio.sleep(0)  # (each is seconds of the loop: the trader's turn between two)
-        for name, answer in (("预挂", await self.export_preopen([])), ("规则", self.export_rules())):
-            docs = [x for x in (answer if isinstance(answer, list) else [answer]) if isinstance(x, Document)]
-            parts.extend(docs)
-            if not docs:
-                nothing.append(name)
-            await asyncio.sleep(0)
+        # 1.154.53: the pre-open review is asked for by the summary and the pre-open files alike — a second of the loop each
+        # time with 40,000 working records: made by the first and handed to the others (REVIEW_SHARED: as within one build
+        # of the page, for this command's own task), with a breath between two files
+        shared: list = [{}]
+        token = REVIEW_SHARED.set(shared)
+        try:
+            bare = dataclasses.replace(req, args=[])
+            for name, made in (("日记", lambda: self.cmd_journal(bare)), ("汇总", lambda: self.cmd_summary(bare)), ("样本", lambda: self.cmd_samples(bare)),
+                               ("预挂", lambda: self.export_preopen([])), ("规则", self.export_rules)):
+                answer = made()
+                if inspect.isawaitable(answer):
+                    answer = await answer
+                docs = [x for x in (answer if isinstance(answer, list) else [answer]) if isinstance(x, Document)]
+                parts.extend(docs)
+                if not docs:
+                    nothing.append(name)
+                await asyncio.sleep(self.EXPORT_BREATH_S)
+        finally:
+            shared[0] = None
+            REVIEW_SHARED.reset(token)
         tally = await self.cmd_tally(dataclasses.replace(req, args=[]))
         later = isinstance(tally, str) and tally.startswith("统计中")
         parts.extend(x for x in (tally if isinstance(tally, list) else []) if isinstance(x, Document))
@@ -20340,7 +20360,8 @@ class Bot:
         flt, problem = self.journal_filter_words(words)
         if problem:
             return problem
-        payload = self.journal_payload(full=True, history=0)
+        with self.review_scope():
+            payload = self.journal_payload(full=True, history=0)
         mine = self.sim_trades()
         trades = [t for t in payload.pop("trades") if not flt or journal_match(mine.get(t["id"]) or {}, flt)]
         if not trades:
@@ -20376,8 +20397,10 @@ class Bot:
                          "涨跌两边在同一行；更早的、没成交且已撤的旧记录已归档，不在这个文件里")]
         review = self.preopen_review()
         if review:
+            note = str(review.get("archive_note") or "")
             docs.append(Document(f"preopen-summary-{self.export_stamp()}.csv", self.preopen_summary_csv(review),
-                                 "预挂统计表（全部日期，归档的旧记录也计入）：合计、按天、按卡、按档位（按五五开的预期对实际）、按开始小时、按方向、周末对工作日；第一列是表名"))
+                                 ("预挂统计表（全部日期，归档的旧记录也计入）：" if not note else "预挂统计表（全部日期）：")
+                                 + "合计、按天、按卡、按档位（按五五开的预期对实际）、按开始小时、按方向、周末对工作日；第一列是表名" + (f"｜⚠️ {note}" if note else "")))
         return docs
 
     EXPORT_SLICE = 2_000  # /export 预挂: this many records are looked at before the trader has its turn (tens of thousands: a second in one go)
@@ -28564,6 +28587,20 @@ class Bot:
         """A context for one build of the review page's data (WebServer.cached): nothing here; LiveBot keeps each pre-open
         record's figures for the length of it (preopen.quotes_kept)."""
         return contextlib.nullcontext()
+
+    def review_held(self) -> dict | None:
+        """What is kept of the review's data where this is asked: the build under way's (review_scope: review_kept), else —
+        within /export 全部, in its own task — what that command's files share (REVIEW_SHARED, 1.154.53); None: nothing kept."""
+        kept = getattr(self, "review_kept", None)
+        if kept is None and (shared := REVIEW_SHARED.get()):
+            kept = shared[0]
+        return kept
+
+    def archive_note(self) -> str:
+        """The pre-open review's word that its archived records are not counted in just now (LiveBot.preopen_review_build,
+        1.154.53) — "" when they are, or there is no such mode: said under whatever is made of that review meanwhile. Within
+        a build or an export the review asked for here is the one already made (review_held)."""
+        return str((self.preopen_review() or {}).get("archive_note") or "")
 
     def rules_clear(self, seconds: float) -> bool:
         """Whether the rule taker neither goes first now nor will within ``seconds`` (LiveBot: by its own plan of the day).

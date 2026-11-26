@@ -423,7 +423,7 @@ async def the_rules_file() -> None:
 async def the_old_files_and_everything() -> None:
     """The three files the bot already sent, by their words; the whole records gzipped; and 全部."""
     bot = await TJ["build"]()
-    bot.TALLY_PACE_S = 0.0
+    bot.TALLY_PACE_S = bot.EXPORT_BREATH_S = 0.0
 
     async def none(path, **params):
         return []

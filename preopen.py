@@ -553,10 +553,15 @@ class Ledger:
                 self.conn.executemany("INSERT INTO archive VALUES (?,?) ON CONFLICT(slug) DO UPDATE SET body=excluded.body",
                                       ((slug, json.dumps(self.rows[slug], ensure_ascii=False)) for slug in part))
                 self.conn.executemany("DELETE FROM pairs WHERE slug=?", ((slug,) for slug in part))
+                now_held = int(self.conn.execute("SELECT COUNT(*) FROM archive").fetchone()[0])
+                if now_held - held != len(part):
+                    # 1.154.53: ...and said in the file itself, with the rows, in one transaction: the counts kept of the archive
+                    # across a restart (share_save) are the archive's only while none of its rows was replaced in place
+                    share_gen_bump(self.conn)
             for slug in part:  # (on disk first: a chunk that could not be written leaves its records where they were)
                 self.unindex(slug, self.rows.pop(slug))
-            self.archived_count = self.archive_count()
-            if self.archived_count - held != len(part):  # a record the archive held already — saved again after its move by a task that still had it — was replaced there, in place
+            self.archived_count = now_held
+            if now_held - held != len(part):  # a record the archive held already — saved again after its move by a task that still had it — was replaced there, in place
                 Ledger.rewrites += 1
         return len(gone)
 
@@ -1365,6 +1370,21 @@ def read_archive(path: str) -> Iterator[dict]:
         conn.close()
 
 
+def archive_rows(path: str) -> int:
+    """How many records the ledger file's archive holds, while no controller holds the file (a controller's ledger keeps
+    the count: archived_count) — one count over the archive's keys, no record read; 0 without a file or before the first
+    move. 1.154.53: LiveBot.preopen_review asks before it would read the archive record by record."""
+    if path == ":memory:" or not Path(path).exists():
+        return 0
+    conn = sqlite3.connect(path)
+    try:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='archive'").fetchone() is None:
+            return 0
+        return int(conn.execute("SELECT COUNT(*) FROM archive").fetchone()[0])
+    finally:
+        conn.close()
+
+
 def archive_file(path: str, now_ms: int) -> int:
     """Ledger.archive_old on the ledger file while no controller holds it (the mode off: LiveBot.preopen_tidy) — the
     positions check and the review page read that file's working records whole, twice a minute and six times a build;
@@ -1673,7 +1693,16 @@ class ArchiveShare:
     they are and passed by here (``skip``). What another hand changes leaving every key where it was — a body rewritten
     in place — is not seen before the next start. And the counts are not used at all (fits) when the archive holds a
     record that is no plain withdrawn quote, or one of a window after today's: the page reads the archive record by
-    record then, as it did. After a start the first call reads the archive whole, once."""
+    record then, as it did — a small one; a large one is left out and said (LiveBot.preopen_review_build).
+
+    1.154.53: after a start the first call read the archive whole, once — on the bot's one event loop: 187,104 records
+    and 20.8 s on 11-26. The read is cut into steps (ShareWork) that a background task takes one at a time
+    (LiveBot.preopen_share_keeper); a caller on the loop reads only what is little (read, whole=False). And the counts
+    are kept in the ledger's file (state / restored, share_save / share_load), so a start reads only the rows archived
+    since — while the archive's generation in that file (share_gen) is the one they were counted under: a pass that
+    replaces a row of the archive in place moves it on in the same transaction (Ledger.archive_old). A version before
+    this one run on the file in between does not: what it replaced in place then is not seen (a count or two of
+    withdrawn quotes off, never a fill or a P&L) until the archive is next read whole."""
     def __init__(self, path: str = "") -> None:
         self.path = path
         self.top = self.count = 0  # the archive's rows counted here: those up to this rowid, this many
@@ -1736,41 +1765,50 @@ class ArchiveShare:
         self.known[window] = seen
 
     @classmethod
-    def read(cls, conn: sqlite3.Connection, path: str, rows: list[dict], kept: ArchiveShare | None = None) -> ArchiveShare:
+    def read(cls, conn: sqlite3.Connection, path: str, rows: list[dict], kept: ArchiveShare | None = None, whole: bool = True) -> ArchiveShare:
         """The archive's share as the archive is now, for the working records ``rows``: ``kept`` — the last call's — with the
         rows moved in since counted in (none read when there are none), or the archive read whole (the first call, a
         ledger in memory, another file, and whenever its rows did not only grow: the class's own words). ``known`` then
-        holds the windows of ``rows`` and no other. ``kept`` is changed in place: after an error it is no use."""
-        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='archive'").fetchone() is None:
-            return cls(path)  # (a file nothing was moved in yet)
-        count = conn.execute("SELECT COUNT(*) FROM archive").fetchone()[0]
-        mine = [slug for slug in {p.get("slug") for p in rows} if isinstance(slug, str)]
-        skip = frozenset(slug for at in range(0, len(mine), 500) for (slug,) in conn.execute(
-            f"SELECT slug FROM archive WHERE slug IN ({','.join('?' * len(mine[at:at + 500]))})", mine[at:at + 500]))
-        share = kept
-        # still the rows it counted, and nothing but rows after them: the last of them is where it was, and they and the later ones are all there is
-        fresh = (share is None or not share.count or path == ":memory:" or share.path != path or share.rewrites != Ledger.rewrites or share.skip != skip
-                 or conn.execute("SELECT slug FROM archive WHERE rowid = ?", (share.top,)).fetchone() != share.last
-                 or share.count + conn.execute("SELECT COUNT(*) FROM archive WHERE rowid > ?", (share.top,)).fetchone()[0] != count)
-        if fresh:
+        holds the windows of ``rows`` and no other. ``kept`` is changed in place: after an error it is no use.
+        1.154.53: the work itself is ShareWork's, a step at a time — here to its end. ``whole`` false: only while that is
+        little (SHARE_LOOP_ROWS rows to read, SHARE_LOOP_WINDOWS windows to look up) — else ShareBehind, nothing read and
+        ``kept`` as it was: the caller is on the event loop, and the rest is a background task's (LiveBot.preopen_share_round)."""
+        work = ShareWork(conn, path, rows, kept)
+        if not whole and path != ":memory:" and work.heavy():  # (a ledger in memory is read whole at every call, as it always was: no counts of it are kept)
+            raise ShareBehind(f"归档 {work.total} 条里还有 {work.rows_left} 条没计数、{work.windows_left} 个场次没查", work.total)
+        while work.step(SHARE_READ_STEP):
+            pass
+        return work.share
+
+    def state(self, gen: int) -> dict:
+        """These counts as they are kept in the ledger's file (share_save): everything but ``known``, which is the working
+        records' and looked up again (learn). ``gen``: the archive's generation they were counted under (share_gen)."""
+        return {"v": SHARE_VERSION, "kinds": list(REVIEW_KINDS), "gen": int(gen), "top": self.top, "count": self.count, "last": list(self.last) if self.last else None,
+                "skip": sorted(self.skip), "plain": self.plain, "sent": dict(self.sent),
+                "lines": {kind: [[key, line.records, line.windows, None if line.latest == -math.inf else line.latest] for key, line in lines.items()]
+                          for kind, lines in self.lines.items()}}
+
+    @classmethod
+    def restored(cls, path: str, state: Any, gen: int) -> ArchiveShare | None:
+        """The counts kept in the file as a share again — None when they are not this code's (SHARE_VERSION, the tables' kinds),
+        not of this generation of the archive, or not what state() writes. Whether the archive is still the rows they were
+        counted from is read's own check, as for a share kept in memory (the last row where it was, the rows adding up)."""
+        thaw = lambda k: tuple(thaw(x) for x in k) if isinstance(k, list) else k
+        try:
+            if state["v"] != SHARE_VERSION or state["kinds"] != list(REVIEW_KINDS) or int(state["gen"]) != int(gen):
+                return None
             share = cls(path)
-            share.skip = skip
-        reached, added = share.top, 0
-        for rowid, slug, body in conn.execute("SELECT rowid, slug, body FROM archive WHERE rowid > ? ORDER BY rowid", (share.top,)):
-            pair = json.loads(body)
-            if not fresh and window_of(pair) not in share.known:  # (a window quoted and archived since the last call: an earlier record of it would be among the rows counted)
-                share.learn(conn, window_of(pair))
-            share.add(slug, pair)
-            reached, added, share.last = rowid, added + 1, (slug,)
-        share.top, share.count = reached, share.count + added
-        windows = {window_of(p) for p in rows}
-        for window in windows - share.known.keys():
-            if fresh:
-                share.known[window] = ()  # (every window of the archive is held just now: this one has no record there)
-            else:
-                share.learn(conn, window)
-        share.known = {window: share.known[window] for window in windows}
-        return share
+            share.top, share.count = int(state["top"]), int(state["count"])
+            share.last = tuple(state["last"]) if state["last"] else None
+            share.skip, share.plain = frozenset(state["skip"]), bool(state["plain"])
+            share.sent = {"up": int(state["sent"]["up"]), "down": int(state["sent"]["down"])}
+            for kind in REVIEW_KINDS:
+                for key, records, windows, latest in state["lines"][kind]:
+                    line = share.lines[kind][thaw(key)] = ArchiveLine()
+                    line.records, line.windows, line.latest = int(records), int(windows), -math.inf if latest is None else latest
+            return share
+        except (KeyError, TypeError, ValueError):
+            return None
 
     def fits(self, now_ms: int) -> bool:
         """Whether these counts can stand for the archive's records in review(…, now_ms): each a plain withdrawn quote
@@ -1801,16 +1839,150 @@ class ArchiveShare:
         return r
 
 
-def archive_share(source: Ledger | str, rows: list[dict], kept: ArchiveShare | None = None) -> ArchiveShare:
+class ShareBehind(Exception):
+    """ArchiveShare.read(whole=False): bringing the share up to date is more than a call on the event loop may do. ``total``:
+    the archive's records."""
+    def __init__(self, text: str, total: int = 0) -> None:
+        super().__init__(text)
+        self.total = int(total)
+
+
+SHARE_VERSION = 1           # of the counts kept in the file (ArchiveShare.state): another number when what an archived record adds to a table changes
+SHARE_KEY, SHARE_GEN_KEY = "archive_share", "archive_gen"  # the ledger's settings they are kept under, and the archive's generation (share_gen)
+SHARE_READ_STEP = 1_000     # ArchiveShare.read: the archive's rows a query (never the whole of it in memory)
+SHARE_STEP = 100            # the background preparation: rows read / windows looked up before the event loop has its turn (a hundredth of a second each)
+SHARE_LOOP_ROWS = 2_000     # a call on the event loop reads no more rows of the archive than this (an hour's pass moves a few hundred in)...
+SHARE_LOOP_WINDOWS = 1_500  # ...and looks up no more windows it does not hold
+
+
+class ShareWork:
+    """ArchiveShare.read a step at a time (1.154.53). 11-26: the first call after a start read the archive whole on the
+    bot's one event loop — 187,104 records, 20.8 s in which no book was read, no order sent or withdrawn (/diag: 主循环最长
+    20783 ms，卡在 preopen.read) — whatever asked for the review first: the page, /journal, /summary, /export. And the
+    archive grows by some 14,000 records a day. The same work, in the same order, cut into steps: read() runs them to the
+    end where that is little; a background task (LiveBot.preopen_share_round) takes a step, lets the loop have its
+    turn, and takes the next. ``kept`` is changed in place as the steps go: nobody else may use it meanwhile.
+
+    The rows are read a page at a time by their rowid (no statement stays open between two steps). Rows a pass appends
+    while the steps go are read at the end like any others; a row replaced in place meanwhile is Ledger.rewrites' to say
+    (``stale``: the work is begun again)."""
+    def __init__(self, conn: sqlite3.Connection, path: str, rows: list[dict], kept: ArchiveShare | None = None) -> None:
+        self.conn, self.path = conn, path
+        self.windows = {window_of(p) for p in rows}
+        self.todo: list[str] = []
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='archive'").fetchone() is None:
+            self.share, self.fresh, self.stage, self.rows_left, self.windows_left, self.total = ArchiveShare(path), True, "done", 0, 0, 0  # (a file nothing was moved in yet)
+            return
+        count = self.total = conn.execute("SELECT COUNT(*) FROM archive").fetchone()[0]
+        mine = [slug for slug in {p.get("slug") for p in rows} if isinstance(slug, str)]
+        skip = frozenset(slug for at in range(0, len(mine), 500) for (slug,) in conn.execute(
+            f"SELECT slug FROM archive WHERE slug IN ({','.join('?' * len(mine[at:at + 500]))})", mine[at:at + 500]))
+        share = kept
+        # still the rows it counted, and nothing but rows after them: the last of them is where it was, and they and the later ones are all there is
+        fresh = (share is None or not share.count or path == ":memory:" or share.path != path or share.rewrites != Ledger.rewrites or share.skip != skip
+                 or conn.execute("SELECT slug FROM archive WHERE rowid = ?", (share.top,)).fetchone() != share.last
+                 or share.count + conn.execute("SELECT COUNT(*) FROM archive WHERE rowid > ?", (share.top,)).fetchone()[0] != count)
+        if fresh:
+            share = ArchiveShare(path)
+            share.skip = skip
+        self.share, self.fresh, self.stage = share, fresh, "rows"
+        self.reached, self.added = share.top, 0
+        self.rows_left = count - share.count  # (a fresh one's count is 0: every row)
+        self.windows_left = 0 if fresh else len(self.windows - share.known.keys())  # (read whole, every window of the archive is held: none to look up)
+
+    @property
+    def done(self) -> bool:
+        return self.stage == "done"
+
+    @property
+    def stale(self) -> bool:
+        """A row of the archive was replaced in place since this work began: what was counted of it may not be it any more."""
+        return self.share.rewrites != Ledger.rewrites
+
+    def heavy(self) -> bool:
+        """More than a call on the event loop may do (ArchiveShare.read, whole=False)."""
+        return self.rows_left > SHARE_LOOP_ROWS or self.windows_left > SHARE_LOOP_WINDOWS
+
+    def step(self, n: int = SHARE_STEP) -> bool:
+        """The next ``n`` rows read and counted — then, the rows done, the next ``n`` windows looked up; whether more is left."""
+        share = self.share
+        if self.stage == "rows":
+            page = self.conn.execute("SELECT rowid, slug, body FROM archive WHERE rowid > ? ORDER BY rowid LIMIT ?", (self.reached, n)).fetchall()
+            for rowid, slug, body in page:
+                pair = json.loads(body)
+                if not self.fresh and window_of(pair) not in share.known:  # (a window quoted and archived since the last call: an earlier record of it would be among the rows counted)
+                    share.learn(self.conn, window_of(pair))
+                share.add(slug, pair)
+                self.reached, self.added, share.last = rowid, self.added + 1, (slug,)
+            self.rows_left = max(0, self.rows_left - len(page))
+            if len(page) < n:
+                share.top, share.count = self.reached, share.count + self.added
+                self.todo = sorted(self.windows - share.known.keys())
+                self.stage, self.rows_left = "windows", 0
+            return True
+        if self.stage == "windows":
+            part, self.todo = self.todo[:n], self.todo[n:]
+            for window in part:
+                if self.fresh:
+                    share.known[window] = ()  # (every window of the archive is held just now: this one has no record there)
+                else:
+                    share.learn(self.conn, window)
+            self.windows_left = 0 if self.fresh else len(self.todo)
+            if not self.todo:
+                share.known = {window: share.known[window] for window in self.windows}
+                self.stage = "done"
+        return not self.done
+
+
+def share_gen(conn: sqlite3.Connection) -> int:
+    """The archive's generation as the file says it: one more each time a pass replaced a row of it in place (share_gen_bump);
+    0 in a file that says none (nothing replaced since this was first kept, or no settings table)."""
+    try:
+        row = conn.execute("SELECT body FROM settings WHERE key = ?", (SHARE_GEN_KEY,)).fetchone()
+        return int(row[0]) if row else 0  # (a bare number: no record is parsed for it)
+    except (sqlite3.Error, TypeError, ValueError):
+        return 0
+
+
+def share_gen_bump(conn: sqlite3.Connection) -> None:
+    """One more generation — inside the caller's transaction (Ledger.archive_old: with the rows that replaced one)."""
+    conn.execute("INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET body=excluded.body", (SHARE_GEN_KEY, str(share_gen(conn) + 1)))
+
+
+def share_load(conn: sqlite3.Connection, path: str) -> ArchiveShare | None:
+    """The archive's counts kept in the ledger's file (share_save) as a share to bring up to date — None when there are none,
+    they cannot be read, or they are no use (ArchiveShare.restored). 1.154.53: after a start only the rows archived since
+    are read; until then every start read the archive whole."""
+    try:
+        row = conn.execute("SELECT body FROM settings WHERE key = ?", (SHARE_KEY,)).fetchone()
+        return ArchiveShare.restored(path, json.loads(row[0]), share_gen(conn)) if row else None
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
+
+
+def share_save(conn: sqlite3.Connection, share: ArchiveShare) -> bool:
+    """These counts into the ledger's file, for the next start (one small row of its settings); False when they could not be
+    written (a file without the table, a full disk: the next start reads the archive whole, as before — in the background)."""
+    try:
+        with conn:
+            conn.execute("INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET body=excluded.body",
+                         (SHARE_KEY, json.dumps(share.state(share_gen(conn)), ensure_ascii=False)))
+        return True
+    except (sqlite3.Error, TypeError, ValueError):
+        return False
+
+
+def archive_share(source: Ledger | str, rows: list[dict], kept: ArchiveShare | None = None, whole: bool = True) -> ArchiveShare:
     """ArchiveShare.read on a ledger — a controller's, or while the mode is off the file's path (none there: an empty
-    share) — whose working records are ``rows``; ``kept`` is what the last call returned (LiveBot.preopen_review)."""
+    share) — whose working records are ``rows``; ``kept`` is what the last call returned (LiveBot.preopen_review).
+    ``whole`` false: ShareBehind where that would be more than a call on the event loop may do (ArchiveShare.read)."""
     if not isinstance(source, str):
-        return ArchiveShare.read(source.conn, source.path, rows, kept)
+        return ArchiveShare.read(source.conn, source.path, rows, kept, whole)
     if source == ":memory:" or not Path(source).exists():
         return ArchiveShare(source)
     conn = sqlite3.connect(source)
     try:
-        return ArchiveShare.read(conn, source, rows, kept)
+        return ArchiveShare.read(conn, source, rows, kept, whole)
     finally:
         conn.close()
 
